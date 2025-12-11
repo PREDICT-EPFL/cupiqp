@@ -51,19 +51,23 @@ class Data:
                 raise ValueError("x_l and x_u must be one-dimensional arrays.")
             if x_l.shape[0] != P.shape[0] or x_u.shape[0] != P.shape[0]:
                 raise ValueError("Dimension mismatch between x_l, x_u, and P.")
-        else:
-            x_l = np.full(P.shape[0], -1.e20)
-            x_u = np.full(P.shape[0], 1.e20)
+            
+        x_l = -np.inf * np.ones(P.shape[0]) if x_l is None else x_l
+        x_u = np.inf * np.ones(P.shape[0]) if x_u is None else x_u
+        
+        self._idx_xl = np.where(np.isfinite(x_l))[0]
+        self._x_l = x_l[self._idx_xl]
+        self._idx_xu = np.where(np.isfinite(x_u))[0]
+        self._x_u = x_u[self._idx_xu]
 
         self._A = A
         self._b = b
         self._G = G
-        self._h_u = h_u
-        self._h_l = h_l
-        # self.x_u = x_u if x_u is not None else np.full(P.shape[0], np.inf)
-        # self.x_l = x_l if x_l is not None else np.full(P.shape[0], -np.inf)
-        self._x_u = x_u
-        self._x_l = x_l
+
+        self._idx_hl = np.where(np.isfinite(h_l))[0]
+        self._idx_hu = np.where(np.isfinite(h_u))[0]
+        self._h_l = h_l[self._idx_hl]
+        self._h_u = h_u[self._idx_hu]
         
 
     @property
@@ -116,3 +120,43 @@ class Data:
     def m(self):
         """Number of inequality constraints."""
         return self._G.shape[0]
+    
+    @property
+    def num_hl(self):
+        """Number of lower inequality constraints."""
+        return len(self._idx_hl)
+    
+    @property
+    def idx_hl(self):
+        """Indices of lower inequality constraints."""
+        return self._idx_hl
+    
+    @property
+    def num_hu(self):
+        """Number of upper inequality constraints."""
+        return len(self._idx_hu)
+    
+    @property
+    def idx_hu(self):
+        """Indices of upper inequality constraints."""
+        return self._idx_hu
+    
+    @property
+    def num_xl(self):
+        """Number of lower bound constraints."""
+        return len(self._idx_xl)
+    
+    @property
+    def idx_xl(self):
+        """Indices of lower bound constraints."""
+        return self._idx_xl
+    
+    @property
+    def num_xu(self):
+        """Number of upper bound constraints."""
+        return len(self._idx_xu)
+    
+    @property
+    def idx_xu(self):
+        """Indices of upper bound constraints."""
+        return self._idx_xu

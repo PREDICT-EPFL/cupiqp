@@ -22,11 +22,11 @@ class KKTSolverBase(ABC):
         self._z_reg_inv = np.nan * np.ones(data.m)
 
     @abstractmethod
-    def update_scalings_and_factor(self, data: Data, rho: float, delta: float) -> bool:
+    def update_scalings_and_factor(self, data: Data, delta: float, x_reg: np.ndarray, z_reg: np.ndarray) -> bool:
         pass
 
     @abstractmethod
-    def solve(self, rhs_x, rhs_y, rhs_z, lhs_x, lhs_y, lhs_z) -> None:
+    def solve(self, data: Data, rhs_x, rhs_y, rhs_z):
         pass
 
     def eval_P_x(self, data: Data, x):
