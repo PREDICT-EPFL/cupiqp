@@ -94,6 +94,12 @@ class KKTSystem:
         
         # return lhs
 
+    def eval_P_x(self, data: Data, alpha: float, x: np.ndarray) -> np.ndarray:
+        """
+        Evaluate alpha * P * x
+        """
+        return self._kkt_solver.eval_P_x(data, alpha, x)
+    
     def eval_A_xn_and_AT_xt(self, data: Data, alpha_n: float, alpha_t: float, xn: np.ndarray, xt: np.ndarray):
         """
         Evaluate Ax and A^T xt with scaling factors alpha_n and alpha_t:

@@ -29,12 +29,12 @@ class KKTSolverBase(ABC):
     def solve(self, data: Data, rhs_x, rhs_y, rhs_z):
         pass
 
-    def eval_P_x(self, data: Data, x):
+    def eval_P_x(self, data: Data, alpha: float, x):
         """
-        Evaluate P * x
+        Evaluate alpha * P * x
         """
         # TODO: in PIQP cpp code the data stores upper triangular part of P only, so we need to adjust accordingly
-        return data.P @ x
+        return alpha * (data.P @ x)
 
     def eval_A_xn_and_AT_xt(self, data: Data, alpha_n: float, alpha_t: float, xn, xt):
         """
