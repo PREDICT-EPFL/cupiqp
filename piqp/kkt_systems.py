@@ -30,6 +30,11 @@ class KKTSystem:
 
 
     def update_scalings_and_factor(self, data: Data, rho: float, delta: float, vars: Variables) -> bool:
+        """
+        Update the scaling factors and refactor the KKT matrix.
+
+        The variable vars is the current primal/dual variable values at this iteration, i.e., values of x, y, z_u, z_l, s_u, s_l, z_bu, z_bl, s_bu, s_bl at the current iteration.
+        """
         self._delta = delta
 
         # store the current slack and dual variable values at this iteration
@@ -57,22 +62,22 @@ class KKTSystem:
 
     def solve(self, data: Data, settings: Settings, rhs: Variables, lhs: Variables) -> None:
         
-        w_bu_delta_inv = 1. / (rhs.s_bu / rhs.z_bu + self._delta)
-        w_bl_delta_inv = 1. / (rhs.s_bl / rhs.z_bl + self._delta)
+        w_bu_delta_inv = 1. / (self._m_s_bu * self._m_z_bu_inv + self._delta)
+        w_bl_delta_inv = 1. / (self._m_s_bl * self._m_z_bl_inv + self._delta)
 
         rhs_z_u = rhs.z_u - self._m_z_u_inv * rhs.s_u  # rhs_z_u - inv(Z_u) * r_s_u
         rhs_z_l = rhs.z_l - self._m_z_l_inv * rhs.s_l  # rhs_z_l - inv(Z_l) * r_s_l
         rhs_z_bu = rhs.z_bu - self._m_z_bu_inv * rhs.s_bu  # rhs_z_bu - inv(Z_bu) * r_s_bu
         rhs_z_bl = rhs.z_bl - self._m_z_bl_inv * rhs.s_bl  # rhs_z_bl - inv(Z_bl) * r_s_bl
 
-        rhs_x_bar = rhs.x
+        rhs_x_bar = rhs.x.copy()
         rhs_x_bar[data.idx_xu] += w_bu_delta_inv * rhs_z_bu
         rhs_x_bar[data.idx_xl] -= w_bl_delta_inv * rhs_z_bl
 
-        rhs_y = rhs.y
+        rhs_y = rhs.y.copy()
 
-        w_u_delta_inv = 1. / (rhs.s_u / rhs.z_u + self._delta)
-        w_l_delta_inv = 1. / (rhs.s_l / rhs.z_l + self._delta)
+        w_u_delta_inv = 1. / (self._m_s_u * self._m_z_u_inv + self._delta)
+        w_l_delta_inv = 1. / (self._m_s_l * self._m_z_l_inv + self._delta)
 
         rhs_z_bar = 1./ (w_u_delta_inv + w_l_delta_inv) * (w_u_delta_inv * rhs_z_u - w_l_delta_inv * rhs_z_l)
 
@@ -183,7 +188,7 @@ class KKTSystem:
         rhs_vector = np.hstack((rhs.x, rhs.y, rhs.z_u, rhs.z_l, rhs.z_bu, rhs.z_bl, rhs.s_u, rhs.s_l, rhs.s_bu, rhs.s_bl))
         sol = np.linalg.solve(kkt_mat, rhs_vector)
         assert np.abs(np.max(kkt_mat @ sol - rhs_vector)) < 1e-8, "KKT solution verification failed!"
-        lhs = Variables(self._data)
+        lhs = Variables(n, p, m, self._data.num_xu, self._data.num_xl)
         lhs.x = sol[:n]
         lhs.y = sol[n:n + p]
         lhs.z_u = sol[n + p:n + p + m]

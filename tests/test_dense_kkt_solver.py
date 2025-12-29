@@ -33,11 +33,11 @@ class TestKKTSystem(unittest.TestCase):
         rho = 1e-1
         x_reg = np.ones(data.n)
         z_reg = np.ones(data.m)
-        vars = Variables(data)
+        vars = Variables(data.n, data.p, data.m, data.num_xu, data.num_xl)
         vars.set_random()
-        rhs = Variables(data)
+        rhs = Variables(data.n, data.p, data.m, data.num_xu, data.num_xl)
         rhs.set_random()
-        lhs = Variables(data)
+        lhs = Variables(data.n, data.p, data.m, data.num_xu, data.num_xl)
         print("The full KKT matrix is: ")
 
         kkt_mat = kkt_system.kkt_matrix(rho=rho, delta=delta, vars=vars)
@@ -93,11 +93,11 @@ class TestKKTSystem(unittest.TestCase):
         rho = 1e-1
         x_reg = np.ones(data.n)
         z_reg = np.ones(data.m)
-        vars = Variables(data)
+        vars = Variables(data.n, data.p, data.m, data.num_xu, data.num_xl)
         vars.set_random()
-        rhs = Variables(data)
+        rhs = Variables(data.n, data.p, data.m, data.num_xu, data.num_xl)
         rhs.set_random()
-        lhs = Variables(data)
+        lhs = Variables(data.n, data.p, data.m, data.num_xu, data.num_xl)
         print("The full KKT matrix is: ")
 
         kkt_mat = kkt_system.kkt_matrix(rho=rho, delta=delta, vars=vars)

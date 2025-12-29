@@ -41,6 +41,7 @@ class Settings:
     iterative_refinement_static_regularization_rel: float = 2.220446049250313e-32  # Approximation of epsilon squared
 
     verbose: bool = False
+    debug: bool = False
     compute_timings: bool = False
 
     def verify_settings(self) -> bool:

@@ -2,8 +2,6 @@ import numpy as np
 from enum import Enum
 from dataclasses import dataclass
 
-from .data import Data
-
 class Status(Enum):
     PIQP_UNSOLVED = -1
     PIQP_SOLVED= 0
@@ -17,19 +15,23 @@ class Variables:
     """
     Class to hold optimization variables.
     """
-    def __init__(self, data: Data):
-        self._data = data
-        self.x = np.zeros(data.n)        # Primal variables
-        self.y = np.zeros(data.p)        # Dual variables for equality constraints
-        self.z_u = np.ones(data.m)      # Dual variables for inequality constraints (upper)
-        self.z_l = np.ones(data.m)      # Dual variables for inequality constraints (lower)
-        self.z_bl = np.ones(data.num_xl)     # Dual variables for bound constraints (lower)
-        self.z_bu = np.ones(data.num_xu)     # Dual variables for bound constraints (upper)
-        self.s_u = np.ones(data.m)      # Slack variables for inequality constraints (upper)
-        self.s_l = np.ones(data.m)      # Slack variables for inequality constraints (lower)
-        self.s_bl = np.ones(data.num_xl)     # Slack variables for bound constraints (lower)
-        self.s_bu = np.ones(data.num_xu)     # Slack variables for bound constraints (upper)
+    def __init__(self, n: int, p: int, m: int, num_xu: int = 0, num_xl: int = 0):
+        self.n = n        # Number of primal variables
+        self.p = p        # Number of equality constraints
+        self.m = m        # Number of inequality constraints
+        self.num_xu = num_xu  # Number of upper bound constraints
+        self.num_xl = num_xl  # Number of lower bound constraints
 
+        self.x = np.zeros(n)        # Primal variables
+        self.y = np.zeros(p)        # Dual variables for equality constraints
+        self.z_u = np.ones(m)      # Dual variables for inequality constraints (upper)
+        self.z_l = np.ones(m)      # Dual variables for inequality constraints (lower)
+        self.z_bl = np.ones(num_xl)     # Dual variables for bound constraints (lower)
+        self.z_bu = np.ones(num_xu)     # Dual variables for bound constraints (upper)
+        self.s_u = np.ones(m)      # Slack variables for inequality constraints (upper)
+        self.s_l = np.ones(m)      # Slack variables for inequality constraints (lower)
+        self.s_bl = np.ones(num_xl)     # Slack variables for bound constraints (lower)
+        self.s_bu = np.ones(num_xu)     # Slack variables for bound constraints (upper)
         # z_l, z_u are of size m because in the original KKT matrix we must have rows[G, ...; -G, ...] to efficiently handle double-sided inequalities
 
     def all_finite(self) -> bool:
@@ -86,7 +88,7 @@ class Variables:
                 len(self.s_bl) == len(other.s_bl) and
                 len(self.s_bu) == len(other.s_bu)):
             raise ValueError("Dimension mismatch in Variables subtraction.")
-        result = Variables(self._data)
+        result = Variables(self.n, self.p, self.m, self.num_xu, self.num_xl)
         result.x = self.x - other.x
         result.y = self.y - other.y
         result.z_u = self.z_u - other.z_u
@@ -134,10 +136,12 @@ class Info:
     status: Status = Status.PIQP_UNSOLVED
 
     iter: int = 0
+    rho: float = None
+    delta: float = None
     mu: float = None
     sigma: float = None
-    primal_step: float = None
-    dual_step: float = None
+    primal_step: float = 0.0
+    dual_step: float = 0.0
     
     primal_res: float = None
     primal_res_rel: float = None
@@ -157,6 +161,7 @@ class Info:
     
     primal_obj: float = None
     dual_obj: float = None
+    duality_gap: float = None
     duality_gap_rel: float = None
     
     factor_retires: int = 0
@@ -174,5 +179,5 @@ class Info:
 
 class Result(Variables):
     def __init__(self):
-        super().__init__(n=0, p=0, m=0)  # Initialize with default sizes; adjust as needed
+        super().__init__(n=0, p=0, m=0, num_xu=0, num_xl=0)  # Initialize with default sizes; adjust as needed
         self.info = Info()
