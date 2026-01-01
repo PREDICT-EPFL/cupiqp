@@ -22,11 +22,10 @@ class KKTSystem:
         self._m_s_l = np.zeros(self._data.m)
         self._m_z_u_inv = np.zeros(self._data.m)
         self._m_z_l_inv = np.zeros(self._data.m)
-        self._m_s_bu = np.zeros(self._data.num_xu)
-        self._m_s_bl = np.zeros(self._data.num_xl)
-        self._m_z_bu_inv = np.zeros(self._data.num_xu)
-        self._m_z_bl_inv = np.zeros(self._data.num_xl)
-
+        self._m_s_bu = np.zeros(self._data.n)
+        self._m_s_bl = np.zeros(self._data.n)
+        self._m_z_bu_inv = np.zeros(self._data.n)
+        self._m_z_bl_inv = np.zeros(self._data.n)
 
 
     def update_scalings_and_factor(self, data: Data, rho: float, delta: float, vars: Variables) -> bool:
@@ -38,37 +37,44 @@ class KKTSystem:
         self._delta = delta
 
         # store the current slack and dual variable values at this iteration
-        self._m_s_u = vars.s_u
-        self._m_s_l = vars.s_l
-        self._m_s_bu = vars.s_bu
-        self._m_s_bl = vars.s_bl
-        self._m_z_u_inv = 1. / vars.z_u
-        self._m_z_l_inv = 1. / vars.z_l
-        self._m_z_bu_inv = 1. / vars.z_bu
-        self._m_z_bl_inv = 1. / vars.z_bl
+        self._m_s_u[:] = vars.s_u
+        self._m_s_l[:] = vars.s_l
+        self._m_s_bu[:] = vars.s_bu
+        self._m_s_bl[:] = vars.s_bl
+        self._m_z_u_inv[data.idx_hu] = 1. / vars.z_u[data.idx_hu]
+        self._m_z_l_inv[data.idx_hl] = 1. / vars.z_l[data.idx_hl]
+        self._m_z_bu_inv[data.idx_xu] = 1. / vars.z_bu[data.idx_xu]
+        self._m_z_bl_inv[data.idx_xl] = 1. / vars.z_bl[data.idx_xl]
 
-        # TODO: vars will be used if we have box constraints
-        w_bu_delta = vars.s_bu / vars.z_bu + self._delta
-        w_bl_delta = vars.s_bl / vars.z_bl + self._delta
+        # eliminate the box constraints by adding their contribution to x_reg and z_reg
+        w_bu_delta = vars.s_bu[data.idx_xu] / vars.z_bu[data.idx_xu] + self._delta
+        w_bl_delta = vars.s_bl[data.idx_xl] / vars.z_bl[data.idx_xl] + self._delta
         self._x_reg = rho * np.ones(self._data.n)
-        self._x_reg[data.idx_xu] += + 1./w_bu_delta
-        self._x_reg[data.idx_xl] += + 1./w_bl_delta
+        self._x_reg[data.idx_xu] += 1./w_bu_delta
+        self._x_reg[data.idx_xl] += 1./w_bl_delta
 
-        w_u_delta_inv = 1. / (vars.s_u / vars.z_u + self._delta)
-        w_l_delta_inv = 1. / (vars.s_l / vars.z_l + self._delta)
-        self._z_reg = 1. / (w_u_delta_inv + w_l_delta_inv)
-
-        return self._kkt_solver.update_scalings_and_factor(data, delta, self._x_reg, self._z_reg)
-
+        # w_u_delta_inv = 1. / (vars.s_u / vars.z_u + self._delta)
+        # w_l_delta_inv = 1. / (vars.s_l / vars.z_l + self._delta)
+        # self._z_reg = 1. / (w_u_delta_inv + w_l_delta_inv)
+        # TODO: deal with this if idx_hu and idx_hl are different
+        w_u_delta_inv = 1. / (vars.s_u[data.idx_hu] / vars.z_u[data.idx_hu] + self._delta)
+        w_l_delta_inv = 1. / (vars.s_l[data.idx_hl] / vars.z_l[data.idx_hl] + self._delta)
+        tmp = np.zeros(self._data.m)
+        tmp[data.idx_hu] += w_u_delta_inv
+        tmp[data.idx_hl] += w_l_delta_inv
+        self._z_reg = np.zeros(self._data.m)
+        self._z_reg = 1. / tmp
+        return self._kkt_solver.update_scalings_and_factor(data, delta, self._x_reg, self._z_reg) # ! this is implicitly assuming idx_hu and idx_hl cover all indices of inequalities 0:m
+    
     def solve(self, data: Data, settings: Settings, rhs: Variables, lhs: Variables) -> None:
         
-        w_bu_delta_inv = 1. / (self._m_s_bu * self._m_z_bu_inv + self._delta)
-        w_bl_delta_inv = 1. / (self._m_s_bl * self._m_z_bl_inv + self._delta)
+        w_bu_delta_inv = 1. / (self._m_s_bu[data.idx_xu] * self._m_z_bu_inv[data.idx_xu] + self._delta)
+        w_bl_delta_inv = 1. / (self._m_s_bl[data.idx_xl] * self._m_z_bl_inv[data.idx_xl] + self._delta)
 
-        rhs_z_u = rhs.z_u - self._m_z_u_inv * rhs.s_u  # rhs_z_u - inv(Z_u) * r_s_u
-        rhs_z_l = rhs.z_l - self._m_z_l_inv * rhs.s_l  # rhs_z_l - inv(Z_l) * r_s_l
-        rhs_z_bu = rhs.z_bu - self._m_z_bu_inv * rhs.s_bu  # rhs_z_bu - inv(Z_bu) * r_s_bu
-        rhs_z_bl = rhs.z_bl - self._m_z_bl_inv * rhs.s_bl  # rhs_z_bl - inv(Z_bl) * r_s_bl
+        rhs_z_u = rhs.z_u[data.idx_hu] - self._m_z_u_inv[data.idx_hu] * rhs.s_u[data.idx_hu]  # rhs_z_u - inv(Z_u) * r_s_u
+        rhs_z_l = rhs.z_l[data.idx_hl] - self._m_z_l_inv[data.idx_hl] * rhs.s_l[data.idx_hl]  # rhs_z_l - inv(Z_l) * r_s_l
+        rhs_z_bu = rhs.z_bu[data.idx_xu] - self._m_z_bu_inv[data.idx_xu] * rhs.s_bu[data.idx_xu]  # rhs_z_bu - inv(Z_bu) * r_s_bu
+        rhs_z_bl = rhs.z_bl[data.idx_xl] - self._m_z_bl_inv[data.idx_xl] * rhs.s_bl[data.idx_xl]  # rhs_z_bl - inv(Z_bl) * r_s_bl
 
         rhs_x_bar = rhs.x.copy()
         rhs_x_bar[data.idx_xu] += w_bu_delta_inv * rhs_z_bu
@@ -76,28 +82,34 @@ class KKTSystem:
 
         rhs_y = rhs.y.copy()
 
-        w_u_delta_inv = 1. / (self._m_s_u * self._m_z_u_inv + self._delta)
-        w_l_delta_inv = 1. / (self._m_s_l * self._m_z_l_inv + self._delta)
+        w_u_delta_inv = 1. / (self._m_s_u[data.idx_hu] * self._m_z_u_inv[data.idx_hu] + self._delta)
+        w_l_delta_inv = 1. / (self._m_s_l[data.idx_hl] * self._m_z_l_inv[data.idx_hl] + self._delta)
 
-        rhs_z_bar = 1./ (w_u_delta_inv + w_l_delta_inv) * (w_u_delta_inv * rhs_z_u - w_l_delta_inv * rhs_z_l)
+        # rhs_z_bar = 1./ (w_u_delta_inv + w_l_delta_inv) * (w_u_delta_inv * rhs_z_u - w_l_delta_inv * rhs_z_l)
+        tmp = np.zeros(data.m)
+        tmp[data.idx_hu] += w_u_delta_inv * rhs_z_u
+        tmp[data.idx_hl] -= w_l_delta_inv * rhs_z_l
+        tmp2 = np.ones(data.m)
+        tmp2[data.idx_hu] += w_u_delta_inv
+        tmp2[data.idx_hl] += w_l_delta_inv
+        rhs_z_bar = 1./ tmp2 * tmp
 
         delta_x, delta_y, delta_z = self._kkt_solver.solve(data, rhs_x_bar, rhs_y, rhs_z_bar)
 
         # recover primal/dual step from kkt solution
         lhs.x = delta_x  # delta_x
         lhs.y = delta_y  # delta_y
-        lhs.z_u = w_u_delta_inv * (data.G @ delta_x - rhs_z_u)   # delta_z_u
-        lhs.z_l = w_l_delta_inv * (-data.G @ delta_x - rhs_z_l)  # delta_z_l
-        lhs.z_bu = w_bu_delta_inv * (delta_x[data.idx_xu] - rhs.z_bu + self._m_z_bu_inv * rhs.s_bu)  # delta_z_bu
-        lhs.z_bl = -w_bl_delta_inv * (delta_x[data.idx_xl] + rhs.z_bl - self._m_z_bl_inv * rhs.s_bl)  # delta_z_bl
+        lhs.z_u[data.idx_hu] = w_u_delta_inv * (data.G[data.idx_hu, :] @ delta_x - rhs_z_u)   # delta_z_u
+        lhs.z_l[data.idx_hl] = w_l_delta_inv * (-data.G[data.idx_hl, :] @ delta_x - rhs_z_l)  # delta_z_l
+        lhs.z_bu[data.idx_xu] = w_bu_delta_inv * (delta_x[data.idx_xu] - rhs.z_bu[data.idx_xu] + self._m_z_bu_inv[data.idx_xu] * rhs.s_bu[data.idx_xu])  # delta_z_bu
+        lhs.z_bl[data.idx_xl] = -w_bl_delta_inv * (delta_x[data.idx_xl] + rhs.z_bl[data.idx_xl] - self._m_z_bl_inv[data.idx_xl] * rhs.s_bl[data.idx_xl])  # delta_z_bl
 
         # recover slack variable steps
-        lhs.s_u = self._m_z_u_inv * (rhs.s_u - self._m_s_u * lhs.z_u)  # delta_s_u = inv(Z_u) (r_s_u - S_u delta_z_u)
-        lhs.s_l = self._m_z_l_inv * (rhs.s_l - self._m_s_l * lhs.z_l)  # delta_s_l = inv(Z_l) (r_s_l - S_l delta_z_l)
-        lhs.s_bu = self._m_z_bu_inv * (rhs.s_bu - self._m_s_bu * lhs.z_bu)  # delta_s_bu = inv(Z_bu) (r_s_bu - S_bu delta_z_bu)
-        lhs.s_bl = self._m_z_bl_inv * (rhs.s_bl - self._m_s_bl * lhs.z_bl)  # delta_s_bl = inv(Z_bl) (r_s_bl - S_bl delta_z_bl)
+        lhs.s_u[data.idx_hu] = self._m_z_u_inv[data.idx_hu] * (rhs.s_u[data.idx_hu] - self._m_s_u[data.idx_hu] * lhs.z_u[data.idx_hu])  # delta_s_u = inv(Z_u) (r_s_u - S_u delta_z_u)
+        lhs.s_l[data.idx_hl] = self._m_z_l_inv[data.idx_hl] * (rhs.s_l[data.idx_hl] - self._m_s_l[data.idx_hl] * lhs.z_l[data.idx_hl])  # delta_s_l = inv(Z_l) (r_s_l - S_l delta_z_l)
+        lhs.s_bu[data.idx_xu] = self._m_z_bu_inv[data.idx_xu] * (rhs.s_bu[data.idx_xu] - self._m_s_bu[data.idx_xu] * lhs.z_bu[data.idx_xu])  # delta_s_bu = inv(Z_bu) (r_s_bu - S_bu delta_z_bu)
+        lhs.s_bl[data.idx_xl] = self._m_z_bl_inv[data.idx_xl] * (rhs.s_bl[data.idx_xl] - self._m_s_bl[data.idx_xl] * lhs.z_bl[data.idx_xl])  # delta_s_bl = inv(Z_bl) (r_s_bl - S_bl delta_z_bl)
         
-        # return lhs
 
     def eval_P_x(self, data: Data, alpha: float, x: np.ndarray) -> np.ndarray:
         """

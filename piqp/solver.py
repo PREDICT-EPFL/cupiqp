@@ -22,12 +22,12 @@ class SolverBase:
 
         self._result.info.rho = self.settings.rho_init
         self._result.info.delta = self.settings.delta_init
-        self._step = Variables(self._data.n, self._data.p, self._data.m, self._data.num_xu, self._data.num_xl)
+        self._step = Variables(self._data.n, self._data.p, self._data.m)
 
         self._kkt_system = KKTSystem(self._data)
 
-        self._res_nr = Variables(self._data.n, self._data.p, self._data.m, self._data.num_xu, self._data.num_xl)  # used to store the non-regularized residuals
-        self._res_r = Variables(self._data.n, self._data.p, self._data.m, self._data.num_xu, self._data.num_xl)  # used to store the regularized residuals
+        self._res_nr = Variables(self._data.n, self._data.p, self._data.m)  # used to store the non-regularized residuals
+        self._res_r = Variables(self._data.n, self._data.p, self._data.m)  # used to store the regularized residuals
         
         
 
@@ -55,14 +55,24 @@ class SolverBase:
 
         self._result.x = np.zeros(self._data.n)
         self._result.y = np.zeros(self._data.p)
-        self._result.s_l = np.zeros(self._data.m)
-        self._result.s_u = np.zeros(self._data.m)
-        self._result.s_bl = np.zeros(self._data.n)
-        self._result.s_bu = np.zeros(self._data.n)
-        self._result.z_l = np.zeros(self._data.m)
-        self._result.z_u = np.zeros(self._data.m)
-        self._result.z_bl = np.zeros(self._data.n)
-        self._result.z_bu = np.zeros(self._data.n)
+        # self._result.s_l = np.zeros(self._data.m)
+        # self._result.s_u = np.zeros(self._data.m)
+        # self._result.s_bl = np.zeros(self._data.n)
+        # self._result.s_bu = np.zeros(self._data.n)
+        # self._result.z_l = np.zeros(self._data.m)
+        # self._result.z_u = np.zeros(self._data.m)
+        # self._result.z_bl = np.zeros(self._data.n)
+        # self._result.z_bu = np.zeros(self._data.n)
+
+        # ! using np.nan because it raises error when the implementation is wrong, making debugging easier
+        self._result.s_l = np.nan * np.ones(self._data.m)
+        self._result.s_u = np.nan * np.ones(self._data.m)
+        self._result.s_bl = np.nan * np.ones(self._data.n)
+        self._result.s_bu = np.nan * np.ones(self._data.n)
+        self._result.z_l = np.nan * np.ones(self._data.m)
+        self._result.z_u = np.nan * np.ones(self._data.m)
+        self._result.z_bl = np.nan * np.ones(self._data.n)
+        self._result.z_bu = np.nan * np.ones(self._data.n)
 
         self._result.s_l[self._data.idx_hl] = 1.0
         self._result.z_l[self._data.idx_hl] = 1.0
@@ -83,19 +93,23 @@ class SolverBase:
         self._res = Result()  # used to store the right hand side of KKT system
         self._res.x = -self._data.c.copy()
         self._res.y = self._data.b.copy()
-        self._res.z_l = -self._data.h_l.copy()
-        self._res.z_u = self._data.h_u.copy()
-        self._res.z_bl = -self._data.x_l.copy()
-        self._res.z_bu = self._data.x_u.copy()
-        self._res.s_l = np.zeros(self._data.m)
-        self._res.s_u = np.zeros(self._data.m)
-        self._res.s_bl = np.zeros(self._data.n)
-        self._res.s_bu = np.zeros(self._data.n)
-
-        # full_kkt = self._kkt_system.kkt_matrix(self._result.rho, self._result.delta, res)
-        # print("The full KKT matrix is: ")
-        # print_matlab_format(full_kkt, name="KKT_Matrix")
-        # print("res:", res)
+        self._res.z_l = np.nan * np.zeros(self._data.m)
+        self._res.z_l[self._data.idx_hl] = -self._data.h_l[self._data.idx_hl]
+        self._res.z_u = np.nan * np.zeros(self._data.m)
+        self._res.z_u[self._data.idx_hu] = self._data.h_u[self._data.idx_hu]
+        self._res.z_bl = np.nan * np.zeros(self._data.n)
+        self._res.z_bl[self._data.idx_xl] = -self._data.x_l[self._data.idx_xl]
+        self._res.z_bu = np.nan * np.zeros(self._data.n)
+        self._res.z_bu[self._data.idx_xu] = self._data.x_u[self._data.idx_xu]
+        
+        self._res.s_l = np.nan * np.zeros(self._data.m)
+        self._res.s_u = np.nan * np.zeros(self._data.m)
+        self._res.s_bl = np.nan * np.zeros(self._data.n)
+        self._res.s_bu = np.nan * np.zeros(self._data.n)
+        self._res.s_l[self._data.idx_hl] = 0.
+        self._res.s_u[self._data.idx_hu] = 0.
+        self._res.s_bl[self._data.idx_xl] = 0.
+        self._res.s_bu[self._data.idx_xu] = 0.
 
         self._kkt_system.solve(self._data, self.settings, self._res, self._result)  # getting an initial point of _result
 
@@ -105,24 +119,26 @@ class SolverBase:
         ## ----------- keep z and s non-negative --------------
         # this is according to the IV.A part of Roland Schwan 2023 paper
         delta_s = 0.0
-        if self._data.m > 0:
-            delta_s = max(delta_s, -self._result.s_l.min())
-            delta_s = max(delta_s, -self._result.s_u.min())
+        if self._data.num_hl > 0:
+            delta_s = max(delta_s, -self._result.s_l[self._data.idx_hl].min())
+        if self._data.num_hu > 0:
+            delta_s = max(delta_s, -self._result.s_u[self._data.idx_hu].min())
 
         if self._data.num_xl > 0:
-            delta_s = max(delta_s, -self._result.s_bl.min())
+            delta_s = max(delta_s, -self._result.s_bl[self._data.idx_xl].min())
         if self._data.num_xu > 0:
-            delta_s = max(delta_s, -self._result.s_bu.min())
+            delta_s = max(delta_s, -self._result.s_bu[self._data.idx_xu].min())
 
         delta_z = 0.0
-        if self._data.m > 0:
-            delta_z = max(delta_z, -self._result.z_l.min())
-            delta_z = max(delta_z, -self._result.z_u.min())
+        if self._data.num_hl > 0:
+            delta_z = max(delta_z, -self._result.z_l[self._data.idx_hl].min())
+        if self._data.num_hu > 0:
+            delta_z = max(delta_z, -self._result.z_u[self._data.idx_hu].min())
         
         if self._data.num_xl > 0:
-            delta_z = max(delta_z, -self._result.z_bl.min())
+            delta_z = max(delta_z, -self._result.z_bl[self._data.idx_xl].min())
         if self._data.num_xu > 0:
-            delta_z = max(delta_z, -self._result.z_bu.min())
+            delta_z = max(delta_z, -self._result.z_bu[self._data.idx_xu].min())
 
         self._result.s_l[self._data.idx_hl] += delta_s
         self._result.z_l[self._data.idx_hl] += delta_z
@@ -163,16 +179,15 @@ class SolverBase:
             print("self._result:", self._result)
 
         self._result.info.mu = self._calculate_mu()
-        # print("Initial mu:", self._result.info.mu)
 
-
-        self._prox_vars = Variables(self._data.n, self._data.p, self._data.m, self._data.num_xu, self._data.num_xl)
+        self._prox_vars = Variables(self._data.n, self._data.p, self._data.m)
         self._prox_vars.x = self._result.x
         self._prox_vars.y = self._result.y
         self._prox_vars.z_l = self._result.z_l
         self._prox_vars.z_u = self._result.z_u
 
-        print("Initial point set. Starting iterations...\n", self._prox_vars)
+        if self.settings.debug:
+            print("Initial point set. Starting iterations...\n", self._prox_vars)
 
         ## ---------------------------------------------
         ## ---------- remaining iterations -------------
@@ -243,14 +258,13 @@ class SolverBase:
             # avoid getting to close to the boundary
             alpha_s *= self.settings.tau
             alpha_z *= self.settings.tau
-            # print("alpha_s, alpha_z:", alpha_s, alpha_z)
 
             # ------------------ compute centering parameter sigma ------------------
             self._result.info.sigma = 0.
             self._result.info.sigma += np.dot(self._result.s_l + alpha_s * self._step.s_l, self._result.z_l + alpha_z * self._step.z_l)
             self._result.info.sigma += np.dot(self._result.s_u + alpha_s * self._step.s_u, self._result.z_u + alpha_z * self._step.z_u)
-            self._result.info.sigma += np.dot(self._result.s_bl + alpha_s * self._step.s_bl, self._result.z_bl + alpha_z * self._step.z_bl)
-            self._result.info.sigma += np.dot(self._result.s_bu + alpha_s * self._step.s_bu, self._result.z_bu + alpha_z * self._step.z_bu)
+            self._result.info.sigma += np.dot(self._result.s_bl[self._data.idx_xl] + alpha_s * self._step.s_bl[self._data.idx_xl], self._result.z_bl[self._data.idx_xl] + alpha_z * self._step.z_bl[self._data.idx_xl])
+            self._result.info.sigma += np.dot(self._result.s_bu[self._data.idx_xu] + alpha_s * self._step.s_bu[self._data.idx_xu], self._result.z_bu[self._data.idx_xu] + alpha_z * self._step.z_bu[self._data.idx_xu])
 
             self._result.info.sigma /= self._result.info.mu * (self._data.m + self._data.m + self._data.num_xl + self._data.num_xu)
             self._result.info.sigma = max(0., min(1., self._result.info.sigma))
@@ -371,13 +385,13 @@ class SolverBase:
         
         return alpha_s, alpha_z
     
-    
+
     def _calculate_mu(self) -> float:
-        mu = (self._result.s_l.dot(self._result.z_l)
-                + self._result.s_u.dot(self._result.z_u) \
-                + self._result.s_bl.dot(self._result.z_bl) \
-                + self._result.s_bu.dot(self._result.z_bu)) \
-                / (self._data.m + self._data.m + self._data.num_xl + self._data.num_xu)
+        mu = (self._result.s_l[self._data.idx_hl].dot(self._result.z_l[self._data.idx_hl])
+                + self._result.s_u[self._data.idx_hu].dot(self._result.z_u[self._data.idx_hu]) \
+                + self._result.s_bl[self._data.idx_xl].dot(self._result.z_bl[self._data.idx_xl]) \
+                + self._result.s_bu[self._data.idx_xu].dot(self._result.z_bu[self._data.idx_xu])) \
+                / (self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)
         return float(mu)
 
 
@@ -404,17 +418,21 @@ class SolverBase:
         # work_x += G^T * (z_u - z_l)
         # work_z.noalias() = m_result.z_u - m_result.z_l
 
-        G_x, GT_zu_minus_zl = self._kkt_system.eval_G_xn_and_GT_xt(self._data, 1., 1., self._result.x, self._result.z_u - self._result.z_l)
+        # TODO: Need to reconsider this if idx_hu and idx_hl are not full
+        tmp = np.zeros(self._data.m)
+        tmp[self._data.idx_hu] += self._result.z_u[self._data.idx_hu]
+        tmp[self._data.idx_hl] -= self._result.z_l[self._data.idx_hl]
+        G_x, GT_zu_minus_zl = self._kkt_system.eval_G_xn_and_GT_xt(self._data, 1., 1., self._result.x, tmp)
 
         # ------------ update primal / dual objectives and duality gap ------------
         self._result.info.primal_obj = -0.5 * np.dot(minus_P_x, self._result.x) + np.dot(self._data.c, self._result.x)
         # dual objective is: 0.5 x^T P x - b^T y - h_u^T z_u + h_l^T z_l - x_u^T z_bu + x_l^T z_bl
         self._result.info.dual_obj = 0.5 * np.dot(minus_P_x, self._result.x)
         self._result.info.dual_obj += - np.dot(self._data.b, self._result.y)
-        self._result.info.dual_obj += np.dot(self._data.h_l, self._result.z_l)
-        self._result.info.dual_obj += - np.dot(self._data.h_u, self._result.z_u)
-        self._result.info.dual_obj += np.dot(self._data.x_l, self._result.z_bl)
-        self._result.info.dual_obj += - np.dot(self._data.x_u, self._result.z_bu)
+        self._result.info.dual_obj += np.dot(self._data.h_l[self._data.idx_hl], self._result.z_l[self._data.idx_hl])
+        self._result.info.dual_obj += - np.dot(self._data.h_u[self._data.idx_hu], self._result.z_u[self._data.idx_hu])
+        self._result.info.dual_obj += np.dot(self._data.x_l[self._data.idx_xl], self._result.z_bl[self._data.idx_xl])
+        self._result.info.dual_obj += - np.dot(self._data.x_u[self._data.idx_xu], self._result.z_bu[self._data.idx_xu])
         
 
         self._result.info.duality_gap = abs(self._result.info.primal_obj - self._result.info.dual_obj)
@@ -424,14 +442,17 @@ class SolverBase:
         # where duality_gap_rel_norm is a scale estimate computed from the unscaled absolute contributions to the cost (e.g. |x^T P x|, |c^T x|, |b^T y|, |h_l^T z_l|, |h_u^T z_u|, |x_l^T z_bl|, |x_u^T z_bu|), each passed through the preconditioner unscale_cost.
 
         # res_nr.x = -(P*x + c + A^T*y + G^T*(z_u - z_l) + z_bu - z_bl)
-        self._res_nr.x = minus_P_x - self._data.c - AT_y - GT_zu_minus_zl - (self._result.z_bu - self._result.z_bl)
+        # TODO: Need to reconsider this if idx_hu and idx_hl are not full
+        self._res_nr.x = minus_P_x - self._data.c - AT_y - GT_zu_minus_zl # - (self._result.z_bu - self._result.z_bl)
+        self._res_nr.x[self._data.idx_xl] += self._result.z_bl[self._data.idx_xl]
+        self._res_nr.x[self._data.idx_xu] -= self._result.z_bu[self._data.idx_xu]
         # res_nr.y = -(A*x - b)
         self._res_nr.y = minus_A_x + self._data.b
         # TODO: need to consider which index contains the constraints
-        self._res_nr.z_l = G_x - self._result.s_l - self._data.h_l
-        self._res_nr.z_u = -G_x - self._result.s_u + self._data.h_u
-        self._res_nr.z_bl = self._result.x - self._result.s_bl - self._data.x_l
-        self._res_nr.z_bu = - (self._result.x + self._result.s_bu - self._data.x_u)
+        self._res_nr.z_l[self._data.idx_hl] = (G_x - self._result.s_l - self._data.h_l)[self._data.idx_hl]
+        self._res_nr.z_u[self._data.idx_hu] = (-G_x - self._result.s_u + self._data.h_u)[self._data.idx_hu]
+        self._res_nr.z_bl[self._data.idx_xl] = (self._result.x - self._result.s_bl - self._data.x_l)[self._data.idx_xl]
+        self._res_nr.z_bu[self._data.idx_xu] = - (self._result.x + self._result.s_bu - self._data.x_u)[self._data.idx_xu]
 
 
         # ------------ update primal and dual residuals ------------
@@ -460,6 +481,7 @@ class SolverBase:
         dual_res_norm = max(dual_res_norm, np.linalg.norm(self._data.c, ord=np.inf))
         dual_res_norm = max(dual_res_norm, np.linalg.norm(AT_y, ord=np.inf))
         dual_res_norm = max(dual_res_norm, np.linalg.norm(GT_zu_minus_zl, ord=np.inf))
+        # TODO: Need to reconsider this if idx_hu and idx_hl are not full
         dual_res_norm = max(dual_res_norm, np.linalg.norm(self._result.z_bu - self._result.z_bl, ord=np.inf))
         self._result.info.dual_res_rel = self._result.info.dual_res / max(1., dual_res_norm)
         
@@ -492,32 +514,23 @@ class SolverBase:
 
     def _primal_res_nr(self) -> float:
         inf = 0.
-        inf = max(inf, np.max(np.abs(self._res_nr.y)))
-        inf = max(inf, np.max(np.abs(self._res_nr.z_u)))
-        inf = max(inf, np.max(np.abs(self._res_nr.z_l)))
-        # inf = max(inf, np.max(np.abs(self._res_nr.z_bu)))
-        # inf = max(inf, np.max(np.abs(self._res_nr.z_bl)))
+        inf = max(inf, np.linalg.norm(self._res_nr.y, ord=np.inf))
+        inf = max(inf, np.linalg.norm(self._res_nr.z_u[self._data.idx_hu], ord=np.inf))
+        inf = max(inf, np.linalg.norm(self._res_nr.z_l[self._data.idx_hl], ord=np.inf))
         # ! I don't understand here. Why it is not taking the abs value of z_bl and z_bu?
         # ! This is just copied from the cpp implementation.
-        inf = max(inf, np.max(self._res_nr.z_bu))
-        inf = max(inf, np.max(self._res_nr.z_bl))
+        inf = max(inf, np.linalg.norm(self._res_nr.z_bu[self._data.idx_xu], ord=np.inf))
+        inf = max(inf, np.linalg.norm(self._res_nr.z_bl[self._data.idx_xl], ord=np.inf))
         return inf
 
 
     def _primal_res_r(self) -> float:
-        # TODO: fix this according to the cpp implementation
-        # ! primal_res_r and primal_res_nr are doing the same stuff, but using self._res and self._res_nr respectively
-        # primal_res_r = np.max(np.abs(np.concatenate([
-        #     self._res.y,
-        #     self._res.z_u + self._res.s_u - self._res.z_l - self._res.s_l
-        # ])))
-        # return primal_res_r
         inf = 0.
-        inf = max(inf, np.max(np.abs(self._res.y)))
-        inf = max(inf, np.max(np.abs(self._res.z_u)))
-        inf = max(inf, np.max(np.abs(self._res.z_l)))
-        inf = max(inf, np.max(np.abs(self._res.z_bu)))
-        inf = max(inf, np.max(np.abs(self._res.z_bl)))
+        inf = max(inf, np.linalg.norm(self._res.y, ord=np.inf))
+        inf = max(inf, np.linalg.norm(self._res.z_u[self._data.idx_hu], ord=np.inf))
+        inf = max(inf, np.linalg.norm(self._res.z_l[self._data.idx_hl], ord=np.inf))
+        inf = max(inf, np.linalg.norm(self._res.z_bu[self._data.idx_xu], ord=np.inf))
+        inf = max(inf, np.linalg.norm(self._res.z_bl[self._data.idx_xl], ord=np.inf))
         return inf
     
     def _dual_res_nr(self) -> float:
@@ -529,22 +542,12 @@ class SolverBase:
     def _primal_prox_inf(self) -> float:
         inf = 0.
         inf = max(inf, np.linalg.norm(self._result.y - self._prox_vars.y, ord=np.inf))
-        inf = max(inf, np.linalg.norm(self._result.z_l - self._prox_vars.z_l, ord=np.inf))
-        inf = max(inf, np.linalg.norm(self._result.z_u - self._prox_vars.z_u, ord=np.inf))
-        inf = max(inf, np.linalg.norm(self._result.z_bl - self._prox_vars.z_bl, ord=np.inf))
-        inf = max(inf, np.linalg.norm(self._result.z_bu - self._prox_vars.z_bu, ord=np.inf))
+        inf = max(inf, np.linalg.norm(self._result.z_l[self._data.idx_hl] - self._prox_vars.z_l[self._data.idx_hl], ord=np.inf))
+        inf = max(inf, np.linalg.norm(self._result.z_u[self._data.idx_hu] - self._prox_vars.z_u[self._data.idx_hu], ord=np.inf))
+        inf = max(inf, np.linalg.norm(self._result.z_bl[self._data.idx_xl] - self._prox_vars.z_bl[self._data.idx_xl], ord=np.inf))
+        inf = max(inf, np.linalg.norm(self._result.z_bu[self._data.idx_xu] - self._prox_vars.z_bu[self._data.idx_xu], ord=np.inf))
         return inf
     
     def _dual_prox_inf(self) -> float:
         return np.linalg.norm(self._result.x - self._prox_vars.x, ord=np.inf)
     
-
-# class DenseSolver(SolverBase):
-#     def __init__(self):
-#         super().__init__()
-#         self._kkt_system = De
-
-#     def _solve_impl(self):
-#         # Implement the dense solver logic here
-#         self._result.status = Status.PIQP_SOLVED
-#         # Fill in other result fields as necessary

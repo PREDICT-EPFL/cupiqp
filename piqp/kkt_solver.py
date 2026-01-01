@@ -103,7 +103,7 @@ class DenseKKTSolver(KKTSolverBase):
         self._z_reg_inv = 1.0 / z_reg
         self._update_kkt(data, x_reg)
         try:
-            self._kkt_mat = cholesky(self._kkt_mat, lower=True, overwrite_a=True, check_finite=True)  # ? overwrite_a seems not making a difference?
+            self._kkt_mat = cholesky(self._kkt_mat, lower=True, overwrite_a=False, check_finite=True)  # ? overwrite_a seems not making a difference?
             return True
         except np.linalg.LinAlgError:
             return False
@@ -113,11 +113,11 @@ class DenseKKTSolver(KKTSolverBase):
         Solve the KKT system using the factorized KKT matrix.
         """
         # Solve KKT * dx = rhs_x + 1/delta*A^T*rhs_y + G^T*diag(z_reg_inv)*rhs_z
-        lhs_x_tmp = rhs_x.copy()
+        lhs_x_tmp = np.array(rhs_x).flatten()
         if data.p > 0:
-            lhs_x_tmp += 1/self._delta * data.A.T @ rhs_y
+            lhs_x_tmp += (data.A.T @ rhs_y) / self._delta
         if data.m > 0:
-            lhs_x_tmp += data.G.T @ np.diag(self._z_reg_inv) @ rhs_z
+            lhs_x_tmp += data.G.T @ (self._z_reg_inv * rhs_z)
         # Solve L * L^T * dx = effective_rhs
         y = solve_triangular(self._kkt_mat, lhs_x_tmp, lower=True, overwrite_b=False)  # TODO: inplace
         lhs_x = solve_triangular(self._kkt_mat.T, y, lower=False, overwrite_b=False)  # TODO: inplace

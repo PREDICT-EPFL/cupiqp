@@ -15,23 +15,21 @@ class Variables:
     """
     Class to hold optimization variables.
     """
-    def __init__(self, n: int, p: int, m: int, num_xu: int = 0, num_xl: int = 0):
+    def __init__(self, n: int, p: int, m: int):
         self.n = n        # Number of primal variables
         self.p = p        # Number of equality constraints
         self.m = m        # Number of inequality constraints
-        self.num_xu = num_xu  # Number of upper bound constraints
-        self.num_xl = num_xl  # Number of lower bound constraints
 
         self.x = np.zeros(n)        # Primal variables
         self.y = np.zeros(p)        # Dual variables for equality constraints
         self.z_u = np.ones(m)      # Dual variables for inequality constraints (upper)
         self.z_l = np.ones(m)      # Dual variables for inequality constraints (lower)
-        self.z_bl = np.ones(num_xl)     # Dual variables for bound constraints (lower)
-        self.z_bu = np.ones(num_xu)     # Dual variables for bound constraints (upper)
+        self.z_bl = np.ones(n)     # Dual variables for bound constraints (lower)
+        self.z_bu = np.ones(n)     # Dual variables for bound constraints (upper)
         self.s_u = np.ones(m)      # Slack variables for inequality constraints (upper)
         self.s_l = np.ones(m)      # Slack variables for inequality constraints (lower)
-        self.s_bl = np.ones(num_xl)     # Slack variables for bound constraints (lower)
-        self.s_bu = np.ones(num_xu)     # Slack variables for bound constraints (upper)
+        self.s_bl = np.ones(n)     # Slack variables for bound constraints (lower)
+        self.s_bu = np.ones(n)     # Slack variables for bound constraints (upper)
         # z_l, z_u are of size m because in the original KKT matrix we must have rows[G, ...; -G, ...] to efficiently handle double-sided inequalities
 
     def all_finite(self) -> bool:
@@ -179,5 +177,5 @@ class Info:
 
 class Result(Variables):
     def __init__(self):
-        super().__init__(n=0, p=0, m=0, num_xu=0, num_xl=0)  # Initialize with default sizes; adjust as needed
+        super().__init__(n=0, p=0, m=0)  # Initialize with default sizes; adjust as needed
         self.info = Info()

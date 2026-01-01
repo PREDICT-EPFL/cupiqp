@@ -1,10 +1,11 @@
 import numpy as np
-from typing import Optional
+from typing import Optional, Union
+from .typedef import PIQP_INF
 
 class Data:
     def __init__(self, 
-                 P, 
-                 c, 
+                 P: np.ndarray, 
+                 c: np.ndarray, 
                  A: Optional[np.ndarray] = None, 
                  b: Optional[np.ndarray] = None, 
                  G: Optional[np.ndarray] = None, 
@@ -34,14 +35,18 @@ class Data:
             A = np.zeros((0, P.shape[0]))
             b = np.zeros(0)
         
-        if G is not None and h_u is not None and h_l is not None:
+        if G is not None:
             if G.ndim != 2:
                 raise ValueError("G must be a two-dimensional array.")
-            if h_u.ndim != 1 or h_l.ndim != 1:
-                raise ValueError("h_u and h_l must be one-dimensional arrays.")
-            if G.shape[0] != h_u.shape[0] or G.shape[0] != h_l.shape[0]:
-                raise ValueError("Dimension mismatch between G, h_u, and h_l.")
+            if h_l is None and h_u is None:
+                raise ValueError("Either h_l or h_u should be provided.")
+            if h_l is not None and np.shape(h_l) != (G.shape[0],):
+                raise ValueError(f"h_l must have shape {(G.shape[0],)}, got {h_l.shape}")
+            if h_u is not None and np.shape(h_u) != (G.shape[0],):
+                raise ValueError(f"h_u must have shape {(G.shape[0],)}, got {h_u.shape}")
         else:
+            if h_u is not None or h_l is not None:
+                raise ValueError("h_l and h_l should be None when G is None.")
             G = np.zeros((0, P.shape[0]))
             h_u = np.zeros(0)
             h_l = np.zeros(0)
@@ -51,23 +56,16 @@ class Data:
                 raise ValueError("x_l and x_u must be one-dimensional arrays.")
             if x_l.shape[0] != P.shape[0] or x_u.shape[0] != P.shape[0]:
                 raise ValueError("Dimension mismatch between x_l, x_u, and P.")
-            
-        x_l = -np.inf * np.ones(P.shape[0]) if x_l is None else x_l
-        x_u = np.inf * np.ones(P.shape[0]) if x_u is None else x_u
         
-        self._idx_xl = np.where(np.isfinite(x_l))[0]
-        self._x_l = x_l[self._idx_xl]
-        self._idx_xu = np.where(np.isfinite(x_u))[0]
-        self._x_u = x_u[self._idx_xu]
-
         self._A = A
         self._b = b
         self._G = G
 
-        self._idx_hl = np.where(np.isfinite(h_l))[0]
-        self._idx_hu = np.where(np.isfinite(h_u))[0]
-        self._h_l = h_l[self._idx_hl]
-        self._h_u = h_u[self._idx_hu]
+        self.set_h_l(h_l)
+        self.set_h_u(h_u)
+        self.disable_inf_constraints()
+        self.set_x_l(x_l)
+        self.set_x_u(x_u)
         
 
     @property
@@ -160,3 +158,46 @@ class Data:
     def idx_xu(self):
         """Indices of upper bound constraints."""
         return self._idx_xu
+    
+    def set_h_l(self, h_l: Union[np.ndarray, None]):
+        if h_l is not None:
+            self._idx_hl = np.where(h_l > -PIQP_INF)[0].tolist()
+            self._h_l = h_l.copy()
+        else:
+            self._idx_hl = []
+            self._h_l = -2 * PIQP_INF * np.ones((self.m,))
+        
+    def set_h_u(self, h_u: Union[np.ndarray, None]):
+        if h_u is not None:
+            self._idx_hu = np.where(h_u < PIQP_INF)[0].tolist()
+            self._h_u = h_u.copy()
+        else:
+            self._idx_hu = []
+            self._h_u = 2 * PIQP_INF * np.ones((self.m,))
+        
+    def disable_inf_constraints(self):
+        """
+        For inequalities like -inf < g'x < +inf, set g to 0 and upper/lower bound to +1/-1
+        """
+        for i in range(self.m):
+            if self._h_l[i] <= -PIQP_INF and self._h_u[i] >= PIQP_INF:
+                self._G[i, :] = np.zeros((self.n))
+                self._h_l[i] = -1.
+                self._h_u[i] = 1.
+        
+    def set_x_l(self, x_l: Union[np.ndarray, None]):
+        if x_l is not None:
+            self._idx_xl = np.where(x_l > -PIQP_INF)[0].tolist()
+            self._x_l = x_l.copy()
+        else:
+            self._idx_xl = []
+            self._x_l = -2 * PIQP_INF * np.ones((self.n,))
+
+    def set_x_u(self, x_u: Union[np.ndarray, None]):
+        if x_u is not None:
+            self._idx_xu = np.where(x_u < PIQP_INF)[0].tolist()
+            self._x_u = x_u.copy()
+        else:
+            self._idx_xu = []
+            self._x_u = 2 * PIQP_INF * np.ones((self.n,))
+    
