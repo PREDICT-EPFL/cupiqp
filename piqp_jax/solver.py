@@ -190,8 +190,27 @@ class SolverBase:
                 self._result.info.prev_primal_res = self._result.info.primal_res
                 self._result.info.prev_dual_res = self._result.info.dual_res
 
+            # ? The convergence criteria seems different from the one in the paper
+            if ((self._result.info.primal_res < self.settings.eps_abs or self._result.info.primal_res_rel < self.settings.eps_rel) and
+                (self._result.info.dual_res < self.settings.eps_abs or self._result.info.dual_res_rel < self.settings.eps_rel) and
+                (not self.settings.check_duality_gap or self._result.info.duality_gap < self.settings.eps_duality_gap_abs or self._result.info.duality_gap_rel < self.settings.eps_duality_gap_rel)):
+                self._result.info.status = Status.PIQP_SOLVED
+                return self._result.info.status
+            
             # ? why not update both here?
             self._update_residuals_r()
+
+            if (self._result.info.no_dual_update > min(5, self.settings.reg_finetune_dual_update_threshold) and
+                self._result.info.primal_prox_inf > self.settings.infeasibility_threshold and
+                (self._result.info.primal_res_reg < self.settings.eps_abs or self._result.info.primal_res_reg_rel < self.settings.eps_rel)):
+                self._result.info.status = Status.PIQP_PRIMAL_INFEASIBLE
+                return self._result.info.status
+            
+            if (self._result.info.no_primal_update > min(5, self.settings.reg_finetune_primal_update_threshold) and
+                self._result.info.dual_prox_inf > self.settings.infeasibility_threshold and
+                (self._result.info.dual_res_reg < self.settings.eps_abs or self._result.info.dual_res_reg_rel < self.settings.eps_rel)):
+                self._result.info.status = Status.PIQP_DUAL_INFEASIBLE
+                return self._result.info.status
 
 
             if self.settings.verbose:
@@ -415,18 +434,43 @@ class SolverBase:
         G_x, GT_zu_minus_zl = self._kkt_system.eval_G_xn_and_GT_xt(self._data, 1., 1., self._result.x, tmp)
 
         # ------------ update primal / dual objectives and duality gap ------------
-        self._result.info.primal_obj = -0.5 * jnp.dot(minus_P_x, self._result.x) + jnp.dot(self._data.c, self._result.x)
+        # primal objective: 0.5 x^T P x + c^T x
         # dual objective is: 0.5 x^T P x - b^T y - h_u^T z_u + h_l^T z_l - x_u^T z_bu + x_l^T z_bl
-        self._result.info.dual_obj = 0.5 * jnp.dot(minus_P_x, self._result.x)
-        self._result.info.dual_obj += - jnp.dot(self._data.b, self._result.y)
-        self._result.info.dual_obj += jnp.dot(self._data.h_l[self._data.idx_hl], self._result.z_l[self._data.idx_hl])
-        self._result.info.dual_obj += - jnp.dot(self._data.h_u[self._data.idx_hu], self._result.z_u[self._data.idx_hu])
-        self._result.info.dual_obj += jnp.dot(self._data.x_l[self._data.idx_xl], self._result.z_bl[self._data.idx_xl])
-        self._result.info.dual_obj += - jnp.dot(self._data.x_u[self._data.idx_xu], self._result.z_bu[self._data.idx_xu])
+        # -x^T P x
+        tmp = jnp.dot(minus_P_x, self._result.x)
+        self._result.info.primal_obj = -0.5 * tmp
+        self._result.info.dual_obj = 0.5 * tmp
+        duality_gap_rel_norm = abs(tmp)
+        # c^T x
+        tmp = jnp.dot(self._data.c, self._result.x)
+        self._result.info.primal_obj += tmp
+        duality_gap_rel_norm = max(abs(tmp), duality_gap_rel_norm)
+        # -b^T y
+        tmp = -jnp.dot(self._data.b, self._result.y)
+        self._result.info.dual_obj += tmp
+        duality_gap_rel_norm = max(abs(tmp), duality_gap_rel_norm)
+        # h_l^T z_l
+        tmp = jnp.dot(self._data.h_l[self._data.idx_hl], self._result.z_l[self._data.idx_hl])
+        self._result.info.dual_obj += tmp
+        duality_gap_rel_norm = max(abs(tmp), duality_gap_rel_norm)
+        # -h_u^T z_u
+        tmp = -jnp.dot(self._data.h_u[self._data.idx_hu], self._result.z_u[self._data.idx_hu])
+        self._result.info.dual_obj += tmp
+        duality_gap_rel_norm = max(abs(tmp), duality_gap_rel_norm)
+        # x_l^T z_bl
+        tmp = jnp.dot(self._data.x_l[self._data.idx_xl], self._result.z_bl[self._data.idx_xl])
+        self._result.info.dual_obj += tmp
+        duality_gap_rel_norm = max(abs(tmp), duality_gap_rel_norm)
+        # -x_u^T z_bu
+        tmp = -jnp.dot(self._data.x_u[self._data.idx_xu], self._result.z_bu[self._data.idx_xu])
+        self._result.info.dual_obj += tmp
+        duality_gap_rel_norm = max(abs(tmp), duality_gap_rel_norm)
         
+        self._result.info.duality_gap = abs(self._result.info.primal_obj - self._result.info.dual_obj)
+        self._result.info.duality_gap_rel = self._result.info.duality_gap / max(1., duality_gap_rel_norm)
+        # duality_gap_rel = duality_gap / max(1, duality_gap_rel_norm)
+        # where duality_gap_rel_norm is a scale estimate computed from the unscaled absolute contributions to the cost (e.g. |x^T P x|, |c^T x|, |b^T y|, |h_l^T z_l|, |h_u^T z_u|, |x_l^T z_bl|, |x_u^T z_bu|), each passed through the preconditioner unscale_cost.
 
-        self._result.info.duality_gap = jnp.abs(self._result.info.primal_obj - self._result.info.dual_obj)
-        self._result.info.duality_gap_rel = ... # TODO
 
         # duality_gap_rel = duality_gap / max(1, duality_gap_rel_norm)
         # where duality_gap_rel_norm is a scale estimate computed from the unscaled absolute contributions to the cost (e.g. |x^T P x|, |c^T x|, |b^T y|, |h_l^T z_l|, |h_u^T z_u|, |x_l^T z_bl|, |x_u^T z_bu|), each passed through the preconditioner unscale_cost.
@@ -464,13 +508,15 @@ class SolverBase:
         primal_rel_norm = jnp.maximum(primal_rel_norm, jnp.linalg.norm(self._result.s_bl, ord=jnp.inf))
         self._result.info.primal_res_rel = self._result.info.primal_res / jnp.maximum(1., primal_rel_norm)
 
+        # dual_res_norm = max(||P*x||_inf, ||c||_inf, ||A^T*y + G^T*(z_u - z_l) + z_bu - z_bl||_inf)
         self._result.info.dual_res = jnp.linalg.norm(self._res_nr.x, ord=jnp.inf)
         dual_res_norm = jnp.linalg.norm(minus_P_x, ord=jnp.inf)
-        dual_res_norm = jnp.maximum(dual_res_norm, jnp.linalg.norm(self._data.c, ord=jnp.inf))
-        dual_res_norm = jnp.maximum(dual_res_norm, jnp.linalg.norm(AT_y, ord=jnp.inf))
-        dual_res_norm = jnp.maximum(dual_res_norm, jnp.linalg.norm(GT_zu_minus_zl, ord=jnp.inf))
-        # TODO: Need to reconsider this if idx_hu and idx_hl are not full
-        dual_res_norm = jnp.maximum(dual_res_norm, jnp.linalg.norm(self._result.z_bu - self._result.z_bl, ord=jnp.inf))
+        dual_res_norm = max(dual_res_norm, jnp.linalg.norm(self._data.c, ord=jnp.inf))
+        assert jnp.union1d(self._data.idx_hl, self._data.idx_hu).size == self._data.m, "idx_hl and idx_hu cover 1, ..., m."
+        tmp = AT_y + GT_zu_minus_zl
+        tmp = tmp.at[self._data.idx_xl].add(-self._result.z_bl[self._data.idx_xl])
+        tmp = tmp.at[self._data.idx_xu].add(self._result.z_bu[self._data.idx_xu])
+        dual_res_norm = max(dual_res_norm, jnp.linalg.norm(tmp, ord=jnp.inf))
         self._result.info.dual_res_rel = self._result.info.dual_res / jnp.maximum               (1., dual_res_norm)
         
 

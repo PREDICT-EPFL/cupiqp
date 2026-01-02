@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 import jax.numpy as jnp
-from jax import jit
+import jax
 from jax.scipy.linalg import solve_triangular, cholesky
 import scipy.sparse as sp
 
@@ -10,17 +10,17 @@ from .kkt_fwd import KKTUpdateOptions
 
 
 # JIT-compiled module-level functions
-@jit
+@jax.jit
 def _eval_P_x_jit(alpha: float, P: Matrix, x: Vector) -> Vector:
     return alpha * (P @ x)
 
-@jit
+@jax.jit
 def _eval_A_AT_jit(alpha_n: float, alpha_t: float, A: Matrix, xn: Vector, xt: Vector):
     zn = alpha_n * (A @ xn)
     zt = alpha_t * (A.T @ xt)
     return zn, zt
 
-@jit
+@jax.jit
 def _eval_G_GT_jit(alpha_n: float, alpha_t: float, G: Matrix, xn: Vector, xt: Vector):
     zn = alpha_n * (G @ xn)
     zt = alpha_t * (G.T @ xt)
@@ -69,6 +69,23 @@ class KKTSolverBase(ABC):
         """
         return _eval_G_GT_jit(alpha_n, alpha_t, data.G, xn, xt)
 
+@jax.jit
+def _dense_kkt_update_and_factor_jit(P: Matrix, x_reg: Vector, delta: float, AtA: Matrix, G: Matrix, z_reg_inv: Vector) -> Matrix:
+    """
+    Compute the KKT matrix:
+    KKT = P + x_reg + 1/delta*A^T*A + G^T*(z_reg)^-1*G
+    """
+    # ! can do these only for lower diagonal part
+    diag_indices = jnp.diag_indices(P.shape[0])
+    kkt_mat = P.at[diag_indices].add(x_reg)
+    
+    if AtA.shape[0] > 0:
+        kkt_mat += (1.0 / delta) * AtA
+
+    if G.shape[0] > 0:
+        kkt_mat += G.T @ jnp.diag(z_reg_inv) @ G
+    
+    return cholesky(kkt_mat, lower=True)
 
 class DenseKKTSolver(KKTSolverBase):
     """
@@ -95,21 +112,6 @@ class DenseKKTSolver(KKTSolverBase):
     def update_data(self, data: Data, update_options: KKTUpdateOptions):
         if update_options == KKTUpdateOptions.KKT_UPDATE_A and data.p > 0:
             self._AtA = data.A.T @ data.A
-
-    def _update_kkt(self, data: Data, x_reg: Vector) -> None:
-        """
-        Compute the KKT matrix:
-        KKT = P + x_reg + 1/delta*A^T*A + G^T*(z_reg)^-1*G
-        """
-        # ! can do these only for lower diagonal part
-        diag_indices = jnp.diag_indices(data.P.shape[0])
-        self._kkt_mat = data.P.at[diag_indices].add(x_reg)
-        
-        if data.p > 0:
-            self._kkt_mat += (1.0 / self._delta) * self._AtA
-
-        if data.m > 0:
-            self._kkt_mat += data.G.T @ jnp.diag(self._z_reg_inv) @ data.G
     
     def update_scalings_and_factor(self, data: Data, delta: float, x_reg: Vector, z_reg: Vector) -> bool:
         """
@@ -117,12 +119,8 @@ class DenseKKTSolver(KKTSolverBase):
         """
         self._delta = delta
         self._z_reg_inv = 1.0 / z_reg
-        self._update_kkt(data, x_reg)
-        try:
-            self._kkt_mat = cholesky(self._kkt_mat, lower=True)
-            return True
-        except jnp.linalg.LinAlgError:
-            return False
+        self._kkt_mat = _dense_kkt_update_and_factor_jit(data.P, x_reg, delta, self._AtA, data.G, self._z_reg_inv)
+        return True
         
     def solve(self, data: Data, rhs_x, rhs_y, rhs_z):
         """

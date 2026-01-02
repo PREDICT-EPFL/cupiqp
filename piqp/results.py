@@ -147,7 +147,7 @@ class Info:
     dual_res_rel: float = None
     
     primal_res_reg: float = None
-    primal_res_reg_rel: float = None
+    primal_res_reg_rel: float = None  # relative primal residual with regularization
     dual_res_reg: float = None
     dual_res_reg_rel: float = None
     
@@ -159,8 +159,8 @@ class Info:
     
     primal_obj: float = None
     dual_obj: float = None
-    duality_gap: float = None
-    duality_gap_rel: float = None
+    duality_gap: float = None      # duality gap
+    duality_gap_rel: float = None  # relative duality gap
     
     factor_retires: int = 0
     reg_limit: float = None
