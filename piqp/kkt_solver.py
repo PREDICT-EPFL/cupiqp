@@ -3,9 +3,9 @@ import numpy as np
 from scipy.linalg import solve_triangular, cholesky, ldl
 import scipy.sparse as sp
 
-from piqp.typedef import Vector, Matrix
-from piqp.data import Data
-from piqp.kkt_fwd import KKTUpdateOptions
+from .typedef import Vector, Matrix
+from .data import Data
+from .kkt_fwd import KKTUpdateOptions
 
 
 class KKTSolverBase(ABC):

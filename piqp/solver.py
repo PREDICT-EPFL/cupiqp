@@ -534,10 +534,10 @@ class SolverBase:
         return inf
     
     def _dual_res_nr(self) -> float:
-        return self._res_nr.x
+        return np.linalg.norm(self._res_nr.x, ord=np.inf)
     
     def _dual_res_r(self) -> float:
-        return self._res.x
+        return np.linalg.norm(self._res.x, ord=np.inf)
     
     def _primal_prox_inf(self) -> float:
         inf = 0.
