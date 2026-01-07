@@ -85,11 +85,11 @@ class KKTSystem:
         w_u_delta_inv = 1. / (self._m_s_u[data.idx_hu] * self._m_z_u_inv[data.idx_hu] + self._delta)
         w_l_delta_inv = 1. / (self._m_s_l[data.idx_hl] * self._m_z_l_inv[data.idx_hl] + self._delta)
 
-        # rhs_z_bar = 1./ (w_u_delta_inv + w_l_delta_inv) * (w_u_delta_inv * rhs_z_u - w_l_delta_inv * rhs_z_l)
+        # rhs_z_bar = (1./ (w_u_delta_inv + w_l_delta_inv)) * (w_u_delta_inv * rhs_z_u - w_l_delta_inv * rhs_z_l)
         tmp = np.zeros(data.m)
         tmp[data.idx_hu] += w_u_delta_inv * rhs_z_u
         tmp[data.idx_hl] -= w_l_delta_inv * rhs_z_l
-        tmp2 = np.ones(data.m)
+        tmp2 = np.zeros(data.m)
         tmp2[data.idx_hu] += w_u_delta_inv
         tmp2[data.idx_hl] += w_l_delta_inv
         rhs_z_bar = 1./ tmp2 * tmp
@@ -200,7 +200,7 @@ class KKTSystem:
         rhs_vector = np.hstack((rhs.x, rhs.y, rhs.z_u, rhs.z_l, rhs.z_bu, rhs.z_bl, rhs.s_u, rhs.s_l, rhs.s_bu, rhs.s_bl))
         sol = np.linalg.solve(kkt_mat, rhs_vector)
         assert np.abs(np.max(kkt_mat @ sol - rhs_vector)) < 1e-8, "KKT solution verification failed!"
-        lhs = Variables(n, p, m, self._data.num_xu, self._data.num_xl)
+        lhs = Variables(n, p, m)
         lhs.x = sol[:n]
         lhs.y = sol[n:n + p]
         lhs.z_u = sol[n + p:n + p + m]

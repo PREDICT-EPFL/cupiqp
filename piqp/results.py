@@ -86,7 +86,7 @@ class Variables:
                 len(self.s_bl) == len(other.s_bl) and
                 len(self.s_bu) == len(other.s_bu)):
             raise ValueError("Dimension mismatch in Variables subtraction.")
-        result = Variables(self.n, self.p, self.m, self.num_xu, self.num_xl)
+        result = Variables(self.n, self.p, self.m)
         result.x = self.x - other.x
         result.y = self.y - other.y
         result.z_u = self.z_u - other.z_u

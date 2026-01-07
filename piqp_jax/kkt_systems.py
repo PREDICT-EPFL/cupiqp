@@ -90,7 +90,7 @@ class KKTSystem:
         tmp = jnp.zeros(data.m)
         tmp = tmp.at[data.idx_hu].add(w_u_delta_inv * rhs_z_u)
         tmp = tmp.at[data.idx_hl].add(-w_l_delta_inv * rhs_z_l)
-        tmp2 = jnp.ones(data.m)
+        tmp2 = jnp.zeros(data.m)
         tmp2 = tmp2.at[data.idx_hu].add(w_u_delta_inv)
         tmp2 = tmp2.at[data.idx_hl].add(w_l_delta_inv)
         rhs_z_bar = 1./ tmp2 * tmp
