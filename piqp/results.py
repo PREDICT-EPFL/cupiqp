@@ -128,6 +128,19 @@ class Variables:
         self.s_l = np.random.rand(*self.s_l.shape) + 1.0
         self.s_bu = np.random.rand(*self.s_bu.shape) + 1.0
         self.s_bl = np.random.rand(*self.s_bl.shape) + 1.0
+
+    def set_constant(self, value: float):
+        """Testing purpose only: set all variables to a constant value."""
+        self.x.fill(value)
+        self.y.fill(value)
+        self.z_u.fill(value)
+        self.z_l.fill(value)
+        self.z_bu.fill(value)
+        self.z_bl.fill(value)
+        self.s_u.fill(value)
+        self.s_l.fill(value)
+        self.s_bu.fill(value)
+        self.s_bl.fill(value)
     
 @dataclass
 class Info:

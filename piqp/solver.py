@@ -1,7 +1,6 @@
 import numpy as np
 from typing import Tuple
 
-from .utils import print_matlab_format
 from .settings import Settings
 from .data import Data
 from .results import Result, Status, Variables
@@ -24,8 +23,7 @@ class SolverBase:
         self._result.info.delta = self.settings.delta_init
         self._step = Variables(self._data.n, self._data.p, self._data.m)
 
-        self._kkt_system = KKTSystem(self._data)
-
+        self._kkt_system = KKTSystem(self._data, self.settings)
         self._res_nr = Variables(self._data.n, self._data.p, self._data.m)  # used to store the non-regularized residuals
         self._res_r = Variables(self._data.n, self._data.p, self._data.m)  # used to store the regularized residuals
         

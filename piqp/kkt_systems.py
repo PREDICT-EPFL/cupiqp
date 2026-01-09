@@ -9,12 +9,20 @@ class KKTSystem:
     """
     The KKT system handles the full KKT condition.
     """
-    def __init__(self, data: Data):
+    def __init__(self, data: Data, settings: Settings):
         self._data = data
-        self._kkt_solver = DenseKKTSolver(self._data)
+        self._settings = settings
+        
         self._x_reg = np.nan * np.ones(self._data.n)
         self._z_reg = np.nan * np.ones(self._data.m)
+        if self._settings.kkt_solver == "dense_cholesky":
+            self._kkt_solver = DenseKKTSolver(data)
+        elif self._settings.kkt_solver == "sparse_ldlt":
+            self._kkt_solver = SparseKKTSolver(data)
+        else:
+            raise ValueError(f"Unknown kkt_solver type: {self._settings.kkt_solver}")
 
+        self._rho = np.nan
         self._delta = np.nan
 
         # store the value of slack and dual variables value at this iteration, will be used in recovering the slack step: S*delta_z + Z*delta_s = r_s
@@ -34,6 +42,7 @@ class KKTSystem:
 
         The variable vars is the current primal/dual variable values at this iteration, i.e., values of x, y, z_u, z_l, s_u, s_l, z_bu, z_bl, s_bu, s_bl at the current iteration.
         """
+        self._rho = rho
         self._delta = delta
 
         # store the current slack and dual variable values at this iteration
@@ -201,28 +210,27 @@ class KKTSystem:
         sol = np.linalg.solve(kkt_mat, rhs_vector)
         assert np.abs(np.max(kkt_mat @ sol - rhs_vector)) < 1e-8, "KKT solution verification failed!"
         lhs = Variables(n, p, m)
-        lhs.x = sol[:n]
-        lhs.y = sol[n:n + p]
-        lhs.z_u = sol[n + p:n + p + m]
-        lhs.z_l = sol[n + p + m:n + p + 2*m]
 
-        idx = n + p + 2*m
-        lhs.z_bu = sol[idx : idx + self._data.num_xu]
-
-        idx += self._data.num_xu
-        lhs.z_bl = sol[idx : idx + self._data.num_xl]
-
-        idx += self._data.num_xl
+        idx = 0
+        lhs.x = sol[idx : idx + n]
+        idx += n
+        lhs.y = sol[idx : idx + p]
+        idx += p
+        lhs.z_u = sol[idx : idx + m]
+        idx += m
+        lhs.z_l = sol[idx : idx + m]
+        idx += m
+        lhs.z_bu = sol[idx : idx + n]
+        idx += n
+        lhs.z_bl = sol[idx : idx + n]
+        idx += n
         lhs.s_u = sol[idx : idx + m]
-
         idx += m
         lhs.s_l = sol[idx : idx + m]
-
         idx += m
-        lhs.s_bu = sol[idx : idx + self._data.num_xu]
-
-        idx += self._data.num_xu
-        lhs.s_bl = sol[idx : idx + self._data.num_xl]
+        lhs.s_bu = sol[idx : idx + n]
+        idx += n
+        lhs.s_bl = sol[idx : idx + n]
 
         return lhs
     

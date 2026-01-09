@@ -1,4 +1,4 @@
-
+from typing import Literal
 from dataclasses import dataclass
 
 
@@ -30,7 +30,7 @@ class Settings:
 
     tau: float = 0.99
 
-    kkt_solver: str = "dense_cholesky"  # Assuming KKTSolver is an enum converted to string
+    kkt_solver: Literal["dense_cholesky", "sparse_ldlt"] = "dense_cholesky"
 
     iterative_refinement_always_enabled: bool = False
     iterative_refinement_eps_abs: float = 1e-12

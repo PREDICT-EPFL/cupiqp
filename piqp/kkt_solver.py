@@ -137,7 +137,6 @@ class SparseKKTSolver(KKTSolverBase):
     """
     def __init__(self, data: Data):
         super().__init__(data)
-        print("Initializing SparseKKTSolver...")
         # ! at this moment it's not really sparse. We're justing not eliminating A and G to use ldlt factorization on the full KKT matrix.
         self._delta = np.nan
         self._x_reg = np.nan * np.ones(data.n)  # used to store the diag(P) + reg_x, i.e., [... P_ii + reg_x_i ...]
