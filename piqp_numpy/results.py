@@ -189,6 +189,6 @@ class Info:
 
 
 class Result(Variables):
-    def __init__(self):
-        super().__init__(n=0, p=0, m=0)  # Initialize with default sizes; adjust as needed
+    def __init__(self, n: int, p: int, m: int):
+        super().__init__(n=n, p=p, m=m)  # Initialize with default sizes; adjust as needed
         self.info = Info()

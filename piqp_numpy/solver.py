@@ -11,14 +11,14 @@ class SolverBase:
 
         self.settings = Settings()
         self._data: Data = None
-        self._result = Result()  # store the values of primal and dual variables of current iteration
+        self._result: Result = None  # store the values of primal and dual variables of current iteration
         self._step: Variables = None # store the step direction of primal and dual variables
 
         self._kkt_system = None
     
     def setup(self, P, c, A, b, G, h_u, h_l, x_u, x_l):
         self._data = Data(P, c, A, b, G, h_u, h_l, x_u, x_l)
-
+        self._result = Result(self._data.n, self._data.p, self._data.m)
         self._result.info.rho = self.settings.rho_init
         self._result.info.delta = self.settings.delta_init
         self._step = Variables(self._data.n, self._data.p, self._data.m)
@@ -88,7 +88,7 @@ class SolverBase:
             self._result
         )
 
-        self._res = Result()  # used to store the right hand side of KKT system
+        self._res = Result(self._data.n, self._data.p, self._data.m)  # used to store the right hand side of KKT system
         self._res.x = -self._data.c.copy()
         self._res.y = self._data.b.copy()
         self._res.z_l = np.nan * np.zeros(self._data.m)
