@@ -14,8 +14,8 @@ class Data:
                  x_u: Optional[np.ndarray] = None, 
                  x_l: Optional[np.ndarray] = None):
         
-        self._P = P
-        self._c = c
+        self._P = np.array(P, dtype=np.float64)
+        self._c = np.array(c, dtype=np.float64)
 
         if self._P.ndim != 2 or self._P.shape[0] != self._P.shape[1]:
             raise ValueError("P must be a square matrix.")
@@ -60,12 +60,18 @@ class Data:
         self._A = A
         self._b = b
         self._G = G
+        self._h_u = np.array(h_u, dtype=np.float64) if h_u is not None else None
+        self._h_l = np.array(h_l, dtype=np.float64) if h_l is not None else None
+        self._x_u = np.array(x_u, dtype=np.float64) if x_u is not None else None
+        self._x_l = np.array(x_l, dtype=np.float64) if x_l is not None else None
 
-        self.set_h_l(h_l)
-        self.set_h_u(h_u)
+        self.set_h_l()
+        self.set_h_u()
         self.disable_inf_constraints()
-        self.set_x_l(x_l)
-        self.set_x_u(x_u)
+        self.set_h_l()
+        self.set_h_u()
+        self.set_x_l()
+        self.set_x_u()
         
 
     @property
@@ -159,18 +165,18 @@ class Data:
         """Indices of upper bound constraints."""
         return self._idx_xu
     
-    def set_h_l(self, h_l: Union[np.ndarray, None]):
-        if h_l is not None:
-            self._idx_hl = np.where(h_l > -PIQP_INF)[0].tolist()
-            self._h_l = h_l.copy()
+    def set_h_l(self):
+        if self._h_l is not None:
+            self._idx_hl = np.where(self._h_l > -PIQP_INF)[0].tolist()
+            self._h_l = np.array(self._h_l, dtype=np.float64)
         else:
             self._idx_hl = []
             self._h_l = -2 * PIQP_INF * np.ones((self.m,))
         
-    def set_h_u(self, h_u: Union[np.ndarray, None]):
-        if h_u is not None:
-            self._idx_hu = np.where(h_u < PIQP_INF)[0].tolist()
-            self._h_u = h_u.copy()
+    def set_h_u(self):
+        if self._h_u is not None:
+            self._idx_hu = np.where(self._h_u < PIQP_INF)[0].tolist()
+            self._h_u = np.array(self._h_u, dtype=np.float64)
         else:
             self._idx_hu = []
             self._h_u = 2 * PIQP_INF * np.ones((self.m,))
@@ -185,18 +191,18 @@ class Data:
                 self._h_l[i] = -1.
                 self._h_u[i] = 1.
         
-    def set_x_l(self, x_l: Union[np.ndarray, None]):
-        if x_l is not None:
-            self._idx_xl = np.where(x_l > -PIQP_INF)[0].tolist()
-            self._x_l = x_l.copy()
+    def set_x_l(self):
+        if self._x_l is not None:
+            self._idx_xl = np.where(self._x_l > -PIQP_INF)[0].tolist()
+            self._x_l = np.array(self._x_l, dtype=np.float64)
         else:
             self._idx_xl = []
             self._x_l = -2 * PIQP_INF * np.ones((self.n,))
 
-    def set_x_u(self, x_u: Union[np.ndarray, None]):
-        if x_u is not None:
-            self._idx_xu = np.where(x_u < PIQP_INF)[0].tolist()
-            self._x_u = x_u.copy()
+    def set_x_u(self):
+        if self._x_u is not None:
+            self._idx_xu = np.where(self._x_u < PIQP_INF)[0].tolist()
+            self._x_u = np.array(self._x_u, dtype=np.float64)
         else:
             self._idx_xu = []
             self._x_u = 2 * PIQP_INF * np.ones((self.n,))
