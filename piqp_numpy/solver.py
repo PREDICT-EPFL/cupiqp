@@ -29,10 +29,10 @@ class SolverBase:
         
         
 
-    def solve(self):
-        self._solve_impl()
+    def solve(self) -> Status:
+        return self._solve_impl()
 
-    def _solve_impl(self):
+    def _solve_impl(self) -> Status:
         self._result.info.status = Status.PIQP_UNSOLVED 
         self._result.info.iter = 0
         self._result.info.reg_limit = self.settings.reg_lower_limit
@@ -347,7 +347,8 @@ class SolverBase:
                 self._result.info.delta = max(self._result.info.reg_limit, (1. - 0.666 * mu_rate) * self._result.info.delta)
 
 
-            # Update the hyper parameters rho and delta
+        self._result.info.status = Status.PIQP_MAX_ITER_REACHED
+        return self._result.info.status
 
             
     def _calculate_step(self) -> Tuple[float, float]:
