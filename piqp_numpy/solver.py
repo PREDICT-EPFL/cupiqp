@@ -253,9 +253,19 @@ class SolverBase:
                     flush=True
                 )
 
-            factor_success = self._kkt_system.update_scalings_and_factor(self._data, self._result.info.rho, self._result.info.delta, self._result)
-            assert factor_success, "KKT matrix factorization failed."
+            while self._result.info.factor_retires < self.settings.max_factor_retires:
+                factor_succeeded = self._kkt_system.update_scalings_and_factor(self._data, self._result.info.rho, self._result.info.delta, self._result)
+                if factor_succeeded:
+                    break
+                else:
+                    self._result.info.factor_retires += 1
+                    self._result.info.rho *= 100.
+                    self._result.info.delta *= 100.
+                    self._result.info.reg_limit = min(10 * self._result.info.reg_limit, self.settings.eps_abs)
 
+            if self._result.info.factor_retires >= self.settings.max_factor_retires:
+                self._result.info.status = Status.PIQP_NUMERICAL_ISSUES
+                return self._result.info.status
             
             # ------------------ predictor step ------------------
 
