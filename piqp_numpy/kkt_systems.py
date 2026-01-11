@@ -56,29 +56,33 @@ class KKTSystem:
         self._m_z_bl_inv[data.idx_xl] = 1. / vars.z_bl[data.idx_xl]
 
         # eliminate the box constraints by adding their contribution to x_reg and z_reg
-        w_bu_delta = vars.s_bu[data.idx_xu] / vars.z_bu[data.idx_xu] + self._delta
-        w_bl_delta = vars.s_bl[data.idx_xl] / vars.z_bl[data.idx_xl] + self._delta
+        self._w_bu_delta_inv = 1. / (self._m_s_bu[data.idx_xu] * self._m_z_bu_inv[data.idx_xu] + self._delta)
+        self._w_bl_delta_inv = 1. / (self._m_s_bl[data.idx_xl] * self._m_z_bl_inv[data.idx_xl] + self._delta)
         self._x_reg = rho * np.ones(self._data.n)
-        self._x_reg[data.idx_xu] += 1./w_bu_delta
-        self._x_reg[data.idx_xl] += 1./w_bl_delta
+        self._x_reg[data.idx_xu] += self._w_bu_delta_inv
+        self._x_reg[data.idx_xl] += self._w_bl_delta_inv
 
         # w_u_delta_inv = 1. / (vars.s_u / vars.z_u + self._delta)
         # w_l_delta_inv = 1. / (vars.s_l / vars.z_l + self._delta)
         # self._z_reg = 1. / (w_u_delta_inv + w_l_delta_inv)
         # TODO: deal with this if idx_hu and idx_hl are different
-        w_u_delta_inv = 1. / (vars.s_u[data.idx_hu] / vars.z_u[data.idx_hu] + self._delta)
-        w_l_delta_inv = 1. / (vars.s_l[data.idx_hl] / vars.z_l[data.idx_hl] + self._delta)
-        tmp = np.zeros(self._data.m)
-        tmp[data.idx_hu] += w_u_delta_inv
-        tmp[data.idx_hl] += w_l_delta_inv
-        self._z_reg = np.zeros(self._data.m)
-        self._z_reg = 1. / tmp
+        # store w_u_delta_inv and w_l_delta_inv for later use in solve()
+        self._w_u_delta_inv = 1. / (self._m_s_u[data.idx_hu] * self._m_z_u_inv[data.idx_hu] + self._delta)
+        self._w_l_delta_inv = 1. / (self._m_s_l[data.idx_hl] * self._m_z_l_inv[data.idx_hl] + self._delta)
+        if data.idx_hl == data.idx_hu == list(range(data.m)):    
+            self._z_reg = 1./ (self._w_u_delta_inv + self._w_l_delta_inv)
+        elif np.union1d(data.idx_hu, data.idx_hl).tolist() == list(range(data.m)):
+            tmp = np.zeros(self._data.m)
+            tmp[data.idx_hu] += self._w_u_delta_inv
+            tmp[data.idx_hl] += self._w_l_delta_inv
+            self._z_reg = np.zeros(self._data.m)
+            assert np.all(tmp > 0.), "Some entries in z_reg are non-positive."
+            self._z_reg = 1. / tmp
+        else:
+            raise NotImplementedError("The current implementation only supports the case where all inequality constraints have either upper or lower bounds.")
         return self._kkt_solver.update_scalings_and_factor(data, delta, self._x_reg, self._z_reg) # ! this is implicitly assuming idx_hu and idx_hl cover all indices of inequalities 0:m
     
     def solve(self, data: Data, settings: Settings, rhs: Variables, lhs: Variables) -> None:
-        
-        w_bu_delta_inv = 1. / (self._m_s_bu[data.idx_xu] * self._m_z_bu_inv[data.idx_xu] + self._delta)
-        w_bl_delta_inv = 1. / (self._m_s_bl[data.idx_xl] * self._m_z_bl_inv[data.idx_xl] + self._delta)
 
         rhs_z_u = rhs.z_u[data.idx_hu] - self._m_z_u_inv[data.idx_hu] * rhs.s_u[data.idx_hu]  # rhs_z_u - inv(Z_u) * r_s_u
         rhs_z_l = rhs.z_l[data.idx_hl] - self._m_z_l_inv[data.idx_hl] * rhs.s_l[data.idx_hl]  # rhs_z_l - inv(Z_l) * r_s_l
@@ -86,32 +90,26 @@ class KKTSystem:
         rhs_z_bl = rhs.z_bl[data.idx_xl] - self._m_z_bl_inv[data.idx_xl] * rhs.s_bl[data.idx_xl]  # rhs_z_bl - inv(Z_bl) * r_s_bl
 
         rhs_x_bar = rhs.x.copy()
-        rhs_x_bar[data.idx_xu] += w_bu_delta_inv * rhs_z_bu
-        rhs_x_bar[data.idx_xl] -= w_bl_delta_inv * rhs_z_bl
+        rhs_x_bar[data.idx_xu] += self._w_bu_delta_inv * rhs_z_bu
+        rhs_x_bar[data.idx_xl] -= self._w_bl_delta_inv * rhs_z_bl
 
         rhs_y = rhs.y.copy()
 
-        w_u_delta_inv = 1. / (self._m_s_u[data.idx_hu] * self._m_z_u_inv[data.idx_hu] + self._delta)
-        w_l_delta_inv = 1. / (self._m_s_l[data.idx_hl] * self._m_z_l_inv[data.idx_hl] + self._delta)
-
         # rhs_z_bar = (1./ (w_u_delta_inv + w_l_delta_inv)) * (w_u_delta_inv * rhs_z_u - w_l_delta_inv * rhs_z_l)
         tmp = np.zeros(data.m)
-        tmp[data.idx_hu] += w_u_delta_inv * rhs_z_u
-        tmp[data.idx_hl] -= w_l_delta_inv * rhs_z_l
-        tmp2 = np.zeros(data.m)
-        tmp2[data.idx_hu] += w_u_delta_inv
-        tmp2[data.idx_hl] += w_l_delta_inv
-        rhs_z_bar = 1./ tmp2 * tmp
+        tmp[data.idx_hu] += self._w_u_delta_inv * rhs_z_u
+        tmp[data.idx_hl] -= self._w_l_delta_inv * rhs_z_l
+        rhs_z_bar = self._z_reg * tmp
 
         delta_x, delta_y, delta_z = self._kkt_solver.solve(data, rhs_x_bar, rhs_y, rhs_z_bar)
 
         # recover primal/dual step from kkt solution
         lhs.x = delta_x  # delta_x
         lhs.y = delta_y  # delta_y
-        lhs.z_u[data.idx_hu] = w_u_delta_inv * (data.G[data.idx_hu, :] @ delta_x - rhs_z_u)   # delta_z_u
-        lhs.z_l[data.idx_hl] = w_l_delta_inv * (-data.G[data.idx_hl, :] @ delta_x - rhs_z_l)  # delta_z_l
-        lhs.z_bu[data.idx_xu] = w_bu_delta_inv * (delta_x[data.idx_xu] - rhs.z_bu[data.idx_xu] + self._m_z_bu_inv[data.idx_xu] * rhs.s_bu[data.idx_xu])  # delta_z_bu
-        lhs.z_bl[data.idx_xl] = -w_bl_delta_inv * (delta_x[data.idx_xl] + rhs.z_bl[data.idx_xl] - self._m_z_bl_inv[data.idx_xl] * rhs.s_bl[data.idx_xl])  # delta_z_bl
+        lhs.z_u[data.idx_hu] = self._w_u_delta_inv * (data.G[data.idx_hu, :] @ delta_x - rhs_z_u)   # delta_z_u
+        lhs.z_l[data.idx_hl] = self._w_l_delta_inv * (-data.G[data.idx_hl, :] @ delta_x - rhs_z_l)  # delta_z_l
+        lhs.z_bu[data.idx_xu] = self._w_bu_delta_inv * (delta_x[data.idx_xu] - rhs.z_bu[data.idx_xu] + self._m_z_bu_inv[data.idx_xu] * rhs.s_bu[data.idx_xu])  # delta_z_bu
+        lhs.z_bl[data.idx_xl] = -self._w_bl_delta_inv * (delta_x[data.idx_xl] + rhs.z_bl[data.idx_xl] - self._m_z_bl_inv[data.idx_xl] * rhs.s_bl[data.idx_xl])  # delta_z_bl
 
         # recover slack variable steps
         lhs.s_u[data.idx_hu] = self._m_z_u_inv[data.idx_hu] * (rhs.s_u[data.idx_hu] - self._m_s_u[data.idx_hu] * lhs.z_u[data.idx_hu])  # delta_s_u = inv(Z_u) (r_s_u - S_u delta_z_u)
