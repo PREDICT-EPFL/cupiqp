@@ -30,6 +30,22 @@ class SolverBase:
         
 
     def solve(self) -> Status:
+        if self.settings.verbose:
+            if self.settings.kkt_solver == "dense_cholesky":
+                print("dense backend:")
+                print(f"variables n = {self._data.n}")
+                print(f"equality constraints p = {self._data.p}")
+                print(f"inequality constraints m = {self._data.m}")
+            else:
+                print("sparse backend:")
+                print(f"variables n = {self._data.n}, nzz(P upper triangular) = {self._data.non_zeros_P_utri()}")
+                print(f"equality constraints p = {self._data.p}, nnz(A) = {self._data.non_zeros_A()}")
+                print(f"inequality constraints m = {self._data.m}, nnz(G) = {self._data.non_zeros_G()}")
+            print(f"inequality lower bounds n_h_l = {self._data.num_hl}")
+            print(f"inequality upper bounds n_h_u = {self._data.num_hu}")
+            print(f"variable lower bounds n_x_l = {self._data.num_xl}")
+            print(f"variable upper bounds n_x_u = {self._data.num_xu}")
+            print("")
         return self._solve_impl()
 
     def _solve_impl(self) -> Status:
