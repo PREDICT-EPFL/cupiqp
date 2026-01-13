@@ -2,6 +2,7 @@ import cupy as cp
 from cupyx.scipy.linalg import solve_triangular
 from cupy_backends.cuda.libs import cusolver
 
+from ..typedef import Vector
 from ..kkt_solver import KKTSolverBase, KKTUpdateOptions
 from .dense_data import DenseData
 
@@ -17,13 +18,14 @@ class DenseKKTSolver(KKTSolverBase):
     Then we can solve for Delta_y and Delta_z accordingly.
     """
     def __init__(self, data: DenseData):
-        super().__init__(data)
+        super().__init__()
 
         self._delta = cp.nan
         self._x_reg = cp.nan * cp.ones(data.n)  # used to store the diag(P) + reg_x, i.e., [... P_ii + reg_x_i ...]
         self._z_reg_inv = cp.nan * cp.ones(data.m)  # used to store the inverse of diag(W+delta*I), i.e., [... (s_i/z_i + delta)^-1 ...]
         
         self._kkt_mat = cp.zeros((data.n, data.n))  # Placeholder for KKT matrix
+        self._rhs = cp.zeros(data.n, dtype=cp.float64)
 
         self._AtA = data.A.T @ data.A if data.p > 0 else cp.zeros((0, 0))
 
@@ -59,29 +61,26 @@ class DenseKKTSolver(KKTSolverBase):
         except cp.linalg.LinAlgError:  # TODO: need to investigate specific exception type raise by cupy.linalg.cholesky
             return False
         
-    def solve(self, data: DenseData, rhs_x, rhs_y, rhs_z):
+    def solve(self, data: DenseData, rhs_x: cp.ndarray, rhs_y: cp.ndarray, rhs_z: cp.ndarray, delta_x: cp.ndarray, delta_y: cp.ndarray, delta_z: cp.ndarray):
         """
         Solve the KKT system using the factorized KKT matrix.
         """
-        # Solve KKT * dx = rhs_x + 1/delta*A^T*rhs_y + G^T*diag(z_reg_inv)*rhs_z
-        lhs_x_tmp = rhs_x.copy()
+        # solve KKT * dx = rhs_x + 1/delta*A^T*rhs_y + G^T*diag(z_reg_inv)*rhs_z
+        self._rhs[:] = rhs_x
         if data.p > 0:
-            lhs_x_tmp += 1/self._delta * data.A.T @ rhs_y
+            self._rhs += 1/self._delta * data.A.T @ rhs_y
+        # ! need to be careful when union(idx_hl, idx_hu) != all indices of m
         if data.m > 0:
-            lhs_x_tmp += data.G.T @ (self._z_reg_inv * rhs_z)
-        # Solve L * L^T * dx = effective_rhs
+            self._rhs += data.G.T @ (self._z_reg_inv * rhs_z)
         
-        y = solve_triangular(self._kkt_mat, lhs_x_tmp, lower=True, overwrite_b=False)  # TODO: inplace
-        lhs_x = solve_triangular(self._kkt_mat, y, lower=True, trans='T', overwrite_b=False)  # TODO: inplace
-
-        # dy = 1/delta * (A * dx - r_y)
-        lhs_y = 1/self._delta * (data.A @ lhs_x - rhs_y) if data.p > 0 else cp.array([])
-
-        # dz = (W+delta*I)^-1 * (G * dx - r_z)
-        lhs_z = self._z_reg_inv * (data.G @ lhs_x - rhs_z) if data.m > 0 else cp.array([])
-
-        return lhs_x, lhs_y, lhs_z
-
+        # forward substitution
+        delta_x[:] = solve_triangular(self._kkt_mat, self._rhs, lower=True, overwrite_b=True)
+        # backward substitution
+        delta_x[:] = solve_triangular(self._kkt_mat, delta_x, lower=True, trans='T', overwrite_b=True)
+        # dy = 1/delta * (A * dx - r_y), dz = (W+delta*I)^-1 * (G * dx - r_z)
+        delta_y[:] = 1/self._delta * (data.A @ delta_x - rhs_y) if data.p > 0 else cp.array([])
+        delta_z[:] = self._z_reg_inv * (data.G @ delta_x - rhs_z) if data.m > 0 else cp.array([])
+    
     def eval_P_x(self, data: DenseData, alpha: float, x: cp.ndarray, z: cp.ndarray):
         z[:] = data.P @ x * alpha
     

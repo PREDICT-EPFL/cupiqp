@@ -101,11 +101,12 @@ class KKTSystem:
         tmp2[data.idx_hl] += w_l_delta_inv
         rhs_z_bar = 1./ tmp2 * tmp
 
-        delta_x, delta_y, delta_z = self._kkt_solver.solve(data, rhs_x_bar, rhs_y, rhs_z_bar)
+        delta_x, delta_y, delta_z = cp.zeros(data.n), cp.zeros(data.p), cp.zeros(data.m)
+        self._kkt_solver.solve(data, rhs_x_bar, rhs_y, rhs_z_bar, delta_x, delta_y, delta_z)
 
         # recover primal/dual step from kkt solution
-        lhs.x = delta_x  # delta_x
-        lhs.y = delta_y  # delta_y
+        lhs.x[:] = delta_x  # delta_x
+        lhs.y[:] = delta_y  # delta_y
         lhs.z_u[data.idx_hu] = w_u_delta_inv * (data.G[data.idx_hu, :] @ delta_x - rhs_z_u)   # delta_z_u
         lhs.z_l[data.idx_hl] = w_l_delta_inv * (-data.G[data.idx_hl, :] @ delta_x - rhs_z_l)  # delta_z_l
         lhs.z_bu[data.idx_xu] = w_bu_delta_inv * (delta_x[data.idx_xu] - rhs.z_bu[data.idx_xu] + self._m_z_bu_inv[data.idx_xu] * rhs.s_bu[data.idx_xu])  # delta_z_bu

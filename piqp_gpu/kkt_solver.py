@@ -16,9 +16,8 @@ class KKTSolverBase(ABC):
     where W = diag(s_i/z_i) for i=1,...,m
     Actually we should note the delta*I as regularization term since it's not necessarily delta*I if there are contributions from the box constriants, which are denoted as reg_x and reg_z.
     """
-    def __init__(self, data: Data):
-        self._x_reg = cp.nan * cp.ones(data.n)
-        self._z_reg_inv = cp.nan * cp.ones(data.m)
+    def __init__(self):
+        pass
 
     @abstractmethod
     def update_scalings_and_factor(self, data: Data, delta: float, x_reg: Vector, z_reg: Vector) -> bool:

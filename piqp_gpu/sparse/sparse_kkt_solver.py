@@ -11,7 +11,7 @@ class SparseKKTSolver(KKTSolverBase):
     Sparse KKT solver with LDLT factorization.
     """
     def __init__(self, data: SparseData):
-        super().__init__(data)
+        super().__init__()
         self._delta = cp.nan
         self._x_reg = cp.zeros(data.n)
         self._z_reg = cp.zeros(data.m)
@@ -122,7 +122,7 @@ class SparseKKTSolver(KKTSolverBase):
 
         return True
     
-    def solve(self, data: SparseData, rhs_x: cp.ndarray, rhs_y: cp.ndarray, rhs_z: cp.ndarray):
+    def solve(self, data: SparseData, rhs_x: cp.ndarray, rhs_y: cp.ndarray, rhs_z: cp.ndarray, delta_x: cp.ndarray, delta_y: cp.ndarray, delta_z: cp.ndarray):
         """
         Solve the KKT system using the factorized KKT matrix.
         """
@@ -138,10 +138,9 @@ class SparseKKTSolver(KKTSolverBase):
         assert self._sol.dtype == cp.float64
         assert cp.allclose(self._kkt_mat @ self._sol, self._rhs)
 
-        delta_x = self._sol[:n].copy()
-        delta_y = self._sol[n:n+p].copy()
-        delta_z = self._sol[n+p:n+p+m].copy()
-        return delta_x, delta_y, delta_z
+        delta_x[:] = self._sol[:n]
+        delta_y[:] = self._sol[n:n+p]
+        delta_z[:] = self._sol[n+p:n+p+m]
     
 
     def eval_P_x(self, data: SparseData, alpha: float, x: cp.ndarray, z: cp.ndarray):
