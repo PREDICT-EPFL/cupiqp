@@ -118,7 +118,8 @@ class DenseKKTSolver(KKTSolverBase):
         lhs_x_tmp = np.array(rhs_x).flatten()
         if data.p > 0:
             lhs_x_tmp += (data.A.T @ rhs_y) / self._delta
-        if data.m > 0:
+        # if data.m > 0:
+        if data.num_hl > 0 or data.num_hu > 0:
             lhs_x_tmp += data.G.T @ (self._z_reg_inv * rhs_z)
         # Solve L * L^T * dx = effective_rhs
         y = solve_triangular(self._kkt_mat, lhs_x_tmp, lower=True, overwrite_b=False)  # TODO: inplace
