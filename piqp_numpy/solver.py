@@ -38,9 +38,9 @@ class SolverBase:
                 print(f"inequality constraints m = {self._data.m}")
             else:
                 print("sparse backend:")
-                print(f"variables n = {self._data.n}, nzz(P upper triangular) = {self._data.non_zeros_P_utri()}")
-                print(f"equality constraints p = {self._data.p}, nnz(A) = {self._data.non_zeros_A()}")
-                print(f"inequality constraints m = {self._data.m}, nnz(G) = {self._data.non_zeros_G()}")
+                print(f"variables n = {self._data.n}, nnz(P) = {self._data.P.nnz}")
+                print(f"equality constraints p = {self._data.p}, nnz(A) = {self._data.A.nnz}")
+                print(f"inequality constraints m = {self._data.m}, nnz(G) = {self._data.G.nnz}")
             print(f"inequality lower bounds n_h_l = {self._data.num_hl}")
             print(f"inequality upper bounds n_h_u = {self._data.num_hu}")
             print(f"variable lower bounds n_x_l = {self._data.num_xl}")
@@ -62,7 +62,7 @@ class SolverBase:
         self._result.info.delta = self.settings.delta_init     
 
         if self.settings.verbose:
-            print("iter   prim_obj        dual_obj        duality_gap    prim_res       dual_res       rho          delta        mu           p_step    d_step\n")  
+            print("iter   prim_obj        dual_obj      duality_gap      prim_res       dual_res       rho          delta        mu         p_step    d_step")
 
         ## ----------- initial iteration --------------
         # eq(12) in Roland Schwan 2023 paper
@@ -617,6 +617,7 @@ class SolverBase:
         inf = max(inf, np.linalg.norm(self._result.y - self._prox_vars.y, ord=np.inf))
         inf = max(inf, np.linalg.norm(self._result.z_l[self._data.idx_hl] - self._prox_vars.z_l[self._data.idx_hl], ord=np.inf)) if self._data.num_hl > 0 else inf
         inf = max(inf, np.linalg.norm(self._result.z_u[self._data.idx_hu] - self._prox_vars.z_u[self._data.idx_hu], ord=np.inf)) if self._data.num_hu > 0 else inf
+        # ! same as the questions in _primal_res_r and _primal_res_nr
         inf = max(inf, np.linalg.norm(self._result.z_bl[self._data.idx_xl] - self._prox_vars.z_bl[self._data.idx_xl], ord=np.inf)) if self._data.num_xl > 0 else inf
         inf = max(inf, np.linalg.norm(self._result.z_bu[self._data.idx_xu] - self._prox_vars.z_bu[self._data.idx_xu], ord=np.inf)) if self._data.num_xu > 0 else inf
         # inf = max(inf, np.max(self._prox_vars.z_bl[self._data.idx_xl] - self._result.z_bl[self._data.idx_xl])) if self._data.num_xl > 0 else inf

@@ -1,21 +1,26 @@
 import numpy as np
 from typing import Optional, Union
+import scipy.sparse as sp
+
 from .typedef import PIQP_INF
+
+ArrayLike = Union[np.ndarray, sp.spmatrix]
+
 
 class Data:
     def __init__(self, 
-                 P: np.ndarray, 
-                 c: np.ndarray, 
-                 A: Optional[np.ndarray] = None, 
-                 b: Optional[np.ndarray] = None, 
-                 G: Optional[np.ndarray] = None, 
-                 h_u: Optional[np.ndarray] = None, 
-                 h_l: Optional[np.ndarray] = None, 
-                 x_u: Optional[np.ndarray] = None, 
-                 x_l: Optional[np.ndarray] = None):
+                 P: ArrayLike, 
+                 c: ArrayLike, 
+                 A: Optional[ArrayLike] = None, 
+                 b: Optional[ArrayLike] = None, 
+                 G: Optional[ArrayLike] = None, 
+                 h_u: Optional[ArrayLike] = None, 
+                 h_l: Optional[ArrayLike] = None, 
+                 x_u: Optional[ArrayLike] = None, 
+                 x_l: Optional[ArrayLike] = None):
         
-        self._P = np.array(P, dtype=np.float64)
-        self._c = np.array(c, dtype=np.float64)
+        self._P = self._as_float64(P)
+        self._c = self._as_float64(c)
 
         if self._P.ndim != 2 or self._P.shape[0] != self._P.shape[1]:
             raise ValueError("P must be a square matrix.")
@@ -57,14 +62,23 @@ class Data:
             if x_l.shape[0] != P.shape[0] or x_u.shape[0] != P.shape[0]:
                 raise ValueError("Dimension mismatch between x_l, x_u, and P.")
         
-        self._A = A
-        self._b = b
-        self._G = G
-        self._h_u = np.array(h_u, dtype=np.float64) if h_u is not None else None
-        self._h_l = np.array(h_l, dtype=np.float64) if h_l is not None else None
-        self._x_u = np.array(x_u, dtype=np.float64) if x_u is not None else None
-        self._x_l = np.array(x_l, dtype=np.float64) if x_l is not None else None
+        self._A = self._as_float64(A)
+        self._b = self._as_float64(b)
+        self._G = self._as_float64(G)
+        self._h_u = self._as_float64(h_u) if h_u is not None else None
+        self._h_l = self._as_float64(h_l) if h_l is not None else None
+        self._x_u = self._as_float64(x_u) if x_u is not None else None
+        self._x_l = self._as_float64(x_l) if x_l is not None else None
+        self._preprocess()
 
+    @staticmethod
+    def _as_float64(M: ArrayLike) -> ArrayLike:
+        if sp.issparse(M):
+            return M.astype(np.float64)
+        else:
+            return np.array(M, dtype=np.float64)
+
+    def _preprocess(self):
         self.set_h_l()
         self.set_h_u()
         self.disable_inf_constraints()
@@ -207,3 +221,33 @@ class Data:
             self._idx_xu = []
             self._x_u = 2 * PIQP_INF * np.ones((self.n,))
     
+class DenseData(Data):
+    def __init__(self, 
+                 P: np.ndarray, 
+                 c: np.ndarray, 
+                 A: Optional[np.ndarray] = None, 
+                 b: Optional[np.ndarray] = None, 
+                 G: Optional[np.ndarray] = None, 
+                 h_u: Optional[np.ndarray] = None, 
+                 h_l: Optional[np.ndarray] = None, 
+                 x_u: Optional[np.ndarray] = None, 
+                 x_l: Optional[np.ndarray] = None):
+        super().__init__(P, c, A, b, G, h_u, h_l, x_u, x_l)
+        
+class SparseData(Data):
+    """
+    Sparse version of Data class to store sparse matrices.
+    Currently, this is just a placeholder and behaves the same as Data.
+    Future implementations may include sparse matrix storage and operations.
+    """
+    def __init__(self, 
+                 P: sp.csc_matrix, 
+                 c: np.ndarray, 
+                 A: Optional[sp.csc_matrix] = None, 
+                 b: Optional[np.ndarray] = None, 
+                 G: Optional[sp.csc_matrix] = None, 
+                 h_u: Optional[np.ndarray] = None, 
+                 h_l: Optional[np.ndarray] = None, 
+                 x_u: Optional[np.ndarray] = None, 
+                 x_l: Optional[np.ndarray] = None):
+        super().__init__(P, c, A, b, G, h_u, h_l, x_u, x_l)

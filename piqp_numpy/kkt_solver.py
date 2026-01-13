@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 import numpy as np
-from scipy.linalg import solve_triangular, cholesky, ldl
+from scipy.linalg import solve_triangular, cholesky
+import qdldl
 import scipy.sparse as sp
 
 from .typedef import Vector, Matrix
@@ -93,7 +94,8 @@ class DenseKKTSolver(KKTSolverBase):
             self._kkt_mat += (1.0 / self._delta) * self._AtA
 
         if data.m > 0:
-            self._kkt_mat += data.G.T @ np.diag(self._z_reg_inv) @ data.G
+            # self._kkt_mat += data.G.T @ np.diag(self._z_reg_inv) @ data.G
+            self._kkt_mat += data.G.T @ (self._z_reg_inv[:, np.newaxis] * data.G)
     
     def update_scalings_and_factor(self, data: Data, delta: float, x_reg: np.ndarray, z_reg: np.ndarray) -> bool:
         """
@@ -137,36 +139,75 @@ class SparseKKTSolver(KKTSolverBase):
     """
     def __init__(self, data: Data):
         super().__init__(data)
-        # ! at this moment it's not really sparse. We're justing not eliminating A and G to use ldlt factorization on the full KKT matrix.
         self._delta = np.nan
         self._x_reg = np.nan * np.ones(data.n)  # used to store the diag(P) + reg_x, i.e., [... P_ii + reg_x_i ...]
-        self._z_reg_inv = np.nan * np.ones(data.m)  # used to store the inverse of diag(W+delta*I), i.e., [... (s_i/z_i + delta)^-1 ...]
-        
-        self._kkt_mat = np.zeros((data.n + data.p + data.m, data.n + data.p + data.m))  # Placeholder for KKT matrix
+        self._z_reg = np.nan * np.ones(data.m)  # used to store the inverse of diag(W+delta*I), i.e., [... (s_i/z_i + delta)^-1 ...]
+        self._kkt_mat = self._initialize_kkt_csr(data.P, data.A, data.G)  # placeholder for KKT matrix
+        self._ldlt_solver = qdldl.Solver(self._kkt_mat)
 
-        self._AtA = data.A.T @ data.A if data.p > 0 else sp.csc_matrix((0, 0))
+    @staticmethod
+    def _initialize_kkt_csr(P: sp.csr_matrix, A: sp.csr_matrix, G: sp.csr_matrix) -> sp.csr_matrix:
+        """
+        Initialize the KKT matrix based on the sparsity of P, A, G.
+
+        This builds a CSR matrix with a fixed sparsity pattern suitable for repeated
+        numeric refactorizations. We intentionally insert identity diagonals into each
+        diagonal block so later updates can use setdiag() without changing structure.
+        """
+        P = P.tocsr()
+        n = P.shape[0]
+
+        p = 0 if A is None else int(A.shape[0])
+        m = 0 if G is None else int(G.shape[0])
+
+        # Sparse diagonal placeholders (avoid cp.diag / cp.eye which create dense matrices)
+        # Keep a diagonal entry present in each block so setdiag() won't change sparsity.
+        P_diag_abs_max = np.max(np.abs(P.diagonal()))  # ensure diagonal exists
+        
+        In = sp.diags(2 * P_diag_abs_max * np.ones(n, dtype=np.float64), 0, shape=(n, n), format="csr")  # make sure the diagonal entries of P+In are non-zero
+        Ip = -sp.diags(np.ones(p, dtype=np.float64), 0, shape=(p, p), format="csr") if p else None
+        Im = -sp.diags(np.ones(m, dtype=np.float64), 0, shape=(m, m), format="csr") if m else None
+        kkt = sp.bmat([
+                [P+In, A.T,  G.T],
+                [A,    Ip,   None],
+                [G,    None, Im],
+            ], format="csr", dtype=np.float64
+            )
+        return kkt
+
 
     def update_scalings_and_factor(self, data: Data, delta: float, x_reg: np.ndarray, z_reg: np.ndarray) -> bool:
         self._delta = delta
-        self._x_reg = x_reg
-        self._z_reg_inv = 1.0 / z_reg
+        self._x_reg[:] = x_reg
+        self._z_reg[:] = z_reg
 
         n, p, m = data.n, data.p, data.m
-        self._kkt_mat[:n, :n] = data.P + np.diag(self._x_reg)
-        self._kkt_mat[:n, n:n+p] = data.A.T
-        self._kkt_mat[:n, n+p:] = data.G.T
-        self._kkt_mat[n:n+p, :n] = data.A
-        self._kkt_mat[n:n+p, n:n+p] = -self._delta * np.eye(p)
-        self._kkt_mat[n+p:, :n] = data.G
-        self._kkt_mat[n+p:, n+p:] = -np.diag(1.0 / self._z_reg_inv)
-
-        # lu, d, perm = ldl(self._kkt_mat, lower=True, hermitian=True, check_finite=True)
-        # raise NotImplementedError("SparseKKTSolver is not yet implemented.")
-        return True
+        
+        # Top-left block: P + diag(x_reg)
+        P_reg = data.P + sp.diags(self._x_reg, format='csc')
+        
+        # Middle diagonal block: -delta * I
+        delta_I = -self._delta * sp.eye(p, format='csc') if p > 0 else sp.csc_matrix((0, 0))
+        
+        # Bottom-right diagonal block: -diag(1/z_reg)
+        z_inv_diag = -sp.diags(self._z_reg, format='csc') if m > 0 else sp.csc_matrix((0, 0))
+        
+        self._kkt_mat = sp.bmat([
+                [P_reg, data.A.T, data.G.T],
+                [data.A, delta_I, None],
+                [data.G, None, z_inv_diag]
+            ], format='csc')
+        # ldl(self._kkt_mat)  # ! for now just check if it's factorable
+        try:
+            self._ldlt_solver.update(self._kkt_mat)
+            return True
+        except Exception as e:
+            print(f"Sparse ldlt solver failed to factorize the KKT matrix: {e}")
+            return False
 
     def solve(self, data: Data, rhs_x, rhs_y, rhs_z):
         rhs = np.concatenate([rhs_x, rhs_y, rhs_z])
-        lhs = np.linalg.solve(self._kkt_mat, rhs)
+        lhs = self._ldlt_solver.solve(rhs)
         delta_x = lhs[:len(rhs_x)]
         delta_y = lhs[len(rhs_x):len(rhs_x)+len(rhs_y)]
         delta_z = lhs[len(rhs_x)+len(rhs_y):]
