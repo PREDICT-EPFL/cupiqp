@@ -1,20 +1,26 @@
 import cupy as cp
-from typing import Optional
+from typing import Optional, Union
+import cupyx.scipy.sparse as sp
+
+from .typedef import PIQP_INF
+
+ArrayLike = Union[cp.ndarray, sp.spmatrix]
+
 
 class Data:
     def __init__(self, 
-                 P, 
-                 c, 
-                 A: Optional[cp.ndarray] = None, 
-                 b: Optional[cp.ndarray] = None, 
-                 G: Optional[cp.ndarray] = None, 
-                 h_u: Optional[cp.ndarray] = None, 
-                 h_l: Optional[cp.ndarray] = None, 
-                 x_u: Optional[cp.ndarray] = None, 
-                 x_l: Optional[cp.ndarray] = None):
+                 P: ArrayLike, 
+                 c: ArrayLike, 
+                 A: Optional[ArrayLike] = None, 
+                 b: Optional[ArrayLike] = None, 
+                 G: Optional[ArrayLike] = None, 
+                 h_u: Optional[ArrayLike] = None, 
+                 h_l: Optional[ArrayLike] = None, 
+                 x_u: Optional[ArrayLike] = None, 
+                 x_l: Optional[ArrayLike] = None):
         
-        self._P = P
-        self._c = c
+        self._P = self._as_float64(P)
+        self._c = self._as_float64(c)
 
         if self._P.ndim != 2 or self._P.shape[0] != self._P.shape[1]:
             raise ValueError("P must be a square matrix.")
@@ -34,14 +40,18 @@ class Data:
             A = cp.zeros((0, P.shape[0]))
             b = cp.zeros(0)
         
-        if G is not None and h_u is not None and h_l is not None:
+        if G is not None:
             if G.ndim != 2:
                 raise ValueError("G must be a two-dimensional array.")
-            if h_u.ndim != 1 or h_l.ndim != 1:
-                raise ValueError("h_u and h_l must be one-dimensional arrays.")
-            if G.shape[0] != h_u.shape[0] or G.shape[0] != h_l.shape[0]:
-                raise ValueError("Dimension mismatch between G, h_u, and h_l.")
+            if h_l is None and h_u is None:
+                raise ValueError("Either h_l or h_u should be provided.")
+            if h_l is not None and cp.shape(h_l) != (G.shape[0],):
+                raise ValueError(f"h_l must have shape {(G.shape[0],)}, got {h_l.shape}")
+            if h_u is not None and cp.shape(h_u) != (G.shape[0],):
+                raise ValueError(f"h_u must have shape {(G.shape[0],)}, got {h_u.shape}")
         else:
+            if h_u is not None or h_l is not None:
+                raise ValueError("h_l and h_l should be None when G is None.")
             G = cp.zeros((0, P.shape[0]))
             h_u = cp.zeros(0)
             h_l = cp.zeros(0)
@@ -51,23 +61,31 @@ class Data:
                 raise ValueError("x_l and x_u must be one-dimensional arrays.")
             if x_l.shape[0] != P.shape[0] or x_u.shape[0] != P.shape[0]:
                 raise ValueError("Dimension mismatch between x_l, x_u, and P.")
-            
-        x_l = -cp.inf * cp.ones(P.shape[0]) if x_l is None else x_l
-        x_u = cp.inf * cp.ones(P.shape[0]) if x_u is None else x_u
         
-        self._idx_xl = cp.where(cp.isfinite(x_l))[0]
-        self._x_l = x_l[self._idx_xl]
-        self._idx_xu = cp.where(cp.isfinite(x_u))[0]
-        self._x_u = x_u[self._idx_xu]
+        self._A = self._as_float64(A)
+        self._b = self._as_float64(b)
+        self._G = self._as_float64(G)
+        self._h_u = self._as_float64(h_u) if h_u is not None else None
+        self._h_l = self._as_float64(h_l) if h_l is not None else None
+        self._x_u = self._as_float64(x_u) if x_u is not None else None
+        self._x_l = self._as_float64(x_l) if x_l is not None else None
+        self._preprocess()
 
-        self._A = A
-        self._b = b
-        self._G = G
+    @staticmethod
+    def _as_float64(M: ArrayLike) -> ArrayLike:
+        if sp.issparse(M):
+            return M.astype(cp.float64)
+        else:
+            return cp.array(M, dtype=cp.float64)
 
-        self._idx_hl = cp.where(cp.isfinite(h_l))[0]
-        self._idx_hu = cp.where(cp.isfinite(h_u))[0]
-        self._h_l = h_l[self._idx_hl]
-        self._h_u = h_u[self._idx_hu]
+    def _preprocess(self):
+        self.set_h_l()
+        self.set_h_u()
+        self.disable_inf_constraints()
+        self.set_h_l()
+        self.set_h_u()
+        self.set_x_l()
+        self.set_x_u()
         
 
     @property
@@ -160,3 +178,45 @@ class Data:
     def idx_xu(self):
         """Indices of upper bound constraints."""
         return self._idx_xu
+    
+    def set_h_l(self):
+        if self._h_l is not None:
+            self._idx_hl = cp.where(self._h_l > -PIQP_INF)[0].tolist()
+            self._h_l = cp.array(self._h_l, dtype=cp.float64)
+        else:
+            self._idx_hl = []
+            self._h_l = -2 * PIQP_INF * cp.ones((self.m,))
+        
+    def set_h_u(self):
+        if self._h_u is not None:
+            self._idx_hu = cp.where(self._h_u < PIQP_INF)[0].tolist()
+            self._h_u = cp.array(self._h_u, dtype=cp.float64)
+        else:
+            self._idx_hu = []
+            self._h_u = 2 * PIQP_INF * cp.ones((self.m,))
+        
+    def disable_inf_constraints(self):
+        """
+        For inequalities like -inf < g'x < +inf, set g to 0 and upper/lower bound to +1/-1
+        """
+        for i in range(self.m):
+            if self._h_l[i] <= -PIQP_INF and self._h_u[i] >= PIQP_INF:
+                self._G[i, :] = cp.zeros((self.n))
+                self._h_l[i] = -1.
+                self._h_u[i] = 1.
+        
+    def set_x_l(self):
+        if self._x_l is not None:
+            self._idx_xl = cp.where(self._x_l > -PIQP_INF)[0].tolist()
+            self._x_l = cp.array(self._x_l, dtype=cp.float64)
+        else:
+            self._idx_xl = []
+            self._x_l = -2 * PIQP_INF * cp.ones((self.n,))
+
+    def set_x_u(self):
+        if self._x_u is not None:
+            self._idx_xu = cp.where(self._x_u < PIQP_INF)[0].tolist()
+            self._x_u = cp.array(self._x_u, dtype=cp.float64)
+        else:
+            self._idx_xu = []
+            self._x_u = 2 * PIQP_INF * cp.ones((self.n,))
