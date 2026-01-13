@@ -26,13 +26,13 @@ class SparseKKTSolver(KKTSolverBase):
 
         # NOTE: do NOT use a context manager here; it will close the solver at the end
         # of __init__, making subsequent factorize() calls fail.
-        self._solver = DirectSolver(
+        self._ldlt_solver = DirectSolver(
             self._kkt_mat,
             self._rhs
         )
-        config = self._solver.plan_config
+        config = self._ldlt_solver.plan_config
         config.reordering_algorithm = DirectSolverAlgType.ALG_1
-        self._solver.plan()  # precompute reordering and symbolic factorization
+        self._ldlt_solver.plan()  # precompute reordering and symbolic factorization
 
     def __del__(self):
         # Best-effort cleanup.
@@ -115,7 +115,7 @@ class SparseKKTSolver(KKTSolverBase):
         self._update_kkt(data, delta, x_reg, z_reg)
 
         try:
-            self._solver.factorize()
+            self._ldlt_solver.factorize()
         except Exception as e:
             print(f"Factorization failed: {e}")
             return False
@@ -133,14 +133,14 @@ class SparseKKTSolver(KKTSolverBase):
 
         # update RHS in-place to reuse factorization results. See here: https://docs.nvidia.com/cuda/nvmath-python/0.6.0/host-apis/sparse/generated/nvmath.sparse.advanced.DirectSolver.html.
         # Also see: https://github.com/NVIDIA/nvmath-python/blob/main/examples/sparse/advanced/direct_solver/example05_reset_operands.py
-        self._sol[:] = self._solver.solve()
+        self._sol[:] = self._ldlt_solver.solve()
 
         assert self._sol.dtype == cp.float64
         assert cp.allclose(self._kkt_mat @ self._sol, self._rhs)
 
-        delta_x = self._sol[:n]
-        delta_y = self._sol[n:n+p]
-        delta_z = self._sol[n+p:n+p+m]
+        delta_x = self._sol[:n].copy()
+        delta_y = self._sol[n:n+p].copy()
+        delta_z = self._sol[n+p:n+p+m].copy()
         return delta_x, delta_y, delta_z
     
 
