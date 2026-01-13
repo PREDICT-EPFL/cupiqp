@@ -25,14 +25,17 @@ class KKTSystem:
             raise ValueError(f"Unsupported kkt_solver: {settings.kkt_solver}")
 
         # store the value of slack and dual variables value at this iteration, will be used in recovering the slack step: S*delta_z + Z*delta_s = r_s
+        # allocate for max possible size, but we will only use part of them according to idx_hu and idx_hl. 
         self._m_s_u = cp.zeros(self._data.m)
         self._m_s_l = cp.zeros(self._data.m)
         self._m_z_u_inv = cp.zeros(self._data.m)
         self._m_z_l_inv = cp.zeros(self._data.m)
-        self._m_s_bu = cp.zeros(self._data.num_xu)
-        self._m_s_bl = cp.zeros(self._data.num_xl)
-        self._m_z_bu_inv = cp.zeros(self._data.num_xu)
-        self._m_z_bl_inv = cp.zeros(self._data.num_xl)
+        # allocate for max possible size, but we will only use part of them according to idx_xu and idx_xl. 
+        # TODO: can be optimized later to reduce memory usage
+        self._m_s_bu = cp.zeros(self._data.n)
+        self._m_s_bl = cp.zeros(self._data.n)
+        self._m_z_bu_inv = cp.zeros(self._data.n)
+        self._m_z_bl_inv = cp.zeros(self._data.n)
 
 
     def update_scalings_and_factor(self, data: Data, rho: float, delta: float, vars: Variables) -> bool:
