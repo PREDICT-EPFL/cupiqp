@@ -513,8 +513,7 @@ class SolverBase:
 
         self._result.info.primal_res = self._primal_res_nr()
 
-
-        primal_rel_norm = cp.linalg.norm(minus_A_x, ord=cp.inf)
+        primal_rel_norm = cp.linalg.norm(minus_A_x, ord=cp.inf) if self._data.p > 0 else 0.0
         primal_rel_norm = max(primal_rel_norm, cp.linalg.norm(self._data.b, ord=cp.inf)) if self._data.p > 0 else primal_rel_norm
         primal_rel_norm = max(primal_rel_norm, cp.linalg.norm(G_x[self._data.idx_hu], ord=cp.inf)) if self._data.num_hu > 0 else primal_rel_norm
         primal_rel_norm = max(primal_rel_norm, cp.linalg.norm(G_x[self._data.idx_hl], ord=cp.inf)) if self._data.num_hl > 0 else primal_rel_norm
@@ -568,7 +567,7 @@ class SolverBase:
 
     def _primal_res_nr(self) -> float:
         inf = 0.
-        inf = max(inf, cp.linalg.norm(self._res_nr.y, ord=cp.inf))
+        inf = max(inf, cp.linalg.norm(self._res_nr.y, ord=cp.inf)) if self._data.p > 0 else inf
         inf = max(inf, cp.linalg.norm(self._res_nr.z_u[self._data.idx_hu], ord=cp.inf)) if self._data.num_hu > 0 else inf
         inf = max(inf, cp.linalg.norm(self._res_nr.z_l[self._data.idx_hl], ord=cp.inf)) if self._data.num_hl > 0 else inf
         # ! I don't understand here. Why it is not taking the abs value of z_bl and z_bu?
@@ -580,7 +579,7 @@ class SolverBase:
 
     def _primal_res_r(self) -> float:
         inf = 0.
-        inf = max(inf, cp.linalg.norm(self._res.y, ord=cp.inf))
+        inf = max(inf, cp.linalg.norm(self._res.y, ord=cp.inf)) if self._data.p > 0 else inf
         inf = max(inf, cp.linalg.norm(self._res.z_u[self._data.idx_hu], ord=cp.inf)) if self._data.num_hu > 0 else inf
         inf = max(inf, cp.linalg.norm(self._res.z_l[self._data.idx_hl], ord=cp.inf)) if self._data.num_hl > 0 else inf
         inf = max(inf, cp.linalg.norm(self._res.z_bu[self._data.idx_xu], ord=cp.inf)) if self._data.num_xu > 0 else inf
@@ -595,7 +594,7 @@ class SolverBase:
     
     def _primal_prox_inf(self) -> float:
         inf = 0.
-        inf = max(inf, cp.linalg.norm(self._result.y - self._prox_vars.y, ord=cp.inf))
+        inf = max(inf, cp.linalg.norm(self._result.y - self._prox_vars.y, ord=cp.inf)) if self._data.p > 0 else inf
         inf = max(inf, cp.linalg.norm(self._result.z_l[self._data.idx_hl] - self._prox_vars.z_l[self._data.idx_hl], ord=cp.inf)) if self._data.num_hl > 0 else inf
         inf = max(inf, cp.linalg.norm(self._result.z_u[self._data.idx_hu] - self._prox_vars.z_u[self._data.idx_hu], ord=cp.inf)) if self._data.num_hu > 0 else inf
         inf = max(inf, cp.linalg.norm(self._result.z_bl[self._data.idx_xl] - self._prox_vars.z_bl[self._data.idx_xl], ord=cp.inf)) if self._data.num_xl > 0 else inf
