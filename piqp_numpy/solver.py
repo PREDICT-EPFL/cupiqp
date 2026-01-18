@@ -267,6 +267,9 @@ class SolverBase:
                 self._result.info.status = Status.PIQP_NUMERICAL_ISSUES
                 return self._result.info.status
             
+            # reset factor retires for next iteration
+            self._result.info.factor_retires = 0
+            
             # ------------------ predictor step ------------------
 
             if self.settings.debug:
