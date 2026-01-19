@@ -29,6 +29,9 @@ class SolverBase:
 
         self._res_nr = Variables(self._data.n, self._data.p, self._data.m)  # used to store the non-regularized residuals
         self._res_r = Variables(self._data.n, self._data.p, self._data.m)  # used to store the regularized residuals
+
+        self._work_z = cp.empty(2 * self._data.m + 2 * self._data.n)  # used in _calculate_step to hold all concatenated slack or dual steps / results
+        self._work_s = cp.empty(2 * self._data.m + 2 * self._data.n)  # used in _calculate_step to hold all concatenated slack or dual steps / results
         
         
 
@@ -378,53 +381,47 @@ class SolverBase:
     def _calculate_step(self) -> Tuple[float, float]:
         """
         Compute the step length of the slack variables and dual variables. Make sure they remain non-negative.
+        Vectorized implementation to minimize GPU kernel launches and synchronization.
         """
-        alpha_s = 1.0
-        alpha_z = 1.0
+        num_hl, num_hu, num_xl, num_xu = self._data.num_hl, self._data.num_hu, self._data.num_xl, self._data.num_xu
 
+        # first compute alpha_s, use self._work_s to concatenate step, use self._work_z to concatenate result
+        offset = 0
+        self._work_s[offset : offset+num_hl] = self._step.s_l[self._data.idx_hl]
+        self._work_z[offset : offset+num_hl] = self._result.s_l[self._data.idx_hl]
+        offset += num_hl
+        self._work_s[offset:offset + num_hu] = self._step.s_u[self._data.idx_hu]
+        self._work_z[offset:offset + num_hu] = self._result.s_u[self._data.idx_hu]
+        offset += num_hu
+        self._work_s[offset:offset + num_xl] = self._step.s_bl[self._data.idx_xl]
+        self._work_z[offset:offset + num_xl] = self._result.s_bl[self._data.idx_xl]
+        offset += num_xl
+        self._work_s[offset:offset + num_xu] = self._step.s_bu[self._data.idx_xu]
+        self._work_z[offset:offset + num_xu] = self._result.s_bu[self._data.idx_xu]
+        offset += num_xu
 
-        if self._data.m > 0:
-            # s_i + alpha_s * delta_s_i >= 0  =>  if delta_s_i < 0, alpha_s <= -s_i / delta_s_i
-            
-            # Vectorized computation of step sizes
-            # for s_l and s_u (inequality constraint slacks)
-            mask_s_l = self._step.s_l < 0
-            mask_s_u = self._step.s_u < 0
-            
-            if cp.any(mask_s_l):
-                alpha_s = min(alpha_s, cp.min(-self._result.s_l[mask_s_l] / self._step.s_l[mask_s_l]))
-            if cp.any(mask_s_u):
-                alpha_s = min(alpha_s, cp.min(-self._result.s_u[mask_s_u] / self._step.s_u[mask_s_u]))
-            
-            # for z_l and z_u (dual variables)
-            mask_z_l = self._step.z_l < 0
-            mask_z_u = self._step.z_u < 0
-            
-            if cp.any(mask_z_l):
-                alpha_z = min(alpha_z, cp.min(-self._result.z_l[mask_z_l] / self._step.z_l[mask_z_l]))
-            if cp.any(mask_z_u):
-                alpha_z = min(alpha_z, cp.min(-self._result.z_u[mask_z_u] / self._step.z_u[mask_z_u]))
+        # if step < 0, must limit alpha <= -s / step, otherwise take full step 1.0
+        self._work_s[:offset] = cp.where(self._work_s[:offset] < 0, -self._work_z[:offset] / self._work_s[:offset], 1.)
+        alpha_s = cp.min(self._work_s[:offset])
 
-        if self._data.num_xl > 0:
-            # for s_bl and z_bl (bound constraint slacks and duals - lower)
-            mask_s_bl = self._step.s_bl < 0
-            mask_z_bl = self._step.z_bl < 0
-            
-            if cp.any(mask_s_bl):
-                alpha_s = min(alpha_s, cp.min(-self._result.s_bl[mask_s_bl] / self._step.s_bl[mask_s_bl]))
-            if cp.any(mask_z_bl):
-                alpha_z = min(alpha_z, cp.min(-self._result.z_bl[mask_z_bl] / self._step.z_bl[mask_z_bl]))
+        # then compute alpha_z, use self._work_s to concatenate step, use self._work_z to concatenate result
+        offset = 0
+        self._work_z[offset : offset+num_hl] = self._step.z_l[self._data.idx_hl]
+        self._work_s[offset : offset+num_hl] = self._result.z_l[self._data.idx_hl]
+        offset += num_hl
+        self._work_z[offset:offset + num_hu] = self._step.z_u[self._data.idx_hu]
+        self._work_s[offset:offset + num_hu] = self._result.z_u[self._data.idx_hu]
+        offset += num_hu
+        self._work_z[offset:offset + num_xl] = self._step.z_bl[self._data.idx_xl]
+        self._work_s[offset:offset + num_xl] = self._result.z_bl[self._data.idx_xl]
+        offset += num_xl
+        self._work_z[offset:offset + num_xu] = self._step.z_bu[self._data.idx_xu]
+        self._work_s[offset:offset + num_xu] = self._result.z_bu[self._data.idx_xu]
+        offset += num_xu
 
-        if self._data.num_xu > 0:
-            # for s_bu and z_bu (bound constraint slacks and duals - upper)
-            mask_s_bu = self._step.s_bu < 0
-            mask_z_bu = self._step.z_bu < 0
-            
-            if cp.any(mask_s_bu):
-                alpha_s = min(alpha_s, cp.min(-self._result.s_bu[mask_s_bu] / self._step.s_bu[mask_s_bu]))
-            if cp.any(mask_z_bu):
-                alpha_z = min(alpha_z, cp.min(-self._result.z_bu[mask_z_bu] / self._step.z_bu[mask_z_bu]))
-        
+        self._work_z[:offset] = cp.where(self._work_z[:offset] < 0, -self._work_s[:offset] / self._work_z[:offset], 1.)
+        alpha_z = cp.min(self._work_z[:offset])
+
         return alpha_s, alpha_z
     
 
