@@ -142,7 +142,7 @@ class Data:
     @property
     def num_hl(self):
         """Number of lower inequality constraints."""
-        return len(self._idx_hl)
+        return cp.size(self._idx_hl)
     
     @property
     def idx_hl(self):
@@ -152,7 +152,7 @@ class Data:
     @property
     def num_hu(self):
         """Number of upper inequality constraints."""
-        return len(self._idx_hu)
+        return cp.size(self._idx_hu)
     
     @property
     def idx_hu(self):
@@ -162,7 +162,7 @@ class Data:
     @property
     def num_xl(self):
         """Number of lower bound constraints."""
-        return len(self._idx_xl)
+        return cp.size(self._idx_xl)
     
     @property
     def idx_xl(self):
@@ -172,7 +172,7 @@ class Data:
     @property
     def num_xu(self):
         """Number of upper bound constraints."""
-        return len(self._idx_xu)
+        return cp.size(self._idx_xu)
     
     @property
     def idx_xu(self):
@@ -181,18 +181,18 @@ class Data:
     
     def set_h_l(self):
         if self._h_l is not None:
-            self._idx_hl = cp.where(self._h_l > -PIQP_INF)[0].tolist()
+            self._idx_hl = cp.where(self._h_l > -PIQP_INF)[0].astype(cp.int32)
             self._h_l = cp.array(self._h_l, dtype=cp.float64)
         else:
-            self._idx_hl = []
+            self._idx_hl = cp.empty((0,), dtype=cp.int32)
             self._h_l = -2 * PIQP_INF * cp.ones((self.m,))
         
     def set_h_u(self):
         if self._h_u is not None:
-            self._idx_hu = cp.where(self._h_u < PIQP_INF)[0].tolist()
+            self._idx_hu = cp.where(self._h_u < PIQP_INF)[0].astype(cp.int32)
             self._h_u = cp.array(self._h_u, dtype=cp.float64)
         else:
-            self._idx_hu = []
+            self._idx_hu = cp.empty((0,), dtype=cp.int32)
             self._h_u = 2 * PIQP_INF * cp.ones((self.m,))
         
     def disable_inf_constraints(self):
@@ -207,16 +207,16 @@ class Data:
         
     def set_x_l(self):
         if self._x_l is not None:
-            self._idx_xl = cp.where(self._x_l > -PIQP_INF)[0].tolist()
+            self._idx_xl = cp.where(self._x_l > -PIQP_INF)[0].astype(cp.int32)
             self._x_l = cp.array(self._x_l, dtype=cp.float64)
         else:
-            self._idx_xl = []
+            self._idx_xl = cp.empty((0,), dtype=cp.int32)
             self._x_l = -2 * PIQP_INF * cp.ones((self.n,))
 
     def set_x_u(self):
         if self._x_u is not None:
-            self._idx_xu = cp.where(self._x_u < PIQP_INF)[0].tolist()
+            self._idx_xu = cp.where(self._x_u < PIQP_INF)[0].astype(cp.int32)
             self._x_u = cp.array(self._x_u, dtype=cp.float64)
         else:
-            self._idx_xu = []
+            self._idx_xu = cp.empty((0,), dtype=cp.int32)
             self._x_u = 2 * PIQP_INF * cp.ones((self.n,))
