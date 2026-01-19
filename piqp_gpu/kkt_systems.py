@@ -16,6 +16,9 @@ class KKTSystem:
         self._x_reg = cp.nan * cp.ones(self._data.n)
         self._z_reg = cp.nan * cp.ones(self._data.m)
 
+        self._work_x = cp.nan * cp.zeros(self._data.n)
+        self._work_z = cp.nan * cp.zeros(self._data.m)
+
         self._delta = cp.nan
 
         if settings.kkt_solver == "sparse_ldlt":
@@ -81,25 +84,25 @@ class KKTSystem:
     
     @nvtx.annotate("KKTSystem::solve")
     def solve(self, data: Data, settings: Settings, rhs: Variables, lhs: Variables) -> None:
+        # ! these following lines are causing extra allocation, need to be optimized later!
         rhs_z_u = rhs.z_u[data.idx_hu] - self._m_z_u_inv[data.idx_hu] * rhs.s_u[data.idx_hu]  # rhs_z_u - inv(Z_u) * r_s_u
         rhs_z_l = rhs.z_l[data.idx_hl] - self._m_z_l_inv[data.idx_hl] * rhs.s_l[data.idx_hl]  # rhs_z_l - inv(Z_l) * r_s_l
         rhs_z_bu = rhs.z_bu[data.idx_xu] - self._m_z_bu_inv[data.idx_xu] * rhs.s_bu[data.idx_xu]  # rhs_z_bu - inv(Z_bu) * r_s_bu
         rhs_z_bl = rhs.z_bl[data.idx_xl] - self._m_z_bl_inv[data.idx_xl] * rhs.s_bl[data.idx_xl]  # rhs_z_bl - inv(Z_bl) * r_s_bl
 
-        rhs_x_bar = rhs.x.copy()
-        rhs_x_bar[data.idx_xu] += self._w_bu_delta_inv * rhs_z_bu
-        rhs_x_bar[data.idx_xl] -= self._w_bl_delta_inv * rhs_z_bl
+        # use self._work_x to hold modified rhs_x, avoid extra allocation
+        self._work_x[:] = rhs.x
+        self._work_x[data.idx_xu] += self._w_bu_delta_inv * rhs_z_bu
+        self._work_x[data.idx_xl] -= self._w_bl_delta_inv * rhs_z_bl
 
-        rhs_y = rhs.y.copy()
-
-        # rhs_z_bar = (1./ (w_u_delta_inv + w_l_delta_inv)) * (w_u_delta_inv * rhs_z_u - w_l_delta_inv * rhs_z_l)
-        tmp = cp.zeros(data.m)
-        tmp[data.idx_hu] += self._w_u_delta_inv * rhs_z_u
-        tmp[data.idx_hl] -= self._w_l_delta_inv * rhs_z_l
-        rhs_z_bar = self._z_reg * tmp
+        # use self._work_z to hold modified rhs_z, avoid extra allocation
+        self._work_z.fill(0)  # faster than cp.zeros assignment
+        self._work_z[data.idx_hu] += self._w_u_delta_inv * rhs_z_u
+        self._work_z[data.idx_hl] -= self._w_l_delta_inv * rhs_z_l
+        self._work_z[:] *= self._z_reg
 
         delta_z = cp.ones(self._data.m)
-        self._kkt_solver.solve(data, rhs_x_bar, rhs_y, rhs_z_bar, lhs.x, lhs.y, delta_z)
+        self._kkt_solver.solve(data, self._work_x, rhs.y, self._work_z, lhs.x, lhs.y, delta_z)
         delta_x = lhs.x  # reference
         lhs.z_u[data.idx_hu] = self._w_u_delta_inv * (data.G[data.idx_hu, :] @ delta_x - rhs_z_u)   # delta_z_u
         lhs.z_l[data.idx_hl] = self._w_l_delta_inv * (-data.G[data.idx_hl, :] @ delta_x - rhs_z_l)  # delta_z_l
