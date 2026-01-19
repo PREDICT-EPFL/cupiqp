@@ -1,4 +1,5 @@
 import cupy as cp
+import nvtx
 
 from .data import Data
 from .settings import Settings
@@ -44,6 +45,7 @@ class KKTSystem:
         self._w_bl_delta_inv = cp.zeros(self._data.num_xl)  # store 1./(s_bl / z_bl + delta)
 
 
+    @nvtx.annotate("KKTSystem::update_scalings_and_factor")
     def update_scalings_and_factor(self, data: Data, rho: float, delta: float, vars: Variables) -> bool:
         """
         Update the scaling factors and refactor the KKT matrix.
@@ -77,6 +79,7 @@ class KKTSystem:
         self._z_reg[:] = 1. / self._z_reg
         return self._kkt_solver.update_scalings_and_factor(data, delta, self._x_reg, self._z_reg) # ! this is implicitly assuming idx_hu and idx_hl cover all indices of inequalities 0:m
     
+    @nvtx.annotate("KKTSystem::solve")
     def solve(self, data: Data, settings: Settings, rhs: Variables, lhs: Variables) -> None:
         rhs_z_u = rhs.z_u[data.idx_hu] - self._m_z_u_inv[data.idx_hu] * rhs.s_u[data.idx_hu]  # rhs_z_u - inv(Z_u) * r_s_u
         rhs_z_l = rhs.z_l[data.idx_hl] - self._m_z_l_inv[data.idx_hl] * rhs.s_l[data.idx_hl]  # rhs_z_l - inv(Z_l) * r_s_l
@@ -110,12 +113,14 @@ class KKTSystem:
         lhs.s_bl[data.idx_xl] = self._m_z_bl_inv[data.idx_xl] * (rhs.s_bl[data.idx_xl] - self._m_s_bl[data.idx_xl] * lhs.z_bl[data.idx_xl])  # delta_s_bl = inv(Z_bl) (r_s_bl - S_bl delta_z_bl)
 
 
+    @nvtx.annotate("KKTSystem::eval_P_x")
     def eval_P_x(self, data: Data, alpha: float, x: cp.ndarray, z: cp.ndarray):
         """
         Evaluate alpha * P * x
         """
         self._kkt_solver.eval_P_x(data, alpha, x, z)
     
+    @nvtx.annotate("KKTSystem::eval_A_xn_and_AT_xt")
     def eval_A_xn_and_AT_xt(self, data: Data, alpha_n: float, alpha_t: float, xn: cp.ndarray, xt: cp.ndarray, zn: cp.ndarray, zt: cp.ndarray):
         """
         Evaluate Ax and A^T xt with scaling factors alpha_n and alpha_t:
@@ -124,6 +129,7 @@ class KKTSystem:
         """
         self._kkt_solver.eval_A_xn_and_AT_xt(data, alpha_n, xn, alpha_t, xt, zn, zt)
     
+    @nvtx.annotate("KKTSystem::eval_G_xn_and_GT_xt")
     def eval_G_xn_and_GT_xt(self, data: Data, alpha_n: float, alpha_t: float, xn: cp.ndarray, xt: cp.ndarray, zn: cp.ndarray, zt: cp.ndarray):
         """
         Evaluate Gx and G^T xt with scaling factors alpha_n and alpha_t:

@@ -1,5 +1,6 @@
 import cupy as cp
 from typing import Tuple
+import nvtx
 
 from .settings import Settings
 from .data import Data
@@ -373,7 +374,7 @@ class SolverBase:
         self._result.info.status = Status.PIQP_MAX_ITER_REACHED
         return self._result.info.status
 
-            
+    @nvtx.annotate("Solver::_calculate_step")
     def _calculate_step(self) -> Tuple[float, float]:
         """
         Compute the step length of the slack variables and dual variables. Make sure they remain non-negative.
@@ -427,6 +428,7 @@ class SolverBase:
         return alpha_s, alpha_z
     
 
+    @nvtx.annotate("Solver::_calculate_mu")
     def _calculate_mu(self) -> float:
         mu = (self._result.s_l[self._data.idx_hl].dot(self._result.z_l[self._data.idx_hl])
                 + self._result.s_u[self._data.idx_hu].dot(self._result.z_u[self._data.idx_hu]) \
@@ -436,6 +438,7 @@ class SolverBase:
         return float(mu)
 
 
+    @nvtx.annotate("Solver::_update_residuals_nr")
     def _update_residuals_nr(self):
         """
         Compute the non-regularized primal and dual residuals:
@@ -554,6 +557,7 @@ class SolverBase:
         self._result.info.dual_res_rel = self._result.info.dual_res / max(1., dual_res_norm)
         
 
+    @nvtx.annotate("Solver::_update_residuals_r")
     def _update_residuals_r(self):
         """
         Compute the regularized primal and dual residuals. The computation is based on the non-regularized residuals computed in _update_residuals_nr.

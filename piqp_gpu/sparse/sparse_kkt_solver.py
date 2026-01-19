@@ -2,6 +2,7 @@ from typing import Optional
 import cupy as cp
 from cupyx.scipy.sparse import csr_matrix, diags, bmat
 from nvmath.sparse.advanced import DirectSolver, DirectSolverAlgType
+import nvtx
 
 from ..kkt_solver import KKTSolverBase
 from .sparse_data import SparseData
@@ -90,6 +91,7 @@ class SparseKKTSolver(KKTSolverBase):
                     break
         return diag_idx
     
+    @nvtx.annotate("SparseKKTSolver::_update_kkt")
     def _update_kkt(self, data: SparseData, delta: float, x_reg: cp.ndarray, z_reg: cp.ndarray) -> None:
         # IMPORTANT:
         # - cupyx CSR does not support efficient block assignment like self._kkt_mat[:n, :n] = ...
@@ -106,7 +108,7 @@ class SparseKKTSolver(KKTSolverBase):
         full_diag = cp.concatenate([diag_top, diag_mid, diag_bot])
         self._kkt_mat.data[self._diag_indices] = full_diag
     
-
+    @nvtx.annotate("SparseKKTSolver::update_scalings_and_factor")
     def update_scalings_and_factor(self, data: SparseData, delta: float, x_reg: cp.ndarray, z_reg: cp.ndarray) -> bool:
         self._delta = delta
         self._x_reg = x_reg
@@ -122,6 +124,7 @@ class SparseKKTSolver(KKTSolverBase):
 
         return True
     
+    @nvtx.annotate("SparseKKTSolver::solve")
     def solve(self, data: SparseData, rhs_x: cp.ndarray, rhs_y: cp.ndarray, rhs_z: cp.ndarray, delta_x: cp.ndarray, delta_y: cp.ndarray, delta_z: cp.ndarray):
         """
         Solve the KKT system using the factorized KKT matrix.
@@ -143,13 +146,16 @@ class SparseKKTSolver(KKTSolverBase):
         delta_z[:] = self._sol[n+p:n+p+m]
     
 
+    @nvtx.annotate("SparseKKTSolver::eval_P_x")
     def eval_P_x(self, data: SparseData, alpha: float, x: cp.ndarray, z: cp.ndarray):
         z[:] = data.P @ x * alpha
     
+    @nvtx.annotate("SparseKKTSolver::eval_A_xn_and_AT_xt")
     def eval_A_xn_and_AT_xt(self, data: SparseData, alpha_n: float, xn: cp.ndarray, alpha_t: float, xt: cp.ndarray, zn: cp.ndarray, zt: cp.ndarray):
         zn[:] = (data.A @ xn) * alpha_n
         zt[:] = (data.A.T @ xt) * alpha_t
     
+    @nvtx.annotate("SparseKKTSolver::eval_G_xn_and_GT_xt")
     def eval_G_xn_and_GT_xt(self, data: SparseData, alpha_n: float, xn: cp.ndarray, alpha_t: float, xt: cp.ndarray, zn: cp.ndarray, zt: cp.ndarray):
         zn[:] = (data.G @ xn) * alpha_n
         zt[:] = (data.G.T @ xt) * alpha_t
