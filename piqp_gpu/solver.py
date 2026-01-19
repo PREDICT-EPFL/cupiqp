@@ -130,27 +130,21 @@ class SolverBase:
 
         ## ----------- keep z and s non-negative --------------
         # this is according to the IV.A part of Roland Schwan 2023 paper
-        delta_s = 0.0
-        if self._data.num_hl > 0:
-            delta_s = max(delta_s, -self._result.s_l[self._data.idx_hl].min())
-        if self._data.num_hu > 0:
-            delta_s = max(delta_s, -self._result.s_u[self._data.idx_hu].min())
-
-        if self._data.num_xl > 0:
-            delta_s = max(delta_s, -self._result.s_bl[self._data.idx_xl].min())
-        if self._data.num_xu > 0:
-            delta_s = max(delta_s, -self._result.s_bu[self._data.idx_xu].min())
-
-        delta_z = 0.0
-        if self._data.num_hl > 0:
-            delta_z = max(delta_z, -self._result.z_l[self._data.idx_hl].min())
-        if self._data.num_hu > 0:
-            delta_z = max(delta_z, -self._result.z_u[self._data.idx_hu].min())
-        
-        if self._data.num_xl > 0:
-            delta_z = max(delta_z, -self._result.z_bl[self._data.idx_xl].min())
-        if self._data.num_xu > 0:
-            delta_z = max(delta_z, -self._result.z_bu[self._data.idx_xu].min())
+        offset = 0
+        self._work_s[offset:offset+self._data.num_hl] = self._result.s_l[self._data.idx_hl]
+        self._work_z[offset:offset+self._data.num_hl] = self._result.z_l[self._data.idx_hl]
+        offset += self._data.num_hl
+        self._work_s[offset:offset+self._data.num_hu] = self._result.s_u[self._data.idx_hu]
+        self._work_z[offset:offset+self._data.num_hu] = self._result.z_u[self._data.idx_hu]
+        offset += self._data.num_hu
+        self._work_s[offset:offset+self._data.num_xl] = self._result.s_bl[self._data.idx_xl]
+        self._work_z[offset:offset+self._data.num_xl] = self._result.z_bl[self._data.idx_xl]
+        offset += self._data.num_xl
+        self._work_s[offset:offset+self._data.num_xu] = self._result.s_bu[self._data.idx_xu]
+        self._work_z[offset:offset+self._data.num_xu] = self._result.z_bu[self._data.idx_xu]
+        offset += self._data.num_xu
+        delta_s = -cp.min(self._work_s[:offset])  # single D2H transfer
+        delta_z = -cp.min(self._work_z[:offset])  # single D2H transfer
 
         self._result.s_l[self._data.idx_hl] += delta_s
         self._result.z_l[self._data.idx_hl] += delta_z
