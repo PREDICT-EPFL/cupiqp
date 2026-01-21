@@ -17,6 +17,7 @@ class SolverBase:
 
         self._kkt_system = None
     
+    @nvtx.annotate("Solver::setup")
     def setup(self, P, c, A, b, G, h_u, h_l, x_u, x_l):
         self._data = Data(P, c, A, b, G, h_u, h_l, x_u, x_l)
         self._result = Result(self._data.n, self._data.p, self._data.m)
@@ -72,128 +73,129 @@ class SolverBase:
 
         ## ----------- initial iteration --------------
         # eq(12) in Roland Schwan 2023 paper
+        with nvtx.annotate("Solver::initialization"):
+            self._result.x = cp.zeros(self._data.n)
+            self._result.y = cp.zeros(self._data.p)
 
-        self._result.x = cp.zeros(self._data.n)
-        self._result.y = cp.zeros(self._data.p)
+            # ! using cp.nan because it raises error when the implementation is wrong, making debugging easier
+            self._result.s_l = cp.nan * cp.ones(self._data.m)
+            self._result.s_u = cp.nan * cp.ones(self._data.m)
+            self._result.s_bl = cp.nan * cp.ones(self._data.n)
+            self._result.s_bu = cp.nan * cp.ones(self._data.n)
+            self._result.z_l = cp.nan * cp.ones(self._data.m)
+            self._result.z_u = cp.nan * cp.ones(self._data.m)
+            self._result.z_bl = cp.nan * cp.ones(self._data.n)
+            self._result.z_bu = cp.nan * cp.ones(self._data.n)
 
-        # ! using cp.nan because it raises error when the implementation is wrong, making debugging easier
-        self._result.s_l = cp.nan * cp.ones(self._data.m)
-        self._result.s_u = cp.nan * cp.ones(self._data.m)
-        self._result.s_bl = cp.nan * cp.ones(self._data.n)
-        self._result.s_bu = cp.nan * cp.ones(self._data.n)
-        self._result.z_l = cp.nan * cp.ones(self._data.m)
-        self._result.z_u = cp.nan * cp.ones(self._data.m)
-        self._result.z_bl = cp.nan * cp.ones(self._data.n)
-        self._result.z_bu = cp.nan * cp.ones(self._data.n)
+            self._result.s_l[self._data.idx_hl] = 1.0
+            self._result.z_l[self._data.idx_hl] = 1.0
+            self._result.s_u[self._data.idx_hu] = 1.0
+            self._result.z_u[self._data.idx_hu] = 1.0
+            self._result.s_bl[self._data.idx_xl] = 1.0
+            self._result.z_bl[self._data.idx_xl] = 1.0
+            self._result.s_bu[self._data.idx_xu] = 1.0
+            self._result.z_bu[self._data.idx_xu] = 1.0
 
-        self._result.s_l[self._data.idx_hl] = 1.0
-        self._result.z_l[self._data.idx_hl] = 1.0
-        self._result.s_u[self._data.idx_hu] = 1.0
-        self._result.z_u[self._data.idx_hu] = 1.0
-        self._result.s_bl[self._data.idx_xl] = 1.0
-        self._result.z_bl[self._data.idx_xl] = 1.0
-        self._result.s_bu[self._data.idx_xu] = 1.0
-        self._result.z_bu[self._data.idx_xu] = 1.0
+            self._kkt_system.update_scalings_and_factor(
+                self._data,
+                self._result.info.rho,
+                self._result.info.delta,
+                self._result
+            )
 
-        self._kkt_system.update_scalings_and_factor(
-            self._data,
-            self._result.info.rho,
-            self._result.info.delta,
-            self._result
-        )
+            self._res = Result(self._data.n, self._data.p, self._data.m)  # used to store the right hand side of KKT system
+            self._res.x[:] = -self._data.c
+            self._res.y[:] = self._data.b
+            self._res.z_l = cp.nan * cp.zeros(self._data.m)
+            self._res.z_l[self._data.idx_hl] = -self._data.h_l[self._data.idx_hl]
+            self._res.z_u = cp.nan * cp.zeros(self._data.m)
+            self._res.z_u[self._data.idx_hu] = self._data.h_u[self._data.idx_hu]
+            self._res.z_bl = cp.nan * cp.zeros(self._data.n)
+            self._res.z_bl[self._data.idx_xl] = -self._data.x_l[self._data.idx_xl]
+            self._res.z_bu = cp.nan * cp.zeros(self._data.n)
+            self._res.z_bu[self._data.idx_xu] = self._data.x_u[self._data.idx_xu]
+            
+            self._res.s_l = cp.nan * cp.zeros(self._data.m)
+            self._res.s_u = cp.nan * cp.zeros(self._data.m)
+            self._res.s_bl = cp.nan * cp.zeros(self._data.n)
+            self._res.s_bu = cp.nan * cp.zeros(self._data.n)
+            self._res.s_l[self._data.idx_hl] = 0.
+            self._res.s_u[self._data.idx_hu] = 0.
+            self._res.s_bl[self._data.idx_xl] = 0.
+            self._res.s_bu[self._data.idx_xu] = 0.
 
-        self._res = Result(self._data.n, self._data.p, self._data.m)  # used to store the right hand side of KKT system
-        self._res.x[:] = -self._data.c
-        self._res.y[:] = self._data.b
-        self._res.z_l = cp.nan * cp.zeros(self._data.m)
-        self._res.z_l[self._data.idx_hl] = -self._data.h_l[self._data.idx_hl]
-        self._res.z_u = cp.nan * cp.zeros(self._data.m)
-        self._res.z_u[self._data.idx_hu] = self._data.h_u[self._data.idx_hu]
-        self._res.z_bl = cp.nan * cp.zeros(self._data.n)
-        self._res.z_bl[self._data.idx_xl] = -self._data.x_l[self._data.idx_xl]
-        self._res.z_bu = cp.nan * cp.zeros(self._data.n)
-        self._res.z_bu[self._data.idx_xu] = self._data.x_u[self._data.idx_xu]
-        
-        self._res.s_l = cp.nan * cp.zeros(self._data.m)
-        self._res.s_u = cp.nan * cp.zeros(self._data.m)
-        self._res.s_bl = cp.nan * cp.zeros(self._data.n)
-        self._res.s_bu = cp.nan * cp.zeros(self._data.n)
-        self._res.s_l[self._data.idx_hl] = 0.
-        self._res.s_u[self._data.idx_hu] = 0.
-        self._res.s_bl[self._data.idx_xl] = 0.
-        self._res.s_bu[self._data.idx_xu] = 0.
+            self._kkt_system.solve(self._data, self.settings, self._res, self._result)  # getting an initial point of _result
 
-        self._kkt_system.solve(self._data, self.settings, self._res, self._result)  # getting an initial point of _result
+            if self.settings.debug:
+                print("Initial point after solving KKT system:", self._result)
 
-        if self.settings.debug:
-            print("Initial point after solving KKT system:", self._result)
+            ## ----------- keep z and s non-negative --------------
+            # this is according to the IV.A part of Roland Schwan 2023 paper
+            offset = 0
+            self._work_s[offset:offset+self._data.num_hl] = self._result.s_l[self._data.idx_hl]
+            self._work_z[offset:offset+self._data.num_hl] = self._result.z_l[self._data.idx_hl]
+            offset += self._data.num_hl
+            self._work_s[offset:offset+self._data.num_hu] = self._result.s_u[self._data.idx_hu]
+            self._work_z[offset:offset+self._data.num_hu] = self._result.z_u[self._data.idx_hu]
+            offset += self._data.num_hu
+            self._work_s[offset:offset+self._data.num_xl] = self._result.s_bl[self._data.idx_xl]
+            self._work_z[offset:offset+self._data.num_xl] = self._result.z_bl[self._data.idx_xl]
+            offset += self._data.num_xl
+            self._work_s[offset:offset+self._data.num_xu] = self._result.s_bu[self._data.idx_xu]
+            self._work_z[offset:offset+self._data.num_xu] = self._result.z_bu[self._data.idx_xu]
+            offset += self._data.num_xu
+            delta_s = -cp.min(self._work_s[:offset])  # single D2H transfer
+            delta_z = -cp.min(self._work_z[:offset])  # single D2H transfer
 
-        ## ----------- keep z and s non-negative --------------
-        # this is according to the IV.A part of Roland Schwan 2023 paper
-        offset = 0
-        self._work_s[offset:offset+self._data.num_hl] = self._result.s_l[self._data.idx_hl]
-        self._work_z[offset:offset+self._data.num_hl] = self._result.z_l[self._data.idx_hl]
-        offset += self._data.num_hl
-        self._work_s[offset:offset+self._data.num_hu] = self._result.s_u[self._data.idx_hu]
-        self._work_z[offset:offset+self._data.num_hu] = self._result.z_u[self._data.idx_hu]
-        offset += self._data.num_hu
-        self._work_s[offset:offset+self._data.num_xl] = self._result.s_bl[self._data.idx_xl]
-        self._work_z[offset:offset+self._data.num_xl] = self._result.z_bl[self._data.idx_xl]
-        offset += self._data.num_xl
-        self._work_s[offset:offset+self._data.num_xu] = self._result.s_bu[self._data.idx_xu]
-        self._work_z[offset:offset+self._data.num_xu] = self._result.z_bu[self._data.idx_xu]
-        offset += self._data.num_xu
-        delta_s = -cp.min(self._work_s[:offset])  # single D2H transfer
-        delta_z = -cp.min(self._work_z[:offset])  # single D2H transfer
+            self._result.s_l[self._data.idx_hl] += delta_s
+            self._result.z_l[self._data.idx_hl] += delta_z
+            self._result.s_u[self._data.idx_hu] += delta_s
+            self._result.z_u[self._data.idx_hu] += delta_z
 
-        self._result.s_l[self._data.idx_hl] += delta_s
-        self._result.z_l[self._data.idx_hl] += delta_z
-        self._result.s_u[self._data.idx_hu] += delta_s
-        self._result.z_u[self._data.idx_hu] += delta_z
+            self._result.s_bl[self._data.idx_xl] += delta_s
+            self._result.z_bl[self._data.idx_xl] += delta_z
+            self._result.s_bu[self._data.idx_xu] += delta_s
+            self._result.z_bu[self._data.idx_xu] += delta_z
 
-        self._result.s_bl[self._data.idx_xl] += delta_s
-        self._result.z_bl[self._data.idx_xl] += delta_z
-        self._result.s_bu[self._data.idx_xu] += delta_s
-        self._result.z_bu[self._data.idx_xu] += delta_z
+            # self._result.info.mu = cp.maximum(self._calculate_mu(), 1e-10)
+            self._result.info.mu = self._calculate_mu()
+            if self.settings.debug:
+                print("Initial mu:", self._result.info.mu)
 
-        self._result.info.mu = max(self._calculate_mu(), 1e-10)
-        if self.settings.debug:
-            print("Initial mu:", self._result.info.mu)
+            # put s and z on the central path
+            for idx in self._data.idx_hu:
+                c = self._result.z_u[idx] - delta_z
+                self._result.z_u[idx] = (c + cp.sqrt(c * c + 4 * self._result.info.mu)) / 2
+                self._result.s_u[idx] = self._result.z_u[idx] - c
 
-        # put s and z on the central path
-        for idx in self._data.idx_hu:
-            c = self._result.z_u[idx] - delta_z
-            self._result.z_u[idx] = (c + cp.sqrt(c * c + 4 * self._result.info.mu)) / 2
-            self._result.s_u[idx] = self._result.z_u[idx] - c
+            for idx in self._data.idx_hl:
+                c = self._result.z_l[idx] - delta_z
+                self._result.z_l[idx] = (c + cp.sqrt(c * c + 4 * self._result.info.mu)) / 2
+                self._result.s_l[idx] = self._result.z_l[idx] - c
 
-        for idx in self._data.idx_hl:
-            c = self._result.z_l[idx] - delta_z
-            self._result.z_l[idx] = (c + cp.sqrt(c * c + 4 * self._result.info.mu)) / 2
-            self._result.s_l[idx] = self._result.z_l[idx] - c
+            for idx in self._data.idx_xu:
+                c = self._result.z_bu[idx] - delta_z
+                self._result.z_bu[idx] = (c + cp.sqrt(c * c + 4 * self._result.info.mu)) / 2
+                self._result.s_bu[idx] = self._result.z_bu[idx] - c
 
-        for idx in self._data.idx_xu:
-            c = self._result.z_bu[idx] - delta_z
-            self._result.z_bu[idx] = (c + cp.sqrt(c * c + 4 * self._result.info.mu)) / 2
-            self._result.s_bu[idx] = self._result.z_bu[idx] - c
+            for idx in self._data.idx_xl:
+                c = self._result.z_bl[idx] - delta_z
+                self._result.z_bl[idx] = (c + cp.sqrt(c * c + 4 * self._result.info.mu)) / 2
+                self._result.s_bl[idx] = self._result.z_bl[idx] - c
 
-        for idx in self._data.idx_xl:
-            c = self._result.z_bl[idx] - delta_z
-            self._result.z_bl[idx] = (c + cp.sqrt(c * c + 4 * self._result.info.mu)) / 2
-            self._result.s_bl[idx] = self._result.z_bl[idx] - c
+            if self.settings.debug:
+                print("self._result:", self._result)
 
-        if self.settings.debug:
-            print("self._result:", self._result)
+            self._result.info.mu = self._calculate_mu()
 
-        self._result.info.mu = self._calculate_mu()
+            self._prox_vars = Variables(self._data.n, self._data.p, self._data.m)
+            self._prox_vars.x[:] = self._result.x
+            self._prox_vars.y[:] = self._result.y
+            self._prox_vars.z_l[:] = self._result.z_l
+            self._prox_vars.z_u[:] = self._result.z_u
 
-        self._prox_vars = Variables(self._data.n, self._data.p, self._data.m)
-        self._prox_vars.x[:] = self._result.x
-        self._prox_vars.y[:] = self._result.y
-        self._prox_vars.z_l[:] = self._result.z_l
-        self._prox_vars.z_u[:] = self._result.z_u
-
-        if self.settings.debug:
-            print("Initial point set. Starting iterations...\n", self._prox_vars)
+            if self.settings.debug:
+                print("Initial point set. Starting iterations...\n", self._prox_vars)
 
         ## ---------------------------------------------
         ## ---------- remaining iterations -------------
