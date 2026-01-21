@@ -108,8 +108,9 @@ class KKTSystem:
 
         with nvtx.annotate("KKTSystem::solve::recover_lhs"):
             delta_x = lhs.x  # reference
-            lhs.z_u[:] = self._w_u_delta_inv * (data.G[data.idx_hu, :] @ delta_x - lhs.z_u)   # delta_z_u
-            lhs.z_l[:] = self._w_l_delta_inv * (-data.G[data.idx_hl, :] @ delta_x - lhs.z_l)  # delta_z_l
+            G_dx = data.G @ delta_x  # G * delta_x
+            lhs.z_u[:] = self._w_u_delta_inv * (G_dx[data.idx_hu] - lhs.z_u)   # delta_z_u
+            lhs.z_l[:] = self._w_l_delta_inv * (-G_dx[data.idx_hl] - lhs.z_l)  # delta_z_l
             lhs.z_bu[:] = self._w_bu_delta_inv * (delta_x[data.idx_xu] - rhs.z_bu + self._m_z_bu_inv * rhs.s_bu)  # delta_z_bu
             lhs.z_bl[:] = -self._w_bl_delta_inv * (delta_x[data.idx_xl] + rhs.z_bl - self._m_z_bl_inv * rhs.s_bl)  # delta_z_bl
 
