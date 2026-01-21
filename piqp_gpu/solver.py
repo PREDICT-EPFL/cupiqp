@@ -218,13 +218,13 @@ class SolverBase:
             # ? why not update both here?
             self._update_residuals_r()
 
-            if (self._result.info.no_dual_update > min(5, self.settings.reg_finetune_dual_update_threshold) and
+            if (self._result.info.no_dual_update > cp.minimum(5., self.settings.reg_finetune_dual_update_threshold) and
                 self._result.info.primal_prox_inf > self.settings.infeasibility_threshold and
                 (self._result.info.primal_res_reg < self.settings.eps_abs or self._result.info.primal_res_reg_rel < self.settings.eps_rel)):
                 self._result.info.status = Status.PIQP_PRIMAL_INFEASIBLE
                 return self._result.info.status
             
-            if (self._result.info.no_primal_update > min(5, self.settings.reg_finetune_primal_update_threshold) and
+            if (self._result.info.no_primal_update > cp.minimum(5., self.settings.reg_finetune_primal_update_threshold) and
                 self._result.info.dual_prox_inf > self.settings.infeasibility_threshold and
                 (self._result.info.dual_res_reg < self.settings.eps_abs or self._result.info.dual_res_reg_rel < self.settings.eps_rel)):
                 self._result.info.status = Status.PIQP_DUAL_INFEASIBLE
@@ -255,7 +255,7 @@ class SolverBase:
                     self._result.info.factor_retires += 1
                     self._result.info.rho *= 100.
                     self._result.info.delta *= 100.
-                    self._result.info.reg_limit = min(10 * self._result.info.reg_limit, self.settings.eps_abs)
+                    self._result.info.reg_limit = cp.min(10 * self._result.info.reg_limit, self.settings.eps_abs)
             
             if self._result.info.factor_retires >= self.settings.max_factor_retires:
                 self._result.info.status = Status.PIQP_NUMERICAL_ISSUES
@@ -307,7 +307,7 @@ class SolverBase:
             self._result.info.sigma += cp.dot(self._result.s_bl[self._data.idx_xl] + alpha_s * self._step.s_bl[self._data.idx_xl], self._result.z_bl[self._data.idx_xl] + alpha_z * self._step.z_bl[self._data.idx_xl])
             self._result.info.sigma += cp.dot(self._result.s_bu[self._data.idx_xu] + alpha_s * self._step.s_bu[self._data.idx_xu], self._result.z_bu[self._data.idx_xu] + alpha_z * self._step.z_bu[self._data.idx_xu])
             self._result.info.sigma /= self._result.info.mu * (self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)
-            self._result.info.sigma = max(0., min(1., self._result.info.sigma))
+            self._result.info.sigma = cp.maximum(0., cp.minimum(1., self._result.info.sigma))
             self._result.info.sigma = self._result.info.sigma ** 3
 
 
@@ -354,9 +354,9 @@ class SolverBase:
             # TODO: more conditions to add in if clause
             if self._result.info.dual_res < 0.95 * self._result.info.prev_dual_res:
                 self._prox_vars.x[:] = self._result.x
-                self._result.info.rho = max(self._result.info.reg_limit, (1. - mu_rate) * self._result.info.rho)
+                self._result.info.rho = cp.maximum(self._result.info.reg_limit, (1. - mu_rate) * self._result.info.rho)
             else:
-                self._result.info.rho = max(self._result.info.reg_limit, (1. - 0.666 * mu_rate) * self._result.info.rho)
+                self._result.info.rho = cp.maximum(self._result.info.reg_limit, (1. - 0.666 * mu_rate) * self._result.info.rho)
 
             if self._result.info.primal_res < 0.95 * self._result.info.prev_primal_res:
                 self._prox_vars.y[:] = self._result.y
@@ -365,9 +365,9 @@ class SolverBase:
                 self._prox_vars.z_bu[:] = self._result.z_bu
                 self._prox_vars.z_bl[:] = self._result.z_bl
                 
-                self._result.info.delta = max(self._result.info.reg_limit, (1. - mu_rate) * self._result.info.delta)
+                self._result.info.delta = cp.maximum(self._result.info.reg_limit, (1. - mu_rate) * self._result.info.delta)
             else:
-                self._result.info.delta = max(self._result.info.reg_limit, (1. - 0.666 * mu_rate) * self._result.info.delta)
+                self._result.info.delta = cp.maximum(self._result.info.reg_limit, (1. - 0.666 * mu_rate) * self._result.info.delta)
 
 
         self._result.info.status = Status.PIQP_MAX_ITER_REACHED
@@ -428,7 +428,7 @@ class SolverBase:
                 + self._result.s_bl[self._data.idx_xl].dot(self._result.z_bl[self._data.idx_xl]) \
                 + self._result.s_bu[self._data.idx_xu].dot(self._result.z_bu[self._data.idx_xu])) \
                 / (self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)
-        return float(mu)
+        return mu
 
 
     @nvtx.annotate("Solver::_update_residuals_nr")
@@ -473,34 +473,34 @@ class SolverBase:
         tmp = cp.dot(minus_P_x, self._result.x)
         self._result.info.primal_obj = -0.5 * tmp
         self._result.info.dual_obj = 0.5 * tmp
-        duality_gap_rel_norm = abs(tmp)
+        duality_gap_rel_norm = cp.abs(tmp)
         # c^T x
         tmp = cp.dot(self._data.c, self._result.x)
         self._result.info.primal_obj += tmp
-        duality_gap_rel_norm = max(abs(tmp), duality_gap_rel_norm)
+        duality_gap_rel_norm = cp.maximum(cp.abs(tmp), duality_gap_rel_norm)
         # -b^T y
         tmp = -cp.dot(self._data.b, self._result.y)
         self._result.info.dual_obj += tmp
-        duality_gap_rel_norm = max(abs(tmp), duality_gap_rel_norm)
+        duality_gap_rel_norm = cp.maximum(cp.abs(tmp), duality_gap_rel_norm)
         # h_l^T z_l
         tmp = cp.dot(self._data.h_l[self._data.idx_hl], self._result.z_l[self._data.idx_hl])
         self._result.info.dual_obj += tmp
-        duality_gap_rel_norm = max(abs(tmp), duality_gap_rel_norm)
+        duality_gap_rel_norm = cp.maximum(cp.abs(tmp), duality_gap_rel_norm)
         # -h_u^T z_u
         tmp = -cp.dot(self._data.h_u[self._data.idx_hu], self._result.z_u[self._data.idx_hu])
         self._result.info.dual_obj += tmp
-        duality_gap_rel_norm = max(abs(tmp), duality_gap_rel_norm)
+        duality_gap_rel_norm = cp.maximum(cp.abs(tmp), duality_gap_rel_norm)
         # x_l^T z_bl
         tmp = cp.dot(self._data.x_l[self._data.idx_xl], self._result.z_bl[self._data.idx_xl])
         self._result.info.dual_obj += tmp
-        duality_gap_rel_norm = max(abs(tmp), duality_gap_rel_norm)
+        duality_gap_rel_norm = cp.maximum(cp.abs(tmp), duality_gap_rel_norm)
         # -x_u^T z_bu
         tmp = -cp.dot(self._data.x_u[self._data.idx_xu], self._result.z_bu[self._data.idx_xu])
         self._result.info.dual_obj += tmp
-        duality_gap_rel_norm = max(abs(tmp), duality_gap_rel_norm)
+        duality_gap_rel_norm = cp.maximum(cp.abs(tmp), duality_gap_rel_norm)
         
-        self._result.info.duality_gap = abs(self._result.info.primal_obj - self._result.info.dual_obj)
-        self._result.info.duality_gap_rel = self._result.info.duality_gap / max(1., duality_gap_rel_norm)
+        self._result.info.duality_gap = cp.abs(self._result.info.primal_obj - self._result.info.dual_obj)
+        self._result.info.duality_gap_rel = self._result.info.duality_gap / cp.maximum(1., duality_gap_rel_norm)
         # duality_gap_rel = duality_gap / max(1, duality_gap_rel_norm)
         # where duality_gap_rel_norm is a scale estimate computed from the unscaled absolute contributions to the cost (e.g. |x^T P x|, |c^T x|, |b^T y|, |h_l^T z_l|, |h_u^T z_u|, |x_l^T z_bl|, |x_u^T z_bu|), each passed through the preconditioner unscale_cost.
 
@@ -524,30 +524,30 @@ class SolverBase:
 
         self._result.info.primal_res = self._primal_res_nr()
 
-        primal_rel_norm = cp.linalg.norm(minus_A_x, ord=cp.inf) if self._data.p > 0 else 0.0
-        primal_rel_norm = max(primal_rel_norm, cp.linalg.norm(self._data.b, ord=cp.inf)) if self._data.p > 0 else primal_rel_norm
-        primal_rel_norm = max(primal_rel_norm, cp.linalg.norm(G_x[self._data.idx_hu], ord=cp.inf)) if self._data.num_hu > 0 else primal_rel_norm
-        primal_rel_norm = max(primal_rel_norm, cp.linalg.norm(G_x[self._data.idx_hl], ord=cp.inf)) if self._data.num_hl > 0 else primal_rel_norm
-        primal_rel_norm = max(primal_rel_norm, cp.linalg.norm(self._data.h_u[self._data.idx_hu], ord=cp.inf)) if self._data.num_hu > 0 else primal_rel_norm
-        primal_rel_norm = max(primal_rel_norm, cp.linalg.norm(self._data.h_l[self._data.idx_hl], ord=cp.inf)) if self._data.num_hl > 0 else primal_rel_norm
-        primal_rel_norm = max(primal_rel_norm, cp.linalg.norm(self._data.x_u[self._data.idx_xu], ord=cp.inf)) if self._data.num_xu > 0 else primal_rel_norm
-        primal_rel_norm = max(primal_rel_norm, cp.linalg.norm(self._data.x_l[self._data.idx_xl], ord=cp.inf)) if self._data.num_xl > 0 else primal_rel_norm
-        primal_rel_norm = max(primal_rel_norm, cp.linalg.norm(self._result.s_u[self._data.idx_hu], ord=cp.inf)) if self._data.num_hu > 0 else primal_rel_norm
-        primal_rel_norm = max(primal_rel_norm, cp.linalg.norm(self._result.s_l[self._data.idx_hl], ord=cp.inf)) if self._data.num_hl > 0 else primal_rel_norm
-        primal_rel_norm = max(primal_rel_norm, cp.linalg.norm(self._result.s_bu[self._data.idx_xu], ord=cp.inf)) if self._data.num_xu > 0 else primal_rel_norm
-        primal_rel_norm = max(primal_rel_norm, cp.linalg.norm(self._result.s_bl[self._data.idx_xl], ord=cp.inf)) if self._data.num_xl > 0 else primal_rel_norm
-        self._result.info.primal_res_rel = self._result.info.primal_res / max(1., primal_rel_norm)
+        primal_rel_norm = cp.linalg.norm(minus_A_x, ord=cp.inf) if self._data.p > 0 else cp.float64(0.0)
+        primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._data.b, ord=cp.inf)) if self._data.p > 0 else primal_rel_norm
+        primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(G_x[self._data.idx_hu], ord=cp.inf)) if self._data.num_hu > 0 else primal_rel_norm
+        primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(G_x[self._data.idx_hl], ord=cp.inf)) if self._data.num_hl > 0 else primal_rel_norm
+        primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._data.h_u[self._data.idx_hu], ord=cp.inf)) if self._data.num_hu > 0 else primal_rel_norm
+        primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._data.h_l[self._data.idx_hl], ord=cp.inf)) if self._data.num_hl > 0 else primal_rel_norm
+        primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._data.x_u[self._data.idx_xu], ord=cp.inf)) if self._data.num_xu > 0 else primal_rel_norm
+        primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._data.x_l[self._data.idx_xl], ord=cp.inf)) if self._data.num_xl > 0 else primal_rel_norm
+        primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._result.s_u[self._data.idx_hu], ord=cp.inf)) if self._data.num_hu > 0 else primal_rel_norm
+        primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._result.s_l[self._data.idx_hl], ord=cp.inf)) if self._data.num_hl > 0 else primal_rel_norm
+        primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._result.s_bu[self._data.idx_xu], ord=cp.inf)) if self._data.num_xu > 0 else primal_rel_norm
+        primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._result.s_bl[self._data.idx_xl], ord=cp.inf)) if self._data.num_xl > 0 else primal_rel_norm
+        self._result.info.primal_res_rel = self._result.info.primal_res / cp.maximum(1., primal_rel_norm)
 
         # dual_res_norm = max(||P*x||_inf, ||c||_inf, ||A^T*y + G^T*(z_u - z_l) + z_bu - z_bl||_inf)
         self._result.info.dual_res = cp.linalg.norm(self._res_nr.x, ord=cp.inf)
         dual_res_norm = cp.linalg.norm(minus_P_x, ord=cp.inf)
-        dual_res_norm = max(dual_res_norm, cp.linalg.norm(self._data.c, ord=cp.inf))
+        dual_res_norm = cp.maximum(dual_res_norm, cp.linalg.norm(self._data.c, ord=cp.inf))
         assert cp.allclose(cp.union1d(cp.array(self._data.idx_hl), cp.array(self._data.idx_hu)), cp.arange(self._data.m)), "idx_hl and idx_hu cover 1, ..., m."
         tmp = AT_y + GT_zu_minus_zl
         tmp[self._data.idx_xl] -= self._result.z_bl[self._data.idx_xl]
         tmp[self._data.idx_xu] += self._result.z_bu[self._data.idx_xu]
-        dual_res_norm = max(dual_res_norm, cp.linalg.norm(tmp, ord=cp.inf))
-        self._result.info.dual_res_rel = self._result.info.dual_res / max(1., dual_res_norm)
+        dual_res_norm = cp.maximum(dual_res_norm, cp.linalg.norm(tmp, ord=cp.inf))
+        self._result.info.dual_res_rel = self._result.info.dual_res / cp.maximum(1., dual_res_norm)
         
 
     @nvtx.annotate("Solver::_update_residuals_r")
@@ -578,24 +578,24 @@ class SolverBase:
         self._result.info.dual_prox_inf = self._dual_prox_inf() * self._result.info.rho
 
     def _primal_res_nr(self) -> float:
-        inf = 0.
-        inf = max(inf, cp.linalg.norm(self._res_nr.y, ord=cp.inf)) if self._data.p > 0 else inf
-        inf = max(inf, cp.linalg.norm(self._res_nr.z_u[self._data.idx_hu], ord=cp.inf)) if self._data.num_hu > 0 else inf
-        inf = max(inf, cp.linalg.norm(self._res_nr.z_l[self._data.idx_hl], ord=cp.inf)) if self._data.num_hl > 0 else inf
-        # ! I don't understand here. Why it is not taking the abs value of z_bl and z_bu?
-        # ! This is just copied from the cpp implementation.
-        inf = max(inf, cp.linalg.norm(self._res_nr.z_bu[self._data.idx_xu], ord=cp.inf)) if self._data.num_xu > 0 else inf
-        inf = max(inf, cp.linalg.norm(self._res_nr.z_bl[self._data.idx_xl], ord=cp.inf)) if self._data.num_xl > 0 else inf
+        inf = cp.float64(0.)
+        inf = cp.maximum(inf, cp.linalg.norm(self._res_nr.y, ord=cp.inf)) if self._data.p > 0 else inf
+        inf = cp.maximum(inf, cp.linalg.norm(self._res_nr.z_u[self._data.idx_hu], ord=cp.inf)) if self._data.num_hu > 0 else inf
+        inf = cp.maximum(inf, cp.linalg.norm(self._res_nr.z_l[self._data.idx_hl], ord=cp.inf)) if self._data.num_hl > 0 else inf
+        #! The values of z_u, z_l, z_bu, z_bl with active indices should all be positive.
+        #! can optionally use cp.maximum, if more efficient
+        inf = cp.maximum(inf, cp.linalg.norm(self._res_nr.z_bu[self._data.idx_xu], ord=cp.inf)) if self._data.num_xu > 0 else inf
+        inf = cp.maximum(inf, cp.linalg.norm(self._res_nr.z_bl[self._data.idx_xl], ord=cp.inf)) if self._data.num_xl > 0 else inf
         return inf
 
 
     def _primal_res_r(self) -> float:
-        inf = 0.
-        inf = max(inf, cp.linalg.norm(self._res.y, ord=cp.inf)) if self._data.p > 0 else inf
-        inf = max(inf, cp.linalg.norm(self._res.z_u[self._data.idx_hu], ord=cp.inf)) if self._data.num_hu > 0 else inf
-        inf = max(inf, cp.linalg.norm(self._res.z_l[self._data.idx_hl], ord=cp.inf)) if self._data.num_hl > 0 else inf
-        inf = max(inf, cp.linalg.norm(self._res.z_bu[self._data.idx_xu], ord=cp.inf)) if self._data.num_xu > 0 else inf
-        inf = max(inf, cp.linalg.norm(self._res.z_bl[self._data.idx_xl], ord=cp.inf)) if self._data.num_xl > 0 else inf
+        inf = cp.float64(0.)
+        inf = cp.maximum(inf, cp.linalg.norm(self._res.y, ord=cp.inf)) if self._data.p > 0 else inf
+        inf = cp.maximum(inf, cp.linalg.norm(self._res.z_u[self._data.idx_hu], ord=cp.inf)) if self._data.num_hu > 0 else inf
+        inf = cp.maximum(inf, cp.linalg.norm(self._res.z_l[self._data.idx_hl], ord=cp.inf)) if self._data.num_hl > 0 else inf
+        inf = cp.maximum(inf, cp.linalg.norm(self._res.z_bu[self._data.idx_xu], ord=cp.inf)) if self._data.num_xu > 0 else inf
+        inf = cp.maximum(inf, cp.linalg.norm(self._res.z_bl[self._data.idx_xl], ord=cp.inf)) if self._data.num_xl > 0 else inf
         return inf
     
     def _dual_res_nr(self) -> float:
@@ -605,12 +605,12 @@ class SolverBase:
         return cp.linalg.norm(self._res.x, ord=cp.inf)
     
     def _primal_prox_inf(self) -> float:
-        inf = 0.
-        inf = max(inf, cp.linalg.norm(self._result.y - self._prox_vars.y, ord=cp.inf)) if self._data.p > 0 else inf
-        inf = max(inf, cp.linalg.norm(self._result.z_l[self._data.idx_hl] - self._prox_vars.z_l[self._data.idx_hl], ord=cp.inf)) if self._data.num_hl > 0 else inf
-        inf = max(inf, cp.linalg.norm(self._result.z_u[self._data.idx_hu] - self._prox_vars.z_u[self._data.idx_hu], ord=cp.inf)) if self._data.num_hu > 0 else inf
-        inf = max(inf, cp.linalg.norm(self._result.z_bl[self._data.idx_xl] - self._prox_vars.z_bl[self._data.idx_xl], ord=cp.inf)) if self._data.num_xl > 0 else inf
-        inf = max(inf, cp.linalg.norm(self._result.z_bu[self._data.idx_xu] - self._prox_vars.z_bu[self._data.idx_xu], ord=cp.inf)) if self._data.num_xu > 0 else inf
+        inf = cp.float64(0.)
+        inf = cp.maximum(inf, cp.linalg.norm(self._result.y - self._prox_vars.y, ord=cp.inf)) if self._data.p > 0 else inf
+        inf = cp.maximum(inf, cp.linalg.norm(self._result.z_l[self._data.idx_hl] - self._prox_vars.z_l[self._data.idx_hl], ord=cp.inf)) if self._data.num_hl > 0 else inf
+        inf = cp.maximum(inf, cp.linalg.norm(self._result.z_u[self._data.idx_hu] - self._prox_vars.z_u[self._data.idx_hu], ord=cp.inf)) if self._data.num_hu > 0 else inf
+        inf = cp.maximum(inf, cp.linalg.norm(self._result.z_bl[self._data.idx_xl] - self._prox_vars.z_bl[self._data.idx_xl], ord=cp.inf)) if self._data.num_xl > 0 else inf
+        inf = cp.maximum(inf, cp.linalg.norm(self._result.z_bu[self._data.idx_xu] - self._prox_vars.z_bu[self._data.idx_xu], ord=cp.inf)) if self._data.num_xu > 0 else inf
         return inf
     
     def _dual_prox_inf(self) -> float:
