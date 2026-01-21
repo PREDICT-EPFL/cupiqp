@@ -108,17 +108,16 @@ class KKTSystem:
 
         with nvtx.annotate("KKTSystem::solve::recover_lhs"):
             delta_x = lhs.x  # reference
-            lhs.z_u = self._w_u_delta_inv * (data.G[data.idx_hu, :] @ delta_x - lhs.z_u)   # delta_z_u
-            lhs.z_l = self._w_l_delta_inv * (-data.G[data.idx_hl, :] @ delta_x - lhs.z_l)  # delta_z_l
-            lhs.z_bu = self._w_bu_delta_inv * (delta_x[data.idx_xu] - rhs.z_bu + self._m_z_bu_inv * rhs.s_bu)  # delta_z_bu
-            lhs.z_bl = -self._w_bl_delta_inv * (delta_x[data.idx_xl] + rhs.z_bl - self._m_z_bl_inv * rhs.s_bl)  # delta_z_bl
+            lhs.z_u[:] = self._w_u_delta_inv * (data.G[data.idx_hu, :] @ delta_x - lhs.z_u)   # delta_z_u
+            lhs.z_l[:] = self._w_l_delta_inv * (-data.G[data.idx_hl, :] @ delta_x - lhs.z_l)  # delta_z_l
+            lhs.z_bu[:] = self._w_bu_delta_inv * (delta_x[data.idx_xu] - rhs.z_bu + self._m_z_bu_inv * rhs.s_bu)  # delta_z_bu
+            lhs.z_bl[:] = -self._w_bl_delta_inv * (delta_x[data.idx_xl] + rhs.z_bl - self._m_z_bl_inv * rhs.s_bl)  # delta_z_bl
 
             # recover slack variable steps
-            lhs.s_u = self._m_z_u_inv * (rhs.s_u - self._m_s_u * lhs.z_u)  # delta_s_u = inv(Z_u) (r_s_u - S_u delta_z_u)
-            lhs.s_l = self._m_z_l_inv * (rhs.s_l - self._m_s_l * lhs.z_l)  # delta_s_l = inv(Z_l) (r_s_l - S_l delta_z_l)
-            lhs.s_bu = self._m_z_bu_inv * (rhs.s_bu - self._m_s_bu * lhs.z_bu)  # delta_s_bu = inv(Z_bu) (r_s_bu - S_bu delta_z_bu)
-            lhs.s_bl = self._m_z_bl_inv * (rhs.s_bl - self._m_s_bl * lhs.z_bl)  # delta_s_bl = inv(Z_bl) (r_s_bl - S_bl delta_z_bl)
-
+            lhs.s_u[:] = self._m_z_u_inv * (rhs.s_u - self._m_s_u * lhs.z_u)  # delta_s_u = inv(Z_u) (r_s_u - S_u delta_z_u)
+            lhs.s_l[:] = self._m_z_l_inv * (rhs.s_l - self._m_s_l * lhs.z_l)  # delta_s_l = inv(Z_l) (r_s_l - S_l delta_z_l)
+            lhs.s_bu[:] = self._m_z_bu_inv * (rhs.s_bu - self._m_s_bu * lhs.z_bu)  # delta_s_bu = inv(Z_bu) (r_s_bu - S_bu delta_z_bu)
+            lhs.s_bl[:] = self._m_z_bl_inv * (rhs.s_bl - self._m_s_bl * lhs.z_bl)  # delta_s_bl = inv(Z_bl) (r_s_bl - S_bl delta_z_bl)
 
     @nvtx.annotate("KKTSystem::eval_P_x")
     def eval_P_x(self, data: Data, alpha: float, x: cp.ndarray, z: cp.ndarray):
