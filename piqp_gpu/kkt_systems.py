@@ -80,7 +80,9 @@ class KKTSystem:
         self._z_reg[data.idx_hu] += self._w_u_delta_inv
         self._z_reg[data.idx_hl] += self._w_l_delta_inv
         self._z_reg[:] = 1. / self._z_reg
-        return self._kkt_solver.update_scalings_and_factor(data, delta, self._x_reg, self._z_reg) # ! this is implicitly assuming idx_hu and idx_hl cover all indices of inequalities 0:m
+
+        factor_success = self._kkt_solver.update_scalings_and_factor(data, delta, self._x_reg, self._z_reg) # ! this is implicitly assuming idx_hu and idx_hl cover all indices of inequalities 0:m
+        return factor_success
     
     @nvtx.annotate("KKTSystem::solve")
     def solve(self, data: Data, settings: Settings, rhs: Variables, lhs: Variables) -> None:
@@ -102,9 +104,7 @@ class KKTSystem:
             self._work_z[data.idx_hl] -= self._w_l_delta_inv * rhs_z_l
             self._work_z[:] *= self._z_reg
 
-            delta_z = cp.ones(self._data.m)
-
-        self._kkt_solver.solve(data, self._work_x, rhs.y, self._work_z, lhs.x, lhs.y, delta_z)
+        self._kkt_solver.solve(data, self._work_x, rhs.y, self._work_z, lhs.x, lhs.y, self._work_z)  # ! the second _work_z is used to hold delta_z, but useless anyway. Can be further optimized.
 
         with nvtx.annotate("KKTSystem::solve::recover_lhs"):
             delta_x = lhs.x  # reference
