@@ -87,30 +87,29 @@ class KKTSystem:
     @nvtx.annotate("KKTSystem::solve")
     def solve(self, data: Data, settings: Settings, rhs: Variables, lhs: Variables) -> None:
         with nvtx.annotate("KKTSystem::solve::prepare_rhs"):
-            # elliminate slack variables from rhs
-            # ! these following lines are causing extra allocation, need to be optimized later!
-            rhs_z_u = rhs.z_u - self._m_z_u_inv * rhs.s_u  # rhs_z_u - inv(Z_u) * r_s_u
-            rhs_z_l = rhs.z_l - self._m_z_l_inv * rhs.s_l  # rhs_z_l - inv(Z_l) * r_s_l
-            rhs_z_bu = rhs.z_bu - self._m_z_bu_inv * rhs.s_bu  # rhs_z_bu - inv(Z_bu) * r_s_bu
-            rhs_z_bl = rhs.z_bl - self._m_z_bl_inv * rhs.s_bl  # rhs_z_bl - inv(Z_bl) * r_s_bl
+            # elliminate slack variables from rhs, use lhs.z_* to hold the modified rhs.z_*
+            lhs.z_u[:] = rhs.z_u - self._m_z_u_inv * rhs.s_u  # rhs_z_u - inv(Z_u) * r_s_u
+            lhs.z_l[:] = rhs.z_l - self._m_z_l_inv * rhs.s_l  # rhs_z_l - inv(Z_l) * r_s_l
+            lhs.z_bu[:] = rhs.z_bu - self._m_z_bu_inv * rhs.s_bu  # rhs_z_bu - inv(Z_bu) * r_s_bu
+            lhs.z_bl[:] = rhs.z_bl - self._m_z_bl_inv * rhs.s_bl  # rhs_z_bl - inv(Z_bl) * r_s_bl
 
             # use self._work_x to hold modified rhs_x, avoid extra allocation
             self._work_x[:] = rhs.x
-            self._work_x[data.idx_xu] += self._w_bu_delta_inv * rhs_z_bu
-            self._work_x[data.idx_xl] -= self._w_bl_delta_inv * rhs_z_bl
+            self._work_x[data.idx_xu] += self._w_bu_delta_inv * lhs.z_bu
+            self._work_x[data.idx_xl] -= self._w_bl_delta_inv * lhs.z_bl
 
             # use self._work_z to hold modified rhs_z, avoid extra allocation
             self._work_z.fill(0)  # faster than cp.zeros assignment
-            self._work_z[data.idx_hu] += self._w_u_delta_inv * rhs_z_u
-            self._work_z[data.idx_hl] -= self._w_l_delta_inv * rhs_z_l
+            self._work_z[data.idx_hu] += self._w_u_delta_inv * lhs.z_u
+            self._work_z[data.idx_hl] -= self._w_l_delta_inv * lhs.z_l
             self._work_z[:] *= self._z_reg
 
         self._kkt_solver.solve(data, self._work_x, rhs.y, self._work_z, lhs.x, lhs.y, self._work_z)  # ! the second _work_z is used to hold delta_z, but useless anyway. Can be further optimized.
 
         with nvtx.annotate("KKTSystem::solve::recover_lhs"):
             delta_x = lhs.x  # reference
-            lhs.z_u = self._w_u_delta_inv * (data.G[data.idx_hu, :] @ delta_x - rhs_z_u)   # delta_z_u
-            lhs.z_l = self._w_l_delta_inv * (-data.G[data.idx_hl, :] @ delta_x - rhs_z_l)  # delta_z_l
+            lhs.z_u = self._w_u_delta_inv * (data.G[data.idx_hu, :] @ delta_x - lhs.z_u)   # delta_z_u
+            lhs.z_l = self._w_l_delta_inv * (-data.G[data.idx_hl, :] @ delta_x - lhs.z_l)  # delta_z_l
             lhs.z_bu = self._w_bu_delta_inv * (delta_x[data.idx_xu] - rhs.z_bu + self._m_z_bu_inv * rhs.s_bu)  # delta_z_bu
             lhs.z_bl = -self._w_bl_delta_inv * (delta_x[data.idx_xl] + rhs.z_bl - self._m_z_bl_inv * rhs.s_bl)  # delta_z_bl
 
