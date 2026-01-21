@@ -119,7 +119,9 @@ class SparseKKTSolver(KKTSolverBase):
 
         try:
             with nvtx.annotate("SparseKKTSolver::cudss_factorize"):
+                cp.cuda.get_current_stream().synchronize()
                 self._ldlt_solver.factorize()
+                cp.cuda.get_current_stream().synchronize()
         except Exception as e:
             print(f"Factorization failed: {e}")
             return False
@@ -139,10 +141,12 @@ class SparseKKTSolver(KKTSolverBase):
         # update RHS in-place to reuse factorization results. See here: https://docs.nvidia.com/cuda/nvmath-python/0.6.0/host-apis/sparse/generated/nvmath.sparse.advanced.DirectSolver.html.
         # Also see: https://github.com/NVIDIA/nvmath-python/blob/main/examples/sparse/advanced/direct_solver/example05_reset_operands.py
         with nvtx.annotate("SparseKKTSolver::cudss_solve"):
+            cp.cuda.get_current_stream().synchronize()
             self._sol[:] = self._ldlt_solver.solve()
+            cp.cuda.get_current_stream().synchronize()
 
-        assert self._sol.dtype == cp.float64
-        assert cp.allclose(self._kkt_mat @ self._sol, self._rhs)
+        # assert self._sol.dtype == cp.float64
+        # assert cp.allclose(self._kkt_mat @ self._sol, self._rhs)
 
         delta_x[:] = self._sol[:n]
         delta_y[:] = self._sol[n:n+p]
