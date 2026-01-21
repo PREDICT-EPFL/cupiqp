@@ -15,24 +15,34 @@ class SolverBase:
         self._result: Result = None  # store the values of primal and dual variables of current iteration
         self._step: Variables = None # store the step direction of primal and dual variables
 
+        self._result = Result()    # store the values of primal, dual and slack variables of current iteration, and other information
+        self._step = Variables()   # used to store the step direction of primal and dual variables
+
+        self._res_nr = Variables()  # used to store the non-regularized residuals
+        self._res_r = Variables()  # used to store the regularized residuals
+        self._res = Variables()  # used to store the right hand side of KKT system
+        self._prox_vars = Variables()  # used to store the proximal variables
+
         self._kkt_system = None
     
     @nvtx.annotate("Solver::setup")
     def setup(self, P, c, A, b, G, h_u, h_l, x_u, x_l):
         self._data = Data(P, c, A, b, G, h_u, h_l, x_u, x_l)
-        self._result = Result(self._data.n, self._data.p, self._data.m)
-
+        self._result.init(self._data)
         self._result.info.rho = self.settings.rho_init
         self._result.info.delta = self.settings.delta_init
-        self._step = Variables(self._data.n, self._data.p, self._data.m)
+        self._result.init(self._data)
+        
+        self._step.init(self._data)
+        self._res_nr.init(self._data)
+        self._res_r.init(self._data)
+        self._res.init(self._data)
+        self._prox_vars.init(self._data)
 
         self._kkt_system = KKTSystem(self._data, self.settings)
 
-        self._res_nr = Variables(self._data.n, self._data.p, self._data.m)  # used to store the non-regularized residuals
-        self._res_r = Variables(self._data.n, self._data.p, self._data.m)  # used to store the regularized residuals
-
-        self._work_z = cp.empty(2 * self._data.m + 2 * self._data.n)  # used in _calculate_step to hold all concatenated slack or dual steps / results
-        self._work_s = cp.empty(2 * self._data.m + 2 * self._data.n)  # used in _calculate_step to hold all concatenated slack or dual steps / results
+        self._work_z = cp.empty(self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)  # used in _calculate_step to hold all concatenated slack or dual steps / results
+        self._work_s = cp.empty(self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)  # used in _calculate_step to hold all concatenated slack or dual steps / results
         
         
 
@@ -74,27 +84,17 @@ class SolverBase:
         ## ----------- initial iteration --------------
         # eq(12) in Roland Schwan 2023 paper
         with nvtx.annotate("Solver::initialization"):
-            self._result.x = cp.zeros(self._data.n)
-            self._result.y = cp.zeros(self._data.p)
+            self._result.x.fill(0.0)
+            self._result.y.fill(0.0)
 
-            # ! using cp.nan because it raises error when the implementation is wrong, making debugging easier
-            self._result.s_l = cp.nan * cp.ones(self._data.m)
-            self._result.s_u = cp.nan * cp.ones(self._data.m)
-            self._result.s_bl = cp.nan * cp.ones(self._data.n)
-            self._result.s_bu = cp.nan * cp.ones(self._data.n)
-            self._result.z_l = cp.nan * cp.ones(self._data.m)
-            self._result.z_u = cp.nan * cp.ones(self._data.m)
-            self._result.z_bl = cp.nan * cp.ones(self._data.n)
-            self._result.z_bu = cp.nan * cp.ones(self._data.n)
-
-            self._result.s_l[self._data.idx_hl] = 1.0
-            self._result.z_l[self._data.idx_hl] = 1.0
-            self._result.s_u[self._data.idx_hu] = 1.0
-            self._result.z_u[self._data.idx_hu] = 1.0
-            self._result.s_bl[self._data.idx_xl] = 1.0
-            self._result.z_bl[self._data.idx_xl] = 1.0
-            self._result.s_bu[self._data.idx_xu] = 1.0
-            self._result.z_bu[self._data.idx_xu] = 1.0
+            self._result.s_l.fill(1.0)
+            self._result.z_l.fill(1.0)
+            self._result.s_u.fill(1.0)
+            self._result.z_u.fill(1.0)
+            self._result.s_bl.fill(1.0)
+            self._result.z_bl.fill(1.0)
+            self._result.s_bu.fill(1.0)
+            self._result.z_bu.fill(1.0)
 
             self._kkt_system.update_scalings_and_factor(
                 self._data,
@@ -103,26 +103,16 @@ class SolverBase:
                 self._result
             )
 
-            self._res = Result(self._data.n, self._data.p, self._data.m)  # used to store the right hand side of KKT system
             self._res.x[:] = -self._data.c
             self._res.y[:] = self._data.b
-            self._res.z_l = cp.nan * cp.zeros(self._data.m)
-            self._res.z_l[self._data.idx_hl] = -self._data.h_l[self._data.idx_hl]
-            self._res.z_u = cp.nan * cp.zeros(self._data.m)
-            self._res.z_u[self._data.idx_hu] = self._data.h_u[self._data.idx_hu]
-            self._res.z_bl = cp.nan * cp.zeros(self._data.n)
-            self._res.z_bl[self._data.idx_xl] = -self._data.x_l[self._data.idx_xl]
-            self._res.z_bu = cp.nan * cp.zeros(self._data.n)
-            self._res.z_bu[self._data.idx_xu] = self._data.x_u[self._data.idx_xu]
-            
-            self._res.s_l = cp.nan * cp.zeros(self._data.m)
-            self._res.s_u = cp.nan * cp.zeros(self._data.m)
-            self._res.s_bl = cp.nan * cp.zeros(self._data.n)
-            self._res.s_bu = cp.nan * cp.zeros(self._data.n)
-            self._res.s_l[self._data.idx_hl] = 0.
-            self._res.s_u[self._data.idx_hu] = 0.
-            self._res.s_bl[self._data.idx_xl] = 0.
-            self._res.s_bu[self._data.idx_xu] = 0.
+            self._res.z_l[:] = -self._data.h_l[self._data.idx_hl]
+            self._res.z_u[:] = self._data.h_u[self._data.idx_hu]
+            self._res.z_bl[:] = -self._data.x_l[self._data.idx_xl]
+            self._res.z_bu[:] = self._data.x_u[self._data.idx_xu]
+            self._res.s_l[:] = 0.
+            self._res.s_u[:] = 0.
+            self._res.s_bl[:] = 0.
+            self._res.s_bu[:] = 0.
 
             self._kkt_system.solve(self._data, self.settings, self._res, self._result)  # getting an initial point of _result
 
@@ -147,15 +137,15 @@ class SolverBase:
             delta_s = -cp.min(self._work_s[:offset])  # single D2H transfer
             delta_z = -cp.min(self._work_z[:offset])  # single D2H transfer
 
-            self._result.s_l[self._data.idx_hl] += delta_s
-            self._result.z_l[self._data.idx_hl] += delta_z
-            self._result.s_u[self._data.idx_hu] += delta_s
-            self._result.z_u[self._data.idx_hu] += delta_z
+            self._result.s_l += delta_s
+            self._result.z_l += delta_z
+            self._result.s_u += delta_s
+            self._result.z_u += delta_z
 
-            self._result.s_bl[self._data.idx_xl] += delta_s
-            self._result.z_bl[self._data.idx_xl] += delta_z
-            self._result.s_bu[self._data.idx_xu] += delta_s
-            self._result.z_bu[self._data.idx_xu] += delta_z
+            self._result.s_bl += delta_s
+            self._result.z_bl += delta_z
+            self._result.s_bu += delta_s
+            self._result.z_bu += delta_z
 
             # self._result.info.mu = cp.maximum(self._calculate_mu(), 1e-10)
             self._result.info.mu = self._calculate_mu()
@@ -188,7 +178,6 @@ class SolverBase:
 
             self._result.info.mu = self._calculate_mu()
 
-            self._prox_vars = Variables(self._data.n, self._data.p, self._data.m)
             self._prox_vars.x[:] = self._result.x
             self._prox_vars.y[:] = self._result.y
             self._prox_vars.z_l[:] = self._result.z_l
@@ -383,17 +372,17 @@ class SolverBase:
 
         # first compute alpha_s, use self._work_s to concatenate step, use self._work_z to concatenate result
         offset = 0
-        self._work_s[offset : offset+num_hl] = self._step.s_l[self._data.idx_hl]
-        self._work_z[offset : offset+num_hl] = self._result.s_l[self._data.idx_hl]
+        self._work_s[offset : offset+num_hl] = self._step.s_l
+        self._work_z[offset : offset+num_hl] = self._result.s_l
         offset += num_hl
-        self._work_s[offset:offset + num_hu] = self._step.s_u[self._data.idx_hu]
-        self._work_z[offset:offset + num_hu] = self._result.s_u[self._data.idx_hu]
+        self._work_s[offset:offset + num_hu] = self._step.s_u
+        self._work_z[offset:offset + num_hu] = self._result.s_u
         offset += num_hu
-        self._work_s[offset:offset + num_xl] = self._step.s_bl[self._data.idx_xl]
-        self._work_z[offset:offset + num_xl] = self._result.s_bl[self._data.idx_xl]
+        self._work_s[offset:offset + num_xl] = self._step.s_bl
+        self._work_z[offset:offset + num_xl] = self._result.s_bl
         offset += num_xl
-        self._work_s[offset:offset + num_xu] = self._step.s_bu[self._data.idx_xu]
-        self._work_z[offset:offset + num_xu] = self._result.s_bu[self._data.idx_xu]
+        self._work_s[offset:offset + num_xu] = self._step.s_bu
+        self._work_z[offset:offset + num_xu] = self._result.s_bu
         offset += num_xu
 
         # if step < 0, must limit alpha <= -s / step, otherwise take full step 1.0
@@ -402,17 +391,17 @@ class SolverBase:
 
         # then compute alpha_z, use self._work_s to concatenate step, use self._work_z to concatenate result
         offset = 0
-        self._work_z[offset : offset+num_hl] = self._step.z_l[self._data.idx_hl]
-        self._work_s[offset : offset+num_hl] = self._result.z_l[self._data.idx_hl]
+        self._work_z[offset : offset+num_hl] = self._step.z_l
+        self._work_s[offset : offset+num_hl] = self._result.z_l
         offset += num_hl
-        self._work_z[offset:offset + num_hu] = self._step.z_u[self._data.idx_hu]
-        self._work_s[offset:offset + num_hu] = self._result.z_u[self._data.idx_hu]
+        self._work_z[offset : offset+num_hu] = self._step.z_u
+        self._work_s[offset : offset+num_hu] = self._result.z_u
         offset += num_hu
-        self._work_z[offset:offset + num_xl] = self._step.z_bl[self._data.idx_xl]
-        self._work_s[offset:offset + num_xl] = self._result.z_bl[self._data.idx_xl]
+        self._work_z[offset : offset+num_xl] = self._step.z_bl
+        self._work_s[offset : offset+num_xl] = self._result.z_bl
         offset += num_xl
-        self._work_z[offset:offset + num_xu] = self._step.z_bu[self._data.idx_xu]
-        self._work_s[offset:offset + num_xu] = self._result.z_bu[self._data.idx_xu]
+        self._work_z[offset : offset+num_xu] = self._step.z_bu
+        self._work_s[offset : offset+num_xu] = self._result.z_bu
         offset += num_xu
 
         self._work_z[:offset] = cp.where(self._work_z[:offset] < 0, -self._work_s[:offset] / self._work_z[:offset], 1.)
@@ -423,10 +412,10 @@ class SolverBase:
 
     @nvtx.annotate("Solver::_calculate_mu")
     def _calculate_mu(self) -> float:
-        mu = (self._result.s_l[self._data.idx_hl].dot(self._result.z_l[self._data.idx_hl])
-                + self._result.s_u[self._data.idx_hu].dot(self._result.z_u[self._data.idx_hu]) \
-                + self._result.s_bl[self._data.idx_xl].dot(self._result.z_bl[self._data.idx_xl]) \
-                + self._result.s_bu[self._data.idx_xu].dot(self._result.z_bu[self._data.idx_xu])) \
+        mu = (cp.dot(self._result.s_l, self._result.z_l)
+                + cp.dot(self._result.s_u, self._result.z_u) \
+                + cp.dot(self._result.s_bl, self._result.z_bl) \
+                + cp.dot(self._result.s_bu, self._result.z_bu)) \
                 / (self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)
         return mu
 
@@ -460,8 +449,8 @@ class SolverBase:
 
         # TODO: Need to reconsider this if idx_hu and idx_hl are not full
         tmp = cp.zeros(self._data.m)
-        tmp[self._data.idx_hu] += self._result.z_u[self._data.idx_hu]
-        tmp[self._data.idx_hl] -= self._result.z_l[self._data.idx_hl]
+        tmp[self._data.idx_hu] += self._result.z_u
+        tmp[self._data.idx_hl] -= self._result.z_l
         G_x = cp.zeros(self._data.m)
         GT_zu_minus_zl = cp.zeros(self._data.n)
         self._kkt_system.eval_G_xn_and_GT_xt(self._data, 1., 1., self._result.x, tmp, G_x, GT_zu_minus_zl)
@@ -483,19 +472,19 @@ class SolverBase:
         self._result.info.dual_obj += tmp
         duality_gap_rel_norm = cp.maximum(cp.abs(tmp), duality_gap_rel_norm)
         # h_l^T z_l
-        tmp = cp.dot(self._data.h_l[self._data.idx_hl], self._result.z_l[self._data.idx_hl])
+        tmp = cp.dot(self._data.h_l[self._data.idx_hl], self._result.z_l)
         self._result.info.dual_obj += tmp
         duality_gap_rel_norm = cp.maximum(cp.abs(tmp), duality_gap_rel_norm)
         # -h_u^T z_u
-        tmp = -cp.dot(self._data.h_u[self._data.idx_hu], self._result.z_u[self._data.idx_hu])
+        tmp = -cp.dot(self._data.h_u[self._data.idx_hu], self._result.z_u)
         self._result.info.dual_obj += tmp
         duality_gap_rel_norm = cp.maximum(cp.abs(tmp), duality_gap_rel_norm)
         # x_l^T z_bl
-        tmp = cp.dot(self._data.x_l[self._data.idx_xl], self._result.z_bl[self._data.idx_xl])
+        tmp = cp.dot(self._data.x_l[self._data.idx_xl], self._result.z_bl)
         self._result.info.dual_obj += tmp
         duality_gap_rel_norm = cp.maximum(cp.abs(tmp), duality_gap_rel_norm)
         # -x_u^T z_bu
-        tmp = -cp.dot(self._data.x_u[self._data.idx_xu], self._result.z_bu[self._data.idx_xu])
+        tmp = -cp.dot(self._data.x_u[self._data.idx_xu], self._result.z_bu)
         self._result.info.dual_obj += tmp
         duality_gap_rel_norm = cp.maximum(cp.abs(tmp), duality_gap_rel_norm)
         
@@ -505,17 +494,15 @@ class SolverBase:
         # where duality_gap_rel_norm is a scale estimate computed from the unscaled absolute contributions to the cost (e.g. |x^T P x|, |c^T x|, |b^T y|, |h_l^T z_l|, |h_u^T z_u|, |x_l^T z_bl|, |x_u^T z_bu|), each passed through the preconditioner unscale_cost.
 
         # res_nr.x = -(P*x + c + A^T*y + G^T*(z_u - z_l) + z_bu - z_bl)
-        # TODO: Need to reconsider this if idx_hu and idx_hl are not full
-        self._res_nr.x = minus_P_x - self._data.c - AT_y - GT_zu_minus_zl
-        self._res_nr.x[self._data.idx_xl] += self._result.z_bl[self._data.idx_xl]
-        self._res_nr.x[self._data.idx_xu] -= self._result.z_bu[self._data.idx_xu]
+        self._res_nr.x[:] = minus_P_x - self._data.c - AT_y - GT_zu_minus_zl
+        self._res_nr.x[self._data.idx_xl] += self._result.z_bl
+        self._res_nr.x[self._data.idx_xu] -= self._result.z_bu
         # res_nr.y = -(A*x - b)
         self._res_nr.y = minus_A_x + self._data.b
-        # TODO: need to consider which index contains the constraints
-        self._res_nr.z_l[self._data.idx_hl] = (G_x - self._result.s_l - self._data.h_l)[self._data.idx_hl]
-        self._res_nr.z_u[self._data.idx_hu] = (-G_x - self._result.s_u + self._data.h_u)[self._data.idx_hu]
-        self._res_nr.z_bl[self._data.idx_xl] = (self._result.x - self._result.s_bl - self._data.x_l)[self._data.idx_xl]
-        self._res_nr.z_bu[self._data.idx_xu] = - (self._result.x + self._result.s_bu - self._data.x_u)[self._data.idx_xu]
+        self._res_nr.z_l[:] = (G_x[self._data.idx_hl] - self._result.s_l - self._data.h_l[self._data.idx_hl])
+        self._res_nr.z_u[:] = (-G_x[self._data.idx_hu] - self._result.s_u + self._data.h_u[self._data.idx_hu])
+        self._res_nr.z_bl[:] = (self._result.x[self._data.idx_xl] - self._result.s_bl - self._data.x_l[self._data.idx_xl])
+        self._res_nr.z_bu[:] = - (self._result.x[self._data.idx_xu] + self._result.s_bu - self._data.x_u[self._data.idx_xu])
 
 
         # ------------ update primal and dual residuals ------------
@@ -532,10 +519,10 @@ class SolverBase:
         primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._data.h_l[self._data.idx_hl], ord=cp.inf)) if self._data.num_hl > 0 else primal_rel_norm
         primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._data.x_u[self._data.idx_xu], ord=cp.inf)) if self._data.num_xu > 0 else primal_rel_norm
         primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._data.x_l[self._data.idx_xl], ord=cp.inf)) if self._data.num_xl > 0 else primal_rel_norm
-        primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._result.s_u[self._data.idx_hu], ord=cp.inf)) if self._data.num_hu > 0 else primal_rel_norm
-        primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._result.s_l[self._data.idx_hl], ord=cp.inf)) if self._data.num_hl > 0 else primal_rel_norm
-        primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._result.s_bu[self._data.idx_xu], ord=cp.inf)) if self._data.num_xu > 0 else primal_rel_norm
-        primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._result.s_bl[self._data.idx_xl], ord=cp.inf)) if self._data.num_xl > 0 else primal_rel_norm
+        primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._result.s_u, ord=cp.inf)) if self._data.num_hu > 0 else primal_rel_norm
+        primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._result.s_l, ord=cp.inf)) if self._data.num_hl > 0 else primal_rel_norm
+        primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._result.s_bu, ord=cp.inf)) if self._data.num_xu > 0 else primal_rel_norm
+        primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._result.s_bl, ord=cp.inf)) if self._data.num_xl > 0 else primal_rel_norm
         self._result.info.primal_res_rel = self._result.info.primal_res / cp.maximum(1., primal_rel_norm)
 
         # dual_res_norm = max(||P*x||_inf, ||c||_inf, ||A^T*y + G^T*(z_u - z_l) + z_bu - z_bl||_inf)
@@ -544,8 +531,8 @@ class SolverBase:
         dual_res_norm = cp.maximum(dual_res_norm, cp.linalg.norm(self._data.c, ord=cp.inf))
         assert cp.allclose(cp.union1d(cp.array(self._data.idx_hl), cp.array(self._data.idx_hu)), cp.arange(self._data.m)), "idx_hl and idx_hu cover 1, ..., m."
         tmp = AT_y + GT_zu_minus_zl
-        tmp[self._data.idx_xl] -= self._result.z_bl[self._data.idx_xl]
-        tmp[self._data.idx_xu] += self._result.z_bu[self._data.idx_xu]
+        tmp[self._data.idx_xl] -= self._result.z_bl
+        tmp[self._data.idx_xu] += self._result.z_bu
         dual_res_norm = cp.maximum(dual_res_norm, cp.linalg.norm(tmp, ord=cp.inf))
         self._result.info.dual_res_rel = self._result.info.dual_res / cp.maximum(1., dual_res_norm)
         
@@ -563,8 +550,8 @@ class SolverBase:
         self._res.y = self._res_nr.y - self._result.info.delta * (self._prox_vars.y - self._result.y)
         self._res.z_l = self._res_nr.z_l - self._result.info.delta * (self._prox_vars.z_l - self._result.z_l)
         self._res.z_u = self._res_nr.z_u - self._result.info.delta * (self._prox_vars.z_u - self._result.z_u)
-        self._res.z_bl[self._data.idx_xl] = self._res_nr.z_bl[self._data.idx_xl] - self._result.info.delta * (self._prox_vars.z_bl[self._data.idx_xl] - self._result.z_bl[self._data.idx_xl])
-        self._res.z_bu[self._data.idx_xu] = self._res_nr.z_bu[self._data.idx_xu] - self._result.info.delta * (self._prox_vars.z_bu[self._data.idx_xu] - self._result.z_bu[self._data.idx_xu])
+        self._res.z_bl = self._res_nr.z_bl - self._result.info.delta * (self._prox_vars.z_bl - self._result.z_bl)
+        self._res.z_bu = self._res_nr.z_bu - self._result.info.delta * (self._prox_vars.z_bu - self._result.z_bu)
         
         primal_rel_scaling = self._result.info.primal_res / self._result.info.primal_res_rel if self._result.info.primal_res_rel > 0 else 1.
         dual_rel_scaling = self._result.info.dual_res / self._result.info.dual_res_rel if self._result.info.dual_res_rel > 0 else 1.
@@ -580,22 +567,22 @@ class SolverBase:
     def _primal_res_nr(self) -> float:
         inf = cp.float64(0.)
         inf = cp.maximum(inf, cp.linalg.norm(self._res_nr.y, ord=cp.inf)) if self._data.p > 0 else inf
-        inf = cp.maximum(inf, cp.linalg.norm(self._res_nr.z_u[self._data.idx_hu], ord=cp.inf)) if self._data.num_hu > 0 else inf
-        inf = cp.maximum(inf, cp.linalg.norm(self._res_nr.z_l[self._data.idx_hl], ord=cp.inf)) if self._data.num_hl > 0 else inf
+        inf = cp.maximum(inf, cp.linalg.norm(self._res_nr.z_u, ord=cp.inf)) if self._data.num_hu > 0 else inf
+        inf = cp.maximum(inf, cp.linalg.norm(self._res_nr.z_l, ord=cp.inf)) if self._data.num_hl > 0 else inf
         #! The values of z_u, z_l, z_bu, z_bl with active indices should all be positive.
         #! can optionally use cp.maximum, if more efficient
-        inf = cp.maximum(inf, cp.linalg.norm(self._res_nr.z_bu[self._data.idx_xu], ord=cp.inf)) if self._data.num_xu > 0 else inf
-        inf = cp.maximum(inf, cp.linalg.norm(self._res_nr.z_bl[self._data.idx_xl], ord=cp.inf)) if self._data.num_xl > 0 else inf
+        inf = cp.maximum(inf, cp.linalg.norm(self._res_nr.z_bu, ord=cp.inf)) if self._data.num_xu > 0 else inf
+        inf = cp.maximum(inf, cp.linalg.norm(self._res_nr.z_bl, ord=cp.inf)) if self._data.num_xl > 0 else inf
         return inf
 
 
     def _primal_res_r(self) -> float:
         inf = cp.float64(0.)
         inf = cp.maximum(inf, cp.linalg.norm(self._res.y, ord=cp.inf)) if self._data.p > 0 else inf
-        inf = cp.maximum(inf, cp.linalg.norm(self._res.z_u[self._data.idx_hu], ord=cp.inf)) if self._data.num_hu > 0 else inf
-        inf = cp.maximum(inf, cp.linalg.norm(self._res.z_l[self._data.idx_hl], ord=cp.inf)) if self._data.num_hl > 0 else inf
-        inf = cp.maximum(inf, cp.linalg.norm(self._res.z_bu[self._data.idx_xu], ord=cp.inf)) if self._data.num_xu > 0 else inf
-        inf = cp.maximum(inf, cp.linalg.norm(self._res.z_bl[self._data.idx_xl], ord=cp.inf)) if self._data.num_xl > 0 else inf
+        inf = cp.maximum(inf, cp.linalg.norm(self._res.z_u, ord=cp.inf)) if self._data.num_hu > 0 else inf
+        inf = cp.maximum(inf, cp.linalg.norm(self._res.z_l, ord=cp.inf)) if self._data.num_hl > 0 else inf
+        inf = cp.maximum(inf, cp.linalg.norm(self._res.z_bu, ord=cp.inf)) if self._data.num_xu > 0 else inf
+        inf = cp.maximum(inf, cp.linalg.norm(self._res.z_bl, ord=cp.inf)) if self._data.num_xl > 0 else inf
         return inf
     
     def _dual_res_nr(self) -> float:
@@ -607,10 +594,10 @@ class SolverBase:
     def _primal_prox_inf(self) -> float:
         inf = cp.float64(0.)
         inf = cp.maximum(inf, cp.linalg.norm(self._result.y - self._prox_vars.y, ord=cp.inf)) if self._data.p > 0 else inf
-        inf = cp.maximum(inf, cp.linalg.norm(self._result.z_l[self._data.idx_hl] - self._prox_vars.z_l[self._data.idx_hl], ord=cp.inf)) if self._data.num_hl > 0 else inf
-        inf = cp.maximum(inf, cp.linalg.norm(self._result.z_u[self._data.idx_hu] - self._prox_vars.z_u[self._data.idx_hu], ord=cp.inf)) if self._data.num_hu > 0 else inf
-        inf = cp.maximum(inf, cp.linalg.norm(self._result.z_bl[self._data.idx_xl] - self._prox_vars.z_bl[self._data.idx_xl], ord=cp.inf)) if self._data.num_xl > 0 else inf
-        inf = cp.maximum(inf, cp.linalg.norm(self._result.z_bu[self._data.idx_xu] - self._prox_vars.z_bu[self._data.idx_xu], ord=cp.inf)) if self._data.num_xu > 0 else inf
+        inf = cp.maximum(inf, cp.linalg.norm(self._result.z_l - self._prox_vars.z_l, ord=cp.inf)) if self._data.num_hl > 0 else inf
+        inf = cp.maximum(inf, cp.linalg.norm(self._result.z_u - self._prox_vars.z_u, ord=cp.inf)) if self._data.num_hu > 0 else inf
+        inf = cp.maximum(inf, cp.linalg.norm(self._result.z_bl - self._prox_vars.z_bl, ord=cp.inf)) if self._data.num_xl > 0 else inf
+        inf = cp.maximum(inf, cp.linalg.norm(self._result.z_bu - self._prox_vars.z_bu, ord=cp.inf)) if self._data.num_xu > 0 else inf
         return inf
     
     def _dual_prox_inf(self) -> float:
