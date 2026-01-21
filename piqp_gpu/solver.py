@@ -43,6 +43,7 @@ class SolverBase:
 
         self._work_z = cp.empty(self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)  # used in _calculate_step to hold all concatenated slack or dual steps / results
         self._work_s = cp.empty(self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)  # used in _calculate_step to hold all concatenated slack or dual steps / results
+        self._alpha_sz = cp.empty(2) # step lengths of slack and dual variables [alpha_s, alpha_z]
         
         
 
@@ -283,18 +284,17 @@ class SolverBase:
                 print("predictor step is:", self._step)
 
             # step in the non-negative orthant
-            alpha_s, alpha_z = self._calculate_step()
+            self._calculate_step()
 
             # avoid getting to close to the boundary
-            alpha_s *= self.settings.tau
-            alpha_z *= self.settings.tau
+            self._alpha_sz *= self.settings.tau
 
             # ------------------ compute centering parameter sigma ------------------
             self._result.info.sigma = 0.
-            self._result.info.sigma += cp.dot(self._result.s_l[self._data.idx_hl] + alpha_s * self._step.s_l[self._data.idx_hl], self._result.z_l[self._data.idx_hl] + alpha_z * self._step.z_l[self._data.idx_hl])
-            self._result.info.sigma += cp.dot(self._result.s_u[self._data.idx_hu] + alpha_s * self._step.s_u[self._data.idx_hu], self._result.z_u[self._data.idx_hu] + alpha_z * self._step.z_u[self._data.idx_hu])
-            self._result.info.sigma += cp.dot(self._result.s_bl[self._data.idx_xl] + alpha_s * self._step.s_bl[self._data.idx_xl], self._result.z_bl[self._data.idx_xl] + alpha_z * self._step.z_bl[self._data.idx_xl])
-            self._result.info.sigma += cp.dot(self._result.s_bu[self._data.idx_xu] + alpha_s * self._step.s_bu[self._data.idx_xu], self._result.z_bu[self._data.idx_xu] + alpha_z * self._step.z_bu[self._data.idx_xu])
+            self._result.info.sigma += cp.dot(self._result.s_l[self._data.idx_hl] + self._alpha_sz[0] * self._step.s_l[self._data.idx_hl], self._result.z_l[self._data.idx_hl] + self._alpha_sz[1] * self._step.z_l[self._data.idx_hl])
+            self._result.info.sigma += cp.dot(self._result.s_u[self._data.idx_hu] + self._alpha_sz[0] * self._step.s_u[self._data.idx_hu], self._result.z_u[self._data.idx_hu] + self._alpha_sz[1] * self._step.z_u[self._data.idx_hu])
+            self._result.info.sigma += cp.dot(self._result.s_bl[self._data.idx_xl] + self._alpha_sz[0] * self._step.s_bl[self._data.idx_xl], self._result.z_bl[self._data.idx_xl] + self._alpha_sz[1] * self._step.z_bl[self._data.idx_xl])
+            self._result.info.sigma += cp.dot(self._result.s_bu[self._data.idx_xu] + self._alpha_sz[0] * self._step.s_bu[self._data.idx_xu], self._result.z_bu[self._data.idx_xu] + self._alpha_sz[1] * self._step.z_bu[self._data.idx_xu])
             self._result.info.sigma /= self._result.info.mu * (self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)
             self._result.info.sigma = cp.maximum(0., cp.minimum(1., self._result.info.sigma))
             self._result.info.sigma = self._result.info.sigma ** 3
@@ -314,11 +314,11 @@ class SolverBase:
                 print("corrector step is:", self._step)
 
             # step in the non-negative orthant
-            alpha_s, alpha_z = self._calculate_step()
-
+            self._calculate_step()
             # avoid getting too close to the boundary
-            self._result.info.primal_step = alpha_s * self.settings.tau
-            self._result.info.dual_step = alpha_z * self.settings.tau
+            self._alpha_sz *= self.settings.tau
+            self._result.info.primal_step = self._alpha_sz[0]
+            self._result.info.dual_step = self._alpha_sz[1]
 
             # ------------------ update variables ------------------
             self._result.x += self._result.info.primal_step * self._step.x
@@ -363,52 +363,65 @@ class SolverBase:
         return self._result.info.status
 
     @nvtx.annotate("Solver::_calculate_step")
-    def _calculate_step(self) -> Tuple[float, float]:
+    def _calculate_step(self) -> None:
         """
         Compute the step length of the slack variables and dual variables. Make sure they remain non-negative.
         Vectorized implementation to minimize GPU kernel launches and synchronization.
         """
         num_hl, num_hu, num_xl, num_xu = self._data.num_hl, self._data.num_hu, self._data.num_xl, self._data.num_xu
 
-        # first compute alpha_s, use self._work_s to concatenate step, use self._work_z to concatenate result
-        offset = 0
-        self._work_s[offset : offset+num_hl] = self._step.s_l
-        self._work_z[offset : offset+num_hl] = self._result.s_l
-        offset += num_hl
-        self._work_s[offset:offset + num_hu] = self._step.s_u
-        self._work_z[offset:offset + num_hu] = self._result.s_u
-        offset += num_hu
-        self._work_s[offset:offset + num_xl] = self._step.s_bl
-        self._work_z[offset:offset + num_xl] = self._result.s_bl
-        offset += num_xl
-        self._work_s[offset:offset + num_xu] = self._step.s_bu
-        self._work_z[offset:offset + num_xu] = self._result.s_bu
-        offset += num_xu
+        if not hasattr(self, '_calculate_step_cuda_graphs'):
+            self._calculate_step_cuda_graphs = {}
+            self._calculate_step_cuda_graphs_capture_count = 0
 
-        # if step < 0, must limit alpha <= -s / step, otherwise take full step 1.0
-        self._work_s[:offset] = cp.where(self._work_s[:offset] < 0, -self._work_z[:offset] / self._work_s[:offset], 1.)
-        alpha_s = cp.min(self._work_s[:offset])
+        key = (self._step.buffer_ptr, self._result.buffer_ptr)
+        
+        if key not in self._calculate_step_cuda_graphs:
+            self._calculate_step_cuda_graphs_capture_count += 1
+            print(f"Solver::_calculate_step capturing CUDA graph (occurrence {self._calculate_step_cuda_graphs_capture_count})...")
+            stream = cp.cuda.Stream(non_blocking=True)
+            stream.begin_capture()
+            with stream:
+                # first compute alpha_s, use self._work_s to concatenate step, use self._work_z to concatenate result
+                offset = 0
+                self._work_s[offset : offset+num_hl] = self._step.s_l
+                self._work_z[offset : offset+num_hl] = self._result.s_l
+                offset += num_hl
+                self._work_s[offset:offset + num_hu] = self._step.s_u
+                self._work_z[offset:offset + num_hu] = self._result.s_u
+                offset += num_hu
+                self._work_s[offset:offset + num_xl] = self._step.s_bl
+                self._work_z[offset:offset + num_xl] = self._result.s_bl
+                offset += num_xl
+                self._work_s[offset:offset + num_xu] = self._step.s_bu
+                self._work_z[offset:offset + num_xu] = self._result.s_bu
+                offset += num_xu
 
-        # then compute alpha_z, use self._work_s to concatenate step, use self._work_z to concatenate result
-        offset = 0
-        self._work_z[offset : offset+num_hl] = self._step.z_l
-        self._work_s[offset : offset+num_hl] = self._result.z_l
-        offset += num_hl
-        self._work_z[offset : offset+num_hu] = self._step.z_u
-        self._work_s[offset : offset+num_hu] = self._result.z_u
-        offset += num_hu
-        self._work_z[offset : offset+num_xl] = self._step.z_bl
-        self._work_s[offset : offset+num_xl] = self._result.z_bl
-        offset += num_xl
-        self._work_z[offset : offset+num_xu] = self._step.z_bu
-        self._work_s[offset : offset+num_xu] = self._result.z_bu
-        offset += num_xu
+                # if step < 0, must limit alpha <= -s / step, otherwise take full step 1.0
+                self._work_s[:offset] = cp.where(self._work_s[:offset] < 0, -self._work_z[:offset] / self._work_s[:offset], 1.)
+                self._alpha_sz[0] = cp.min(self._work_s[:offset]) # alpha_s
 
-        self._work_z[:offset] = cp.where(self._work_z[:offset] < 0, -self._work_s[:offset] / self._work_z[:offset], 1.)
-        alpha_z = cp.min(self._work_z[:offset])
+                # then compute alpha_z, use self._work_s to concatenate step, use self._work_z to concatenate result
+                offset = 0
+                self._work_z[offset : offset+num_hl] = self._step.z_l
+                self._work_s[offset : offset+num_hl] = self._result.z_l
+                offset += num_hl
+                self._work_z[offset : offset+num_hu] = self._step.z_u
+                self._work_s[offset : offset+num_hu] = self._result.z_u
+                offset += num_hu
+                self._work_z[offset : offset+num_xl] = self._step.z_bl
+                self._work_s[offset : offset+num_xl] = self._result.z_bl
+                offset += num_xl
+                self._work_z[offset : offset+num_xu] = self._step.z_bu
+                self._work_s[offset : offset+num_xu] = self._result.z_bu
+                offset += num_xu
 
-        return alpha_s, alpha_z
-    
+                self._work_z[:offset] = cp.where(self._work_z[:offset] < 0, -self._work_s[:offset] / self._work_z[:offset], 1.)
+                self._alpha_sz[1] = cp.min(self._work_z[:offset]) # alpha_z
+
+            self._calculate_step_cuda_graphs[key] = stream.end_capture()
+
+        self._calculate_step_cuda_graphs[key].launch()
 
     @nvtx.annotate("Solver::_calculate_mu")
     def _calculate_mu(self) -> float:
