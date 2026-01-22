@@ -145,8 +145,8 @@ class SolverBase:
             self._result.s_bu += delta_s
             self._result.z_bu += delta_z
 
-            # self._result.info.mu = cp.maximum(self._calculate_mu(), 1e-10)
-            self._result.info.mu = self._calculate_mu()
+            # need to make sure mu is positive here, otherwise in the next step (put s and z on central path) sqrt(mu) the computed z_* will be zeros
+            self._result.info.mu = cp.maximum(self._calculate_mu(), 1e-10)
             if self.settings.debug:
                 print("Initial mu:", self._result.info.mu)
 
