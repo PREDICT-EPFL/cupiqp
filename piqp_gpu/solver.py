@@ -120,17 +120,17 @@ class SolverBase:
             ## ----------- keep z and s non-negative --------------
             # this is according to the IV.A part of Roland Schwan 2023 paper
             offset = 0
-            self._work_s[offset:offset+self._data.num_hl] = self._result.s_l[self._data.idx_hl]
-            self._work_z[offset:offset+self._data.num_hl] = self._result.z_l[self._data.idx_hl]
+            self._work_s[offset:offset+self._data.num_hl] = self._result.s_l
+            self._work_z[offset:offset+self._data.num_hl] = self._result.z_l
             offset += self._data.num_hl
-            self._work_s[offset:offset+self._data.num_hu] = self._result.s_u[self._data.idx_hu]
-            self._work_z[offset:offset+self._data.num_hu] = self._result.z_u[self._data.idx_hu]
+            self._work_s[offset:offset+self._data.num_hu] = self._result.s_u
+            self._work_z[offset:offset+self._data.num_hu] = self._result.z_u
             offset += self._data.num_hu
-            self._work_s[offset:offset+self._data.num_xl] = self._result.s_bl[self._data.idx_xl]
-            self._work_z[offset:offset+self._data.num_xl] = self._result.z_bl[self._data.idx_xl]
+            self._work_s[offset:offset+self._data.num_xl] = self._result.s_bl
+            self._work_z[offset:offset+self._data.num_xl] = self._result.z_bl
             offset += self._data.num_xl
-            self._work_s[offset:offset+self._data.num_xu] = self._result.s_bu[self._data.idx_xu]
-            self._work_z[offset:offset+self._data.num_xu] = self._result.z_bu[self._data.idx_xu]
+            self._work_s[offset:offset+self._data.num_xu] = self._result.s_bu
+            self._work_z[offset:offset+self._data.num_xu] = self._result.z_bu
             offset += self._data.num_xu
             delta_s = -cp.min(self._work_s[:offset])  # single D2H transfer
             delta_z = -cp.min(self._work_z[:offset])  # single D2H transfer
@@ -151,25 +151,18 @@ class SolverBase:
                 print("Initial mu:", self._result.info.mu)
 
             # put s and z on the central path
-            for idx in self._data.idx_hu:
-                c = self._result.z_u[idx] - delta_z
-                self._result.z_u[idx] = (c + cp.sqrt(c * c + 4 * self._result.info.mu)) / 2
-                self._result.s_u[idx] = self._result.z_u[idx] - c
-
-            for idx in self._data.idx_hl:
-                c = self._result.z_l[idx] - delta_z
-                self._result.z_l[idx] = (c + cp.sqrt(c * c + 4 * self._result.info.mu)) / 2
-                self._result.s_l[idx] = self._result.z_l[idx] - c
-
-            for idx in self._data.idx_xu:
-                c = self._result.z_bu[idx] - delta_z
-                self._result.z_bu[idx] = (c + cp.sqrt(c * c + 4 * self._result.info.mu)) / 2
-                self._result.s_bu[idx] = self._result.z_bu[idx] - c
-
-            for idx in self._data.idx_xl:
-                c = self._result.z_bl[idx] - delta_z
-                self._result.z_bl[idx] = (c + cp.sqrt(c * c + 4 * self._result.info.mu)) / 2
-                self._result.s_bl[idx] = self._result.z_bl[idx] - c
+            # Do the following: c = z* - delta-z; z = (c + sqrt(c^2 + 4*mu)) / 2; s = z - c
+            for s, z in zip(
+                [self._result.s_l, self._result.s_u, self._result.s_bl, self._result.s_bu], 
+                [self._result.z_l, self._result.z_u, self._result.z_bl, self._result.z_bu]
+                ):
+                cp.subtract(z, delta_z, out=s)
+                cp.power(s, 2, out=z)
+                z += 4. * self._result.info.mu
+                cp.sqrt(z, out=z)
+                z += s
+                z /= 2.
+                cp.subtract(z, s, out=s)
 
             if self.settings.debug:
                 print("self._result:", self._result)
