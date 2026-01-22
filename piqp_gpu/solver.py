@@ -598,6 +598,7 @@ class SolverBase:
         self._result.info.primal_prox_inf = self._primal_prox_inf() * self._result.info.delta
         self._result.info.dual_prox_inf = self._dual_prox_inf() * self._result.info.rho
 
+    @nvtx.annotate("Solver::_primal_res_nr")
     def _primal_res_nr(self) -> float:
         inf = cp.float64(0.)
         inf = cp.maximum(inf, cp.linalg.norm(self._res_nr.y, ord=cp.inf)) if self._data.p > 0 else inf
@@ -610,6 +611,7 @@ class SolverBase:
         return inf
 
 
+    @nvtx.annotate("Solver::_primal_res_r")
     def _primal_res_r(self) -> float:
         inf = cp.float64(0.)
         inf = cp.maximum(inf, cp.linalg.norm(self._res.y, ord=cp.inf)) if self._data.p > 0 else inf
@@ -619,12 +621,15 @@ class SolverBase:
         inf = cp.maximum(inf, cp.linalg.norm(self._res.z_bl, ord=cp.inf)) if self._data.num_xl > 0 else inf
         return inf
     
+    @nvtx.annotate("Solver::_dual_res_nr")
     def _dual_res_nr(self) -> float:
         return cp.linalg.norm(self._res_nr.x, ord=cp.inf)
     
+    @nvtx.annotate("Solver::_dual_res_r")
     def _dual_res_r(self) -> float:
         return cp.linalg.norm(self._res.x, ord=cp.inf)
     
+    @nvtx.annotate("Solver::_primal_prox_inf")
     def _primal_prox_inf(self) -> float:
         inf = cp.float64(0.)
         inf = cp.maximum(inf, cp.linalg.norm(self._result.y - self._prox_vars.y, ord=cp.inf)) if self._data.p > 0 else inf
@@ -634,6 +639,7 @@ class SolverBase:
         inf = cp.maximum(inf, cp.linalg.norm(self._result.z_bu - self._prox_vars.z_bu, ord=cp.inf)) if self._data.num_xu > 0 else inf
         return inf
     
+    @nvtx.annotate("Solver::_dual_prox_inf")
     def _dual_prox_inf(self) -> float:
         return cp.linalg.norm(self._result.x - self._prox_vars.x, ord=cp.inf)
     
