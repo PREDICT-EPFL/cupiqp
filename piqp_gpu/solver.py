@@ -12,15 +12,10 @@ class SolverBase:
 
         self.settings = Settings()
         self._data: Data = None
-        self._result: Result = None  # store the values of primal and dual variables of current iteration
-        self._step: Variables = None # store the step direction of primal and dual variables
-
         self._result = Result()    # store the values of primal, dual and slack variables of current iteration, and other information
         self._step = Variables()   # used to store the step direction of primal and dual variables
-
         self._res_nr = Variables()  # used to store the non-regularized residuals
-        self._res_r = Variables()  # used to store the regularized residuals
-        self._res = Variables()  # used to store the right hand side of KKT system
+        self._res = Variables()  # used to store the regularized residuals
         self._prox_vars = Variables()  # used to store the proximal variables
 
         self._kkt_system = None
@@ -35,11 +30,13 @@ class SolverBase:
         
         self._step.init(self._data)
         self._res_nr.init(self._data)
-        self._res_r.init(self._data)
         self._res.init(self._data)
         self._prox_vars.init(self._data)
 
         self._kkt_system = KKTSystem(self._data, self.settings)
+
+        self._work_z_1 = cp.empty(self._data.m)  # used to store intermediate results in _update_residuals_nr
+        self._work_z_2 = cp.empty(self._data.m)  # used to store intermediate results in _update_residuals_nr
 
         self._work_z = cp.empty(self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)  # used in _calculate_step to hold all concatenated slack or dual steps / results
         self._work_s = cp.empty(self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)  # used in _calculate_step to hold all concatenated slack or dual steps / results
@@ -436,43 +433,48 @@ class SolverBase:
     @nvtx.annotate("Solver::_update_residuals_nr")
     def _update_residuals_nr(self):
         """
-        Compute the non-regularized primal and dual residuals:
-        primal_residual = ||[A*x-b; G*x-h+s]||_inf
-        dual_residual = ||P*x + c + AT*y + GT*z||_inf
+        Compute the non-regularized residuals, which reflects the residuals of the KKT conditions excluding the regularization terms in Schwan 2023 paper eq(6)
 
-        res_nr.x = -(P*x + c + A^T*y + G^T*(z_u - z_l) + z_bu - z_bl)
-        res_nr.y = -(A*x - b)
-        res_nr.z_l = -(G*x + s_l - hl)
-        res_nr.z_u = -(-G*x + s_u + hu)
+            res_nr.x = -(P*x + c + A^T*y + G^T*(z_u - z_l) + z_bu - z_bl)  # residual of KKT stationarity
+            res_nr.y = -(A*x - b)                                          # residual of KKT primal feasibility: A*x = b
+            res_nr.z_l = G*x - s_l - hl                                    # residual of KKT primal feasibility: hl <= G*x
+            res_nr.z_u = -G*x - s_u + hu                                   # residual of KKT primal feasibility: G*x <= hu
+            res_nr.z_bu = -(x - s_bu - xu)                                 # residual of KKT primal feasibility: xl <= x
+            res_nr.z_bl = x - s_bl - xl                                    # residual of KKT primal feasibility: x <= xu
 
-        also updates the primal and dual objectives and duality gap in self._result.info
+        primal_residual = ||[A*x - b; G*x - s_l - hl; -G*x - s_u + hu; -x + s_bu + xu; x - s_bl - xl]||_inf
+        dual_residual = ||P*x + c + A^T*y + G^T*(z_u - z_l) + z_bu - z_bl||_inf
+
+        primal_residual_norm = ||A*x; b; G*x; h_u; s_u; h_l; s_l; x_l; s_bu; x_u; s_bl||_inf
+        dual_residual_norm = ||P*x; c; A^T*y; G^T*(z_u - z_l) + z_bu - z_bl||_inf
+        
+
+        Also updates the primal and dual objectives and duality gap in self._result.info:
+            - primal_obj = 0.5 x^T P x + c^T x
+            - dual_obj = -0.5 x^T P x - b^T y - h_u^T z_u + h_l^T z_l - x_u^T z_bu + x_l^T z_bl
         """
         # we calculate these term here first to be able to reuse temporary vectors
-        minus_P_x = cp.zeros(self._data.n)
-        self._kkt_system.eval_P_x(self._data, -1., self._result.x, minus_P_x)
-        # res_nr.y = -A * x
-        # work_x = A^T * y
-        minus_A_x = cp.zeros(self._data.p)
-        AT_y = cp.zeros(self._data.n)
-        self._kkt_system.eval_A_xn_and_AT_xt(self._data, -1., 1., self._result.x, self._result.y, minus_A_x, AT_y)
-        # res_nr.z_u = -G * x
-        # res_nr.z_l = G * x
-        # work_x += G^T * (z_u - z_l)
-        # work_z.noalias() = m_result.z_u - m_result.z_l
+        self._kkt_system.eval_P_x(self._data, -1., self._result.x, self._res_nr.x)
+        dual_res_norm = cp.linalg.norm(self._res_nr.x, ord=cp.inf) # dual_res_norm = max(||P*x||_inf, ||c||_inf, ||A^T*y + G^T*(z_u - z_l) + z_bu - z_bl||_inf), will be updated below
+        
+        # AT_y = self._res.x  # use self._step.x as temporary storage
+        self._kkt_system.eval_A_xn_and_AT_xt(self._data, -1., 1., self._result.x, self._result.y, self._res_nr.y, self._res.x)  # store -A*x in res_nr.y
+        primal_rel_norm = cp.linalg.norm(self._res_nr.y, ord=cp.inf) if self._data.p > 0 else 0.  # primal_rel_norm will be updated below
 
-        # TODO: Need to reconsider this if idx_hu and idx_hl are not full
-        tmp = cp.zeros(self._data.m)
-        tmp[self._data.idx_hu] += self._result.z_u
-        tmp[self._data.idx_hl] -= self._result.z_l
-        G_x = cp.zeros(self._data.m)
-        GT_zu_minus_zl = cp.zeros(self._data.n)
-        self._kkt_system.eval_G_xn_and_GT_xt(self._data, 1., 1., self._result.x, tmp, G_x, GT_zu_minus_zl)
+        self._work_z_1.fill(0.)
+        self._work_z_1[self._data.idx_hu] += self._result.z_u
+        self._work_z_1[self._data.idx_hl] -= self._result.z_l
+        
+        G_x = self._work_z_2 # reuse self._work_z_2 to store G*x
+        GT_zu_minus_zl = self._step.x  # reuse self._step.x as temporary storage
+        self._kkt_system.eval_G_xn_and_GT_xt(self._data, 1., 1., self._result.x, self._work_z_1, G_x, GT_zu_minus_zl)
 
         # ------------ update primal / dual objectives and duality gap ------------
         # primal objective: 0.5 x^T P x + c^T x
         # dual objective is: -0.5 x^T P x - b^T y - h_u^T z_u + h_l^T z_l - x_u^T z_bu + x_l^T z_bl
+
         # -x^T P x
-        tmp = cp.dot(minus_P_x, self._result.x)
+        tmp = cp.dot(self._res_nr.x, self._result.x)  # self._res_nr.x currently holds -P*x
         self._result.info.primal_obj = -0.5 * tmp
         self._result.info.dual_obj = 0.5 * tmp
         duality_gap_rel_norm = cp.abs(tmp)
@@ -503,19 +505,39 @@ class SolverBase:
         
         self._result.info.duality_gap = cp.abs(self._result.info.primal_obj - self._result.info.dual_obj)
         self._result.info.duality_gap_rel = self._result.info.duality_gap / cp.maximum(1., duality_gap_rel_norm)
-        # duality_gap_rel = duality_gap / max(1, duality_gap_rel_norm)
-        # where duality_gap_rel_norm is a scale estimate computed from the unscaled absolute contributions to the cost (e.g. |x^T P x|, |c^T x|, |b^T y|, |h_l^T z_l|, |h_u^T z_u|, |x_l^T z_bl|, |x_u^T z_bu|), each passed through the preconditioner unscale_cost.
 
         # res_nr.x = -(P*x + c + A^T*y + G^T*(z_u - z_l) + z_bu - z_bl)
-        self._res_nr.x[:] = minus_P_x - self._data.c - AT_y - GT_zu_minus_zl
+        # self._res_nr.x is computed as -P*x above
+        self._res_nr.x -= self._data.c
+        self._res_nr.x -= self._res.x  # self._res.x holds A^T*y
+        self._res_nr.x -= GT_zu_minus_zl
         self._res_nr.x[self._data.idx_xl] += self._result.z_bl
         self._res_nr.x[self._data.idx_xu] -= self._result.z_bu
+        
         # res_nr.y = -(A*x - b)
-        self._res_nr.y[:] = minus_A_x + self._data.b
-        self._res_nr.z_l[:] = (G_x[self._data.idx_hl] - self._result.s_l - self._data.h_l[self._data.idx_hl])
-        self._res_nr.z_u[:] = (-G_x[self._data.idx_hu] - self._result.s_u + self._data.h_u[self._data.idx_hu])
-        self._res_nr.z_bl[:] = (self._result.x[self._data.idx_xl] - self._result.s_bl - self._data.x_l[self._data.idx_xl])
-        self._res_nr.z_bu[:] = - (self._result.x[self._data.idx_xu] + self._result.s_bu - self._data.x_u[self._data.idx_xu])
+        self._res_nr.y += self._data.b
+
+        # res_nr.z_l = G*x - s_l - hl  =>  self._res_nr.z_l[:] = (G_x[self._data.idx_hl] - self._result.s_l - self._data.h_l[self._data.idx_hl])
+        cp.take(G_x, self._data.idx_hl, out=self._res_nr.z_l)
+        cp.subtract(self._res_nr.z_l, self._result.s_l, out=self._res_nr.z_l)
+        cp.subtract(self._res_nr.z_l, self._data.h_l[self._data.idx_hl], out=self._res_nr.z_l)  # TODO: this creates a tmp array, optimize?
+        
+        # res_nr.z_u = -G*x - s_u + hu  =>  self._res_nr.z_u[:] = (-G_x[self._data.idx_hu] - self._result.s_u + self._data.h_u[self._data.idx_hu])
+        cp.take(G_x, self._data.idx_hu, out=self._res_nr.z_u)
+        cp.negative(self._res_nr.z_u, out=self._res_nr.z_u)
+        cp.subtract(self._res_nr.z_u, self._result.s_u, out=self._res_nr.z_u)
+        cp.add(self._res_nr.z_u, self._data.h_u[self._data.idx_hu], out=self._res_nr.z_u)  # TODO: this creates a tmp array, optimize?
+
+        # res_nr.z_bl = x - s_bl - xl  =>  self._res_nr.z_bl[:] = (self._result.x[self._data.idx_xl] - self._result.s_bl - self._data.x_l[self._data.idx_xl])
+        cp.take(self._result.x, self._data.idx_xl, out=self._res_nr.z_bl)
+        cp.subtract(self._res_nr.z_bl, self._result.s_bl, out=self._res_nr.z_bl)
+        cp.subtract(self._res_nr.z_bl, self._data.x_l[self._data.idx_xl], out=self._res_nr.z_bl)  # TODO: this creates a tmp array, optimize?
+
+        # res_nr.z_bu = -(x + s_bu - xu)  =>  self._res_nr.z_bu[:] = - (self._result.x[self._data.idx_xu] + self._result.s_bu - self._data.x_u[self._data.idx_xu])
+        cp.take(self._result.x, self._data.idx_xu, out=self._res_nr.z_bu)
+        cp.add(self._res_nr.z_bu, self._result.s_bu, out=self._res_nr.z_bu)
+        cp.subtract(self._res_nr.z_bu, self._data.x_u[self._data.idx_xu], out=self._res_nr.z_bu)  # TODO: this creates a tmp array, optimize?
+        cp.negative(self._res_nr.z_bu, out=self._res_nr.z_bu)
 
 
         # ------------ update primal and dual residuals ------------
@@ -524,7 +546,7 @@ class SolverBase:
 
         self._result.info.primal_res = self._primal_res_nr()
 
-        primal_rel_norm = cp.linalg.norm(minus_A_x, ord=cp.inf) if self._data.p > 0 else cp.float64(0.0)
+        # primal_rel_norm is computed as ||-A*x||_inf above, now update it with other terms
         primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._data.b, ord=cp.inf)) if self._data.p > 0 else primal_rel_norm
         primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(G_x[self._data.idx_hu], ord=cp.inf)) if self._data.num_hu > 0 else primal_rel_norm
         primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(G_x[self._data.idx_hl], ord=cp.inf)) if self._data.num_hl > 0 else primal_rel_norm
@@ -539,14 +561,13 @@ class SolverBase:
         self._result.info.primal_res_rel = self._result.info.primal_res / cp.maximum(1., primal_rel_norm)
 
         # dual_res_norm = max(||P*x||_inf, ||c||_inf, ||A^T*y + G^T*(z_u - z_l) + z_bu - z_bl||_inf)
-        self._result.info.dual_res = cp.linalg.norm(self._res_nr.x, ord=cp.inf)
-        dual_res_norm = cp.linalg.norm(minus_P_x, ord=cp.inf)
-        dual_res_norm = cp.maximum(dual_res_norm, cp.linalg.norm(self._data.c, ord=cp.inf))
-        assert cp.allclose(cp.union1d(cp.array(self._data.idx_hl), cp.array(self._data.idx_hu)), cp.arange(self._data.m)), "idx_hl and idx_hu cover 1, ..., m."
-        tmp = AT_y + GT_zu_minus_zl
-        tmp[self._data.idx_xl] -= self._result.z_bl
-        tmp[self._data.idx_xu] += self._result.z_bu
-        dual_res_norm = cp.maximum(dual_res_norm, cp.linalg.norm(tmp, ord=cp.inf))
+        self._result.info.dual_res = self._dual_res_nr()
+        dual_res_norm = cp.maximum(dual_res_norm, cp.linalg.norm(self._data.c, ord=cp.inf))  # ||P*x||_inf was calculated before
+        # self._res.x currently holds A^T*y
+        self._res.x += GT_zu_minus_zl
+        self._res.x[self._data.idx_xl] -= self._result.z_bl
+        self._res.x[self._data.idx_xu] += self._result.z_bu
+        dual_res_norm = cp.maximum(dual_res_norm, cp.linalg.norm(self._res.x, ord=cp.inf))
         self._result.info.dual_res_rel = self._result.info.dual_res / cp.maximum(1., dual_res_norm)
         
 
