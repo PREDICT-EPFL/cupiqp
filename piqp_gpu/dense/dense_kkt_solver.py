@@ -1,8 +1,8 @@
 import cupy as cp
 from cupyx.scipy.linalg import solve_triangular
+import cupyx
 from cupy_backends.cuda.libs import cusolver
 
-from ..typedef import Vector
 from ..kkt_solver import KKTSolverBase, KKTUpdateOptions
 from .dense_data import DenseData
 
@@ -56,7 +56,9 @@ class DenseKKTSolver(KKTSolverBase):
         self._z_reg_inv = 1.0 / z_reg
         self._update_kkt(data, x_reg)
         try:
-            self._kkt_mat = cp.linalg.cholesky(self._kkt_mat)
+            with cupyx.errstate(linalg='raise'):  # raise exception on factorization failure
+                self._kkt_mat[:, :] = cp.linalg.cholesky(self._kkt_mat)
+                cp.cuda.get_current_stream().synchronize()
             return True
         except cp.linalg.LinAlgError:  # TODO: need to investigate specific exception type raise by cupy.linalg.cholesky
             return False
