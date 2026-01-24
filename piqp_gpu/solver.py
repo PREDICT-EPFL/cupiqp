@@ -101,12 +101,15 @@ class SolverBase:
                 self._result
             )
 
-            self._res.x[:] = -self._data.c
+            self._res.x[:] = self._data.c
+            self._res.x *= -1.0
             self._res.y[:] = self._data.b
-            self._res.z_l[:] = -self._data.h_l[self._data.idx_hl]
-            self._res.z_u[:] = self._data.h_u[self._data.idx_hu]
-            self._res.z_bl[:] = -self._data.x_l[self._data.idx_xl]
-            self._res.z_bu[:] = self._data.x_u[self._data.idx_xu]
+            cp.take(self._data.h_l, self._data.idx_hl, out=self._res.z_l)
+            self._res.z_l *= -1.0
+            cp.take(self._data.h_u, self._data.idx_hu, out=self._res.z_u)
+            cp.take(self._data.x_l, self._data.idx_xl, out=self._res.z_bl)
+            self._res.z_bl *= -1.0
+            cp.take(self._data.x_u, self._data.idx_xu, out=self._res.z_bu)
             self._res.s_l[:] = 0.
             self._res.s_u[:] = 0.
             self._res.s_bl[:] = 0.
