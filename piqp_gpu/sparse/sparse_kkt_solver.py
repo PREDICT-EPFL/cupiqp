@@ -13,9 +13,9 @@ class SparseKKTSolver(KKTSolverBase):
     """
     def __init__(self, data: SparseData):
         super().__init__()
-        self._delta = cp.nan
-        self._x_reg = cp.zeros(data.n)
-        self._z_reg = cp.zeros(data.m)
+        # self._delta = cp.nan
+        # self._x_reg = cp.zeros(data.n)
+        # self._z_reg = cp.zeros(data.m)
 
         self._kkt_mat = self._initialize_kkt_csr(data.P, data.A, data.G)
 
@@ -105,7 +105,7 @@ class SparseKKTSolver(KKTSolverBase):
     
     @nvtx.annotate("SparseKKTSolver::update_scalings_and_factor")
     def update_scalings_and_factor(self, data: SparseData, delta: float, x_reg: cp.ndarray, z_reg: cp.ndarray) -> bool:
-        self._delta = delta
+        # self._delta = delta
         # self._x_reg[:] = x_reg
         # self._z_reg[:] = z_reg
 
