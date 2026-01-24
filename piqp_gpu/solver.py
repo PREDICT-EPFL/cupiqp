@@ -173,6 +173,8 @@ class SolverBase:
             self._prox_vars.y[:] = self._result.y
             self._prox_vars.z_l[:] = self._result.z_l
             self._prox_vars.z_u[:] = self._result.z_u
+            self._prox_vars.z_bl[:] = self._result.z_bl
+            self._prox_vars.z_bu[:] = self._result.z_bu
 
             if self.settings.debug:
                 print("Initial point set. Starting iterations...\n", self._prox_vars)
