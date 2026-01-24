@@ -1,7 +1,8 @@
 from typing import Optional
 import cupy as cp
 from cupyx.scipy.sparse import csr_matrix, diags, bmat
-from nvmath.sparse.advanced import DirectSolver, DirectSolverAlgType
+from nvmath.sparse.advanced import DirectSolver, DirectSolverAlgType, DirectSolverOptions, DirectSolverMatrixType, DirectSolverMatrixViewType
+from nvmath.bindings.cudss import PivotType
 import nvtx
 
 from ..kkt_solver import KKTSolverBase
@@ -28,23 +29,26 @@ class SparseKKTSolver(KKTSolverBase):
         self._diag_z_indices = cp.empty(data.m, dtype=cp.int32)
         self._find_diagonal_indices()
 
-        # NOTE: do NOT use a context manager here; it will close the solver at the end
-        # of __init__, making subsequent factorize() calls fail.
-        self._ldlt_solver = DirectSolver(
-            self._kkt_mat,
-            self._rhs
-        )
-        config = self._ldlt_solver.plan_config
-        config.reordering_algorithm = DirectSolverAlgType.ALG_1
+        # setup cuDSS solver
+        self._ldlt_solver = DirectSolver(self._kkt_mat, self._rhs)
+        self._ldlt_solver.options.sparse_system_type = DirectSolverMatrixType.SYMMETRIC
+        self._ldlt_solver.options.sparse_system_view = DirectSolverMatrixViewType.FULL  # TODO: can change this to LOWER if only update lower part of KKT
+        self._ldlt_solver.plan_config.reordering_algorithm = DirectSolverAlgType.ALG_DEFAULT
+        # self._ldlt_solver.plan_config.pivot_type = PivotType.PIVOT_NONE  # ! set to no pivoting, but seems don't work since changing pivot.eps still makes a difference
+        self._ldlt_solver.factorization_config.pivot_eps = 1e-6  # ! a larger pivot_eps seems to improve convergence
+        
         with nvtx.annotate("SparseKKTSolver::cudss_plan"):
-            self._ldlt_solver.plan()  # precompute reordering and symbolic factorization
+            plan_info = self._ldlt_solver.plan()  # precompute reordering and symbolic factorization
+            # plan_info.inertia  # can be used to check inertia if needed
 
     def __del__(self):
-        # Best-effort cleanup.
-        solver = getattr(self, "_solver", None)
-        close = getattr(solver, "close", None)
-        if callable(close):
-            close()
+        ldlt_solver = getattr(self, "_ldlt_solver", None)
+        if ldlt_solver is not None:
+            try:
+                ldlt_solver.free()
+            except Exception:
+                pass
+            self._ldlt_solver = None
 
     @staticmethod
     def _initialize_kkt_csr(P: csr_matrix, A: Optional[csr_matrix] = None, G: Optional[csr_matrix] = None) -> csr_matrix:
