@@ -240,7 +240,7 @@ class SolverBase:
                     self._result.info.factor_retires += 1
                     self._result.info.rho *= 100.
                     self._result.info.delta *= 100.
-                    self._result.info.reg_limit = cp.min(10 * self._result.info.reg_limit, self.settings.eps_abs)
+                    self._result.info.reg_limit = cp.minimum(10 * self._result.info.reg_limit, self.settings.eps_abs)
             
             if self._result.info.factor_retires >= self.settings.max_factor_retires:
                 self._result.info.status = Status.PIQP_NUMERICAL_ISSUES
