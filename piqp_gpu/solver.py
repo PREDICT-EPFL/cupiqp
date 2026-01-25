@@ -120,57 +120,58 @@ class SolverBase:
             if self.settings.debug:
                 print("Initial point after solving KKT system:", self._result)
 
-            ## ----------- keep z and s non-negative --------------
-            # this is according to the IV.A part of Roland Schwan 2023 paper
-            offset = 0
-            self._work_s[offset:offset+self._data.num_hl] = self._result.s_l
-            self._work_z[offset:offset+self._data.num_hl] = self._result.z_l
-            offset += self._data.num_hl
-            self._work_s[offset:offset+self._data.num_hu] = self._result.s_u
-            self._work_z[offset:offset+self._data.num_hu] = self._result.z_u
-            offset += self._data.num_hu
-            self._work_s[offset:offset+self._data.num_xl] = self._result.s_bl
-            self._work_z[offset:offset+self._data.num_xl] = self._result.z_bl
-            offset += self._data.num_xl
-            self._work_s[offset:offset+self._data.num_xu] = self._result.s_bu
-            self._work_z[offset:offset+self._data.num_xu] = self._result.z_bu
-            offset += self._data.num_xu
-            delta_s = -cp.min(self._work_s[:offset])  # single D2H transfer
-            delta_z = -cp.min(self._work_z[:offset])  # single D2H transfer
+            if self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu > 0:
+                ## ----------- keep z and s non-negative --------------
+                # this is according to the IV.A part of Roland Schwan 2023 paper
+                offset = 0
+                self._work_s[offset:offset+self._data.num_hl] = self._result.s_l
+                self._work_z[offset:offset+self._data.num_hl] = self._result.z_l
+                offset += self._data.num_hl
+                self._work_s[offset:offset+self._data.num_hu] = self._result.s_u
+                self._work_z[offset:offset+self._data.num_hu] = self._result.z_u
+                offset += self._data.num_hu
+                self._work_s[offset:offset+self._data.num_xl] = self._result.s_bl
+                self._work_z[offset:offset+self._data.num_xl] = self._result.z_bl
+                offset += self._data.num_xl
+                self._work_s[offset:offset+self._data.num_xu] = self._result.s_bu
+                self._work_z[offset:offset+self._data.num_xu] = self._result.z_bu
+                offset += self._data.num_xu
+                delta_s = -cp.min(self._work_s[:offset]) # single D2H transfer
+                delta_z = -cp.min(self._work_z[:offset]) # single D2H transfer
 
-            self._result.s_l += delta_s
-            self._result.z_l += delta_z
-            self._result.s_u += delta_s
-            self._result.z_u += delta_z
+                self._result.s_l += delta_s
+                self._result.z_l += delta_z
+                self._result.s_u += delta_s
+                self._result.z_u += delta_z
 
-            self._result.s_bl += delta_s
-            self._result.z_bl += delta_z
-            self._result.s_bu += delta_s
-            self._result.z_bu += delta_z
+                self._result.s_bl += delta_s
+                self._result.z_bl += delta_z
+                self._result.s_bu += delta_s
+                self._result.z_bu += delta_z
 
-            # need to make sure mu is positive here, otherwise in the next step (put s and z on central path) sqrt(mu) the computed z_* will be zeros
-            self._result.info.mu = cp.maximum(self._calculate_mu(), 1e-10)
-            if self.settings.debug:
-                print("Initial mu:", self._result.info.mu)
+                # need to make sure mu is positive here, otherwise in the next step (put s and z on central path) sqrt(mu) the computed z_* will be zeros
+                self._result.info.mu = cp.maximum(self._calculate_mu(), 1e-10)
+                if self.settings.debug:
+                    print("Initial mu:", self._result.info.mu)
 
-            # put s and z on the central path
-            # Do the following: c = z* - delta-z; z = (c + sqrt(c^2 + 4*mu)) / 2; s = z - c
-            for s, z in zip(
-                [self._result.s_l, self._result.s_u, self._result.s_bl, self._result.s_bu], 
-                [self._result.z_l, self._result.z_u, self._result.z_bl, self._result.z_bu]
-                ):
-                cp.subtract(z, delta_z, out=s)
-                cp.power(s, 2, out=z)
-                z += 4. * self._result.info.mu
-                cp.sqrt(z, out=z)
-                z += s
-                z /= 2.
-                cp.subtract(z, s, out=s)
+                # put s and z on the central path
+                # Do the following: c = z* - delta-z; z = (c + sqrt(c^2 + 4*mu)) / 2; s = z - c
+                for s, z in zip(
+                    [self._result.s_l, self._result.s_u, self._result.s_bl, self._result.s_bu], 
+                    [self._result.z_l, self._result.z_u, self._result.z_bl, self._result.z_bu]
+                    ):
+                    cp.subtract(z, delta_z, out=s)
+                    cp.power(s, 2, out=z)
+                    z += 4. * self._result.info.mu
+                    cp.sqrt(z, out=z)
+                    z += s
+                    z /= 2.
+                    cp.subtract(z, s, out=s)
 
-            if self.settings.debug:
-                print("self._result:", self._result)
+                if self.settings.debug:
+                    print("self._result:", self._result)
 
-            self._result.info.mu = self._calculate_mu()
+                self._result.info.mu = self._calculate_mu()
 
             self._prox_vars.x[:] = self._result.x
             self._prox_vars.y[:] = self._result.y
@@ -249,116 +250,150 @@ class SolverBase:
             # reset factor retires for next iteration
             self._result.info.factor_retires = 0
 
-            
-            # ------------------ predictor step ------------------
 
-            if self.settings.debug:
-                print("before predictor step, result is: ", self._result)
-                print("before predictor step, res is: ", self._res)
+            # -------------------- Case without inequality constraints --------------------
+            if self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu == 0:
+                # since there are no inequalities we can take full steps
+                self._kkt_system.solve(self._data, self.settings, self._res, self._step)
 
-            # Short derivation:
-            # Complementarity (elementwise): s_i * z_i = mu (usually written s * z = mu e).
-            # Predictor (affine) aims for the affine step that drives complementarity to zero, so require (s + Δs) ∘ (z + Δz) = 0.
-            # Expand: s ∘ z + S Δz + Z Δs + Δs ∘ Δz = 0, where S = diag(s), Z = diag(z).
-            # Drop the quadratic term Δs ∘ Δz (first‑order Newton linearization) to get the linear system S Δz + Z Δs = - s ∘ z.
-            # Thus the predictor RHS for the slack/dual complementarity equations is - s ∘ z (elementwise product), which is exactly what the four lines set for the different constraint groups.
-            # In words: those lines build the complementarity residual r_s = - s .* z so the KKT solve computes Δs, Δz satisfying S Δz + Z Δs = r_s (the linearized complementarity equation) for the predictor (affine) direction. The .array() calls implement the elementwise product s .* z.
-            self._res.s_l[:] = -self._result.s_l * self._result.z_l
-            self._res.s_u[:] = -self._result.s_u * self._result.z_u
-            self._res.s_bl[:] = -self._result.s_bl * self._result.z_bl
-            self._res.s_bu[:] = -self._result.s_bu * self._result.z_bu
-            
-            
+                self._result.info.primal_step = cp.float64(1.0)
+                self._result.info.dual_step = cp.float64(1.0)
+                self._result.x += self._result.info.primal_step * self._step.x
+                self._result.y += self._result.info.dual_step * self._step.y
 
-            if self.settings.debug:
-                print("predictor step rhs is: res= ", self._res)
+                self._update_residuals_nr()
 
-            self._kkt_system.solve(self._data, self.settings, self._res, self._step)
-
-            if self.settings.debug:
-                print("predictor step is:", self._step)
-
-            # step in the non-negative orthant
-            self._calculate_step()
-
-            # avoid getting to close to the boundary
-            self._alpha_sz *= self.settings.tau
-
-            # ------------------ compute centering parameter sigma ------------------
-            self._result.info.sigma = 0.
-            self._result.info.sigma += cp.dot(self._result.s_l + self._alpha_sz[0] * self._step.s_l, self._result.z_l + self._alpha_sz[1] * self._step.z_l)
-            self._result.info.sigma += cp.dot(self._result.s_u + self._alpha_sz[0] * self._step.s_u, self._result.z_u + self._alpha_sz[1] * self._step.z_u)
-            self._result.info.sigma += cp.dot(self._result.s_bl + self._alpha_sz[0] * self._step.s_bl, self._result.z_bl + self._alpha_sz[1] * self._step.z_bl)
-            self._result.info.sigma += cp.dot(self._result.s_bu + self._alpha_sz[0] * self._step.s_bu, self._result.z_bu + self._alpha_sz[1] * self._step.z_bu)
-            self._result.info.sigma /= self._result.info.mu * cp.float64(self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)
-            self._result.info.sigma = cp.maximum(0., cp.minimum(1., self._result.info.sigma))
-            self._result.info.sigma = self._result.info.sigma ** 3
-
-
-            # ------------------ corrector step ------------------
-            self._res.s_l += -self._step.s_l * self._step.z_l + self._result.info.sigma * self._result.info.mu
-            self._res.s_u += -self._step.s_u * self._step.z_u + self._result.info.sigma * self._result.info.mu
-            self._res.s_bl += -self._step.s_bl * self._step.z_bl + self._result.info.sigma * self._result.info.mu
-            self._res.s_bu += -self._step.s_bu * self._step.z_bu + self._result.info.sigma * self._result.info.mu
-
-            if self.settings.debug:
-                print("corrector step rhs is: res= ", self._res)
-            self._kkt_system.solve(self._data, self.settings, self._res, self._step)
-
-            if self.settings.debug:
-                print("corrector step is:", self._step)
-
-            # step in the non-negative orthant
-            self._calculate_step()
-            # avoid getting too close to the boundary
-            self._alpha_sz *= self.settings.tau
-            self._result.info.primal_step = self._alpha_sz[0]
-            self._result.info.dual_step = self._alpha_sz[1]
-
-            # ------------------ update variables ------------------
-            self._result.x += self._result.info.primal_step * self._step.x
-            self._result.y += self._result.info.dual_step * self._step.y
-            self._result.z_l += self._result.info.dual_step * self._step.z_l
-            self._result.z_u += self._result.info.dual_step * self._step.z_u
-            self._result.z_bl += self._result.info.dual_step * self._step.z_bl
-            self._result.z_bu += self._result.info.dual_step * self._step.z_bu
-            self._result.s_l += self._result.info.primal_step * self._step.s_l
-            self._result.s_u += self._result.info.primal_step * self._step.s_u
-            self._result.s_bl += self._result.info.primal_step * self._step.s_bl
-            self._result.s_bu += self._result.info.primal_step * self._step.s_bu
-
-            mu_prev = self._result.info.mu
-            self._result.info.mu = self._calculate_mu()
-            mu_rate = cp.maximum(0., (mu_prev - self._result.info.mu) / mu_prev)  # r in Algorithm 2 in Roland Schwan 2023 paper
-
-
-            # ------------------ update regularization ------------------
-            self._update_residuals_nr()
-
-            if self._result.info.dual_res < 0.95 * self._result.info.prev_dual_res or \
-                (self._result.info.dual_res < self.settings.eps_abs or self._result.info.dual_res_rel < self.settings.eps_rel) or \
-                (self._result.info.rho == self.settings.reg_finetune_lower_limit and self._result.info.dual_prox_inf < self.settings.infeasibility_threshold) :
-                self._prox_vars.x[:] = self._result.x
-                self._result.info.rho = cp.maximum(self._result.info.reg_limit, (1. - mu_rate) * self._result.info.rho)
-            else:
-                self._result.info.no_primal_update += 1                
-                if self._result.info.iter < 5 or self._result.info.dual_prox_inf < self.settings.infeasibility_threshold:
-                    self._result.info.rho = cp.maximum(self._result.info.reg_limit, (1. - 0.666 * mu_rate) * self._result.info.rho)
-
-            if self._result.info.primal_res < 0.95 * self._result.info.prev_primal_res or \
-                (self._result.info.primal_res < self.settings.eps_abs or self._result.info.primal_res_rel < self.settings.eps_rel) or \
-                (self._result.info.delta == self.settings.reg_finetune_lower_limit and self._result.info.primal_prox_inf < self.settings.infeasibility_threshold):
-                self._prox_vars.y[:] = self._result.y
-                self._prox_vars.z_l[:] = self._result.z_l
-                self._prox_vars.z_u[:] = self._result.z_u
-                self._prox_vars.z_bu[:] = self._result.z_bu
-                self._prox_vars.z_bl[:] = self._result.z_bl
+                if self._result.info.dual_res < 0.95 * self._result.info.prev_dual_res or \
+                    self._result.info.dual_res < self.settings.eps_abs or \
+                        self._result.info.dual_res_rel < self.settings.eps_rel:                
+                    self._prox_vars.x[:] = self._result.x
+                    self._result.info.rho = cp.maximum(self._result.info.reg_limit, 0.1 * self._result.info.rho)                
+                else:                
+                    self._result.info.no_primal_update += 1
+                    if self._result.info.iter < 5 or self._result.info.dual_prox_inf < self.settings.infeasibility_threshold:
+                        self._result.info.rho = cp.maximum(self._result.info.reg_limit, 0.5 * self._result.info.rho)
+                    
                 
-                self._result.info.delta = cp.maximum(self._result.info.reg_limit, (1. - mu_rate) * self._result.info.delta)
+                if self._result.info.primal_res < 0.95 * self._result.info.prev_primal_res or \
+                    self._result.info.primal_res < self.settings.eps_abs or \
+                        self._result.info.primal_res_rel < self.settings.eps_rel:
+                    self._prox_vars.y[:] = self._result.y
+                    self._result.info.delta = cp.maximum(self._result.info.reg_limit, 0.1 * self._result.info.delta)
+                else:
+                    self._result.info.no_dual_update += 1
+                    if self._result.info.iter < 5 or self._result.info.primal_prox_inf < self.settings.infeasibility_threshold:
+                        self._result.info.delta = cp.maximum(self._result.info.reg_limit, 0.5 * self._result.info.delta)
+
+            # -------------------- Case with inequality constraints --------------------
             else:
-                self._result.info.no_dual_update += 1
-                if self._result.info.iter < 5 or self._result.info.primal_prox_inf < self.settings.infeasibility_threshold:
-                    self._result.info.delta = cp.maximum(self._result.info.reg_limit, (1. - 0.666 * mu_rate) * self._result.info.delta)
+                # ------------------ predictor step ------------------
+                if self.settings.debug:
+                    print("before predictor step, result is: ", self._result)
+                    print("before predictor step, res is: ", self._res)
+
+                # Short derivation:
+                # Complementarity (elementwise): s_i * z_i = mu (usually written s * z = mu e).
+                # Predictor (affine) aims for the affine step that drives complementarity to zero, so require (s + Δs) ∘ (z + Δz) = 0.
+                # Expand: s ∘ z + S Δz + Z Δs + Δs ∘ Δz = 0, where S = diag(s), Z = diag(z).
+                # Drop the quadratic term Δs ∘ Δz (first‑order Newton linearization) to get the linear system S Δz + Z Δs = - s ∘ z.
+                # Thus the predictor RHS for the slack/dual complementarity equations is - s ∘ z (elementwise product), which is exactly what the four lines set for the different constraint groups.
+                # In words: those lines build the complementarity residual r_s = - s .* z so the KKT solve computes Δs, Δz satisfying S Δz + Z Δs = r_s (the linearized complementarity equation) for the predictor (affine) direction. The .array() calls implement the elementwise product s .* z.
+                self._res.s_l[:] = -self._result.s_l * self._result.z_l
+                self._res.s_u[:] = -self._result.s_u * self._result.z_u
+                self._res.s_bl[:] = -self._result.s_bl * self._result.z_bl
+                self._res.s_bu[:] = -self._result.s_bu * self._result.z_bu
+                
+                
+
+                if self.settings.debug:
+                    print("predictor step rhs is: res= ", self._res)
+
+                self._kkt_system.solve(self._data, self.settings, self._res, self._step)
+
+                if self.settings.debug:
+                    print("predictor step is:", self._step)
+
+                # step in the non-negative orthant
+                self._calculate_step()
+
+                # avoid getting to close to the boundary
+                self._alpha_sz *= self.settings.tau
+
+                # ------------------ compute centering parameter sigma ------------------
+                self._result.info.sigma = 0.
+                self._result.info.sigma += cp.dot(self._result.s_l + self._alpha_sz[0] * self._step.s_l, self._result.z_l + self._alpha_sz[1] * self._step.z_l)
+                self._result.info.sigma += cp.dot(self._result.s_u + self._alpha_sz[0] * self._step.s_u, self._result.z_u + self._alpha_sz[1] * self._step.z_u)
+                self._result.info.sigma += cp.dot(self._result.s_bl + self._alpha_sz[0] * self._step.s_bl, self._result.z_bl + self._alpha_sz[1] * self._step.z_bl)
+                self._result.info.sigma += cp.dot(self._result.s_bu + self._alpha_sz[0] * self._step.s_bu, self._result.z_bu + self._alpha_sz[1] * self._step.z_bu)
+                self._result.info.sigma /= self._result.info.mu * cp.float64(self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)
+                self._result.info.sigma = cp.maximum(0., cp.minimum(1., self._result.info.sigma))
+                self._result.info.sigma = self._result.info.sigma ** 3
+
+
+                # ------------------ corrector step ------------------
+                self._res.s_l += -self._step.s_l * self._step.z_l + self._result.info.sigma * self._result.info.mu
+                self._res.s_u += -self._step.s_u * self._step.z_u + self._result.info.sigma * self._result.info.mu
+                self._res.s_bl += -self._step.s_bl * self._step.z_bl + self._result.info.sigma * self._result.info.mu
+                self._res.s_bu += -self._step.s_bu * self._step.z_bu + self._result.info.sigma * self._result.info.mu
+
+                if self.settings.debug:
+                    print("corrector step rhs is: res= ", self._res)
+                self._kkt_system.solve(self._data, self.settings, self._res, self._step)
+
+                if self.settings.debug:
+                    print("corrector step is:", self._step)
+
+                # step in the non-negative orthant
+                self._calculate_step()
+                # avoid getting too close to the boundary
+                self._alpha_sz *= self.settings.tau
+                self._result.info.primal_step = self._alpha_sz[0]
+                self._result.info.dual_step = self._alpha_sz[1]
+
+                # ------------------ update variables ------------------
+                self._result.x += self._result.info.primal_step * self._step.x
+                self._result.y += self._result.info.dual_step * self._step.y
+                self._result.z_l += self._result.info.dual_step * self._step.z_l
+                self._result.z_u += self._result.info.dual_step * self._step.z_u
+                self._result.z_bl += self._result.info.dual_step * self._step.z_bl
+                self._result.z_bu += self._result.info.dual_step * self._step.z_bu
+                self._result.s_l += self._result.info.primal_step * self._step.s_l
+                self._result.s_u += self._result.info.primal_step * self._step.s_u
+                self._result.s_bl += self._result.info.primal_step * self._step.s_bl
+                self._result.s_bu += self._result.info.primal_step * self._step.s_bu
+
+                mu_prev = self._result.info.mu
+                self._result.info.mu = self._calculate_mu()
+                mu_rate = cp.maximum(0., (mu_prev - self._result.info.mu) / mu_prev)  # r in Algorithm 2 in Roland Schwan 2023 paper
+
+
+                # ------------------ update regularization ------------------
+                self._update_residuals_nr()
+
+                if self._result.info.dual_res < 0.95 * self._result.info.prev_dual_res or \
+                    (self._result.info.dual_res < self.settings.eps_abs or self._result.info.dual_res_rel < self.settings.eps_rel) or \
+                    (self._result.info.rho == self.settings.reg_finetune_lower_limit and self._result.info.dual_prox_inf < self.settings.infeasibility_threshold) :
+                    self._prox_vars.x[:] = self._result.x
+                    self._result.info.rho = cp.maximum(self._result.info.reg_limit, (1. - mu_rate) * self._result.info.rho)
+                else:
+                    self._result.info.no_primal_update += 1                
+                    if self._result.info.iter < 5 or self._result.info.dual_prox_inf < self.settings.infeasibility_threshold:
+                        self._result.info.rho = cp.maximum(self._result.info.reg_limit, (1. - 0.666 * mu_rate) * self._result.info.rho)
+
+                if self._result.info.primal_res < 0.95 * self._result.info.prev_primal_res or \
+                    (self._result.info.primal_res < self.settings.eps_abs or self._result.info.primal_res_rel < self.settings.eps_rel) or \
+                    (self._result.info.delta == self.settings.reg_finetune_lower_limit and self._result.info.primal_prox_inf < self.settings.infeasibility_threshold):
+                    self._prox_vars.y[:] = self._result.y
+                    self._prox_vars.z_l[:] = self._result.z_l
+                    self._prox_vars.z_u[:] = self._result.z_u
+                    self._prox_vars.z_bu[:] = self._result.z_bu
+                    self._prox_vars.z_bl[:] = self._result.z_bl
+                    
+                    self._result.info.delta = cp.maximum(self._result.info.reg_limit, (1. - mu_rate) * self._result.info.delta)
+                else:
+                    self._result.info.no_dual_update += 1
+                    if self._result.info.iter < 5 or self._result.info.primal_prox_inf < self.settings.infeasibility_threshold:
+                        self._result.info.delta = cp.maximum(self._result.info.reg_limit, (1. - 0.666 * mu_rate) * self._result.info.delta)
 
 
         self._result.info.status = Status.PIQP_MAX_ITER_REACHED
