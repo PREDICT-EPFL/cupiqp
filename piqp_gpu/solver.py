@@ -77,7 +77,7 @@ class SolverBase:
         self._result.info.delta = self.settings.delta_init     
 
         if self.settings.verbose:
-            print("iter   prim_obj        dual_obj        duality_gap    prim_res       dual_res       rho          delta        mu           p_step    d_step\n")  
+            print("iter  prim_obj       dual_obj       duality_gap   prim_res      dual_res      rho         delta       mu          p_step   d_step")  
 
         ## ----------- initial iteration --------------
         # eq(12) in Roland Schwan 2023 paper
@@ -220,14 +220,14 @@ class SolverBase:
                 print(
                     f"{self._result.info.iter:3d}   "
                     f"{float(self._result.info.primal_obj): .5e}   "
-                    f"{float(self._result.info.dual_obj): .5e}   "
-                    f"{float(self._result.info.duality_gap): .5e}   "
-                    f"{float(self._result.info.primal_res): .5e}   "
-                    f"{float(self._result.info.dual_res): .5e}   "
-                    f"{float(self._result.info.rho): .3e}   "
-                    f"{float(self._result.info.delta): .3e}   "
-                    f"{float(self._result.info.mu): .3e}   "
-                    f"{float(self._result.info.primal_step): .4f}   "
+                    f"{float(self._result.info.dual_obj): .5e}  "
+                    f"{float(self._result.info.duality_gap): .5e}  "
+                    f"{float(self._result.info.primal_res): .5e}  "
+                    f"{float(self._result.info.dual_res): .5e}  "
+                    f"{float(self._result.info.rho): .3e}  "
+                    f"{float(self._result.info.delta): .3e}  "
+                    f"{float(self._result.info.mu): .3e}  "
+                    f"{float(self._result.info.primal_step): .4f}  "
                     f"{float(self._result.info.dual_step): .4f}",
                     flush=True
                 )
