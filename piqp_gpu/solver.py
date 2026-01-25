@@ -286,11 +286,11 @@ class SolverBase:
 
             # ------------------ compute centering parameter sigma ------------------
             self._result.info.sigma = 0.
-            self._result.info.sigma += cp.dot(self._result.s_l[self._data.idx_hl] + self._alpha_sz[0] * self._step.s_l[self._data.idx_hl], self._result.z_l[self._data.idx_hl] + self._alpha_sz[1] * self._step.z_l[self._data.idx_hl])
-            self._result.info.sigma += cp.dot(self._result.s_u[self._data.idx_hu] + self._alpha_sz[0] * self._step.s_u[self._data.idx_hu], self._result.z_u[self._data.idx_hu] + self._alpha_sz[1] * self._step.z_u[self._data.idx_hu])
-            self._result.info.sigma += cp.dot(self._result.s_bl[self._data.idx_xl] + self._alpha_sz[0] * self._step.s_bl[self._data.idx_xl], self._result.z_bl[self._data.idx_xl] + self._alpha_sz[1] * self._step.z_bl[self._data.idx_xl])
-            self._result.info.sigma += cp.dot(self._result.s_bu[self._data.idx_xu] + self._alpha_sz[0] * self._step.s_bu[self._data.idx_xu], self._result.z_bu[self._data.idx_xu] + self._alpha_sz[1] * self._step.z_bu[self._data.idx_xu])
-            self._result.info.sigma /= self._result.info.mu * (self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)
+            self._result.info.sigma += cp.dot(self._result.s_l + self._alpha_sz[0] * self._step.s_l, self._result.z_l + self._alpha_sz[1] * self._step.z_l)
+            self._result.info.sigma += cp.dot(self._result.s_u + self._alpha_sz[0] * self._step.s_u, self._result.z_u + self._alpha_sz[1] * self._step.z_u)
+            self._result.info.sigma += cp.dot(self._result.s_bl + self._alpha_sz[0] * self._step.s_bl, self._result.z_bl + self._alpha_sz[1] * self._step.z_bl)
+            self._result.info.sigma += cp.dot(self._result.s_bu + self._alpha_sz[0] * self._step.s_bu, self._result.z_bu + self._alpha_sz[1] * self._step.z_bu)
+            self._result.info.sigma /= self._result.info.mu * cp.float64(self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)
             self._result.info.sigma = cp.maximum(0., cp.minimum(1., self._result.info.sigma))
             self._result.info.sigma = self._result.info.sigma ** 3
 
