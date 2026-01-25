@@ -327,9 +327,9 @@ class SolverBase:
             self._result.s_bl += self._result.info.primal_step * self._step.s_bl
             self._result.s_bu += self._result.info.primal_step * self._step.s_bu
 
-            mu_prev: float = self._result.info.mu
+            mu_prev = self._result.info.mu
             self._result.info.mu = self._calculate_mu()
-            mu_rate: float = max(0., (mu_prev - self._result.info.mu) / mu_prev)  # r in Algorithm 2 in Roland Schwan 2023 paper
+            mu_rate = cp.maximum(0., (mu_prev - self._result.info.mu) / mu_prev)  # r in Algorithm 2 in Roland Schwan 2023 paper
 
 
             # ------------------ update regularization ------------------
