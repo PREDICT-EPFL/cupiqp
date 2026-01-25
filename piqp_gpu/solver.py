@@ -335,14 +335,19 @@ class SolverBase:
             # ------------------ update regularization ------------------
             self._update_residuals_nr()
 
-            # TODO: more conditions to add in if clause
-            if self._result.info.dual_res < 0.95 * self._result.info.prev_dual_res:
+            if self._result.info.dual_res < 0.95 * self._result.info.prev_dual_res or \
+                (self._result.info.dual_res < self.settings.eps_abs or self._result.info.dual_res_rel < self.settings.eps_rel) or \
+                (self._result.info.rho == self.settings.reg_finetune_lower_limit and self._result.info.dual_prox_inf < self.settings.infeasibility_threshold) :
                 self._prox_vars.x[:] = self._result.x
                 self._result.info.rho = cp.maximum(self._result.info.reg_limit, (1. - mu_rate) * self._result.info.rho)
             else:
-                self._result.info.rho = cp.maximum(self._result.info.reg_limit, (1. - 0.666 * mu_rate) * self._result.info.rho)
+                self._result.info.no_primal_update += 1                
+                if self._result.info.iter < 5 or self._result.info.dual_prox_inf < self.settings.infeasibility_threshold:
+                    self._result.info.rho = cp.maximum(self._result.info.reg_limit, (1. - 0.666 * mu_rate) * self._result.info.rho)
 
-            if self._result.info.primal_res < 0.95 * self._result.info.prev_primal_res:
+            if self._result.info.primal_res < 0.95 * self._result.info.prev_primal_res or \
+                (self._result.info.primal_res < self.settings.eps_abs or self._result.info.primal_res_rel < self.settings.eps_rel) or \
+                (self._result.info.delta == self.settings.reg_finetune_lower_limit and self._result.info.primal_prox_inf < self.settings.infeasibility_threshold):
                 self._prox_vars.y[:] = self._result.y
                 self._prox_vars.z_l[:] = self._result.z_l
                 self._prox_vars.z_u[:] = self._result.z_u
@@ -351,7 +356,9 @@ class SolverBase:
                 
                 self._result.info.delta = cp.maximum(self._result.info.reg_limit, (1. - mu_rate) * self._result.info.delta)
             else:
-                self._result.info.delta = cp.maximum(self._result.info.reg_limit, (1. - 0.666 * mu_rate) * self._result.info.delta)
+                self._result.info.no_dual_update += 1
+                if self._result.info.iter < 5 or self._result.info.primal_prox_inf < self.settings.infeasibility_threshold:
+                    self._result.info.delta = cp.maximum(self._result.info.reg_limit, (1. - 0.666 * mu_rate) * self._result.info.delta)
 
 
         self._result.info.status = Status.PIQP_MAX_ITER_REACHED
