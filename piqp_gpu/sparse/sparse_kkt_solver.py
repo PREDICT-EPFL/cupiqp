@@ -1,7 +1,15 @@
 from typing import Optional
 import cupy as cp
 from cupyx.scipy.sparse import csr_matrix, diags, bmat
-from nvmath.sparse.advanced import DirectSolver, DirectSolverAlgType, DirectSolverOptions, DirectSolverMatrixType, DirectSolverMatrixViewType
+from nvmath.sparse.advanced import (
+    DirectSolver,
+    DirectSolverAlgType,
+    DirectSolverOptions,
+    DirectSolverMatrixType,
+    DirectSolverMatrixViewType,
+    ExecutionHybrid,
+    ExecutionCUDA,
+)
 from nvmath.bindings.cudss import PivotType
 import nvtx
 
@@ -30,16 +38,18 @@ class SparseKKTSolver(KKTSolverBase):
         self._find_diagonal_indices()
 
         # setup cuDSS solver
-        self._ldlt_solver = DirectSolver(self._kkt_mat, self._rhs)
-        self._ldlt_solver.options.sparse_system_type = DirectSolverMatrixType.SYMMETRIC
-        self._ldlt_solver.options.sparse_system_view = DirectSolverMatrixViewType.FULL  # TODO: can change this to LOWER if only update lower part of KKT
+        # TODO: can change this to LOWER if only update lower part of KKT
+        opts = DirectSolverOptions(sparse_system_type=DirectSolverMatrixType.SYMMETRIC, 
+                                   sparse_system_view=DirectSolverMatrixViewType.FULL)
+        exe = ExecutionHybrid()  # allow both CPU and GPU execution. Optional: ExecutionCUDA()
+        self._ldlt_solver = DirectSolver(a=self._kkt_mat, b=self._rhs, options=opts, execution=exe)
         self._ldlt_solver.plan_config.reordering_algorithm = DirectSolverAlgType.ALG_DEFAULT
         # self._ldlt_solver.plan_config.pivot_type = PivotType.PIVOT_NONE  # ! set to no pivoting, but seems don't work since changing pivot.eps still makes a difference
-        self._ldlt_solver.factorization_config.pivot_eps = 1e-6  # ! a larger pivot_eps seems to improve convergence
+        # self._ldlt_solver.factorization_config.pivot_eps = 1e-10
         
         with nvtx.annotate("SparseKKTSolver::cudss_plan"):
             plan_info = self._ldlt_solver.plan()  # precompute reordering and symbolic factorization
-            # plan_info.inertia  # can be used to check inertia if needed
+            cp.cuda.get_current_stream().synchronize()
 
     def __del__(self):
         ldlt_solver = getattr(self, "_ldlt_solver", None)
@@ -103,7 +113,8 @@ class SparseKKTSolver(KKTSolverBase):
     
     @nvtx.annotate("SparseKKTSolver::_update_kkt")
     def _update_kkt(self, data: SparseData, delta: float, x_reg: cp.ndarray, z_reg: cp.ndarray) -> None:
-        self._kkt_mat.data[self._diag_x_indices] = data.P.diagonal() + x_reg        
+        self._kkt_mat.data[self._diag_x_indices] = data.P.diagonal()
+        self._kkt_mat.data[self._diag_x_indices] += x_reg        
         self._kkt_mat.data[self._diag_y_indices] = -delta
         self._kkt_mat.data[self._diag_z_indices] = -z_reg
     
@@ -117,9 +128,17 @@ class SparseKKTSolver(KKTSolverBase):
 
         try:
             with nvtx.annotate("SparseKKTSolver::cudss_factorize"):
+                fac_info = self._ldlt_solver.factorize()
+                # surface async device-side failures here so info is meaningful now
                 cp.cuda.get_current_stream().synchronize()
-                self._ldlt_solver.factorize()
-                cp.cuda.get_current_stream().synchronize()
+
+            if fac_info.info != 0:
+                return False
+            
+            # check inertia
+            if fac_info.inertia[0] != data.n or fac_info.inertia[1] != data.p + data.m:
+                return False
+
         except Exception as e:
             print(f"Factorization failed: {e}")
             return False
@@ -143,12 +162,9 @@ class SparseKKTSolver(KKTSolverBase):
             self._sol[:] = self._ldlt_solver.solve()
             cp.cuda.get_current_stream().synchronize()
 
-        # assert self._sol.dtype == cp.float64
-        # assert cp.allclose(self._kkt_mat @ self._sol, self._rhs)
-
-        cp.take(self._sol, cp.arange(0, n), out=delta_x)        # in-place copy for delta_x
-        cp.take(self._sol, cp.arange(n, n+p), out=delta_y)      # in-place copy for delta_y
-        cp.take(self._sol, cp.arange(n+p, n+p+m), out=delta_z)  # in-place copy for delta_z
+        cp.copyto(delta_x, self._sol[:n])
+        cp.copyto(delta_y, self._sol[n:n+p])
+        cp.copyto(delta_z, self._sol[n+p:n+p+m])
     
 
     @nvtx.annotate("SparseKKTSolver::eval_P_x")
