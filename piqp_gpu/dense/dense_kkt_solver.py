@@ -1,8 +1,9 @@
 import cupy as cp
 from cupyx.scipy.linalg import solve_triangular
+import cupyx
 from cupy_backends.cuda.libs import cusolver
+import nvtx
 
-from ..typedef import Vector
 from ..kkt_solver import KKTSolverBase, KKTUpdateOptions
 from .dense_data import DenseData
 
@@ -28,39 +29,58 @@ class DenseKKTSolver(KKTSolverBase):
         self._rhs = cp.zeros(data.n, dtype=cp.float64)
 
         self._AtA = data.A.T @ data.A if data.p > 0 else cp.zeros((0, 0))
+        self._AtA_scaled = cp.zeros_like(self._AtA)   # placeholder for 1/delta* A^T*A
+        self._Gt_scaled = cp.zeros((data.n, data.m), dtype=cp.float64)  # placeholder for G^T * diag(z_reg_inv)
+        self._GtG_scaled = cp.zeros((data.n, data.n), dtype=cp.float64)  # placeholder for G^T * diag(z_reg_inv) * G
 
 
     def update_data(self, data: DenseData, update_options: KKTUpdateOptions):
         if update_options == KKTUpdateOptions.KKT_UPDATE_A and data.p > 0:
             self._AtA = data.A.T @ data.A
 
+    @nvtx.annotate("DenseKKTSolver::_update_kkt")
     def _update_kkt(self, data: DenseData, x_reg: cp.ndarray) -> None:
         """
         Compute the KKT matrix:
         KKT = P + x_reg + 1/delta*A^T*A + G^T*(z_reg)^-1*G
         """
         # ! can do these only for lower diagonal part
-        self._kkt_mat = data.P + cp.diag(x_reg)
+        self._kkt_mat[:, :] = data.P
+        self._kkt_mat.flat[::data.n + 1] += x_reg
         
+        # condense A part: kkt += 1/delta * A^T * A
         if data.p > 0:
-            self._kkt_mat += (1.0 / self._delta) * self._AtA
+            self._AtA_scaled[:, :] = self._AtA
+            cp.multiply(self._AtA_scaled, 1.0 / self._delta, out=self._AtA_scaled)
+            self._kkt_mat += self._AtA_scaled
 
+        # condense G part: kkt += G^T * diag(z_reg_inv) * G
         if data.m > 0:
-            self._kkt_mat += data.G.T @ cp.diag(self._z_reg_inv) @ data.G
+            self._Gt_scaled[:, :] = data.G.T
+            cp.multiply(self._Gt_scaled, self._z_reg_inv, out=self._Gt_scaled)
+            cp.matmul(self._Gt_scaled, data.G, out=self._GtG_scaled)
+            self._kkt_mat += self._GtG_scaled
     
+    @nvtx.annotate("DenseKKTSolver::update_scalings_and_factor")
     def update_scalings_and_factor(self, data: DenseData, delta: float, x_reg: cp.ndarray, z_reg: cp.ndarray) -> bool:
         """
         z_reg = [delta+s_i/z_i for i in 1, ..., m]
         """
         self._delta = delta
-        self._z_reg_inv = 1.0 / z_reg
+        cp.reciprocal(z_reg, out=self._z_reg_inv)
         self._update_kkt(data, x_reg)
         try:
-            self._kkt_mat = cp.linalg.cholesky(self._kkt_mat)
+            with cupyx.errstate(linalg='raise'):  # raise exception on factorization failure
+                # TODO: this is not efficient since it generates tmp rather than in-place factorization
+                # Should investigate cupy raw bindings to call cusolver directly.
+                # Refer to: https://github.com/cupy/cupy/blob/main/cupy/linalg/_decomposition.py
+                self._kkt_mat[:, :] = cp.linalg.cholesky(self._kkt_mat)
+                cp.cuda.get_current_stream().synchronize()
             return True
         except cp.linalg.LinAlgError:  # TODO: need to investigate specific exception type raise by cupy.linalg.cholesky
             return False
-        
+    
+    @nvtx.annotate("DenseKKTSolver::solve")
     def solve(self, data: DenseData, rhs_x: cp.ndarray, rhs_y: cp.ndarray, rhs_z: cp.ndarray, delta_x: cp.ndarray, delta_y: cp.ndarray, delta_z: cp.ndarray):
         """
         Solve the KKT system using the factorized KKT matrix.
@@ -69,18 +89,24 @@ class DenseKKTSolver(KKTSolverBase):
         self._rhs[:] = rhs_x
         if data.p > 0:
             self._rhs += 1/self._delta * data.A.T @ rhs_y
-        # ! need to be careful when union(idx_hl, idx_hu) != all indices of m
         if data.m > 0:
-            self._rhs += data.G.T @ (self._z_reg_inv * rhs_z)
+            self._rhs += self._Gt_scaled @ rhs_z
         
+        # TODO: use cusolver directly to do inplace operation for better performance
         # forward substitution
         delta_x[:] = solve_triangular(self._kkt_mat, self._rhs, lower=True, overwrite_b=True)
         # backward substitution
         delta_x[:] = solve_triangular(self._kkt_mat, delta_x, lower=True, trans='T', overwrite_b=True)
-        # dy = 1/delta * (A * dx - r_y), dz = (W+delta*I)^-1 * (G * dx - r_z)
-        delta_y[:] = 1/self._delta * (data.A @ delta_x - rhs_y) if data.p > 0 else cp.array([])
-        delta_z[:] = self._z_reg_inv * (data.G @ delta_x - rhs_z) if data.m > 0 else cp.array([])
-    
+        # recover delta_y and delta_z
+        # dy = 1/delta * (A * dx - r_y)
+        delta_y[:] = data.A @ delta_x
+        delta_y -= rhs_y
+        delta_y /= self._delta
+        # dz = (W+delta*I)^-1 * (G * dx - r_z)
+        delta_z[:] = data.G @ delta_x
+        delta_z -= rhs_z
+        delta_z *= self._z_reg_inv
+
     def eval_P_x(self, data: DenseData, alpha: float, x: cp.ndarray, z: cp.ndarray):
         z[:] = data.P @ x * alpha
     

@@ -1,7 +1,8 @@
 from typing import Optional
 import cupy as cp
 from cupyx.scipy.sparse import csr_matrix, diags, bmat
-from nvmath.sparse.advanced import DirectSolver, DirectSolverAlgType
+from nvmath.sparse.advanced import DirectSolver, DirectSolverAlgType, DirectSolverOptions, DirectSolverMatrixType, DirectSolverMatrixViewType
+from nvmath.bindings.cudss import PivotType
 import nvtx
 
 from ..kkt_solver import KKTSolverBase
@@ -13,9 +14,9 @@ class SparseKKTSolver(KKTSolverBase):
     """
     def __init__(self, data: SparseData):
         super().__init__()
-        self._delta = cp.nan
-        self._x_reg = cp.zeros(data.n)
-        self._z_reg = cp.zeros(data.m)
+        # self._delta = cp.nan
+        # self._x_reg = cp.zeros(data.n)
+        # self._z_reg = cp.zeros(data.m)
 
         self._kkt_mat = self._initialize_kkt_csr(data.P, data.A, data.G)
 
@@ -23,25 +24,31 @@ class SparseKKTSolver(KKTSolverBase):
         self._sol = cp.zeros(self._kkt_mat.shape[0], dtype=cp.float64)
 
         # pre-compute diagonal indices for efficient in-place updates
-        self._diag_indices = self._find_diagonal_indices(self._kkt_mat)
+        self._diag_x_indices = cp.empty(data.n, dtype=cp.int32)
+        self._diag_y_indices = cp.empty(data.p, dtype=cp.int32)
+        self._diag_z_indices = cp.empty(data.m, dtype=cp.int32)
+        self._find_diagonal_indices()
 
-        # NOTE: do NOT use a context manager here; it will close the solver at the end
-        # of __init__, making subsequent factorize() calls fail.
-        self._ldlt_solver = DirectSolver(
-            self._kkt_mat,
-            self._rhs
-        )
-        config = self._ldlt_solver.plan_config
-        config.reordering_algorithm = DirectSolverAlgType.ALG_1
+        # setup cuDSS solver
+        self._ldlt_solver = DirectSolver(self._kkt_mat, self._rhs)
+        self._ldlt_solver.options.sparse_system_type = DirectSolverMatrixType.SYMMETRIC
+        self._ldlt_solver.options.sparse_system_view = DirectSolverMatrixViewType.FULL  # TODO: can change this to LOWER if only update lower part of KKT
+        self._ldlt_solver.plan_config.reordering_algorithm = DirectSolverAlgType.ALG_DEFAULT
+        # self._ldlt_solver.plan_config.pivot_type = PivotType.PIVOT_NONE  # ! set to no pivoting, but seems don't work since changing pivot.eps still makes a difference
+        self._ldlt_solver.factorization_config.pivot_eps = 1e-6  # ! a larger pivot_eps seems to improve convergence
+        
         with nvtx.annotate("SparseKKTSolver::cudss_plan"):
-            self._ldlt_solver.plan()  # precompute reordering and symbolic factorization
+            plan_info = self._ldlt_solver.plan()  # precompute reordering and symbolic factorization
+            # plan_info.inertia  # can be used to check inertia if needed
 
     def __del__(self):
-        # Best-effort cleanup.
-        solver = getattr(self, "_solver", None)
-        close = getattr(solver, "close", None)
-        if callable(close):
-            close()
+        ldlt_solver = getattr(self, "_ldlt_solver", None)
+        if ldlt_solver is not None:
+            try:
+                ldlt_solver.free()
+            except Exception:
+                pass
+            self._ldlt_solver = None
 
     @staticmethod
     def _initialize_kkt_csr(P: csr_matrix, A: Optional[csr_matrix] = None, G: Optional[csr_matrix] = None) -> csr_matrix:
@@ -73,47 +80,38 @@ class SparseKKTSolver(KKTSolverBase):
             )
         return kkt
     
-    @staticmethod
-    def _find_diagonal_indices(mat: csr_matrix) -> cp.ndarray:
+    def _find_diagonal_indices(self) -> None:
         """
         Find the positions of diagonal elements in the CSR data array.
         Returns a 1D array of indices into mat.data where diagonal elements are located.
         """
-        n = mat.shape[0]
-        diag_idx = cp.empty(n, dtype=cp.int32)
-        
-        for i in range(n):
-            row_start = int(mat.indptr[i])
-            row_end = int(mat.indptr[i + 1])
+        dim = self._kkt_mat.shape[0]
+        diag_idx = cp.empty(dim, dtype=cp.int32)
+        for i in range(dim):
+            row_start = int(self._kkt_mat.indptr[i])
+            row_end = int(self._kkt_mat.indptr[i + 1])
             # find where column == i in this row
             for j in range(row_start, row_end):
-                if int(mat.indices[j]) == i:
+                if int(self._kkt_mat.indices[j]) == i:
                     diag_idx[i] = j
                     break
-        return diag_idx
+
+        n, p, m = self._diag_x_indices.size, self._diag_y_indices.size, self._diag_z_indices.size
+        self._diag_x_indices = diag_idx[:n]
+        self._diag_y_indices = diag_idx[n : n+p]
+        self._diag_z_indices = diag_idx[n+p : n+p+m]
     
     @nvtx.annotate("SparseKKTSolver::_update_kkt")
     def _update_kkt(self, data: SparseData, delta: float, x_reg: cp.ndarray, z_reg: cp.ndarray) -> None:
-        # IMPORTANT:
-        # - cupyx CSR does not support efficient block assignment like self._kkt_mat[:n, :n] = ...
-        # - cp.diag/cp.eye create dense matrices and are very costly
-        # - DirectSolver reuses the symbolic factorization only if sparsity pattern is unchanged
-        # - setdiag() creates NEW buffers, breaking DirectSolver's reference to the matrix
-        #
-        # We built the KKT with diagonal placeholders. Now we update ONLY the diagonal IN-PLACE
-        # by directly modifying the CSR data array using pre-computed indices.
-        n, p, m = data.n, data.p, data.m
-        diag_top = data.P.diagonal() + x_reg
-        diag_mid = -delta * cp.ones(p, dtype=cp.float64)
-        diag_bot = -z_reg
-        full_diag = cp.concatenate([diag_top, diag_mid, diag_bot])
-        self._kkt_mat.data[self._diag_indices] = full_diag
+        self._kkt_mat.data[self._diag_x_indices] = data.P.diagonal() + x_reg        
+        self._kkt_mat.data[self._diag_y_indices] = -delta
+        self._kkt_mat.data[self._diag_z_indices] = -z_reg
     
     @nvtx.annotate("SparseKKTSolver::update_scalings_and_factor")
     def update_scalings_and_factor(self, data: SparseData, delta: float, x_reg: cp.ndarray, z_reg: cp.ndarray) -> bool:
-        self._delta = delta
-        self._x_reg = x_reg
-        self._z_reg = z_reg
+        # self._delta = delta
+        # self._x_reg[:] = x_reg
+        # self._z_reg[:] = z_reg
 
         self._update_kkt(data, delta, x_reg, z_reg)
 
@@ -148,9 +146,9 @@ class SparseKKTSolver(KKTSolverBase):
         # assert self._sol.dtype == cp.float64
         # assert cp.allclose(self._kkt_mat @ self._sol, self._rhs)
 
-        delta_x[:] = self._sol[:n]
-        delta_y[:] = self._sol[n:n+p]
-        delta_z[:] = self._sol[n+p:n+p+m]
+        cp.take(self._sol, cp.arange(0, n), out=delta_x)        # in-place copy for delta_x
+        cp.take(self._sol, cp.arange(n, n+p), out=delta_y)      # in-place copy for delta_y
+        cp.take(self._sol, cp.arange(n+p, n+p+m), out=delta_z)  # in-place copy for delta_z
     
 
     @nvtx.annotate("SparseKKTSolver::eval_P_x")

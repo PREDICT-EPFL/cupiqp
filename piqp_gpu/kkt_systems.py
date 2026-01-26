@@ -30,16 +30,16 @@ class KKTSystem:
 
         # store the value of slack and dual variables value at this iteration, will be used in recovering the slack step: S*delta_z + Z*delta_s = r_s
         # allocate for max possible size, but we will only use part of them according to idx_hu and idx_hl. 
-        self._m_s_u = cp.zeros(self._data.m)
-        self._m_s_l = cp.zeros(self._data.m)
-        self._m_z_u_inv = cp.zeros(self._data.m)
-        self._m_z_l_inv = cp.zeros(self._data.m)
+        self._m_s_u = cp.zeros(self._data.num_hu)
+        self._m_s_l = cp.zeros(self._data.num_hl)
+        self._m_z_u_inv = cp.zeros(self._data.num_hu)
+        self._m_z_l_inv = cp.zeros(self._data.num_hl)
         # allocate for max possible size, but we will only use part of them according to idx_xu and idx_xl. 
         # TODO: can be optimized later to reduce memory usage
-        self._m_s_bu = cp.zeros(self._data.n)
-        self._m_s_bl = cp.zeros(self._data.n)
-        self._m_z_bu_inv = cp.zeros(self._data.n)
-        self._m_z_bl_inv = cp.zeros(self._data.n)
+        self._m_s_bu = cp.zeros(self._data.num_xu)
+        self._m_s_bl = cp.zeros(self._data.num_xl)
+        self._m_z_bu_inv = cp.zeros(self._data.num_xu)
+        self._m_z_bl_inv = cp.zeros(self._data.num_xl)
 
         # pre-allocate memory for some variables used in factor and solve
         self._w_u_delta_inv = cp.zeros(self._data.num_hu)   # store 1./(s_u / z_u + delta)
@@ -47,6 +47,11 @@ class KKTSystem:
         self._w_bu_delta_inv = cp.zeros(self._data.num_xu)  # store 1./(s_bu / z_bu + delta)
         self._w_bl_delta_inv = cp.zeros(self._data.num_xl)  # store 1./(s_bl / z_bl + delta)
 
+        # pre-allocate memory for some variables used to store updated rhs in solve
+        self._updated_rhs_z_u = cp.zeros(self._data.num_hu)
+        self._updated_rhs_z_l = cp.zeros(self._data.num_hl)
+        self._updated_rhs_z_bu = cp.zeros(self._data.num_xu)
+        self._updated_rhs_z_bl = cp.zeros(self._data.num_xl)
 
     @nvtx.annotate("KKTSystem::update_scalings_and_factor")
     def update_scalings_and_factor(self, data: Data, rho: float, delta: float, vars: Variables) -> bool:
@@ -55,31 +60,46 @@ class KKTSystem:
 
         The variable vars is the current primal/dual variable values at this iteration, i.e., values of x, y, z_u, z_l, s_u, s_l, z_bu, z_bl, s_bu, s_bl at the current iteration.
         """
-        self._delta = delta
+        with nvtx.annotate("KKTSystem::update_scalings_and_factor::update_regularizations"):
+            self._delta = delta
 
-        # store the current slack and dual variable values at this iteration
-        self._m_s_u[:] = vars.s_u
-        self._m_s_l[:] = vars.s_l
-        self._m_s_bu[:] = vars.s_bu
-        self._m_s_bl[:] = vars.s_bl
-        self._m_z_u_inv[data.idx_hu] = 1. / vars.z_u[data.idx_hu]
-        self._m_z_l_inv[data.idx_hl] = 1. / vars.z_l[data.idx_hl]
-        self._m_z_bu_inv[data.idx_xu] = 1. / vars.z_bu[data.idx_xu]
-        self._m_z_bl_inv[data.idx_xl] = 1. / vars.z_bl[data.idx_xl]
+            # store the current slack and dual variable values at this iteration
+            self._m_s_u[:] = vars.s_u
+            self._m_s_l[:] = vars.s_l
+            self._m_s_bu[:] = vars.s_bu
+            self._m_s_bl[:] = vars.s_bl
+            cp.reciprocal(vars.z_u, out=self._m_z_u_inv)  # better than self._m_z_u_inv[:] = 1. / vars.z_u since it avoids temporary allocation
+            cp.reciprocal(vars.z_l, out=self._m_z_l_inv)
+            cp.reciprocal(vars.z_bu, out=self._m_z_bu_inv)
+            cp.reciprocal(vars.z_bl, out=self._m_z_bl_inv)
 
-        # eliminate the box constraints by adding their contribution to x_reg and z_reg
-        self._w_bu_delta_inv[:] = 1. / (self._m_s_bu[data.idx_xu] * self._m_z_bu_inv[data.idx_xu] + self._delta)
-        self._w_bl_delta_inv[:] = 1. / (self._m_s_bl[data.idx_xl] * self._m_z_bl_inv[data.idx_xl] + self._delta)
-        self._x_reg[:] = rho * cp.ones(self._data.n)
-        self._x_reg[data.idx_xu] += self._w_bu_delta_inv
-        self._x_reg[data.idx_xl] += self._w_bl_delta_inv
+            # eliminate the box constraints by adding their contribution to x_reg and z_reg
+            # self._w_bu_delta_inv[:] = 1. / (self._m_s_bu * self._m_z_bu_inv + self._delta)
+            cp.multiply(self._m_s_bu, self._m_z_bu_inv, out=self._w_bu_delta_inv)
+            cp.add(self._w_bu_delta_inv, self._delta, out=self._w_bu_delta_inv)
+            cp.reciprocal(self._w_bu_delta_inv, out=self._w_bu_delta_inv)
+            # self._w_bl_delta_inv[:] = 1. / (self._m_s_bl * self._m_z_bl_inv + self._delta)
+            cp.multiply(self._m_s_bl, self._m_z_bl_inv, out=self._w_bl_delta_inv)
+            cp.add(self._w_bl_delta_inv, self._delta, out=self._w_bl_delta_inv)
+            cp.reciprocal(self._w_bl_delta_inv, out=self._w_bl_delta_inv)
 
-        self._w_u_delta_inv[:] = 1. / (vars.s_u[data.idx_hu] / vars.z_u[data.idx_hu] + self._delta)
-        self._w_l_delta_inv[:] = 1. / (vars.s_l[data.idx_hl] / vars.z_l[data.idx_hl] + self._delta)
-        self._z_reg[:] = cp.zeros(self._data.m)
-        self._z_reg[data.idx_hu] += self._w_u_delta_inv
-        self._z_reg[data.idx_hl] += self._w_l_delta_inv
-        self._z_reg[:] = 1. / self._z_reg
+            self._x_reg[:] = rho
+            self._x_reg[data.idx_xu] += self._w_bu_delta_inv
+            self._x_reg[data.idx_xl] += self._w_bl_delta_inv
+
+            # self._w_u_delta_inv[:] = 1. / (vars.s_u / vars.z_u + self._delta)
+            cp.divide(vars.s_u, vars.z_u, out=self._w_u_delta_inv)
+            cp.add(self._w_u_delta_inv, self._delta, out=self._w_u_delta_inv)
+            cp.reciprocal(self._w_u_delta_inv, out=self._w_u_delta_inv)
+            # self._w_l_delta_inv[:] = 1. / (vars.s_l / vars.z_l + self._delta)
+            cp.divide(vars.s_l, vars.z_l, out=self._w_l_delta_inv)
+            cp.add(self._w_l_delta_inv, self._delta, out=self._w_l_delta_inv)
+            cp.reciprocal(self._w_l_delta_inv, out=self._w_l_delta_inv)
+
+            self._z_reg.fill(0.)
+            self._z_reg[data.idx_hu] += self._w_u_delta_inv
+            self._z_reg[data.idx_hl] += self._w_l_delta_inv
+            cp.reciprocal(self._z_reg, out=self._z_reg)  # self._z_reg[:] = 1. / self._z_reg
 
         factor_success = self._kkt_solver.update_scalings_and_factor(data, delta, self._x_reg, self._z_reg) # ! this is implicitly assuming idx_hu and idx_hl cover all indices of inequalities 0:m
         return factor_success
@@ -87,38 +107,101 @@ class KKTSystem:
     @nvtx.annotate("KKTSystem::solve")
     def solve(self, data: Data, settings: Settings, rhs: Variables, lhs: Variables) -> None:
         with nvtx.annotate("KKTSystem::solve::prepare_rhs"):
-            # ! these following lines are causing extra allocation, need to be optimized later!
-            rhs_z_u = rhs.z_u[data.idx_hu] - self._m_z_u_inv[data.idx_hu] * rhs.s_u[data.idx_hu]  # rhs_z_u - inv(Z_u) * r_s_u
-            rhs_z_l = rhs.z_l[data.idx_hl] - self._m_z_l_inv[data.idx_hl] * rhs.s_l[data.idx_hl]  # rhs_z_l - inv(Z_l) * r_s_l
-            rhs_z_bu = rhs.z_bu[data.idx_xu] - self._m_z_bu_inv[data.idx_xu] * rhs.s_bu[data.idx_xu]  # rhs_z_bu - inv(Z_bu) * r_s_bu
-            rhs_z_bl = rhs.z_bl[data.idx_xl] - self._m_z_bl_inv[data.idx_xl] * rhs.s_bl[data.idx_xl]  # rhs_z_bl - inv(Z_bl) * r_s_bl
+            # ------ elliminate slack variables from rhs
+            # rhs_z_u - inv(Z_u) * r_s_u
+            cp.multiply(self._m_z_u_inv, rhs.s_u, out=self._updated_rhs_z_u)
+            cp.subtract(rhs.z_u, self._updated_rhs_z_u, out=self._updated_rhs_z_u)
+            # rhs_z_l - inv(Z_l) * r_s_l
+            cp.multiply(self._m_z_l_inv, rhs.s_l, out=self._updated_rhs_z_l)
+            cp.subtract(rhs.z_l, self._updated_rhs_z_l, out=self._updated_rhs_z_l)
+            # rhs_z_bu - inv(Z_bu) * r_s_bu
+            cp.multiply(self._m_z_bu_inv, rhs.s_bu, out=self._updated_rhs_z_bu)
+            cp.subtract(rhs.z_bu, self._updated_rhs_z_bu, out=self._updated_rhs_z_bu)
+            # rhs_z_bl - inv(Z_bl) * r_s_bl
+            cp.multiply(self._m_z_bl_inv, rhs.s_bl, out=self._updated_rhs_z_bl)
+            cp.subtract(rhs.z_bl, self._updated_rhs_z_bl, out=self._updated_rhs_z_bl)
 
-            # use self._work_x to hold modified rhs_x, avoid extra allocation
+            # To avoid avoid extra allocation, we use:
+            # self._work_x to hold modified rhs_x (to be passed to KKTSolver), self._work_z to hold modified rhs_z (to be passed to KKTSolver)
+            # use lhs.z_* to hold temporary value self._w_u_delta_inv * self._updated_rhs_z_u, and so on
+
+            # The below code is equivalent to:
+            # self._work_x[:] = rhs.x
+            # self._work_x[data.idx_xu] += self._w_bu_delta_inv * self._updated_rhs_z_bu
+            # self._work_x[data.idx_xl] -= self._w_bl_delta_inv * self._updated_rhs_z_bl
+            # self._work_z[:] = 0.
+            # self._work_z[data.idx_hu] += self._w_u_delta_inv * self._updated_rhs_z_u
+            # self._work_z[data.idx_hl] -= self._w_l_delta_inv * self._updated_rhs_z_l
+            # self._work_z[:] *= self._z_reg
+
             self._work_x[:] = rhs.x
-            self._work_x[data.idx_xu] += self._w_bu_delta_inv * rhs_z_bu
-            self._work_x[data.idx_xl] -= self._w_bl_delta_inv * rhs_z_bl
+            cp.multiply(self._w_bu_delta_inv, self._updated_rhs_z_bu, out=lhs.z_bu)
+            cp.add.at(self._work_x, data.idx_xu, lhs.z_bu)
+            cp.multiply(self._w_bl_delta_inv, self._updated_rhs_z_bl, out=lhs.z_bl)
+            cp.negative(lhs.z_bl, out=lhs.z_bl)
+            cp.add.at(self._work_x, data.idx_xl, lhs.z_bl)
 
-            # use self._work_z to hold modified rhs_z, avoid extra allocation
             self._work_z.fill(0)  # faster than cp.zeros assignment
-            self._work_z[data.idx_hu] += self._w_u_delta_inv * rhs_z_u
-            self._work_z[data.idx_hl] -= self._w_l_delta_inv * rhs_z_l
+            cp.multiply(self._w_u_delta_inv, self._updated_rhs_z_u, out=lhs.z_u) # use lhs.z_u as temporary storage
+            cp.add.at(self._work_z, data.idx_hu, lhs.z_u)
+            cp.multiply(self._w_l_delta_inv, self._updated_rhs_z_l, out=lhs.z_l)
+            cp.negative(lhs.z_l, out=lhs.z_l)
+            cp.add.at(self._work_z, data.idx_hl, lhs.z_l)
             self._work_z[:] *= self._z_reg
 
         self._kkt_solver.solve(data, self._work_x, rhs.y, self._work_z, lhs.x, lhs.y, self._work_z)  # ! the second _work_z is used to hold delta_z, but useless anyway. Can be further optimized.
 
         with nvtx.annotate("KKTSystem::solve::recover_lhs"):
-            delta_x = lhs.x  # reference
-            lhs.z_u[data.idx_hu] = self._w_u_delta_inv * (data.G[data.idx_hu, :] @ delta_x - rhs_z_u)   # delta_z_u
-            lhs.z_l[data.idx_hl] = self._w_l_delta_inv * (-data.G[data.idx_hl, :] @ delta_x - rhs_z_l)  # delta_z_l
-            lhs.z_bu[data.idx_xu] = self._w_bu_delta_inv * (delta_x[data.idx_xu] - rhs.z_bu[data.idx_xu] + self._m_z_bu_inv[data.idx_xu] * rhs.s_bu[data.idx_xu])  # delta_z_bu
-            lhs.z_bl[data.idx_xl] = -self._w_bl_delta_inv * (delta_x[data.idx_xl] + rhs.z_bl[data.idx_xl] - self._m_z_bl_inv[data.idx_xl] * rhs.s_bl[data.idx_xl])  # delta_z_bl
+            self._work_z[:] = data.G @ lhs.x  # G * delta_x, where delta_x is stored in lhs.x
 
-            # recover slack variable steps
-            lhs.s_u[data.idx_hu] = self._m_z_u_inv[data.idx_hu] * (rhs.s_u[data.idx_hu] - self._m_s_u[data.idx_hu] * lhs.z_u[data.idx_hu])  # delta_s_u = inv(Z_u) (r_s_u - S_u delta_z_u)
-            lhs.s_l[data.idx_hl] = self._m_z_l_inv[data.idx_hl] * (rhs.s_l[data.idx_hl] - self._m_s_l[data.idx_hl] * lhs.z_l[data.idx_hl])  # delta_s_l = inv(Z_l) (r_s_l - S_l delta_z_l)
-            lhs.s_bu[data.idx_xu] = self._m_z_bu_inv[data.idx_xu] * (rhs.s_bu[data.idx_xu] - self._m_s_bu[data.idx_xu] * lhs.z_bu[data.idx_xu])  # delta_s_bu = inv(Z_bu) (r_s_bu - S_bu delta_z_bu)
-            lhs.s_bl[data.idx_xl] = self._m_z_bl_inv[data.idx_xl] * (rhs.s_bl[data.idx_xl] - self._m_s_bl[data.idx_xl] * lhs.z_bl[data.idx_xl])  # delta_s_bl = inv(Z_bl) (r_s_bl - S_bl delta_z_bl)
+            # ----- recover dual variables on lhs
+            # The below code is equivalent to:
+            # lhs.z_u[:] = self._w_u_delta_inv * (G_dx[data.idx_hu] - self._updated_rhs_z_u)   # delta_z_u
+            # lhs.z_l[:] = self._w_l_delta_inv * (-G_dx[data.idx_hl] - self._updated_rhs_z_l)  # delta_z_l
+            # lhs.z_bu[:] = self._w_bu_delta_inv * (lhs.x[data.idx_xu] - rhs.z_bu + self._m_z_bu_inv * rhs.s_bu)  # delta_z_bu
+            # lhs.z_bl[:] = -self._w_bl_delta_inv * (lhs.x[data.idx_xl] + rhs.z_bl - self._m_z_bl_inv * rhs.s_bl)  # delta_z_bl
 
+            lhs.z_u[:] = self._work_z[data.idx_hu]
+            lhs.z_u -= self._updated_rhs_z_u
+            lhs.z_u *= self._w_u_delta_inv
+
+            lhs.z_l[:] = self._work_z[data.idx_hl]
+            lhs.z_l *= -1.
+            lhs.z_l -= self._updated_rhs_z_l
+            lhs.z_l *= self._w_l_delta_inv
+
+            cp.multiply(self._m_z_bu_inv, rhs.s_bu, out=lhs.z_bu)
+            lhs.z_bu += lhs.x[data.idx_xu]
+            lhs.z_bu -= rhs.z_bu
+            lhs.z_bu *= self._w_bu_delta_inv
+
+            cp.multiply(self._m_z_bl_inv, rhs.s_bl, out=lhs.z_bl)
+            lhs.z_bl -= lhs.x[data.idx_xl]
+            lhs.z_bl -= rhs.z_bl
+            lhs.z_bl *= self._w_bl_delta_inv
+
+            # ----- recover slack variable on lhs
+            # The below code is equivalent to:
+            # lhs.s_u[:] = self._m_z_u_inv * (rhs.s_u - self._m_s_u * lhs.z_u)  # delta_s_u = inv(Z_u) (r_s_u - S_u delta_z_u)
+            # lhs.s_l[:] = self._m_z_l_inv * (rhs.s_l - self._m_s_l * lhs.z_l)  # delta_s_l = inv(Z_l) (r_s_l - S_l delta_z_l)
+            # lhs.s_bu[:] = self._m_z_bu_inv * (rhs.s_bu - self._m_s_bu * lhs.z_bu)  # delta_s_bu = inv(Z_bu) (r_s_bu - S_bu delta_z_bu)
+            # lhs.s_bl[:] = self._m_z_bl_inv * (rhs.s_bl - self._m_s_bl * lhs.z_bl)  # delta_s_bl = inv(Z_bl) (r_s_bl - S_bl delta_z_bl)
+
+            cp.multiply(self._m_s_u, lhs.z_u, out=lhs.s_u)
+            cp.subtract(rhs.s_u, lhs.s_u, out=lhs.s_u)
+            cp.multiply(self._m_z_u_inv, lhs.s_u, out=lhs.s_u)
+
+            cp.multiply(self._m_s_l, lhs.z_l, out=lhs.s_l)
+            cp.subtract(rhs.s_l, lhs.s_l, out=lhs.s_l)
+            cp.multiply(self._m_z_l_inv, lhs.s_l, out=lhs.s_l)
+
+            cp.multiply(self._m_s_bu, lhs.z_bu, out=lhs.s_bu)
+            cp.subtract(rhs.s_bu, lhs.s_bu, out=lhs.s_bu)
+            cp.multiply(self._m_z_bu_inv, lhs.s_bu, out=lhs.s_bu)
+
+            cp.multiply(self._m_s_bl, lhs.z_bl, out=lhs.s_bl)
+            cp.subtract(rhs.s_bl, lhs.s_bl, out=lhs.s_bl)
+            cp.multiply(self._m_z_bl_inv, lhs.s_bl, out=lhs.s_bl)
 
     @nvtx.annotate("KKTSystem::eval_P_x")
     def eval_P_x(self, data: Data, alpha: float, x: cp.ndarray, z: cp.ndarray):

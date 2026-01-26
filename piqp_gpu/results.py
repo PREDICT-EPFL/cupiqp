@@ -2,6 +2,8 @@ import cupy as cp
 from enum import Enum
 from dataclasses import dataclass
 
+from .data import Data
+
 class Status(Enum):
     PIQP_UNSOLVED = -1
     PIQP_SOLVED= 0
@@ -15,22 +17,24 @@ class Variables:
     """
     Class to hold optimization variables.
     """
-    def __init__(self, n: int, p: int, m: int):
-        self.n = n        # Number of primal variables
-        self.p = p        # Number of equality constraints
-        self.m = m        # Number of inequality constraints
+    def __init__(self):
+        pass
 
-        self.x = cp.zeros(n)        # Primal variables
-        self.y = cp.zeros(p)        # Dual variables for equality constraints
-        self.z_u = cp.ones(m)      # Dual variables for inequality constraints (upper)
-        self.z_l = cp.ones(m)      # Dual variables for inequality constraints (lower)
-        self.z_bl = cp.ones(n)     # Dual variables for bound constraints (lower)
-        self.z_bu = cp.ones(n)     # Dual variables for bound constraints (upper)
-        self.s_u = cp.ones(m)      # Slack variables for inequality constraints (upper)
-        self.s_l = cp.ones(m)      # Slack variables for inequality constraints (lower)
-        self.s_bl = cp.ones(n)     # Slack variables for bound constraints (lower)
-        self.s_bu = cp.ones(n)     # Slack variables for bound constraints (upper)
-        # z_l, z_u are of size m because in the original KKT matrix we must have rows[G, ...; -G, ...] to efficiently handle double-sided inequalities
+    def init(self, data: Data):
+        self.n = data.n        # Number of primal variables
+        self.p = data.p        # Number of equality constraints
+        self.m = data.m        # Number of inequality constraints
+        
+        self.x = cp.zeros(data.n)            # Primal variables
+        self.y = cp.zeros(data.p)            # Dual variables for equality constraints
+        self.z_u = cp.ones(data.num_hu)      # Dual variables for inequality constraints (upper)
+        self.z_l = cp.ones(data.num_hl)      # Dual variables for inequality constraints (lower)
+        self.z_bl = cp.ones(data.num_xl)     # Dual variables for bound constraints (lower)
+        self.z_bu = cp.ones(data.num_xu)     # Dual variables for bound constraints (upper)
+        self.s_u = cp.ones(data.num_hu)      # Slack variables for inequality constraints (upper)
+        self.s_l = cp.ones(data.num_hl)      # Slack variables for inequality constraints (lower)
+        self.s_bl = cp.ones(data.num_xl)     # Slack variables for bound constraints (lower)
+        self.s_bu = cp.ones(data.num_xu)     # Slack variables for bound constraints (upper)
 
     def all_finite(self) -> bool:
         return (cp.isfinite(self.x).all() and
@@ -55,49 +59,6 @@ class Variables:
                 cp.allclose(self.s_l, other.s_l, rtol=rtol, atol=atol) and
                 cp.allclose(self.s_bl, other.s_bl, rtol=rtol, atol=atol) and
                 cp.allclose(self.s_bu, other.s_bu, rtol=rtol, atol=atol))
-    
-    def __copy__(self) -> 'Variables':
-        new_vars = Variables(len(self.x), len(self.y), len(self.z_u))
-        new_vars.x = self.x.copy()
-        new_vars.y = self.y.copy()
-        new_vars.z_u = self.z_u.copy()
-        new_vars.z_l = self.z_l.copy()
-        new_vars.z_bu = self.z_bu.copy()
-        new_vars.z_bl = self.z_bl.copy()
-        new_vars.s_u = self.s_u.copy()
-        new_vars.s_l = self.s_l.copy()
-        new_vars.s_bu = self.s_bu.copy()
-        new_vars.s_bl = self.s_bl.copy()
-        return new_vars
-    
-    def copy(self) -> 'Variables':
-        """Create a copy of this Variables object."""
-        return self.__copy__()
-    
-    def __sub__(self, other: 'Variables') -> 'Variables':
-        if not (len(self.x) == len(other.x) and
-                len(self.y) == len(other.y) and
-                len(self.z_u) == len(other.z_u) and
-                len(self.z_l) == len(other.z_l) and
-                len(self.z_bl) == len(other.z_bl) and
-                len(self.z_bu) == len(other.z_bu) and
-                len(self.s_u) == len(other.s_u) and
-                len(self.s_l) == len(other.s_l) and
-                len(self.s_bl) == len(other.s_bl) and
-                len(self.s_bu) == len(other.s_bu)):
-            raise ValueError("Dimension mismatch in Variables subtraction.")
-        result = Variables(self.n, self.p, self.m)
-        result.x = self.x - other.x
-        result.y = self.y - other.y
-        result.z_u = self.z_u - other.z_u
-        result.z_l = self.z_l - other.z_l
-        result.z_bu = self.z_bu - other.z_bu
-        result.z_bl = self.z_bl - other.z_bl
-        result.s_u = self.s_u - other.s_u
-        result.s_l = self.s_l - other.s_l
-        result.s_bu = self.s_bu - other.s_bu
-        result.s_bl = self.s_bl - other.s_bl
-        return result
     
     def __str__(self) -> str:
         return (f"Variables:\n"
@@ -176,6 +137,9 @@ class Info:
 
 
 class Result(Variables):
-    def __init__(self, n: int, p: int, m: int):
-        super().__init__(n, p, m)  # Initialize with default sizes; adjust as needed
+    def __init__(self):
+        super().__init__()
         self.info = Info()
+
+    def init(self, data: Data):
+        super().init(data)
