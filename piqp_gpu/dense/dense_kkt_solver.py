@@ -6,6 +6,7 @@ import nvtx
 
 from ..kkt_solver import KKTSolverBase, KKTUpdateOptions
 from .dense_data import DenseData
+from .dense_cholesky import CholeskyInplaceSolver
 
 class DenseKKTSolver(KKTSolverBase):
     """
@@ -26,13 +27,13 @@ class DenseKKTSolver(KKTSolverBase):
         self._z_reg_inv = cp.nan * cp.ones(data.m)  # used to store the inverse of diag(W+delta*I), i.e., [... (s_i/z_i + delta)^-1 ...]
         
         self._kkt_mat = cp.zeros((data.n, data.n))  # Placeholder for KKT matrix
-        self._rhs = cp.zeros(data.n, dtype=cp.float64)
 
         self._AtA = data.A.T @ data.A if data.p > 0 else cp.zeros((0, 0))
         self._AtA_scaled = cp.zeros_like(self._AtA)   # placeholder for 1/delta* A^T*A
         self._Gt_scaled = cp.zeros((data.n, data.m), dtype=cp.float64)  # placeholder for G^T * diag(z_reg_inv)
         self._GtG_scaled = cp.zeros((data.n, data.n), dtype=cp.float64)  # placeholder for G^T * diag(z_reg_inv) * G
 
+        self._cholesky_solver = CholeskyInplaceSolver(data.n, dtype=cp.float64)
 
     def update_data(self, data: DenseData, update_options: KKTUpdateOptions):
         if update_options == KKTUpdateOptions.KKT_UPDATE_A and data.p > 0:
@@ -69,16 +70,14 @@ class DenseKKTSolver(KKTSolverBase):
         self._delta = delta
         cp.reciprocal(z_reg, out=self._z_reg_inv)
         self._update_kkt(data, x_reg)
-        try:
-            with cupyx.errstate(linalg='raise'):  # raise exception on factorization failure
-                # TODO: this is not efficient since it generates tmp rather than in-place factorization
-                # Should investigate cupy raw bindings to call cusolver directly.
-                # Refer to: https://github.com/cupy/cupy/blob/main/cupy/linalg/_decomposition.py
-                self._kkt_mat[:, :] = cp.linalg.cholesky(self._kkt_mat)
-                cp.cuda.get_current_stream().synchronize()
-            return True
-        except cp.linalg.LinAlgError:  # TODO: need to investigate specific exception type raise by cupy.linalg.cholesky
-            return False
+        # try:
+        #     with cupyx.errstate(linalg='raise'):  # raise exception on factorization failure
+        #         self._kkt_mat[:, :] = cp.linalg.cholesky(self._kkt_mat)
+        #         cp.cuda.get_current_stream().synchronize()
+        #     return True
+        # except cp.linalg.LinAlgError:  # TODO: need to investigate specific exception type raise by cupy.linalg.cholesky
+        #     return False
+        return self._cholesky_solver.factorize(self._kkt_mat)
     
     @nvtx.annotate("DenseKKTSolver::solve")
     def solve(self, data: DenseData, rhs_x: cp.ndarray, rhs_y: cp.ndarray, rhs_z: cp.ndarray, delta_x: cp.ndarray, delta_y: cp.ndarray, delta_z: cp.ndarray):
@@ -86,17 +85,13 @@ class DenseKKTSolver(KKTSolverBase):
         Solve the KKT system using the factorized KKT matrix.
         """
         # solve KKT * dx = rhs_x + 1/delta*A^T*rhs_y + G^T*diag(z_reg_inv)*rhs_z
-        self._rhs[:] = rhs_x
+        delta_x[:] = rhs_x  # use delta_x to hold modified rhs
         if data.p > 0:
-            self._rhs += 1/self._delta * data.A.T @ rhs_y
+            delta_x += 1/self._delta * data.A.T @ rhs_y
         if data.m > 0:
-            self._rhs += self._Gt_scaled @ rhs_z
-        
-        # TODO: use cusolver directly to do inplace operation for better performance
-        # forward substitution
-        delta_x[:] = solve_triangular(self._kkt_mat, self._rhs, lower=True, overwrite_b=True)
-        # backward substitution
-        delta_x[:] = solve_triangular(self._kkt_mat, delta_x, lower=True, trans='T', overwrite_b=True)
+            delta_x += self._Gt_scaled @ rhs_z        
+        self._cholesky_solver.solve(delta_x)
+
         # recover delta_y and delta_z
         # dy = 1/delta * (A * dx - r_y)
         delta_y[:] = data.A @ delta_x
