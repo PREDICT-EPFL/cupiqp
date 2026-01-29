@@ -47,6 +47,25 @@ class Variables:
                 cp.isfinite(self.s_l).all() and
                 cp.isfinite(self.s_bl).all() and
                 cp.isfinite(self.s_bu).all())
+
+    @property
+    def buffer_ptr(self) -> tuple:
+        """
+        Returns a tuple of memory addresses of the underlying arrays.
+        Used for CUDA graph caching keys.
+        """
+        return (
+            self.x.data.ptr,
+            self.y.data.ptr,
+            self.z_u.data.ptr,
+            self.z_l.data.ptr,
+            self.z_bu.data.ptr,
+            self.z_bl.data.ptr,
+            self.s_u.data.ptr,
+            self.s_l.data.ptr,
+            self.s_bu.data.ptr,
+            self.s_bl.data.ptr
+        )
     
     def allclose(self, other: 'Variables', rtol: float = 1e-8, atol: float = 1e-8) -> bool:
         return (cp.allclose(self.x, other.x, rtol=rtol, atol=atol) and
