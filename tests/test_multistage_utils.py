@@ -1,3 +1,4 @@
+from matplotlib.pylab import beta
 import numpy as np
 import warp as wp
 import cupy as cp
@@ -7,14 +8,14 @@ sys.path.append('./')
 sys.path.append('../')
 import unittest
 
-from cupiqp.multistage.multistage_utils import BlockTridiagMat
+from cupiqp.multistage.multistage_utils import create_csr_add_btd_kernel
 
 
 class TestMultistageUtils(unittest.TestCase):
     def setUp(self):
         wp.init()
-        self.block_size = 5
-        self.num_blocks = 4
+        self.block_size = 20
+        self.num_blocks = 40
 
         rng = np.random.default_rng(42)
         
@@ -22,9 +23,7 @@ class TestMultistageUtils(unittest.TestCase):
         self.D_np = rng.standard_normal((self.num_blocks, self.block_size, self.block_size))
         self.L_np = rng.standard_normal((self.num_blocks - 1, self.block_size, self.block_size))
 
-        self.A_block = BlockTridiagMat(num_diag_blocks=self.num_blocks, block_size=self.block_size, device="cuda")
-        wp.copy(self.A_block.diag_blocks.data, wp.array(self.D_np, dtype=wp.float64, device="cuda"))
-        wp.copy(self.A_block.off_diag_blocks_lower.data, wp.array(self.L_np, dtype=wp.float64, device="cuda"))
+        self._csr_add_to_btd_kernel = create_csr_add_btd_kernel(self.num_blocks, self.block_size, dtype=wp.float64)
         
         # Reconstruction logic: BlockTridiag -> CSR
         D_cp = cp.array(self.D_np)
@@ -38,14 +37,30 @@ class TestMultistageUtils(unittest.TestCase):
                 
         self.A_csr = cpsp.bmat(blocks, format='csr', dtype=cp.float64)
 
-    def test_csr_to_block_tridiag(self):
-        A_blk_tridiag = BlockTridiagMat.from_csr(self.A_csr, block_size=self.block_size)
+
+    def test_csr_add_btd(self):
+        diag_blocks = wp.from_numpy(np.random.randn(self.num_blocks, self.block_size, self.block_size), dtype=wp.float64, device="cuda")
+        offdiag_blocks = wp.from_numpy(np.random.randn(self.num_blocks - 1, self.block_size, self.block_size), dtype=wp.float64, device="cuda")
+        alpha = np.random.randn()
+
+        D_benchmark = diag_blocks.numpy() + alpha * self.D_np
+        L_benchmark = offdiag_blocks.numpy() + alpha * self.L_np
+        wp.launch(
+            kernel=self._csr_add_to_btd_kernel,
+            dim=self.A_csr.shape[0],
+            inputs=[
+                alpha,
+                self.A_csr.indptr, self.A_csr.indices, self.A_csr.data,
+                diag_blocks,
+                offdiag_blocks,
+            ],
+            device="cuda"
+        )
+        D_reconstructed = diag_blocks.numpy()
+        L_reconstructed = offdiag_blocks.numpy()
         
-        D_reconstructed = A_blk_tridiag.diag_blocks.data.numpy()
-        L_reconstructed = A_blk_tridiag.off_diag_blocks_lower.data.numpy()
-        
-        self.assertTrue(np.allclose(np.tril(D_reconstructed), np.tril(self.D_np), atol=1e-8))
-        self.assertTrue(np.allclose(L_reconstructed, self.L_np, atol=1e-8))
+        self.assertTrue(np.allclose(D_reconstructed, D_benchmark, atol=1e-8))
+        self.assertTrue(np.allclose(L_reconstructed, L_benchmark, atol=1e-8))
 
 
 if __name__ == "__main__":

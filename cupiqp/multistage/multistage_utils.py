@@ -2,23 +2,26 @@ import warp as wp
 import cupyx.scipy.sparse as cpsp
 
 
-def create_csr_add_btd_kernel(block_size: int, dtype=wp.float64):
+def create_csr_add_btd_kernel(num_blocks: int, block_size: int, dtype=wp.float64):
     @wp.kernel
     def _csr_add_btd_kernel(
         alpha: dtype,
         row_ptr: wp.array(dtype=wp.int32),
         col_idx: wp.array(dtype=wp.int32),
         vals: wp.array(dtype=dtype),
-        beta: dtype,
         diag_data: wp.array3d(dtype=dtype),
         off_lower_data: wp.array3d(dtype=dtype),
     ):
         """
-        Perform Y = alpha*X + beta*Y, where X is in CSR format and Y is in block-tridiagonal (BTD) format.
+        Perform Y = alpha*X + Y, where X is in CSR format and Y is in block-tridiagonal (BTD) format.
         Only adds to diagonal and lower blocks.
         """
+        num_blocks_static = wp.static(num_blocks)
         block_size_static = wp.static(block_size)
         row = wp.tid()  # each thread processes one row
+
+        if row >= num_blocks_static * block_size_static:
+            return
         
         start = row_ptr[row]
         end = row_ptr[row + 1]
@@ -33,14 +36,11 @@ def create_csr_add_btd_kernel(block_size: int, dtype=wp.float64):
             bc = c // block_size_static       # block column index
             lc = c - bc * block_size_static   # local column index within the block
 
-            # diagonal block (lower part)
-            if br == bc and lr >= lc:
-            # if br == bc:
-                diag_data[br, lr, lc] *= beta
+            # diagonal block
+            if br == bc:
                 diag_data[br, lr, lc] += alpha * v
             # lower off-diagonal
             elif br == bc + 1:                
-                off_lower_data[br - 1, lr, lc] *= beta
                 off_lower_data[br - 1, lr, lc] += alpha * v
             else:
                 pass
@@ -88,7 +88,7 @@ class BlockTridiagMat:
         self.diag_blocks = DenseBlocks(num_blocks=num_diag_blocks, rows=block_size, cols=block_size, dtype=dtype, device=device)
         self.off_diag_blocks_lower = DenseBlocks(num_blocks=num_diag_blocks-1, rows=block_size, cols=block_size, dtype=dtype, device=device)
         
-        self._csr_add_to_btd_kernel = create_csr_add_btd_kernel(block_size, dtype)
+        self._csr_add_to_btd_kernel = create_csr_add_btd_kernel(num_diag_blocks, block_size, dtype)
 
     @property
     def num_diag_blocks(self):
@@ -172,10 +172,13 @@ class BlockTridiagMat:
         
         if x.shape[0] != self.rows:
             raise ValueError("Dimension mismatch in add_on_diag")
-        
-        for b in range(num_blocks):
-            for i in range(block_size):
-                self.diag_blocks.data[b, i, i] += x[b * block_size + i]
+            
+        wp.launch(
+            kernel=self._add_on_diag_kernel,
+            dim=self.rows,
+            inputs=[x, self.diag_blocks.data],
+            device=self.diag_blocks.data.device
+        )
 
 
 class BlockVec:
