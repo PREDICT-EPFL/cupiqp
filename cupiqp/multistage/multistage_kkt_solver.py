@@ -46,10 +46,10 @@ class MultistageKKTSolver(KKTSolverBase):
         self._kkt_rhs = wp.zeros((self.num_stages, block_size, 1), dtype=wp.float64, device="cuda")
 
         self._cholesky_factor_launch = create_cholesky_factor_launch(
-            self._kkt_diag_blocks, self._kkt_offdiag_blocks, device="cuda", dtype=wp.float64
+            self._kkt_diag_blocks, self._kkt_offdiag_blocks, device="cuda", dtype=wp.float64, use_cuda_graph=True
         )
         self._cholesky_solve_launch = create_cholesky_solve_launch(
-            self._kkt_diag_blocks, self._kkt_offdiag_blocks, self._kkt_rhs, device="cuda", dtype=wp.float64
+            self._kkt_diag_blocks, self._kkt_offdiag_blocks, self._kkt_rhs, device="cuda", dtype=wp.float64, use_cuda_graph=True
         )
         
         self._add_to_btd_diag_kernel = create_add_on_diag_kernel(block_size, wp.float64)
@@ -157,15 +157,18 @@ class MultistageKKTSolver(KKTSolverBase):
         delta_z *= self._z_reg_inv
     
 
+    @nvtx.annotate("MultistageKKTSolver::eval_P_x")
     def eval_P_x(self, data: MultistageData, alpha: float, x: cp.ndarray, z: cp.ndarray):
         # TODO: customize kernels for this
         z[:] = data.P @ x * alpha
 
+    @nvtx.annotate("MultistageKKTSolver::eval_A_xn_and_AT_xt")
     def eval_A_xn_and_AT_xt(self, data: MultistageData, alpha_n: float, xn: cp.ndarray, alpha_t: float, xt: cp.ndarray, zn: cp.ndarray, zt: cp.ndarray):
         # TODO: customize kernels for this
         zn[:] = (data.A @ xn) * alpha_n
         zt[:] = (data.A.T @ xt) * alpha_t
     
+    @nvtx.annotate("MultistageKKTSolver::eval_G_xn_and_GT_xt")
     def eval_G_xn_and_GT_xt(self, data: MultistageData, alpha_n: float, xn: cp.ndarray, alpha_t: float, xt: cp.ndarray, zn: cp.ndarray, zt: cp.ndarray):
         # TODO: customize kernels for this
         zn[:] = (data.G @ xn) * alpha_n
