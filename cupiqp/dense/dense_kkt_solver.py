@@ -171,13 +171,16 @@ class DenseKKTSolver(KKTSolverBase):
         delta_z -= rhs_z
         delta_z *= self._z_reg_inv
 
+    @nvtx.annotate("DenseKKTSolver::eval_P_x")
     def eval_P_x(self, data: DenseData, alpha: float, x: cp.ndarray, z: cp.ndarray):
         z[:] = data.P @ x * alpha
     
+    @nvtx.annotate("DenseKKTSolver::eval_G_xn_and_GT_xt")
     def eval_A_xn_and_AT_xt(self, data: DenseData, alpha_n: float, xn: cp.ndarray, alpha_t: float, xt: cp.ndarray, zn: cp.ndarray, zt: cp.ndarray):
         zn[:] = (data.A @ xn) * alpha_n
         zt[:] = (data.A.T @ xt) * alpha_t
     
+    @nvtx.annotate("DenseKKTSolver::eval_G_xn_and_GT_xt")
     def eval_G_xn_and_GT_xt(self, data: DenseData, alpha_n: float, xn: cp.ndarray, alpha_t: float, xt: cp.ndarray, zn: cp.ndarray, zt: cp.ndarray):
         zn[:] = (data.G @ xn) * alpha_n
         zt[:] = (data.G.T @ xt) * alpha_t
