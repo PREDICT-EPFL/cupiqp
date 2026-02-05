@@ -30,7 +30,7 @@ class Settings:
 
     tau: float = 0.99
 
-    kkt_solver: Literal["sparse_ldlt", "dense_cholesky"] = "sparse_ldlt"
+    kkt_solver: Literal["sparse_ldlt", "dense_cholesky", "multistage_block_cholesky"] = "sparse_ldlt"
 
     iterative_refinement_always_enabled: bool = False
     iterative_refinement_eps_abs: float = 1e-12
@@ -43,6 +43,9 @@ class Settings:
     verbose: bool = False
     debug: bool = False
     compute_timings: bool = False
+
+    # TODO: this is a temporary setting for the multistage solver, we should find a better way to pass this information or detect the structure of the problem automatically
+    multistage_block_size: int = 1
 
     def verify_settings(self) -> bool:
         return (self.rho_init > 0 and

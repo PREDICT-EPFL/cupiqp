@@ -6,6 +6,7 @@ from .data import Data
 from .settings import Settings
 from .sparse.sparse_kkt_solver import SparseKKTSolver
 from .dense.dense_kkt_solver import DenseKKTSolver
+from .multistage.multistage_kkt_solver import MultistageKKTSolver
 from .results import Variables
 
 
@@ -30,6 +31,8 @@ class KKTSystem:
             self._kkt_solver = SparseKKTSolver(self._data)
         elif settings.kkt_solver == "dense_cholesky":
             self._kkt_solver = DenseKKTSolver(self._data)
+        elif settings.kkt_solver == "multistage_block_cholesky":
+            self._kkt_solver = MultistageKKTSolver(self._data, settings.multistage_block_size)
         else:
             raise ValueError(f"Unsupported kkt_solver: {settings.kkt_solver}")
 
