@@ -63,6 +63,8 @@ class KKTSystem:
 
         # create kernels
         self._eliminate_slacks_kernel = create_eliminate_slacks_kernel(self._data.num_hu, self._data.num_hl, self._data.num_xu, self._data.num_xl)
+        self._eliminate_duals_kernel = create_eliminate_duals_kernel(self._data.n, self._data.m, self._data.num_hu, self._data.num_hl, self._data.num_xu, self._data.num_xl)
+        self._recover_duals_kernel = create_recover_duals_kernel(self._data.num_hl, self._data.num_hu, self._data.num_xu, self._data.num_xl)
         self._recover_slacks_kernel = create_recover_slacks_kernel(self._data.num_hu, self._data.num_hl, self._data.num_xu, self._data.num_xl)
 
     @nvtx.annotate("KKTSystem::update_scalings_and_factor")
@@ -144,6 +146,8 @@ class KKTSystem:
                 device="cuda",
             )
 
+            # ------ elliminate dual variables from rhs to yield one single rhs_z passing to kkt solver
+            
             # To avoid avoid extra allocation, we use:
             # self._work_x to hold modified rhs_x (to be passed to KKTSolver), self._work_z to hold modified rhs_z (to be passed to KKTSolver)
             # use lhs.z_* to hold temporary value self._w_u_delta_inv * self._updated_rhs_z_u, and so on
@@ -157,20 +161,47 @@ class KKTSystem:
             # self._work_z[data.idx_hl] -= self._w_l_delta_inv * self._updated_rhs_z_l
             # self._work_z[:] *= self._z_reg
 
-            self._work_x[:] = rhs.x
-            cp.multiply(self._w_bu_delta_inv, self._updated_rhs_z_bu, out=lhs.z_bu)
-            cp.add.at(self._work_x, data.idx_xu, lhs.z_bu)
-            cp.multiply(self._w_bl_delta_inv, self._updated_rhs_z_bl, out=lhs.z_bl)
-            cp.negative(lhs.z_bl, out=lhs.z_bl)
-            cp.add.at(self._work_x, data.idx_xl, lhs.z_bl)
+            # # ! ALTERNATIVE IMPLEMENTATION (pure cupy operations)
+            # self._work_x[:] = rhs.x
+            # cp.multiply(self._w_bu_delta_inv, self._updated_rhs_z_bu, out=lhs.z_bu)
+            # cp.add.at(self._work_x, data.idx_xu, lhs.z_bu)
+            # cp.multiply(self._w_bl_delta_inv, self._updated_rhs_z_bl, out=lhs.z_bl)
+            # cp.negative(lhs.z_bl, out=lhs.z_bl)
+            # cp.add.at(self._work_x, data.idx_xl, lhs.z_bl)
 
-            self._work_z.fill(0)  # faster than cp.zeros assignment
-            cp.multiply(self._w_u_delta_inv, self._updated_rhs_z_u, out=lhs.z_u) # use lhs.z_u as temporary storage
-            cp.add.at(self._work_z, data.idx_hu, lhs.z_u)
-            cp.multiply(self._w_l_delta_inv, self._updated_rhs_z_l, out=lhs.z_l)
-            cp.negative(lhs.z_l, out=lhs.z_l)
-            cp.add.at(self._work_z, data.idx_hl, lhs.z_l)
-            self._work_z[:] *= self._z_reg
+            # self._work_z.fill(0)  # faster than cp.zeros assignment
+            # cp.multiply(self._w_u_delta_inv, self._updated_rhs_z_u, out=lhs.z_u) # use lhs.z_u as temporary storage
+            # cp.add.at(self._work_z, data.idx_hu, lhs.z_u)
+            # cp.multiply(self._w_l_delta_inv, self._updated_rhs_z_l, out=lhs.z_l)
+            # cp.negative(lhs.z_l, out=lhs.z_l)
+            # cp.add.at(self._work_z, data.idx_hl, lhs.z_l)
+            # self._work_z[:] *= self._z_reg
+
+            wp.launch(
+                kernel=self._eliminate_duals_kernel,
+                dim=self._data.n + self._data.m,
+                inputs=[
+                    # for updating rhs_x
+                    self._data.idx_xu,
+                    self._data.idx_xl,
+                    rhs.x,
+                    self._w_bu_delta_inv,
+                    self._w_bl_delta_inv,
+                    self._updated_rhs_z_bu,
+                    self._updated_rhs_z_bl,
+                    self._work_x,
+                    # for updating rhs_z
+                    self._data.idx_hu,
+                    self._data.idx_hl,
+                    self._w_u_delta_inv,
+                    self._w_l_delta_inv,
+                    self._updated_rhs_z_u,
+                    self._updated_rhs_z_l,
+                    self._z_reg,
+                    self._work_z,  # placeholder for the updated rhs_z
+                ],
+                device="cuda",
+            )
 
         self._kkt_solver.solve(data, self._work_x, rhs.y, self._work_z, lhs.x, lhs.y, self._work_z)  # ! the second _work_z is used to hold delta_z, but useless anyway. Can be further optimized.
 
@@ -184,24 +215,37 @@ class KKTSystem:
             # lhs.z_bu[:] = self._w_bu_delta_inv * (lhs.x[data.idx_xu] - rhs.z_bu + self._m_z_bu_inv * rhs.s_bu)  # delta_z_bu
             # lhs.z_bl[:] = -self._w_bl_delta_inv * (lhs.x[data.idx_xl] + rhs.z_bl - self._m_z_bl_inv * rhs.s_bl)  # delta_z_bl
 
-            lhs.z_u[:] = self._work_z[data.idx_hu]
-            lhs.z_u -= self._updated_rhs_z_u
-            lhs.z_u *= self._w_u_delta_inv
+            # # ! ALTERNATIVE IMPLEMENTATION (pure cupy operations)
+            # lhs.z_u[:] = self._work_z[data.idx_hu]
+            # lhs.z_u -= self._updated_rhs_z_u
+            # lhs.z_u *= self._w_u_delta_inv
 
-            lhs.z_l[:] = self._work_z[data.idx_hl]
-            lhs.z_l *= -1.
-            lhs.z_l -= self._updated_rhs_z_l
-            lhs.z_l *= self._w_l_delta_inv
+            # lhs.z_l[:] = self._work_z[data.idx_hl]
+            # lhs.z_l *= -1.
+            # lhs.z_l -= self._updated_rhs_z_l
+            # lhs.z_l *= self._w_l_delta_inv
 
-            cp.multiply(self._m_z_bu_inv, rhs.s_bu, out=lhs.z_bu)
-            lhs.z_bu += lhs.x[data.idx_xu]
-            lhs.z_bu -= rhs.z_bu
-            lhs.z_bu *= self._w_bu_delta_inv
+            # cp.multiply(self._m_z_bu_inv, rhs.s_bu, out=lhs.z_bu)
+            # lhs.z_bu += lhs.x[data.idx_xu]
+            # lhs.z_bu -= rhs.z_bu
+            # lhs.z_bu *= self._w_bu_delta_inv
 
-            cp.multiply(self._m_z_bl_inv, rhs.s_bl, out=lhs.z_bl)
-            lhs.z_bl -= lhs.x[data.idx_xl]
-            lhs.z_bl -= rhs.z_bl
-            lhs.z_bl *= self._w_bl_delta_inv
+            # cp.multiply(self._m_z_bl_inv, rhs.s_bl, out=lhs.z_bl)
+            # lhs.z_bl -= lhs.x[data.idx_xl]
+            # lhs.z_bl -= rhs.z_bl
+            # lhs.z_bl *= self._w_bl_delta_inv
+
+            wp.launch(
+                kernel=self._recover_duals_kernel,
+                dim=self._data.num_hu+self._data.num_hl+self._data.num_xu+self._data.num_xl,
+                inputs=[
+                    self._work_z, lhs.x,
+                    self._data.idx_hu, self._w_u_delta_inv, self._updated_rhs_z_u, lhs.z_u,
+                    self._data.idx_hl, self._w_l_delta_inv, self._updated_rhs_z_l, lhs.z_l,
+                    self._data.idx_xu, self._w_bu_delta_inv, self._m_z_bu_inv, rhs.z_bu, rhs.s_bu, lhs.z_bu,
+                    self._data.idx_xl, self._w_bl_delta_inv, self._m_z_bl_inv, rhs.z_bl, rhs.s_bl, lhs.z_bl],
+                device="cuda",
+            )
 
             # ----- recover slack variable on lhs
             # The below code is equivalent to:
@@ -356,6 +400,74 @@ class KKTSystem:
         return lhs
     
 
+def create_eliminate_duals_kernel(nx: int, nz: int, num_hu: int, num_hl: int, num_xu: int, num_xl: int):
+    """Create kernel specialized for eliminating duals. Performs the operation:
+
+        rhs.x[data.idx_xu] += self._w_bu_delta_inv * self._updated_rhs_z_bu
+        rhs.x[data.idx_xl] -= self._w_bl_delta_inv * self._updated_rhs_z_bl
+
+        rhs.z = 0.
+        rhs.z[data.idx_hu] += self._w_u_delta_inv * self._updated_rhs_z_u
+        rhs.z[data.idx_hl] -= self._w_l_delta_inv * self._updated_rhs_z_l
+        rhs.z[:] *= self._z_reg
+    """
+    @wp.kernel
+    def eliminate_duals_kernel(
+        # prepare new rhs_x
+        idx_xu: wp.array(dtype=wp.int32),
+        idx_xl: wp.array(dtype=wp.int32),
+        rhs_x: wp.array(dtype=wp.float64),
+        w_bu_delta_inv: wp.array(dtype=wp.float64),
+        w_bl_delta_inv: wp.array(dtype=wp.float64),
+        rhs_z_bu: wp.array(dtype=wp.float64),
+        rhs_z_bl: wp.array(dtype=wp.float64),
+        rhs_x_updated: wp.array(dtype=wp.float64),  # placeholder for the updated rhs_x
+        # prepare new rhs_z
+        idx_hu: wp.array(dtype=wp.int32),
+        idx_hl: wp.array(dtype=wp.int32),
+        w_u_delta_inv: wp.array(dtype=wp.float64),
+        w_l_delta_inv: wp.array(dtype=wp.float64),
+        rhs_z_u: wp.array(dtype=wp.float64),
+        rhs_z_l: wp.array(dtype=wp.float64),
+        z_reg: wp.array(dtype=wp.float64),
+        rhs_z_updated: wp.array(dtype=wp.float64),  # placeholder for the updated rhs_z
+    ):
+        t = wp.tid()
+        nx_static = wp.static(nx)
+        nz_static = wp.static(nz)
+        num_hu_static = wp.static(num_hu)
+        num_hl_static = wp.static(num_hl)
+        num_xu_static = wp.static(num_xu)
+        num_xl_static = wp.static(num_xl)
+
+        # rhs.x[data.idx_xu] += self._w_bu_delta_inv * self._updated_rhs_z_bu
+        # rhs.x[data.idx_xl] -= self._w_bl_delta_inv * self._updated_rhs_z_bl
+        if t < nx_static:
+            rhs_x_updated[t] = rhs_x[t]
+            if t < num_xu_static:
+                rhs_x_updated[idx_xu[t]] += w_bu_delta_inv[t] * rhs_z_bu[t]
+            if t < num_xl_static:
+                rhs_x_updated[idx_xl[t]] -= w_bl_delta_inv[t] * rhs_z_bl[t]
+
+        # rhs.z = 0.
+        # rhs.z[data.idx_hu] += self._w_u_delta_inv * self._updated_rhs_z_u
+        # rhs.z[data.idx_hl] -= self._w_l_delta_inv * self._updated_rhs_z_l
+        # rhs.z[:] *= self._z_reg
+        elif t < nx_static + nz_static:
+            tz = t - nx_static
+            rhs_z_updated[tz] = wp.float64(0.)
+            if tz < num_hu_static:
+                rhs_z_updated[idx_hu[tz]] += w_u_delta_inv[tz] * rhs_z_u[tz]
+            if tz < num_hl_static:
+                rhs_z_updated[idx_hl[tz]] -= w_l_delta_inv[tz] * rhs_z_l[tz]
+            rhs_z_updated[tz] *= z_reg[tz]
+
+        else:
+            return
+
+    return eliminate_duals_kernel
+
+
 def create_eliminate_slacks_kernel(num_hu: int, num_hl: int, num_xu: int, num_xl: int):
     """Create kernel specialized for eliminating slacks. Performs the operation:
     
@@ -405,9 +517,77 @@ def create_eliminate_slacks_kernel(num_hu: int, num_hl: int, num_xu: int, num_xl
             offset = num_hu_static + num_hl_static + num_xu_static
             updated_rhs_z_bl[t - offset] = -result_z_bl_inv[t - offset] * rhs_s_bl[t - offset] + rhs_z_bl[t - offset]
         else:
-            pass
+            return
 
     return eliminate_slacks_kernel
+
+
+def create_recover_duals_kernel(num_hu: int, num_hl: int, num_xu: int, num_xl: int):
+    """Create kernel specialized for recovering duals. Performs the operation:
+
+        lhs.z_u[:] = self._w_u_delta_inv * (G_dx[data.idx_hu] - self._updated_rhs_z_u)
+        lhs.z_l[:] = self._w_l_delta_inv * (-G_dx[data.idx_hl] - self._updated_rhs_z_l)
+        lhs.z_bu[:] = self._w_bu_delta_inv * (lhs.x[data.idx_xu] - rhs.z_bu + self._m_z_bu_inv * rhs.s_bu)
+        lhs.z_bl[:] = -self._w_bl_delta_inv * (lhs.x[data.idx_xl] + rhs.z_bl - self._m_z_bl_inv * rhs.s_bl)
+    """
+    @wp.kernel
+    def recover_duals_kernel(
+        G_dx: wp.array(dtype=wp.float64),
+        lhs_x: wp.array(dtype=wp.float64),
+        # h_u
+        idx_hu: wp.array(dtype=wp.int32),
+        w_u_delta_inv: wp.array(dtype=wp.float64),
+        rhs_z_u: wp.array(dtype=wp.float64),
+        lhs_z_u: wp.array(dtype=wp.float64),
+        # h_l
+        idx_hl: wp.array(dtype=wp.int32),
+        w_l_delta_inv: wp.array(dtype=wp.float64),
+        rhs_z_l: wp.array(dtype=wp.float64),
+        lhs_z_l: wp.array(dtype=wp.float64),
+        # x_u
+        idx_xu: wp.array(dtype=wp.int32),
+        w_bu_delta_inv: wp.array(dtype=wp.float64),
+        m_z_bu_inv: wp.array(dtype=wp.float64),
+        rhs_z_bu: wp.array(dtype=wp.float64),
+        rhs_s_bu: wp.array(dtype=wp.float64),
+        lhs_z_bu: wp.array(dtype=wp.float64),
+        # x_l
+        idx_xl: wp.array(dtype=wp.int32),
+        w_bl_delta_inv: wp.array(dtype=wp.float64),
+        m_z_bl_inv: wp.array(dtype=wp.float64),
+        rhs_z_bl: wp.array(dtype=wp.float64),
+        rhs_s_bl: wp.array(dtype=wp.float64),
+        lhs_z_bl: wp.array(dtype=wp.float64),
+    ):
+        t = wp.tid()
+        num_hu_static = wp.static(num_hu)
+        num_hl_static = wp.static(num_hl)
+        num_xu_static = wp.static(num_xu)
+        num_xl_static = wp.static(num_xl)
+
+        # lhs.z_u[:] = self._w_u_delta_inv * (G_dx[data.idx_hu] - self._updated_rhs_z_u)
+        if t < num_hu_static:
+            lhs_z_u[t] = G_dx[idx_hu[t]] - rhs_z_u[t]
+            lhs_z_u[t] *= w_u_delta_inv[t]
+        # lhs.z_l[:] = self._w_l_delta_inv * (-G_dx[data.idx_hl] - self._updated_rhs_z_l)
+        elif t < num_hu_static + num_hl_static:
+            offset = num_hu_static
+            lhs_z_l[t - offset] = -G_dx[idx_hl[t - offset]] - rhs_z_l[t - offset]
+            lhs_z_l[t - offset] *= w_l_delta_inv[t - offset]
+        # lhs.z_bu[:] = self._w_bu_delta_inv * (lhs.x[data.idx_xu] - rhs.z_bu + self._m_z_bu_inv * rhs.s_bu)
+        elif t < num_hu_static + num_hl_static + num_xu_static:
+            offset = num_hu_static + num_hl_static
+            lhs_z_bu[t - offset] = lhs_x[idx_xu[t - offset]] - rhs_z_bu[t - offset] + m_z_bu_inv[t - offset] * rhs_s_bu[t - offset]
+            lhs_z_bu[t - offset] *= w_bu_delta_inv[t - offset]
+        # lhs.z_bl[:] = -self._w_bl_delta_inv * (lhs.x[data.idx_xl] + rhs.z_bl - self._m_z_bl_inv * rhs.s_bl)
+        elif t < num_hu_static + num_hl_static + num_xu_static + num_xl_static:
+            offset = num_hu_static + num_hl_static + num_xu_static
+            lhs_z_bl[t - offset] = lhs_x[idx_xl[t - offset]] + rhs_z_bl[t - offset] - m_z_bl_inv[t - offset] * rhs_s_bl[t - offset]
+            lhs_z_bl[t - offset] *= -w_bl_delta_inv[t - offset]
+        else:
+            return
+
+    return recover_duals_kernel
 
 
 def create_recover_slacks_kernel(num_hu: int, num_hl: int, num_xu: int, num_xl: int):
@@ -464,6 +644,6 @@ def create_recover_slacks_kernel(num_hu: int, num_hl: int, num_xu: int, num_xl: 
             offset = num_hu_static + num_hl_static + num_xu_static
             updated_lhs_s_bl[t - offset] = result_z_bl_inv[t - offset] * (-result_s_bl[t - offset] * lhs_z_bl[t - offset] + rhs_s_bl[t - offset])
         else:
-            pass
+            return
 
     return recover_slacks_kernel
