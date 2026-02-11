@@ -25,8 +25,6 @@ class KKTSystem:
         self._work_x = cp.nan * cp.zeros(self._data.n)
         self._work_z = cp.nan * cp.zeros(self._data.m)
 
-        self._delta = cp.nan
-
         if settings.kkt_solver == "sparse_ldlt":
             self._kkt_solver = SparseKKTSolver(self._data)
         elif settings.kkt_solver == "dense_cholesky":
@@ -75,7 +73,6 @@ class KKTSystem:
         The variable vars is the current primal/dual variable values at this iteration, i.e., values of x, y, z_u, z_l, s_u, s_l, z_bu, z_bl, s_bu, s_bl at the current iteration.
         """
         with nvtx.annotate("KKTSystem::update_scalings_and_factor::update_regularizations"):
-            self._delta = delta
 
             # store the current slack and dual variable values at this iteration
             self._m_s_u[:] = vars.s_u
@@ -88,27 +85,26 @@ class KKTSystem:
             cp.reciprocal(vars.z_bl, out=self._m_z_bl_inv)
 
             # eliminate the box constraints by adding their contribution to x_reg and z_reg
-            # self._w_bu_delta_inv[:] = 1. / (self._m_s_bu * self._m_z_bu_inv + self._delta)
+            # self._w_bu_delta_inv[:] = 1. / (self._m_s_bu * self._m_z_bu_inv + delta)
             cp.multiply(self._m_s_bu, self._m_z_bu_inv, out=self._w_bu_delta_inv)
-            cp.add(self._w_bu_delta_inv, self._delta, out=self._w_bu_delta_inv)
+            cp.add(self._w_bu_delta_inv, delta, out=self._w_bu_delta_inv)
             cp.reciprocal(self._w_bu_delta_inv, out=self._w_bu_delta_inv)
-            # self._w_bl_delta_inv[:] = 1. / (self._m_s_bl * self._m_z_bl_inv + self._delta)
+            # self._w_bl_delta_inv[:] = 1. / (self._m_s_bl * self._m_z_bl_inv + delta)
             cp.multiply(self._m_s_bl, self._m_z_bl_inv, out=self._w_bl_delta_inv)
-            cp.add(self._w_bl_delta_inv, self._delta, out=self._w_bl_delta_inv)
+            cp.add(self._w_bl_delta_inv, delta, out=self._w_bl_delta_inv)
             cp.reciprocal(self._w_bl_delta_inv, out=self._w_bl_delta_inv)
+            # self._w_u_delta_inv[:] = 1. / (vars.s_u / vars.z_u + delta)
+            cp.multiply(self._m_s_u, self._m_z_u_inv, out=self._w_u_delta_inv)
+            cp.add(self._w_u_delta_inv, delta, out=self._w_u_delta_inv)
+            cp.reciprocal(self._w_u_delta_inv, out=self._w_u_delta_inv)
+            # self._w_l_delta_inv[:] = 1. / (vars.s_l / vars.z_l + delta)
+            cp.multiply(self._m_s_l, self._m_z_l_inv, out=self._w_l_delta_inv)
+            cp.add(self._w_l_delta_inv, delta, out=self._w_l_delta_inv)
+            cp.reciprocal(self._w_l_delta_inv, out=self._w_l_delta_inv)
 
             self._x_reg[:] = rho
             self._x_reg[data.idx_xu] += self._w_bu_delta_inv
             self._x_reg[data.idx_xl] += self._w_bl_delta_inv
-
-            # self._w_u_delta_inv[:] = 1. / (vars.s_u / vars.z_u + self._delta)
-            cp.multiply(self._m_s_u, self._m_z_u_inv, out=self._w_u_delta_inv)
-            cp.add(self._w_u_delta_inv, self._delta, out=self._w_u_delta_inv)
-            cp.reciprocal(self._w_u_delta_inv, out=self._w_u_delta_inv)
-            # self._w_l_delta_inv[:] = 1. / (vars.s_l / vars.z_l + self._delta)
-            cp.multiply(self._m_s_l, self._m_z_l_inv, out=self._w_l_delta_inv)
-            cp.add(self._w_l_delta_inv, self._delta, out=self._w_l_delta_inv)
-            cp.reciprocal(self._w_l_delta_inv, out=self._w_l_delta_inv)
 
             self._z_reg.fill(0.)
             self._z_reg[data.idx_hu] += self._w_u_delta_inv
