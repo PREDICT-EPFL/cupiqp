@@ -44,7 +44,7 @@ class ChainMassOCPProblem(QPProblem, OCPProblem):
         self.xub = np.zeros(dim)
         
         # Initial condition
-        if self.randomize_x0:
+        if self._randomize_x0:
             self.randomize_x0()
         else:
             self.x0 = np.ones(self.system.nx)
