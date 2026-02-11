@@ -27,7 +27,7 @@ class MultistageKKTSolver(KKTSolverBase):
     """
     def __init__(self, data: MultistageData, block_size: int):
         super().__init__()
-        self._delta = cp.nan
+        self._delta = cp.zeros(1, dtype=cp.float64)
         self._x_reg = cp.zeros(data.n, dtype=cp.float64)
         self._z_reg_inv = cp.zeros(data.m, dtype=cp.float64)
 
@@ -91,7 +91,7 @@ class MultistageKKTSolver(KKTSolverBase):
                 kernel=self._csr_add_to_btd_kernel,
                 dim=(data.n,),
                 inputs=[
-                    wp.float64(1.0 / self._delta),
+                    wp.float64(1.0 / self._delta[0]),
                     self._AtA.indptr,
                     self._AtA.indices,
                     self._AtA.data,
@@ -101,6 +101,7 @@ class MultistageKKTSolver(KKTSolverBase):
             )
 
         if data.m > 0:
+            # ! This is inefficient!
             self._GtG_scaled = data.G.T @ cpsp.diags(self._z_reg_inv) @ data.G
             wp.launch(
                 kernel=self._csr_add_to_btd_kernel,
@@ -116,8 +117,8 @@ class MultistageKKTSolver(KKTSolverBase):
             )
 
     @nvtx.annotate("MultistageKKTSolver::update_scalings_and_factor")
-    def update_scalings_and_factor(self, data: MultistageData, delta: float, x_reg: cp.ndarray, z_reg: cp.ndarray) -> bool:
-        self._delta = delta
+    def update_scalings_and_factor(self, data: MultistageData, delta: cp.ndarray, x_reg: cp.ndarray, z_reg: cp.ndarray) -> bool:
+        self._delta[:] = delta
         self._x_reg[:] = x_reg
         cp.reciprocal(z_reg, out=self._z_reg_inv)
 
@@ -133,7 +134,7 @@ class MultistageKKTSolver(KKTSolverBase):
         # solve KKT * dx = rhs_x + 1/delta*A^T*rhs_y + G^T*diag(z_reg_inv)*rhs_z
         delta_x[:] = rhs_x
         if data.p > 0:
-            delta_x += 1/self._delta * data.A.T @ rhs_y
+            delta_x += 1/self._delta[0] * data.A.T @ rhs_y
         if data.m > 0:
             delta_x += data.G.T @ (self._z_reg_inv * rhs_z)
 
@@ -150,7 +151,7 @@ class MultistageKKTSolver(KKTSolverBase):
         # dy = 1/delta * (A * dx - r_y)
         delta_y[:] = data.A @ delta_x
         delta_y -= rhs_y
-        delta_y /= self._delta
+        delta_y /= self._delta[0]
         # dz = z_reg_inv * (G * dx - r_z)
         delta_z[:] = data.G @ delta_x
         delta_z -= rhs_z

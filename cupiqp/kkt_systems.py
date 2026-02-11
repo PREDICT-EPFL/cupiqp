@@ -66,7 +66,7 @@ class KKTSystem:
         self._recover_slacks_kernel = create_recover_slacks_kernel(self._data.num_hu, self._data.num_hl, self._data.num_xu, self._data.num_xl)
 
     @nvtx.annotate("KKTSystem::update_scalings_and_factor")
-    def update_scalings_and_factor(self, data: Data, rho: float, delta: float, vars: Variables) -> bool:
+    def update_scalings_and_factor(self, data: Data, rho: cp.ndarray, delta: cp.ndarray, vars: Variables) -> bool:
         """
         Update the scaling factors and refactor the KKT matrix.
 

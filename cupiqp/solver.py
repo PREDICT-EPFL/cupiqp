@@ -22,10 +22,20 @@ class SolverBase:
     
     @nvtx.annotate("Solver::setup")
     def setup(self, P, c, A, b, G, h_u, h_l, x_u, x_l):
-        self._data = Data(P, c, A, b, G, h_u, h_l, x_u, x_l)
+        if self.settings.kkt_solver == "dense_cholesky":
+            from .dense.dense_data import DenseData
+            self._data = DenseData(P, c, A, b, G, h_u, h_l, x_u, x_l)
+        elif self.settings.kkt_solver == "sparse_ldlt":
+            from .sparse.sparse_data import SparseData
+            self._data = SparseData(P, c, A, b, G, h_u, h_l, x_u, x_l)
+        elif self.settings.kkt_solver == "multistage_block_cholesky":
+            from .multistage.multistage_data import MultistageData
+            self._data = MultistageData(P, c, A, b, G, h_u, h_l, x_u, x_l)
+        else:
+            raise ValueError(f"Unknown kkt_solver type: {self.settings.kkt_solver}")
         self._result.init(self._data)
-        self._result.info.rho = self.settings.rho_init
-        self._result.info.delta = self.settings.delta_init
+        self._result.info.rho[0] = self.settings.rho_init
+        self._result.info.delta[0] = self.settings.delta_init
         self._result.init(self._data)
         
         self._step.init(self._data)
@@ -66,15 +76,15 @@ class SolverBase:
     def _solve_impl(self) -> Status:
         self._result.info.status = Status.PIQP_UNSOLVED 
         self._result.info.iter = 0
-        self._result.info.reg_limit = self.settings.reg_lower_limit
+        self._result.info.reg_limit[0] = self.settings.reg_lower_limit
         self._result.info.factor_retires = 0
         self._result.info.no_primal_update = 0
         self._result.info.no_dual_update = 0
-        self._result.info.mu = 0.
-        self._result.info.primal_step = 0.
-        self._result.info.dual_step = 0.
-        self._result.info.rho = self.settings.rho_init
-        self._result.info.delta = self.settings.delta_init     
+        self._result.info.mu[0] = 0.
+        self._result.info.primal_step[0] = 0.
+        self._result.info.dual_step[0] = 0.
+        self._result.info.rho[0] = self.settings.rho_init
+        self._result.info.delta[0] = self.settings.delta_init
 
         if self.settings.verbose:
             print("iter  prim_obj       dual_obj       duality_gap   prim_res      dual_res      rho         delta       mu          p_step   d_step")  
@@ -150,7 +160,7 @@ class SolverBase:
                 self._result.z_bu += delta_z
 
                 # need to make sure mu is positive here, otherwise in the next step (put s and z on central path) sqrt(mu) the computed z_* will be zeros
-                self._result.info.mu = cp.maximum(self._calculate_mu(), 1e-10)
+                self._result.info.mu[:] = cp.maximum(self._calculate_mu(), 1e-10)
                 if self.settings.debug:
                     print("Initial mu:", self._result.info.mu)
 
@@ -162,7 +172,7 @@ class SolverBase:
                     ):
                     cp.subtract(z, delta_z, out=s)
                     cp.power(s, 2, out=z)
-                    z += 4. * self._result.info.mu
+                    z += 4. * self._result.info.mu[0]
                     cp.sqrt(z, out=z)
                     z += s
                     z /= 2.
@@ -171,7 +181,7 @@ class SolverBase:
                 if self.settings.debug:
                     print("self._result:", self._result)
 
-                self._result.info.mu = self._calculate_mu()
+                self._result.info.mu[:] = self._calculate_mu()
 
             self._prox_vars.x[:] = self._result.x
             self._prox_vars.y[:] = self._result.y
@@ -180,8 +190,8 @@ class SolverBase:
             self._prox_vars.z_bl[:] = self._result.z_bl
             self._prox_vars.z_bu[:] = self._result.z_bu
 
-            if self.settings.debug:
-                print("Initial point set. Starting iterations...\n", self._prox_vars)
+            # if self.settings.debug:
+            #     print("Initial point set. Starting iterations...\n", self._prox_vars)
 
         ## ---------------------------------------------
         ## ---------- remaining iterations -------------
@@ -191,8 +201,8 @@ class SolverBase:
 
             if iter == 0:
                 self._update_residuals_nr()
-                self._result.info.prev_primal_res = self._result.info.primal_res
-                self._result.info.prev_dual_res = self._result.info.dual_res
+                self._result.info.prev_primal_res[:] = self._result.info.primal_res
+                self._result.info.prev_dual_res[:] = self._result.info.dual_res
 
             # ? The convergence criteria seems different from the one in the paper
             if ((self._result.info.primal_res < self.settings.eps_abs or self._result.info.primal_res_rel < self.settings.eps_rel) and
@@ -220,16 +230,16 @@ class SolverBase:
             if self.settings.verbose:
                 print(
                     f"{self._result.info.iter:3d}   "
-                    f"{float(self._result.info.primal_obj): .5e}   "
-                    f"{float(self._result.info.dual_obj): .5e}  "
-                    f"{float(self._result.info.duality_gap): .5e}  "
-                    f"{float(self._result.info.primal_res): .5e}  "
-                    f"{float(self._result.info.dual_res): .5e}  "
-                    f"{float(self._result.info.rho): .3e}  "
-                    f"{float(self._result.info.delta): .3e}  "
-                    f"{float(self._result.info.mu): .3e}  "
-                    f"{float(self._result.info.primal_step): .4f}  "
-                    f"{float(self._result.info.dual_step): .4f}",
+                    f"{float(self._result.info.primal_obj[0]): .5e}   "
+                    f"{float(self._result.info.dual_obj[0]): .5e}  "
+                    f"{float(self._result.info.duality_gap[0]): .5e}  "
+                    f"{float(self._result.info.primal_res[0]): .5e}  "
+                    f"{float(self._result.info.dual_res[0]): .5e}  "
+                    f"{float(self._result.info.rho[0]): .3e}  "
+                    f"{float(self._result.info.delta[0]): .3e}  "
+                    f"{float(self._result.info.mu[0]): .3e}  "
+                    f"{float(self._result.info.primal_step[0]): .4f}  "
+                    f"{float(self._result.info.dual_step[0]): .4f}",
                     flush=True
                 )
 
@@ -241,7 +251,7 @@ class SolverBase:
                     self._result.info.factor_retires += 1
                     self._result.info.rho *= 100.
                     self._result.info.delta *= 100.
-                    self._result.info.reg_limit = cp.minimum(10 * self._result.info.reg_limit, self.settings.eps_abs)
+                    self._result.info.reg_limit[:] = cp.minimum(10 * self._result.info.reg_limit, self.settings.eps_abs)
             
             if self._result.info.factor_retires >= self.settings.max_factor_retires:
                 self._result.info.status = Status.PIQP_NUMERICAL_ISSUES
@@ -256,8 +266,8 @@ class SolverBase:
                 # since there are no inequalities we can take full steps
                 self._kkt_system.solve(self._data, self.settings, self._res, self._step)
 
-                self._result.info.primal_step = cp.float64(1.0)
-                self._result.info.dual_step = cp.float64(1.0)
+                self._result.info.primal_step[:] = cp.float64(1.0)
+                self._result.info.dual_step[:] = cp.float64(1.0)
                 self._result.x += self._result.info.primal_step * self._step.x
                 self._result.y += self._result.info.dual_step * self._step.y
 
@@ -267,22 +277,22 @@ class SolverBase:
                     self._result.info.dual_res < self.settings.eps_abs or \
                         self._result.info.dual_res_rel < self.settings.eps_rel:                
                     self._prox_vars.x[:] = self._result.x
-                    self._result.info.rho = cp.maximum(self._result.info.reg_limit, 0.1 * self._result.info.rho)                
+                    self._result.info.rho[:] = cp.maximum(self._result.info.reg_limit, 0.1 * self._result.info.rho)                
                 else:                
                     self._result.info.no_primal_update += 1
                     if self._result.info.iter < 5 or self._result.info.dual_prox_inf < self.settings.infeasibility_threshold:
-                        self._result.info.rho = cp.maximum(self._result.info.reg_limit, 0.5 * self._result.info.rho)
+                        self._result.info.rho[:] = cp.maximum(self._result.info.reg_limit, 0.5 * self._result.info.rho)
                     
                 
                 if self._result.info.primal_res < 0.95 * self._result.info.prev_primal_res or \
                     self._result.info.primal_res < self.settings.eps_abs or \
                         self._result.info.primal_res_rel < self.settings.eps_rel:
                     self._prox_vars.y[:] = self._result.y
-                    self._result.info.delta = cp.maximum(self._result.info.reg_limit, 0.1 * self._result.info.delta)
+                    self._result.info.delta[:] = cp.maximum(self._result.info.reg_limit, 0.1 * self._result.info.delta)
                 else:
                     self._result.info.no_dual_update += 1
                     if self._result.info.iter < 5 or self._result.info.primal_prox_inf < self.settings.infeasibility_threshold:
-                        self._result.info.delta = cp.maximum(self._result.info.reg_limit, 0.5 * self._result.info.delta)
+                        self._result.info.delta[:] = cp.maximum(self._result.info.reg_limit, 0.5 * self._result.info.delta)
 
             # -------------------- Case with inequality constraints --------------------
             else:
@@ -320,14 +330,14 @@ class SolverBase:
                 self._alpha_sz *= self.settings.tau
 
                 # ------------------ compute centering parameter sigma ------------------
-                self._result.info.sigma = 0.
+                self._result.info.sigma[:] = 0.
                 self._result.info.sigma += cp.dot(self._result.s_l + self._alpha_sz[0] * self._step.s_l, self._result.z_l + self._alpha_sz[1] * self._step.z_l)
                 self._result.info.sigma += cp.dot(self._result.s_u + self._alpha_sz[0] * self._step.s_u, self._result.z_u + self._alpha_sz[1] * self._step.z_u)
                 self._result.info.sigma += cp.dot(self._result.s_bl + self._alpha_sz[0] * self._step.s_bl, self._result.z_bl + self._alpha_sz[1] * self._step.z_bl)
                 self._result.info.sigma += cp.dot(self._result.s_bu + self._alpha_sz[0] * self._step.s_bu, self._result.z_bu + self._alpha_sz[1] * self._step.z_bu)
-                self._result.info.sigma /= self._result.info.mu * cp.float64(self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)
-                self._result.info.sigma = cp.maximum(0., cp.minimum(1., self._result.info.sigma))
-                self._result.info.sigma = self._result.info.sigma ** 3
+                self._result.info.sigma /= self._result.info.mu[0] * cp.float64(self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)
+                self._result.info.sigma[:] = cp.maximum(0., cp.minimum(1., self._result.info.sigma[0]))
+                self._result.info.sigma[:] = self._result.info.sigma ** 3
 
 
                 # ------------------ corrector step ------------------
@@ -347,8 +357,8 @@ class SolverBase:
                 self._calculate_step()
                 # avoid getting too close to the boundary
                 self._alpha_sz *= self.settings.tau
-                self._result.info.primal_step = self._alpha_sz[0]
-                self._result.info.dual_step = self._alpha_sz[1]
+                self._result.info.primal_step[:] = self._alpha_sz[0]
+                self._result.info.dual_step[:] = self._alpha_sz[1]
 
                 # ------------------ update variables ------------------
                 self._result.x += self._result.info.primal_step * self._step.x
@@ -362,9 +372,9 @@ class SolverBase:
                 self._result.s_bl += self._result.info.primal_step * self._step.s_bl
                 self._result.s_bu += self._result.info.primal_step * self._step.s_bu
 
-                mu_prev = self._result.info.mu
-                self._result.info.mu = self._calculate_mu()
-                mu_rate = cp.maximum(0., (mu_prev - self._result.info.mu) / mu_prev)  # r in Algorithm 2 in Roland Schwan 2023 paper
+                mu_prev = self._result.info.mu.copy()
+                self._result.info.mu[:] = self._calculate_mu()
+                mu_rate = cp.maximum(0., (mu_prev - self._result.info.mu[0]) / mu_prev)  # r in Algorithm 2 in Roland Schwan 2023 paper
 
 
                 # ------------------ update regularization ------------------
@@ -374,11 +384,11 @@ class SolverBase:
                     (self._result.info.dual_res < self.settings.eps_abs or self._result.info.dual_res_rel < self.settings.eps_rel) or \
                     (self._result.info.rho == self.settings.reg_finetune_lower_limit and self._result.info.dual_prox_inf < self.settings.infeasibility_threshold) :
                     self._prox_vars.x[:] = self._result.x
-                    self._result.info.rho = cp.maximum(self._result.info.reg_limit, (1. - mu_rate) * self._result.info.rho)
+                    self._result.info.rho[:] = cp.maximum(self._result.info.reg_limit, (1. - mu_rate) * self._result.info.rho)
                 else:
                     self._result.info.no_primal_update += 1                
                     if self._result.info.iter < 5 or self._result.info.dual_prox_inf < self.settings.infeasibility_threshold:
-                        self._result.info.rho = cp.maximum(self._result.info.reg_limit, (1. - 0.666 * mu_rate) * self._result.info.rho)
+                        self._result.info.rho[:] = cp.maximum(self._result.info.reg_limit, (1. - 0.666 * mu_rate) * self._result.info.rho)
 
                 if self._result.info.primal_res < 0.95 * self._result.info.prev_primal_res or \
                     (self._result.info.primal_res < self.settings.eps_abs or self._result.info.primal_res_rel < self.settings.eps_rel) or \
@@ -389,11 +399,11 @@ class SolverBase:
                     self._prox_vars.z_bu[:] = self._result.z_bu
                     self._prox_vars.z_bl[:] = self._result.z_bl
                     
-                    self._result.info.delta = cp.maximum(self._result.info.reg_limit, (1. - mu_rate) * self._result.info.delta)
+                    self._result.info.delta[:] = cp.maximum(self._result.info.reg_limit, (1. - mu_rate) * self._result.info.delta)
                 else:
                     self._result.info.no_dual_update += 1
                     if self._result.info.iter < 5 or self._result.info.primal_prox_inf < self.settings.infeasibility_threshold:
-                        self._result.info.delta = cp.maximum(self._result.info.reg_limit, (1. - 0.666 * mu_rate) * self._result.info.delta)
+                        self._result.info.delta[:] = cp.maximum(self._result.info.reg_limit, (1. - 0.666 * mu_rate) * self._result.info.delta)
 
 
         self._result.info.status = Status.PIQP_MAX_ITER_REACHED
@@ -515,8 +525,8 @@ class SolverBase:
 
         # -x^T P x
         tmp = cp.dot(self._res_nr.x, self._result.x)  # self._res_nr.x currently holds -P*x
-        self._result.info.primal_obj = -0.5 * tmp
-        self._result.info.dual_obj = 0.5 * tmp
+        self._result.info.primal_obj[:] = -0.5 * tmp
+        self._result.info.dual_obj[:] = 0.5 * tmp
         duality_gap_rel_norm = cp.abs(tmp)
         # c^T x
         tmp = cp.dot(self._data.c, self._result.x)
@@ -543,8 +553,8 @@ class SolverBase:
         self._result.info.dual_obj += tmp
         duality_gap_rel_norm = cp.maximum(cp.abs(tmp), duality_gap_rel_norm)
         
-        self._result.info.duality_gap = cp.abs(self._result.info.primal_obj - self._result.info.dual_obj)
-        self._result.info.duality_gap_rel = self._result.info.duality_gap / cp.maximum(1., duality_gap_rel_norm)
+        self._result.info.duality_gap[:] = cp.abs(self._result.info.primal_obj - self._result.info.dual_obj)
+        self._result.info.duality_gap_rel[:] = self._result.info.duality_gap / cp.maximum(1., duality_gap_rel_norm)
 
         # res_nr.x = -(P*x + c + A^T*y + G^T*(z_u - z_l) + z_bu - z_bl)
         # self._res_nr.x is computed as -P*x above
@@ -581,10 +591,10 @@ class SolverBase:
 
 
         # ------------ update primal and dual residuals ------------
-        self._result.info.prev_primal_res = self._result.info.primal_res
-        self._result.info.prev_dual_res = self._result.info.dual_res
+        self._result.info.prev_primal_res[:] = self._result.info.primal_res
+        self._result.info.prev_dual_res[:] = self._result.info.dual_res
 
-        self._result.info.primal_res = self._primal_res_nr()
+        self._result.info.primal_res[:] = self._primal_res_nr()
 
         # primal_rel_norm is computed as ||-A*x||_inf above, now update it with other terms
         primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._data.b, ord=cp.inf)) if self._data.p > 0 else primal_rel_norm
@@ -598,17 +608,17 @@ class SolverBase:
         primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._result.s_l, ord=cp.inf)) if self._data.num_hl > 0 else primal_rel_norm
         primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._result.s_bu, ord=cp.inf)) if self._data.num_xu > 0 else primal_rel_norm
         primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._result.s_bl, ord=cp.inf)) if self._data.num_xl > 0 else primal_rel_norm
-        self._result.info.primal_res_rel = self._result.info.primal_res / cp.maximum(1., primal_rel_norm)
+        self._result.info.primal_res_rel[:] = self._result.info.primal_res / cp.maximum(1., primal_rel_norm)
 
         # dual_res_norm = max(||P*x||_inf, ||c||_inf, ||A^T*y + G^T*(z_u - z_l) + z_bu - z_bl||_inf)
-        self._result.info.dual_res = self._dual_res_nr()
+        self._result.info.dual_res[:] = self._dual_res_nr()
         dual_res_norm = cp.maximum(dual_res_norm, cp.linalg.norm(self._data.c, ord=cp.inf))  # ||P*x||_inf was calculated before
         # self._res.x currently holds A^T*y
         self._res.x += GT_zu_minus_zl
         self._res.x[self._data.idx_xl] -= self._result.z_bl
         self._res.x[self._data.idx_xu] += self._result.z_bu
         dual_res_norm = cp.maximum(dual_res_norm, cp.linalg.norm(self._res.x, ord=cp.inf))
-        self._result.info.dual_res_rel = self._result.info.dual_res / cp.maximum(1., dual_res_norm)
+        self._result.info.dual_res_rel[:] = self._result.info.dual_res / cp.maximum(1., dual_res_norm)
         
 
     @nvtx.annotate("Solver::_update_residuals_r")
@@ -630,13 +640,13 @@ class SolverBase:
         primal_rel_scaling = self._result.info.primal_res / self._result.info.primal_res_rel if self._result.info.primal_res_rel > 0 else 1.
         dual_rel_scaling = self._result.info.dual_res / self._result.info.dual_res_rel if self._result.info.dual_res_rel > 0 else 1.
 
-        self._result.info.primal_res_reg = self._primal_res_r()
-        self._result.info.primal_res_reg_rel = self._result.info.primal_res_reg / primal_rel_scaling
-        self._result.info.dual_res_reg = self._dual_res_r()
-        self._result.info.dual_res_reg_rel = self._result.info.dual_res_reg / dual_rel_scaling
+        self._result.info.primal_res_reg[:] = self._primal_res_r()
+        self._result.info.primal_res_reg_rel[:] = self._result.info.primal_res_reg / primal_rel_scaling
+        self._result.info.dual_res_reg[:] = self._dual_res_r()
+        self._result.info.dual_res_reg_rel[:] = self._result.info.dual_res_reg / dual_rel_scaling
 
-        self._result.info.primal_prox_inf = self._primal_prox_inf() * self._result.info.delta
-        self._result.info.dual_prox_inf = self._dual_prox_inf() * self._result.info.rho
+        self._result.info.primal_prox_inf[:] = self._primal_prox_inf() * self._result.info.delta
+        self._result.info.dual_prox_inf[:] = self._dual_prox_inf() * self._result.info.rho
 
     @nvtx.annotate("Solver::_primal_res_nr")
     def _primal_res_nr(self) -> float:
