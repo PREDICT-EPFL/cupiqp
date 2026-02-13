@@ -51,6 +51,8 @@ class SolverBase:
         self._work_z = cp.empty(self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)  # used in _calculate_step to hold all concatenated slack or dual steps / results
         self._work_s = cp.empty(self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)  # used in _calculate_step to hold all concatenated slack or dual steps / results
         self._alpha_sz = cp.empty(2) # step lengths of slack and dual variables [alpha_s, alpha_z]
+        self._work_primals = cp.empty(self._data.n)
+        self._work_duals = cp.empty(self._data.p + self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)  # used to hold the concatenated dual variables for computing the residuals in _update_residuals_nr
         
         
 
@@ -628,9 +630,7 @@ class SolverBase:
         It adds the regularization terms to the non-regularized residuals to obtain the regularized residuals.
         """
         # update the rhs of the KKT system
-        # r_x = -(P*x + c + A^T*y + G^T*(z_u - z_l)) - rho * (x - x_prox)
         self._res.x[:] = self._res_nr.x - self._result.info.rho * (self._result.x - self._prox_vars.x)
-        # r_y = -(A*x - b - delta*(y - lamda))  # TODO: I understand the formula, but why is it computed this way? I copied the following line from the original C++ code.
         self._res.y[:] = self._res_nr.y - self._result.info.delta * (self._prox_vars.y - self._result.y)
         self._res.z_l[:] = self._res_nr.z_l - self._result.info.delta * (self._prox_vars.z_l - self._result.z_l)
         self._res.z_u[:] = self._res_nr.z_u - self._result.info.delta * (self._prox_vars.z_u - self._result.z_u)
@@ -645,31 +645,38 @@ class SolverBase:
         self._result.info.dual_res_reg[:] = self._dual_res_r()
         self._result.info.dual_res_reg_rel[:] = self._result.info.dual_res_reg / dual_rel_scaling
 
-        self._result.info.primal_prox_inf[:] = self._primal_prox_inf() * self._result.info.delta
-        self._result.info.dual_prox_inf[:] = self._dual_prox_inf() * self._result.info.rho
+        self._result.info.primal_prox_inf[:] = self._primal_prox_inf()
+        self._result.info.primal_prox_inf *= self._result.info.delta
+        self._result.info.dual_prox_inf[:] = self._dual_prox_inf()
+        self._result.info.dual_prox_inf *= self._result.info.rho
 
     @nvtx.annotate("Solver::_primal_res_nr")
     def _primal_res_nr(self) -> float:
-        inf = cp.float64(0.)
-        inf = cp.maximum(inf, cp.linalg.norm(self._res_nr.y, ord=cp.inf)) if self._data.p > 0 else inf
-        inf = cp.maximum(inf, cp.linalg.norm(self._res_nr.z_u, ord=cp.inf)) if self._data.num_hu > 0 else inf
-        inf = cp.maximum(inf, cp.linalg.norm(self._res_nr.z_l, ord=cp.inf)) if self._data.num_hl > 0 else inf
-        #! The values of z_u, z_l, z_bu, z_bl with active indices should all be positive.
-        #! can optionally use cp.maximum, if more efficient
-        inf = cp.maximum(inf, cp.linalg.norm(self._res_nr.z_bu, ord=cp.inf)) if self._data.num_xu > 0 else inf
-        inf = cp.maximum(inf, cp.linalg.norm(self._res_nr.z_bl, ord=cp.inf)) if self._data.num_xl > 0 else inf
-        return inf
-
+        offset = 0
+        self._work_duals[:self._data.p] = self._res_nr.y
+        offset = self._data.p
+        self._work_duals[offset : offset+self._data.num_hu] = self._res_nr.z_u
+        offset += self._data.num_hu
+        self._work_duals[offset : offset+self._data.num_hl] = self._res_nr.z_l
+        offset += self._data.num_hl
+        self._work_duals[offset : offset+self._data.num_xu] = self._res_nr.z_bu
+        offset += self._data.num_xu
+        self._work_duals[offset : offset+self._data.num_xl] = self._res_nr.z_bl
+        return cp.linalg.norm(self._work_duals, ord=cp.inf)
 
     @nvtx.annotate("Solver::_primal_res_r")
     def _primal_res_r(self) -> float:
-        inf = cp.float64(0.)
-        inf = cp.maximum(inf, cp.linalg.norm(self._res.y, ord=cp.inf)) if self._data.p > 0 else inf
-        inf = cp.maximum(inf, cp.linalg.norm(self._res.z_u, ord=cp.inf)) if self._data.num_hu > 0 else inf
-        inf = cp.maximum(inf, cp.linalg.norm(self._res.z_l, ord=cp.inf)) if self._data.num_hl > 0 else inf
-        inf = cp.maximum(inf, cp.linalg.norm(self._res.z_bu, ord=cp.inf)) if self._data.num_xu > 0 else inf
-        inf = cp.maximum(inf, cp.linalg.norm(self._res.z_bl, ord=cp.inf)) if self._data.num_xl > 0 else inf
-        return inf
+        offset = 0
+        self._work_duals[:self._data.p] = self._res.y
+        offset = self._data.p
+        self._work_duals[offset : offset+self._data.num_hu] = self._res.z_u
+        offset += self._data.num_hu
+        self._work_duals[offset : offset+self._data.num_hl] = self._res.z_l
+        offset += self._data.num_hl
+        self._work_duals[offset : offset+self._data.num_xu] = self._res.z_bu
+        offset += self._data.num_xu
+        self._work_duals[offset : offset+self._data.num_xl] = self._res.z_bl
+        return cp.linalg.norm(self._work_duals, ord=cp.inf)
     
     @nvtx.annotate("Solver::_dual_res_nr")
     def _dual_res_nr(self) -> float:
@@ -681,15 +688,19 @@ class SolverBase:
     
     @nvtx.annotate("Solver::_primal_prox_inf")
     def _primal_prox_inf(self) -> float:
-        inf = cp.float64(0.)
-        inf = cp.maximum(inf, cp.linalg.norm(self._result.y - self._prox_vars.y, ord=cp.inf)) if self._data.p > 0 else inf
-        inf = cp.maximum(inf, cp.linalg.norm(self._result.z_l - self._prox_vars.z_l, ord=cp.inf)) if self._data.num_hl > 0 else inf
-        inf = cp.maximum(inf, cp.linalg.norm(self._result.z_u - self._prox_vars.z_u, ord=cp.inf)) if self._data.num_hu > 0 else inf
-        inf = cp.maximum(inf, cp.linalg.norm(self._result.z_bl - self._prox_vars.z_bl, ord=cp.inf)) if self._data.num_xl > 0 else inf
-        inf = cp.maximum(inf, cp.linalg.norm(self._result.z_bu - self._prox_vars.z_bu, ord=cp.inf)) if self._data.num_xu > 0 else inf
+        cp.subtract(self._result.y, self._prox_vars.y, out=self._work_duals[:self._data.p])
+        offset = self._data.p
+        cp.subtract(self._result.z_l, self._prox_vars.z_l, out=self._work_duals[offset : offset+self._data.num_hl])
+        offset += self._data.num_hl
+        cp.subtract(self._result.z_u, self._prox_vars.z_u, out=self._work_duals[offset : offset+self._data.num_hu])
+        offset += self._data.num_hu
+        cp.subtract(self._result.z_bl, self._prox_vars.z_bl, out=self._work_duals[offset : offset+self._data.num_xl])
+        offset += self._data.num_xl
+        cp.subtract(self._result.z_bu, self._prox_vars.z_bu, out=self._work_duals[offset : offset+self._data.num_xu])
+        inf = cp.linalg.norm(self._work_duals, ord=cp.inf)
         return inf
-    
+
     @nvtx.annotate("Solver::_dual_prox_inf")
     def _dual_prox_inf(self) -> float:
-        return cp.linalg.norm(self._result.x - self._prox_vars.x, ord=cp.inf)
-    
+        cp.subtract(self._result.x, self._prox_vars.x, out=self._work_primals)
+        return cp.linalg.norm(self._work_primals, ord=cp.inf)
