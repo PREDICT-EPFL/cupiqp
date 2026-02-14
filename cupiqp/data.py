@@ -70,6 +70,8 @@ class Data:
         self._x_u = self._as_float64(x_u) if x_u is not None else None
         self._x_l = self._as_float64(x_l) if x_l is not None else None
         self._preprocess()
+        self._constraints_rhs_inf_norm = cp.empty(1)
+        self._compute_constraints_rhs_inf_norm()
 
     @staticmethod
     def _as_float64(M: ArrayLike) -> ArrayLike:
@@ -86,7 +88,19 @@ class Data:
         self.set_h_u()
         self.set_x_l()
         self.set_x_u()
-        
+
+    def _compute_constraints_rhs_inf_norm(self):
+        """
+        Compute the infinity norm of the right-hand side of the constraints,
+        used in computing the relative residuals in the solver. 
+        """
+        self._constraints_rhs_inf_norm[:] = 0.
+        inf = self._constraints_rhs_inf_norm  # reference
+        inf = cp.maximum(inf, cp.linalg.norm(self.b, ord=cp.inf)) if self.p > 0 else inf
+        inf = cp.maximum(inf, cp.linalg.norm(self.h_u[self.idx_hu], ord=cp.inf)) if self.num_hu > 0 else inf
+        inf = cp.maximum(inf, cp.linalg.norm(self.h_l[self.idx_hl], ord=cp.inf)) if self.num_hl > 0 else inf
+        inf = cp.maximum(inf, cp.linalg.norm(self.x_u[self.idx_xu], ord=cp.inf)) if self.num_xu > 0 else inf
+        inf = cp.maximum(inf, cp.linalg.norm(self.x_l[self.idx_xl], ord=cp.inf)) if self.num_xl > 0 else inf
 
     @property
     def P(self):

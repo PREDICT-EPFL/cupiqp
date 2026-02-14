@@ -599,17 +599,13 @@ class SolverBase:
         self._result.info.primal_res[:] = self._primal_res_nr()
 
         # primal_rel_norm is computed as ||-A*x||_inf above, now update it with other terms
-        primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._data.b, ord=cp.inf)) if self._data.p > 0 else primal_rel_norm
         primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(G_x[self._data.idx_hu], ord=cp.inf)) if self._data.num_hu > 0 else primal_rel_norm
         primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(G_x[self._data.idx_hl], ord=cp.inf)) if self._data.num_hl > 0 else primal_rel_norm
-        primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._data.h_u[self._data.idx_hu], ord=cp.inf)) if self._data.num_hu > 0 else primal_rel_norm
-        primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._data.h_l[self._data.idx_hl], ord=cp.inf)) if self._data.num_hl > 0 else primal_rel_norm
-        primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._data.x_u[self._data.idx_xu], ord=cp.inf)) if self._data.num_xu > 0 else primal_rel_norm
-        primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._data.x_l[self._data.idx_xl], ord=cp.inf)) if self._data.num_xl > 0 else primal_rel_norm
         primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._result.s_u, ord=cp.inf)) if self._data.num_hu > 0 else primal_rel_norm
         primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._result.s_l, ord=cp.inf)) if self._data.num_hl > 0 else primal_rel_norm
         primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._result.s_bu, ord=cp.inf)) if self._data.num_xu > 0 else primal_rel_norm
         primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._result.s_bl, ord=cp.inf)) if self._data.num_xl > 0 else primal_rel_norm
+        primal_rel_norm = cp.maximum(primal_rel_norm, self._data._constraints_rhs_inf_norm)
         self._result.info.primal_res_rel[:] = self._result.info.primal_res / cp.maximum(1., primal_rel_norm)
 
         # dual_res_norm = max(||P*x||_inf, ||c||_inf, ||A^T*y + G^T*(z_u - z_l) + z_bu - z_bl||_inf)
