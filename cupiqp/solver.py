@@ -53,7 +53,7 @@ class SolverBase:
         self._alpha_sz = cp.empty(2) # step lengths of slack and dual variables [alpha_s, alpha_z]
         self._work_primals = cp.empty(self._data.n)
         self._work_duals = cp.empty(self._data.p + self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)  # used to hold the concatenated dual variables for computing the residuals in _update_residuals_nr
-        
+        self._work_residual = cp.empty(())
         
 
     def solve(self) -> Status:
@@ -682,7 +682,11 @@ class SolverBase:
         self._work_duals[offset : offset+self._data.num_xu] = self._res_nr.z_bu
         offset += self._data.num_xu
         self._work_duals[offset : offset+self._data.num_xl] = self._res_nr.z_bl
-        return cp.linalg.norm(self._work_duals, ord=cp.inf)
+        offset += self._data.num_xl
+        # inf-norm without allocating a scalar output
+        cp.absolute(self._work_duals[:offset], out=self._work_duals[:offset])
+        cp.max(self._work_duals[:offset], out=self._work_residual)
+        return self._work_residual
 
     @nvtx.annotate("Solver::_primal_res_r")
     def _primal_res_r(self) -> float:
@@ -696,15 +700,22 @@ class SolverBase:
         self._work_duals[offset : offset+self._data.num_xu] = self._res.z_bu
         offset += self._data.num_xu
         self._work_duals[offset : offset+self._data.num_xl] = self._res.z_bl
-        return cp.linalg.norm(self._work_duals, ord=cp.inf)
+        offset += self._data.num_xl
+        cp.absolute(self._work_duals[:offset], out=self._work_duals[:offset])
+        cp.max(self._work_duals[:offset], out=self._work_residual)
+        return self._work_residual
     
     @nvtx.annotate("Solver::_dual_res_nr")
     def _dual_res_nr(self) -> float:
-        return cp.linalg.norm(self._res_nr.x, ord=cp.inf)
+        cp.absolute(self._res_nr.x, out=self._work_primals)
+        cp.max(self._work_primals, out=self._work_residual)
+        return self._work_residual
     
     @nvtx.annotate("Solver::_dual_res_r")
     def _dual_res_r(self) -> float:
-        return cp.linalg.norm(self._res.x, ord=cp.inf)
+        cp.absolute(self._res.x, out=self._work_primals)
+        cp.max(self._work_primals, out=self._work_residual)
+        return self._work_residual
     
     @nvtx.annotate("Solver::_primal_prox_inf")
     def _primal_prox_inf(self) -> float:
@@ -717,10 +728,14 @@ class SolverBase:
         cp.subtract(self._result.z_bl, self._prox_vars.z_bl, out=self._work_duals[offset : offset+self._data.num_xl])
         offset += self._data.num_xl
         cp.subtract(self._result.z_bu, self._prox_vars.z_bu, out=self._work_duals[offset : offset+self._data.num_xu])
-        inf = cp.linalg.norm(self._work_duals, ord=cp.inf)
-        return inf
+        offset += self._data.num_xu
+        cp.absolute(self._work_duals[:offset], out=self._work_duals[:offset])
+        cp.max(self._work_duals[:offset], out=self._work_residual)
+        return self._work_residual
 
     @nvtx.annotate("Solver::_dual_prox_inf")
     def _dual_prox_inf(self) -> float:
         cp.subtract(self._result.x, self._prox_vars.x, out=self._work_primals)
-        return cp.linalg.norm(self._work_primals, ord=cp.inf)
+        cp.absolute(self._work_primals, out=self._work_primals)
+        cp.max(self._work_primals, out=self._work_residual)
+        return self._work_residual
