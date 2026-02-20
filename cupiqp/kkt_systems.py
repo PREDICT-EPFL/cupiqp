@@ -73,43 +73,63 @@ class KKTSystem:
         The variable vars is the current primal/dual variable values at this iteration, i.e., values of x, y, z_u, z_l, s_u, s_l, z_bu, z_bl, s_bu, s_bl at the current iteration.
         """
         with nvtx.annotate("KKTSystem::update_scalings_and_factor::update_regularizations"):
+            if not hasattr(self, '_update_scaling_and_factor_cuda_graphs'):
+                self._update_scaling_and_factor_cuda_graphs = {}
+                self._update_scaling_and_factor_cuda_graphs_capture_count = 0
 
-            # store the current slack and dual variable values at this iteration
-            self._m_s_u[:] = vars.s_u
-            self._m_s_l[:] = vars.s_l
-            self._m_s_bu[:] = vars.s_bu
-            self._m_s_bl[:] = vars.s_bl
-            cp.reciprocal(vars.z_u, out=self._m_z_u_inv)  # better than self._m_z_u_inv[:] = 1. / vars.z_u since it avoids temporary allocation
-            cp.reciprocal(vars.z_l, out=self._m_z_l_inv)
-            cp.reciprocal(vars.z_bu, out=self._m_z_bu_inv)
-            cp.reciprocal(vars.z_bl, out=self._m_z_bl_inv)
+            key = (vars.buffer_ptr, 
+                self._m_s_u.data.ptr, self._m_s_l.data.ptr, self._m_s_bu.data.ptr, self._m_s_bl.data.ptr,
+                self._m_z_u_inv.data.ptr, self._m_z_l_inv.data.ptr, self._m_z_bu_inv.data.ptr, self._m_z_bl_inv.data.ptr,
+                self._w_u_delta_inv.data.ptr, self._w_l_delta_inv.data.ptr, self._w_bu_delta_inv.data.ptr, self._w_bl_delta_inv.data.ptr,
+                self._x_reg.data.ptr, self._z_reg.data.ptr,
+                )
 
-            # eliminate the box constraints by adding their contribution to x_reg and z_reg
-            # self._w_bu_delta_inv[:] = 1. / (self._m_s_bu * self._m_z_bu_inv + delta)
-            cp.multiply(self._m_s_bu, self._m_z_bu_inv, out=self._w_bu_delta_inv)
-            cp.add(self._w_bu_delta_inv, delta, out=self._w_bu_delta_inv)
-            cp.reciprocal(self._w_bu_delta_inv, out=self._w_bu_delta_inv)
-            # self._w_bl_delta_inv[:] = 1. / (self._m_s_bl * self._m_z_bl_inv + delta)
-            cp.multiply(self._m_s_bl, self._m_z_bl_inv, out=self._w_bl_delta_inv)
-            cp.add(self._w_bl_delta_inv, delta, out=self._w_bl_delta_inv)
-            cp.reciprocal(self._w_bl_delta_inv, out=self._w_bl_delta_inv)
-            # self._w_u_delta_inv[:] = 1. / (vars.s_u / vars.z_u + delta)
-            cp.multiply(self._m_s_u, self._m_z_u_inv, out=self._w_u_delta_inv)
-            cp.add(self._w_u_delta_inv, delta, out=self._w_u_delta_inv)
-            cp.reciprocal(self._w_u_delta_inv, out=self._w_u_delta_inv)
-            # self._w_l_delta_inv[:] = 1. / (vars.s_l / vars.z_l + delta)
-            cp.multiply(self._m_s_l, self._m_z_l_inv, out=self._w_l_delta_inv)
-            cp.add(self._w_l_delta_inv, delta, out=self._w_l_delta_inv)
-            cp.reciprocal(self._w_l_delta_inv, out=self._w_l_delta_inv)
+            if key not in self._update_scaling_and_factor_cuda_graphs:
+                self._update_scaling_and_factor_cuda_graphs_capture_count += 1
+                print(f"KKTSystems::_update_scaling_and_factor capturing CUDA graph (occurrence {self._update_scaling_and_factor_cuda_graphs_capture_count})...")
+                stream = cp.cuda.Stream(non_blocking=True)
+                stream.begin_capture()
+                with stream:
 
-            self._x_reg[:] = rho
-            self._x_reg[data.idx_xu] += self._w_bu_delta_inv
-            self._x_reg[data.idx_xl] += self._w_bl_delta_inv
+                    # store the current slack and dual variable values at this iteration
+                    self._m_s_u[:] = vars.s_u
+                    self._m_s_l[:] = vars.s_l
+                    self._m_s_bu[:] = vars.s_bu
+                    self._m_s_bl[:] = vars.s_bl
+                    cp.reciprocal(vars.z_u, out=self._m_z_u_inv)  # better than self._m_z_u_inv[:] = 1. / vars.z_u since it avoids temporary allocation
+                    cp.reciprocal(vars.z_l, out=self._m_z_l_inv)
+                    cp.reciprocal(vars.z_bu, out=self._m_z_bu_inv)
+                    cp.reciprocal(vars.z_bl, out=self._m_z_bl_inv)
 
-            self._z_reg.fill(0.)
-            self._z_reg[data.idx_hu] += self._w_u_delta_inv
-            self._z_reg[data.idx_hl] += self._w_l_delta_inv
-            cp.reciprocal(self._z_reg, out=self._z_reg)  # self._z_reg[:] = 1. / self._z_reg
+                    # eliminate the box constraints by adding their contribution to x_reg and z_reg
+                    # self._w_bu_delta_inv[:] = 1. / (self._m_s_bu * self._m_z_bu_inv + delta)
+                    cp.multiply(self._m_s_bu, self._m_z_bu_inv, out=self._w_bu_delta_inv)
+                    cp.add(self._w_bu_delta_inv, delta, out=self._w_bu_delta_inv)
+                    cp.reciprocal(self._w_bu_delta_inv, out=self._w_bu_delta_inv)
+                    # self._w_bl_delta_inv[:] = 1. / (self._m_s_bl * self._m_z_bl_inv + delta)
+                    cp.multiply(self._m_s_bl, self._m_z_bl_inv, out=self._w_bl_delta_inv)
+                    cp.add(self._w_bl_delta_inv, delta, out=self._w_bl_delta_inv)
+                    cp.reciprocal(self._w_bl_delta_inv, out=self._w_bl_delta_inv)
+                    # self._w_u_delta_inv[:] = 1. / (vars.s_u / vars.z_u + delta)
+                    cp.multiply(self._m_s_u, self._m_z_u_inv, out=self._w_u_delta_inv)
+                    cp.add(self._w_u_delta_inv, delta, out=self._w_u_delta_inv)
+                    cp.reciprocal(self._w_u_delta_inv, out=self._w_u_delta_inv)
+                    # self._w_l_delta_inv[:] = 1. / (vars.s_l / vars.z_l + delta)
+                    cp.multiply(self._m_s_l, self._m_z_l_inv, out=self._w_l_delta_inv)
+                    cp.add(self._w_l_delta_inv, delta, out=self._w_l_delta_inv)
+                    cp.reciprocal(self._w_l_delta_inv, out=self._w_l_delta_inv)
+
+                    self._x_reg[:] = rho[0]
+                    self._x_reg[data.idx_xu] += self._w_bu_delta_inv
+                    self._x_reg[data.idx_xl] += self._w_bl_delta_inv
+                    self._z_reg.fill(0.)
+                    self._z_reg[data.idx_hu] += self._w_u_delta_inv
+                    self._z_reg[data.idx_hl] += self._w_l_delta_inv
+                    cp.reciprocal(self._z_reg, out=self._z_reg)
+
+                self._update_scaling_and_factor_cuda_graphs[key] = stream.end_capture()
+
+            self._update_scaling_and_factor_cuda_graphs[key].launch()
 
         factor_success = self._kkt_solver.update_scalings_and_factor(data, delta, self._x_reg, self._z_reg) # ! this is implicitly assuming idx_hu and idx_hl cover all indices of inequalities 0:m
         return factor_success
