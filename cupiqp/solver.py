@@ -505,6 +505,16 @@ class SolverBase:
             - primal_obj = 0.5 x^T P x + c^T x
             - dual_obj = -0.5 x^T P x - b^T y - h_u^T z_u + h_l^T z_l - x_u^T z_bu + x_l^T z_bl
         """
+        if not hasattr(self, '_update_residuals_nr_cuda_graphs'):
+            self._update_residuals_nr_cuda_graphs = {}
+            self._update_residuals_nr_cuda_graphs_capture_count = 0
+
+        key = (self._res.buffer_ptr, 
+               self._result.buffer_ptr,
+               self._prox_vars.buffer_ptr,
+               self._res_nr.buffer_ptr)
+        # TODO: eval_P_x, eval_A_xn_and_AT_xt, eval_G_xn_and_GT_xt contain some cuSPARSE and cuBLAS operations that are not supported by CUDA graph capture. What can we do with it?
+
         # we calculate these term here first to be able to reuse temporary vectors
         self._kkt_system.eval_P_x(self._data, -1., self._result.x, self._res_nr.x)
         dual_res_norm = cp.linalg.norm(self._res_nr.x, ord=cp.inf) # dual_res_norm = max(||P*x||_inf, ||c||_inf, ||A^T*y + G^T*(z_u - z_l) + z_bu - z_bl||_inf), will be updated below
@@ -521,102 +531,112 @@ class SolverBase:
         GT_zu_minus_zl = self._step.x  # reuse self._step.x as temporary storage
         self._kkt_system.eval_G_xn_and_GT_xt(self._data, 1., 1., self._result.x, self._work_z_1, G_x, GT_zu_minus_zl)
 
-        # ------------ update primal / dual objectives and duality gap ------------
-        # primal objective: 0.5 x^T P x + c^T x
-        # dual objective is: -0.5 x^T P x - b^T y - h_u^T z_u + h_l^T z_l - x_u^T z_bu + x_l^T z_bl
+        if key not in self._update_residuals_nr_cuda_graphs:
+            self._update_residuals_nr_cuda_graphs_capture_count += 1
+            print(f"Solver::_update_residuals_nr capturing CUDA graph (occurrence {self._update_residuals_nr_cuda_graphs_capture_count})...")
+            stream = cp.cuda.Stream(non_blocking=True)
+            stream.begin_capture()
+            with stream:
+                # ------------ update primal / dual objectives and duality gap ------------
+                # primal objective: 0.5 x^T P x + c^T x
+                # dual objective is: -0.5 x^T P x - b^T y - h_u^T z_u + h_l^T z_l - x_u^T z_bu + x_l^T z_bl
 
-        # -x^T P x
-        tmp = cp.dot(self._res_nr.x, self._result.x)  # self._res_nr.x currently holds -P*x
-        self._result.info.primal_obj[:] = -0.5 * tmp
-        self._result.info.dual_obj[:] = 0.5 * tmp
-        duality_gap_rel_norm = cp.abs(tmp)
-        # c^T x
-        tmp = cp.dot(self._data.c, self._result.x)
-        self._result.info.primal_obj += tmp
-        duality_gap_rel_norm = cp.maximum(cp.abs(tmp), duality_gap_rel_norm)
-        # -b^T y
-        tmp = -cp.dot(self._data.b, self._result.y)
-        self._result.info.dual_obj += tmp
-        duality_gap_rel_norm = cp.maximum(cp.abs(tmp), duality_gap_rel_norm)
-        # h_l^T z_l
-        tmp = cp.dot(self._data.h_l[self._data.idx_hl], self._result.z_l)
-        self._result.info.dual_obj += tmp
-        duality_gap_rel_norm = cp.maximum(cp.abs(tmp), duality_gap_rel_norm)
-        # -h_u^T z_u
-        tmp = -cp.dot(self._data.h_u[self._data.idx_hu], self._result.z_u)
-        self._result.info.dual_obj += tmp
-        duality_gap_rel_norm = cp.maximum(cp.abs(tmp), duality_gap_rel_norm)
-        # x_l^T z_bl
-        tmp = cp.dot(self._data.x_l[self._data.idx_xl], self._result.z_bl)
-        self._result.info.dual_obj += tmp
-        duality_gap_rel_norm = cp.maximum(cp.abs(tmp), duality_gap_rel_norm)
-        # -x_u^T z_bu
-        tmp = -cp.dot(self._data.x_u[self._data.idx_xu], self._result.z_bu)
-        self._result.info.dual_obj += tmp
-        duality_gap_rel_norm = cp.maximum(cp.abs(tmp), duality_gap_rel_norm)
-        
-        self._result.info.duality_gap[:] = cp.abs(self._result.info.primal_obj - self._result.info.dual_obj)
-        self._result.info.duality_gap_rel[:] = self._result.info.duality_gap / cp.maximum(1., duality_gap_rel_norm)
+                # -x^T P x
+                tmp = cp.dot(self._res_nr.x, self._result.x)  # self._res_nr.x currently holds -P*x
+                self._result.info.primal_obj[:] = -0.5 * tmp
+                self._result.info.dual_obj[:] = 0.5 * tmp
+                duality_gap_rel_norm = cp.abs(tmp)
+                # c^T x
+                tmp = cp.dot(self._data.c, self._result.x)
+                self._result.info.primal_obj += tmp
+                duality_gap_rel_norm = cp.maximum(cp.abs(tmp), duality_gap_rel_norm)
+                # -b^T y
+                tmp = -cp.dot(self._data.b, self._result.y)
+                self._result.info.dual_obj += tmp
+                duality_gap_rel_norm = cp.maximum(cp.abs(tmp), duality_gap_rel_norm)
+                # h_l^T z_l
+                tmp = cp.dot(self._data.h_l[self._data.idx_hl], self._result.z_l)
+                self._result.info.dual_obj += tmp
+                duality_gap_rel_norm = cp.maximum(cp.abs(tmp), duality_gap_rel_norm)
+                # -h_u^T z_u
+                tmp = -cp.dot(self._data.h_u[self._data.idx_hu], self._result.z_u)
+                self._result.info.dual_obj += tmp
+                duality_gap_rel_norm = cp.maximum(cp.abs(tmp), duality_gap_rel_norm)
+                # x_l^T z_bl
+                tmp = cp.dot(self._data.x_l[self._data.idx_xl], self._result.z_bl)
+                self._result.info.dual_obj += tmp
+                duality_gap_rel_norm = cp.maximum(cp.abs(tmp), duality_gap_rel_norm)
+                # -x_u^T z_bu
+                tmp = -cp.dot(self._data.x_u[self._data.idx_xu], self._result.z_bu)
+                self._result.info.dual_obj += tmp
+                duality_gap_rel_norm = cp.maximum(cp.abs(tmp), duality_gap_rel_norm)
+                
+                self._result.info.duality_gap[:] = cp.abs(self._result.info.primal_obj - self._result.info.dual_obj)
+                self._result.info.duality_gap_rel[:] = self._result.info.duality_gap / cp.maximum(1., duality_gap_rel_norm)
 
-        # res_nr.x = -(P*x + c + A^T*y + G^T*(z_u - z_l) + z_bu - z_bl)
-        # self._res_nr.x is computed as -P*x above
-        self._res_nr.x -= self._data.c
-        self._res_nr.x -= self._res.x  # self._res.x holds A^T*y
-        self._res_nr.x -= GT_zu_minus_zl
-        self._res_nr.x[self._data.idx_xl] += self._result.z_bl
-        self._res_nr.x[self._data.idx_xu] -= self._result.z_bu
-        
-        # res_nr.y = -(A*x - b)
-        self._res_nr.y += self._data.b
+                # res_nr.x = -(P*x + c + A^T*y + G^T*(z_u - z_l) + z_bu - z_bl)
+                # self._res_nr.x is computed as -P*x above
+                self._res_nr.x -= self._data.c
+                self._res_nr.x -= self._res.x  # self._res.x holds A^T*y
+                self._res_nr.x -= GT_zu_minus_zl
+                self._res_nr.x[self._data.idx_xl] += self._result.z_bl
+                self._res_nr.x[self._data.idx_xu] -= self._result.z_bu
+                
+                # res_nr.y = -(A*x - b)
+                self._res_nr.y += self._data.b
 
-        # res_nr.z_l = G*x - s_l - hl  =>  self._res_nr.z_l[:] = (G_x[self._data.idx_hl] - self._result.s_l - self._data.h_l[self._data.idx_hl])
-        cp.take(G_x, self._data.idx_hl, out=self._res_nr.z_l)
-        cp.subtract(self._res_nr.z_l, self._result.s_l, out=self._res_nr.z_l)
-        cp.subtract(self._res_nr.z_l, self._data.h_l[self._data.idx_hl], out=self._res_nr.z_l)  # TODO: this creates a tmp array, optimize?
-        
-        # res_nr.z_u = -G*x - s_u + hu  =>  self._res_nr.z_u[:] = (-G_x[self._data.idx_hu] - self._result.s_u + self._data.h_u[self._data.idx_hu])
-        cp.take(G_x, self._data.idx_hu, out=self._res_nr.z_u)
-        cp.negative(self._res_nr.z_u, out=self._res_nr.z_u)
-        cp.subtract(self._res_nr.z_u, self._result.s_u, out=self._res_nr.z_u)
-        cp.add(self._res_nr.z_u, self._data.h_u[self._data.idx_hu], out=self._res_nr.z_u)  # TODO: this creates a tmp array, optimize?
+                # res_nr.z_l = G*x - s_l - hl  =>  self._res_nr.z_l[:] = (G_x[self._data.idx_hl] - self._result.s_l - self._data.h_l[self._data.idx_hl])
+                cp.take(G_x, self._data.idx_hl, out=self._res_nr.z_l)
+                cp.subtract(self._res_nr.z_l, self._result.s_l, out=self._res_nr.z_l)
+                cp.subtract(self._res_nr.z_l, self._data.h_l[self._data.idx_hl], out=self._res_nr.z_l)  # TODO: this creates a tmp array, optimize?
+                
+                # res_nr.z_u = -G*x - s_u + hu  =>  self._res_nr.z_u[:] = (-G_x[self._data.idx_hu] - self._result.s_u + self._data.h_u[self._data.idx_hu])
+                cp.take(G_x, self._data.idx_hu, out=self._res_nr.z_u)
+                cp.negative(self._res_nr.z_u, out=self._res_nr.z_u)
+                cp.subtract(self._res_nr.z_u, self._result.s_u, out=self._res_nr.z_u)
+                cp.add(self._res_nr.z_u, self._data.h_u[self._data.idx_hu], out=self._res_nr.z_u)  # TODO: this creates a tmp array, optimize?
 
-        # res_nr.z_bl = x - s_bl - xl  =>  self._res_nr.z_bl[:] = (self._result.x[self._data.idx_xl] - self._result.s_bl - self._data.x_l[self._data.idx_xl])
-        cp.take(self._result.x, self._data.idx_xl, out=self._res_nr.z_bl)
-        cp.subtract(self._res_nr.z_bl, self._result.s_bl, out=self._res_nr.z_bl)
-        cp.subtract(self._res_nr.z_bl, self._data.x_l[self._data.idx_xl], out=self._res_nr.z_bl)  # TODO: this creates a tmp array, optimize?
+                # res_nr.z_bl = x - s_bl - xl  =>  self._res_nr.z_bl[:] = (self._result.x[self._data.idx_xl] - self._result.s_bl - self._data.x_l[self._data.idx_xl])
+                cp.take(self._result.x, self._data.idx_xl, out=self._res_nr.z_bl)
+                cp.subtract(self._res_nr.z_bl, self._result.s_bl, out=self._res_nr.z_bl)
+                cp.subtract(self._res_nr.z_bl, self._data.x_l[self._data.idx_xl], out=self._res_nr.z_bl)  # TODO: this creates a tmp array, optimize?
 
-        # res_nr.z_bu = -(x + s_bu - xu)  =>  self._res_nr.z_bu[:] = - (self._result.x[self._data.idx_xu] + self._result.s_bu - self._data.x_u[self._data.idx_xu])
-        cp.take(self._result.x, self._data.idx_xu, out=self._res_nr.z_bu)
-        cp.add(self._res_nr.z_bu, self._result.s_bu, out=self._res_nr.z_bu)
-        cp.subtract(self._res_nr.z_bu, self._data.x_u[self._data.idx_xu], out=self._res_nr.z_bu)  # TODO: this creates a tmp array, optimize?
-        cp.negative(self._res_nr.z_bu, out=self._res_nr.z_bu)
+                # res_nr.z_bu = -(x + s_bu - xu)  =>  self._res_nr.z_bu[:] = - (self._result.x[self._data.idx_xu] + self._result.s_bu - self._data.x_u[self._data.idx_xu])
+                cp.take(self._result.x, self._data.idx_xu, out=self._res_nr.z_bu)
+                cp.add(self._res_nr.z_bu, self._result.s_bu, out=self._res_nr.z_bu)
+                cp.subtract(self._res_nr.z_bu, self._data.x_u[self._data.idx_xu], out=self._res_nr.z_bu)  # TODO: this creates a tmp array, optimize?
+                cp.negative(self._res_nr.z_bu, out=self._res_nr.z_bu)
 
 
-        # ------------ update primal and dual residuals ------------
-        self._result.info.prev_primal_res[:] = self._result.info.primal_res
-        self._result.info.prev_dual_res[:] = self._result.info.dual_res
+                # ------------ update primal and dual residuals ------------
+                self._result.info.prev_primal_res[:] = self._result.info.primal_res
+                self._result.info.prev_dual_res[:] = self._result.info.dual_res
 
-        self._result.info.primal_res[:] = self._primal_res_nr()
+                self._result.info.primal_res[:] = self._primal_res_nr()
 
-        # primal_rel_norm is computed as ||-A*x||_inf above, now update it with other terms
-        primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(G_x[self._data.idx_hu], ord=cp.inf)) if self._data.num_hu > 0 else primal_rel_norm
-        primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(G_x[self._data.idx_hl], ord=cp.inf)) if self._data.num_hl > 0 else primal_rel_norm
-        primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._result.s_u, ord=cp.inf)) if self._data.num_hu > 0 else primal_rel_norm
-        primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._result.s_l, ord=cp.inf)) if self._data.num_hl > 0 else primal_rel_norm
-        primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._result.s_bu, ord=cp.inf)) if self._data.num_xu > 0 else primal_rel_norm
-        primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._result.s_bl, ord=cp.inf)) if self._data.num_xl > 0 else primal_rel_norm
-        primal_rel_norm = cp.maximum(primal_rel_norm, self._data._constraints_rhs_inf_norm)
-        self._result.info.primal_res_rel[:] = self._result.info.primal_res / cp.maximum(1., primal_rel_norm)
+                # primal_rel_norm is computed as ||-A*x||_inf above, now update it with other terms
+                primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(G_x[self._data.idx_hu], ord=cp.inf)) if self._data.num_hu > 0 else primal_rel_norm
+                primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(G_x[self._data.idx_hl], ord=cp.inf)) if self._data.num_hl > 0 else primal_rel_norm
+                primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._result.s_u, ord=cp.inf)) if self._data.num_hu > 0 else primal_rel_norm
+                primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._result.s_l, ord=cp.inf)) if self._data.num_hl > 0 else primal_rel_norm
+                primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._result.s_bu, ord=cp.inf)) if self._data.num_xu > 0 else primal_rel_norm
+                primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._result.s_bl, ord=cp.inf)) if self._data.num_xl > 0 else primal_rel_norm
+                primal_rel_norm = cp.maximum(primal_rel_norm, self._data._constraints_rhs_inf_norm)
+                self._result.info.primal_res_rel[:] = self._result.info.primal_res / cp.maximum(1., primal_rel_norm)
 
-        # dual_res_norm = max(||P*x||_inf, ||c||_inf, ||A^T*y + G^T*(z_u - z_l) + z_bu - z_bl||_inf)
-        self._result.info.dual_res[:] = self._dual_res_nr()
-        dual_res_norm = cp.maximum(dual_res_norm, cp.linalg.norm(self._data.c, ord=cp.inf))  # ||P*x||_inf was calculated before
-        # self._res.x currently holds A^T*y
-        self._res.x += GT_zu_minus_zl
-        self._res.x[self._data.idx_xl] -= self._result.z_bl
-        self._res.x[self._data.idx_xu] += self._result.z_bu
-        dual_res_norm = cp.maximum(dual_res_norm, cp.linalg.norm(self._res.x, ord=cp.inf))
-        self._result.info.dual_res_rel[:] = self._result.info.dual_res / cp.maximum(1., dual_res_norm)
+                # dual_res_norm = max(||P*x||_inf, ||c||_inf, ||A^T*y + G^T*(z_u - z_l) + z_bu - z_bl||_inf)
+                self._result.info.dual_res[:] = self._dual_res_nr()
+                dual_res_norm = cp.maximum(dual_res_norm, cp.linalg.norm(self._data.c, ord=cp.inf))  # ||P*x||_inf was calculated before
+                # self._res.x currently holds A^T*y
+                self._res.x += GT_zu_minus_zl
+                self._res.x[self._data.idx_xl] -= self._result.z_bl
+                self._res.x[self._data.idx_xu] += self._result.z_bu
+                dual_res_norm = cp.maximum(dual_res_norm, cp.linalg.norm(self._res.x, ord=cp.inf))
+                self._result.info.dual_res_rel[:] = self._result.info.dual_res / cp.maximum(1., dual_res_norm)
+
+            self._update_residuals_nr_cuda_graphs[key] = stream.end_capture()
+
+        self._update_residuals_nr_cuda_graphs[key].launch()
         
 
     @nvtx.annotate("Solver::_update_residuals_r")
@@ -625,50 +645,75 @@ class SolverBase:
         Compute the regularized primal and dual residuals. The computation is based on the non-regularized residuals computed in _update_residuals_nr.
         It adds the regularization terms to the non-regularized residuals to obtain the regularized residuals.
         """
-        # update the rhs of the KKT system
-        # self._res.x[:] = self._res_nr.x - self._result.info.rho * (self._result.x - self._prox_vars.x)
-        # self._res.y[:] = self._res_nr.y - self._result.info.delta * (self._prox_vars.y - self._result.y)
-        # self._res.z_l[:] = self._res_nr.z_l - self._result.info.delta * (self._prox_vars.z_l - self._result.z_l)
-        # self._res.z_u[:] = self._res_nr.z_u - self._result.info.delta * (self._prox_vars.z_u - self._result.z_u)
-        # self._res.z_bl[:] = self._res_nr.z_bl - self._result.info.delta * (self._prox_vars.z_bl - self._result.z_bl)
-        # self._res.z_bu[:] = self._res_nr.z_bu - self._result.info.delta * (self._prox_vars.z_bu - self._result.z_bu)
 
-        cp.subtract(self._result.x, self._prox_vars.x, out=self._res.x)
-        self._res.x *= self._result.info.rho
-        cp.subtract(self._res_nr.x, self._res.x, out=self._res.x)
+        if not hasattr(self, '_update_residuals_r_cuda_graphs'):
+            self._update_residuals_r_cuda_graphs = {}
+            self._update_residuals_r_cuda_graphs_capture_count = 0
 
-        cp.subtract(self._prox_vars.y, self._result.y, out=self._res.y)
-        self._res.y *= self._result.info.delta
-        cp.subtract(self._res_nr.y, self._res.y, out=self._res.y)
-
-        cp.subtract(self._prox_vars.z_l, self._result.z_l, out=self._res.z_l)
-        self._res.z_l *= self._result.info.delta
-        cp.subtract(self._res_nr.z_l, self._res.z_l, out=self._res.z_l)
-
-        cp.subtract(self._prox_vars.z_u, self._result.z_u, out=self._res.z_u)
-        self._res.z_u *= self._result.info.delta
-        cp.subtract(self._res_nr.z_u, self._res.z_u, out=self._res.z_u)
-
-        cp.subtract(self._prox_vars.z_bl, self._result.z_bl, out=self._res.z_bl)
-        self._res.z_bl *= self._result.info.delta
-        cp.subtract(self._res_nr.z_bl, self._res.z_bl, out=self._res.z_bl)
-
-        cp.subtract(self._prox_vars.z_bu, self._result.z_bu, out=self._res.z_bu)
-        self._res.z_bu *= self._result.info.delta
-        cp.subtract(self._res_nr.z_bu, self._res.z_bu, out=self._res.z_bu)
+        key = (self._res.buffer_ptr, 
+               self._result.buffer_ptr,
+               self._prox_vars.buffer_ptr,
+               self._res_nr.buffer_ptr)
         
-        primal_rel_scaling = self._result.info.primal_res / self._result.info.primal_res_rel if self._result.info.primal_res_rel > 0 else 1.
-        dual_rel_scaling = self._result.info.dual_res / self._result.info.dual_res_rel if self._result.info.dual_res_rel > 0 else 1.
+        if key not in self._update_residuals_r_cuda_graphs:
+            self._update_residuals_r_cuda_graphs_capture_count += 1
+            print(f"Solver::_update_residuals_r capturing CUDA graph (occurrence {self._update_residuals_r_cuda_graphs_capture_count})...")
+            stream = cp.cuda.Stream(non_blocking=True)
+            stream.begin_capture()
+            with stream:
 
-        self._result.info.primal_res_reg[:] = self._primal_res_r()
-        self._result.info.primal_res_reg_rel[:] = self._result.info.primal_res_reg / primal_rel_scaling
-        self._result.info.dual_res_reg[:] = self._dual_res_r()
-        self._result.info.dual_res_reg_rel[:] = self._result.info.dual_res_reg / dual_rel_scaling
+                # update the rhs of the KKT system
+                # self._res.x[:] = self._res_nr.x - self._result.info.rho * (self._result.x - self._prox_vars.x)
+                # self._res.y[:] = self._res_nr.y - self._result.info.delta * (self._prox_vars.y - self._result.y)
+                # self._res.z_l[:] = self._res_nr.z_l - self._result.info.delta * (self._prox_vars.z_l - self._result.z_l)
+                # self._res.z_u[:] = self._res_nr.z_u - self._result.info.delta * (self._prox_vars.z_u - self._result.z_u)
+                # self._res.z_bl[:] = self._res_nr.z_bl - self._result.info.delta * (self._prox_vars.z_bl - self._result.z_bl)
+                # self._res.z_bu[:] = self._res_nr.z_bu - self._result.info.delta * (self._prox_vars.z_bu - self._result.z_bu)
+                cp.subtract(self._result.x, self._prox_vars.x, out=self._res.x)
+                self._res.x *= self._result.info.rho
+                cp.subtract(self._res_nr.x, self._res.x, out=self._res.x)
+                cp.subtract(self._prox_vars.y, self._result.y, out=self._res.y)
+                self._res.y *= self._result.info.delta
+                cp.subtract(self._res_nr.y, self._res.y, out=self._res.y)
+                cp.subtract(self._prox_vars.z_l, self._result.z_l, out=self._res.z_l)
+                self._res.z_l *= self._result.info.delta
+                cp.subtract(self._res_nr.z_l, self._res.z_l, out=self._res.z_l)
+                cp.subtract(self._prox_vars.z_u, self._result.z_u, out=self._res.z_u)
+                self._res.z_u *= self._result.info.delta
+                cp.subtract(self._res_nr.z_u, self._res.z_u, out=self._res.z_u)
+                cp.subtract(self._prox_vars.z_bl, self._result.z_bl, out=self._res.z_bl)
+                self._res.z_bl *= self._result.info.delta
+                cp.subtract(self._res_nr.z_bl, self._res.z_bl, out=self._res.z_bl)
+                cp.subtract(self._prox_vars.z_bu, self._result.z_bu, out=self._res.z_bu)
+                self._res.z_bu *= self._result.info.delta
+                cp.subtract(self._res_nr.z_bu, self._res.z_bu, out=self._res.z_bu)
 
-        self._result.info.primal_prox_inf[:] = self._primal_prox_inf()
-        self._result.info.primal_prox_inf *= self._result.info.delta
-        self._result.info.dual_prox_inf[:] = self._dual_prox_inf()
-        self._result.info.dual_prox_inf *= self._result.info.rho
+                
+                self._result.info.primal_res_reg[:] = self._primal_res_r()
+                # primal_rel_scaling = self._result.info.primal_res / self._result.info.primal_res_rel if self._result.info.primal_res_rel > 0 else 1.
+                # self._result.info.primal_res_reg_rel[:] = self._result.info.primal_res_reg / primal_rel_scaling
+                cp.divide(self._result.info.primal_res, self._result.info.primal_res_rel, out=self._result.info.primal_res_reg_rel)
+                self._result.info.primal_res_reg_rel[:] = cp.where(self._result.info.primal_res_rel > 0,
+                        self._result.info.primal_res_reg_rel, cp.asarray(1.0, dtype=self._result.info.primal_res_reg_rel.dtype))
+                cp.divide(self._result.info.primal_res_reg, self._result.info.primal_res_reg_rel, out=self._result.info.primal_res_reg_rel)
+
+                self._result.info.dual_res_reg[:] = self._dual_res_r()
+                # dual_rel_scaling = self._result.info.dual_res / self._result.info.dual_res_rel if self._result.info.dual_res_rel > 0 else 1.
+                # self._result.info.dual_res_reg_rel[:] = self._result.info.dual_res_reg / dual_rel_scaling
+                cp.divide(self._result.info.dual_res, self._result.info.dual_res_rel, out=self._result.info.dual_res_reg_rel)
+                self._result.info.dual_res_reg_rel[:] = cp.where(self._result.info.dual_res_rel > 0,
+                        self._result.info.dual_res_reg_rel, cp.asarray(1.0, dtype=self._result.info.dual_res_reg_rel.dtype))
+                cp.divide(self._result.info.dual_res_reg, self._result.info.dual_res_reg_rel, out=self._result.info.dual_res_reg_rel)
+
+                self._result.info.primal_prox_inf[:] = self._primal_prox_inf()
+                self._result.info.primal_prox_inf *= self._result.info.delta
+                self._result.info.dual_prox_inf[:] = self._dual_prox_inf()
+                self._result.info.dual_prox_inf *= self._result.info.rho
+        
+            self._update_residuals_r_cuda_graphs[key] = stream.end_capture()
+
+        self._update_residuals_r_cuda_graphs[key].launch()
+        
 
     @nvtx.annotate("Solver::_primal_res_nr")
     def _primal_res_nr(self) -> float:
