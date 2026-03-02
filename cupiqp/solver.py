@@ -343,10 +343,24 @@ class SolverBase:
 
 
                 # ------------------ corrector step ------------------
-                self._res.s_l += -self._step.s_l * self._step.z_l + self._result.info.sigma * self._result.info.mu
-                self._res.s_u += -self._step.s_u * self._step.z_u + self._result.info.sigma * self._result.info.mu
-                self._res.s_bl += -self._step.s_bl * self._step.z_bl + self._result.info.sigma * self._result.info.mu
-                self._res.s_bu += -self._step.s_bu * self._step.z_bu + self._result.info.sigma * self._result.info.mu
+                with nvtx.annotate("Solver::prepare_corrector_step"):
+                    # self._res.s_l += -self._step.s_l * self._step.z_l + self._result.info.sigma * self._result.info.mu
+                    # self._res.s_u += -self._step.s_u * self._step.z_u + self._result.info.sigma * self._result.info.mu
+                    # self._res.s_bl += -self._step.s_bl * self._step.z_bl + self._result.info.sigma * self._result.info.mu
+                    # self._res.s_bu += -self._step.s_bu * self._step.z_bu + self._result.info.sigma * self._result.info.mu
+                    tmp_sigma_mu = self._result.info.sigma * self._result.info.mu
+                    cp.multiply(self._step.s_l, self._step.z_l, out=self._work_duals[:self._data.num_hl])
+                    self._res.s_l -= self._work_duals[:self._data.num_hl]
+                    self._res.s_l += tmp_sigma_mu
+                    cp.multiply(self._step.s_u, self._step.z_u, out=self._work_duals[:self._data.num_hu])
+                    self._res.s_u -= self._work_duals[:self._data.num_hu]
+                    self._res.s_u += tmp_sigma_mu
+                    cp.multiply(self._step.s_bl, self._step.z_bl, out=self._work_duals[:self._data.num_xl])
+                    self._res.s_bl -= self._work_duals[:self._data.num_xl]
+                    self._res.s_bl += tmp_sigma_mu
+                    cp.multiply(self._step.s_bu, self._step.z_bu, out=self._work_duals[:self._data.num_xu])
+                    self._res.s_bu -= self._work_duals[:self._data.num_xu]
+                    self._res.s_bu += tmp_sigma_mu
 
                 if self.settings.debug:
                     print("corrector step rhs is: res= ", self._res)
