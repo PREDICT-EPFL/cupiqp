@@ -310,12 +310,16 @@ class SolverBase:
                 # Drop the quadratic term Δs ∘ Δz (first‑order Newton linearization) to get the linear system S Δz + Z Δs = - s ∘ z.
                 # Thus the predictor RHS for the slack/dual complementarity equations is - s ∘ z (elementwise product), which is exactly what the four lines set for the different constraint groups.
                 # In words: those lines build the complementarity residual r_s = - s .* z so the KKT solve computes Δs, Δz satisfying S Δz + Z Δs = r_s (the linearized complementarity equation) for the predictor (affine) direction. The .array() calls implement the elementwise product s .* z.
-                self._res.s_l[:] = -self._result.s_l * self._result.z_l
-                self._res.s_u[:] = -self._result.s_u * self._result.z_u
-                self._res.s_bl[:] = -self._result.s_bl * self._result.z_bl
-                self._res.s_bu[:] = -self._result.s_bu * self._result.z_bu
-                
-                
+                with nvtx.annotate("Solver::prepare_predictor_step"):
+                    cp.multiply(self._result.s_l, self._result.z_l, out=self._res.s_l)
+                    self._res.s_l *= -1.
+                    cp.multiply(self._result.s_u, self._result.z_u, out=self._res.s_u)
+                    self._res.s_u *= -1.
+                    cp.multiply(self._result.s_bl, self._result.z_bl, out=self._res.s_bl)
+                    self._res.s_bl *= -1.
+                    cp.multiply(self._result.s_bu, self._result.z_bu, out=self._res.s_bu)
+                    self._res.s_bu *= -1.
+                    
 
                 if self.settings.debug:
                     print("predictor step rhs is: res= ", self._res)
