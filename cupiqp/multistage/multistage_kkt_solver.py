@@ -1,5 +1,6 @@
 import cupy as cp
 import cupyx.scipy.sparse as cpsp
+from cupyx.cusparse import spmv
 import warp as wp
 import nvtx
 
@@ -161,17 +162,17 @@ class MultistageKKTSolver(KKTSolverBase):
     @nvtx.annotate("MultistageKKTSolver::eval_P_x")
     def eval_P_x(self, data: MultistageData, alpha: float, x: cp.ndarray, z: cp.ndarray):
         # TODO: customize kernels for this
-        z[:] = data.P @ x * alpha
+        spmv(data.P, x, z, alpha=alpha, beta=0.0)
 
     @nvtx.annotate("MultistageKKTSolver::eval_A_xn_and_AT_xt")
     def eval_A_xn_and_AT_xt(self, data: MultistageData, alpha_n: float, xn: cp.ndarray, alpha_t: float, xt: cp.ndarray, zn: cp.ndarray, zt: cp.ndarray):
         # TODO: customize kernels for this
-        zn[:] = (data.A @ xn) * alpha_n
-        zt[:] = (data.A.T @ xt) * alpha_t
+        spmv(data.A, xn, zn, alpha=alpha_n, beta=0.0)
+        spmv(data.A, xt, zt, alpha=alpha_t, beta=0.0, transa=True)
     
     @nvtx.annotate("MultistageKKTSolver::eval_G_xn_and_GT_xt")
     def eval_G_xn_and_GT_xt(self, data: MultistageData, alpha_n: float, xn: cp.ndarray, alpha_t: float, xt: cp.ndarray, zn: cp.ndarray, zt: cp.ndarray):
         # TODO: customize kernels for this
-        zn[:] = (data.G @ xn) * alpha_n
-        zt[:] = (data.G.T @ xt) * alpha_t
+        spmv(data.G, xn, zn, alpha=alpha_n, beta=0.0)
+        spmv(data.G, xt, zt, alpha=alpha_t, beta=0.0, transa=True)
     

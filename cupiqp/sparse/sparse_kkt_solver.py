@@ -1,6 +1,7 @@
 from typing import Optional
 import cupy as cp
 from cupyx.scipy.sparse import csr_matrix, diags, bmat
+from cupyx.cusparse import spmv
 from nvmath.sparse.advanced import (
     DirectSolver,
     DirectSolverAlgType,
@@ -166,14 +167,14 @@ class SparseKKTSolver(KKTSolverBase):
 
     @nvtx.annotate("SparseKKTSolver::eval_P_x")
     def eval_P_x(self, data: SparseData, alpha: float, x: cp.ndarray, z: cp.ndarray):
-        z[:] = data.P @ x * alpha
+        spmv(data.P, x, z, alpha=alpha, beta=0.0)
     
     @nvtx.annotate("SparseKKTSolver::eval_A_xn_and_AT_xt")
     def eval_A_xn_and_AT_xt(self, data: SparseData, alpha_n: float, xn: cp.ndarray, alpha_t: float, xt: cp.ndarray, zn: cp.ndarray, zt: cp.ndarray):
-        zn[:] = (data.A @ xn) * alpha_n
-        zt[:] = (data.A.T @ xt) * alpha_t
+        spmv(data.A, xn, zn, alpha=alpha_n, beta=0.0)
+        spmv(data.A, xt, zt, alpha=alpha_t, beta=0.0, transa=True)
     
     @nvtx.annotate("SparseKKTSolver::eval_G_xn_and_GT_xt")
     def eval_G_xn_and_GT_xt(self, data: SparseData, alpha_n: float, xn: cp.ndarray, alpha_t: float, xt: cp.ndarray, zn: cp.ndarray, zt: cp.ndarray):
-        zn[:] = (data.G @ xn) * alpha_n
-        zt[:] = (data.G.T @ xt) * alpha_t
+        spmv(data.G, xn, zn, alpha=alpha_n, beta=0.0)
+        spmv(data.G, xt, zt, alpha=alpha_t, beta=0.0, transa=True)
