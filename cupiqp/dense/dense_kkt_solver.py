@@ -2,6 +2,7 @@ import numpy as np
 import cupy as cp
 import warp as wp
 from cupy_backends.cuda.libs import cublas
+from cupy.cublas import gemv
 import nvtx
 
 from ..kkt_solver import KKTSolverBase, KKTUpdateOptions
@@ -173,14 +174,14 @@ class DenseKKTSolver(KKTSolverBase):
 
     @nvtx.annotate("DenseKKTSolver::eval_P_x")
     def eval_P_x(self, data: DenseData, alpha: float, x: cp.ndarray, z: cp.ndarray):
-        z[:] = data.P @ x * alpha
+        gemv(transa='N', alpha=alpha, a=data.P, x=x, beta=0.0, y=z)
     
     @nvtx.annotate("DenseKKTSolver::eval_G_xn_and_GT_xt")
     def eval_A_xn_and_AT_xt(self, data: DenseData, alpha_n: float, xn: cp.ndarray, alpha_t: float, xt: cp.ndarray, zn: cp.ndarray, zt: cp.ndarray):
-        zn[:] = (data.A @ xn) * alpha_n
-        zt[:] = (data.A.T @ xt) * alpha_t
+        gemv(transa='N', alpha=alpha_n, a=data.A, x=xn, beta=0.0, y=zn)
+        gemv(transa='T', alpha=alpha_t, a=data.A, x=xt, beta=0.0, y=zt)
     
     @nvtx.annotate("DenseKKTSolver::eval_G_xn_and_GT_xt")
     def eval_G_xn_and_GT_xt(self, data: DenseData, alpha_n: float, xn: cp.ndarray, alpha_t: float, xt: cp.ndarray, zn: cp.ndarray, zt: cp.ndarray):
-        zn[:] = (data.G @ xn) * alpha_n
-        zt[:] = (data.G.T @ xt) * alpha_t
+        gemv(transa='N', alpha=alpha_n, a=data.G, x=xn, beta=0.0, y=zn)
+        gemv(transa='T', alpha=alpha_t, a=data.G, x=xt, beta=0.0, y=zt)
