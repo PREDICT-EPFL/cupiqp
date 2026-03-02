@@ -62,7 +62,7 @@ class KKTSystem:
         # create kernels
         self._eliminate_slacks_kernel = create_eliminate_slacks_kernel(self._data.num_hu, self._data.num_hl, self._data.num_xu, self._data.num_xl)
         self._eliminate_duals_kernel = create_eliminate_duals_kernel(self._data.n, self._data.m, self._data.num_hu, self._data.num_hl, self._data.num_xu, self._data.num_xl)
-        self._recover_duals_kernel = create_recover_duals_kernel(self._data.num_hl, self._data.num_hu, self._data.num_xu, self._data.num_xl)
+        self._recover_duals_kernel = create_recover_duals_kernel(self._data.num_hu, self._data.num_hl, self._data.num_xu, self._data.num_xl)
         self._recover_slacks_kernel = create_recover_slacks_kernel(self._data.num_hu, self._data.num_hl, self._data.num_xu, self._data.num_xl)
 
     @nvtx.annotate("KKTSystem::update_scalings_and_factor")
