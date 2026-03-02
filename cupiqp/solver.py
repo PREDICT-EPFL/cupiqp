@@ -54,6 +54,7 @@ class SolverBase:
         self._work_primals = cp.empty(self._data.n)
         self._work_duals = cp.empty(self._data.p + self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)  # used to hold the concatenated dual variables for computing the residuals in _update_residuals_nr
         self._work_residual = cp.empty(())
+        self._work_reduce = cp.empty(4)  # used to hold the intermediate results of the reductions related to s_l, s_u, s_bl, s_bu and z_l, z_u, z_bl, z_bu
         
 
     def solve(self) -> Status:
@@ -162,7 +163,9 @@ class SolverBase:
                 self._result.z_bu += delta_z
 
                 # need to make sure mu is positive here, otherwise in the next step (put s and z on central path) sqrt(mu) the computed z_* will be zeros
-                self._result.info.mu[:] = cp.maximum(self._calculate_mu(), 1e-10)
+                self._calculate_mu()
+                cp.clip(self._result.info.mu, 1e-10, None, out=self._result.info.mu)
+
                 if self.settings.debug:
                     print("Initial mu:", self._result.info.mu)
 
@@ -183,7 +186,7 @@ class SolverBase:
                 if self.settings.debug:
                     print("self._result:", self._result)
 
-                self._result.info.mu[:] = self._calculate_mu()
+                self._calculate_mu()
 
             self._prox_vars.x[:] = self._result.x
             self._prox_vars.y[:] = self._result.y
@@ -385,7 +388,7 @@ class SolverBase:
                 self._result.s_bu += self._result.info.primal_step * self._step.s_bu
 
                 mu_prev = self._result.info.mu.copy()
-                self._result.info.mu[:] = self._calculate_mu()
+                self._calculate_mu()
                 mu_rate = cp.maximum(0., (mu_prev - self._result.info.mu[0]) / mu_prev)  # r in Algorithm 2 in Roland Schwan 2023 paper
 
 
@@ -483,13 +486,26 @@ class SolverBase:
         self._calculate_step_cuda_graphs[key].launch()
 
     @nvtx.annotate("Solver::_calculate_mu")
-    def _calculate_mu(self) -> float:
-        mu = (cp.dot(self._result.s_l, self._result.z_l)
-                + cp.dot(self._result.s_u, self._result.z_u) \
-                + cp.dot(self._result.s_bl, self._result.z_bl) \
-                + cp.dot(self._result.s_bu, self._result.z_bu)) \
-                / (self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)
-        return mu
+    def _calculate_mu(self) -> None:
+        if not hasattr(self, '_calculate_mu_cuda_graphs'):
+            self._calculate_mu_cuda_graphs = {}
+            self._calculate_mu_cuda_graphs_capture_count = 0
+        key = (self._result.buffer_ptr, self._result.info.mu.data.ptr)
+        if key not in self._calculate_mu_cuda_graphs:
+            self._calculate_mu_cuda_graphs_capture_count += 1
+            print(f"KKTSystems::_calculate_mu capturing CUDA graph (occurrence {self._calculate_mu_cuda_graphs_capture_count})...")
+            stream = cp.cuda.Stream(non_blocking=True)
+            stream.begin_capture()
+            with stream:
+                cp.dot(self._result.s_l, self._result.z_l, out=self._work_reduce[0:1])
+                cp.dot(self._result.s_u, self._result.z_u, out=self._work_reduce[1:2])
+                cp.dot(self._result.s_bl, self._result.z_bl, out=self._work_reduce[2:3])
+                cp.dot(self._result.s_bu, self._result.z_bu, out=self._work_reduce[3:4])
+                cp.sum(self._work_reduce, out=self._result.info.mu[:], keepdims=True)
+                self._result.info.mu /= (self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)
+            self._calculate_mu_cuda_graphs[key] = stream.end_capture()
+
+        self._calculate_mu_cuda_graphs[key].launch()
 
     @nvtx.annotate("Solver::_calculate_sigma")
     def _calculate_sigma(self) -> None:
