@@ -336,15 +336,7 @@ class SolverBase:
                 self._alpha_sz *= self.settings.tau
 
                 # ------------------ compute centering parameter sigma ------------------
-                self._result.info.sigma[:] = 0.
-                self._result.info.sigma += cp.dot(self._result.s_l + self._alpha_sz[0] * self._step.s_l, self._result.z_l + self._alpha_sz[1] * self._step.z_l)
-                self._result.info.sigma += cp.dot(self._result.s_u + self._alpha_sz[0] * self._step.s_u, self._result.z_u + self._alpha_sz[1] * self._step.z_u)
-                self._result.info.sigma += cp.dot(self._result.s_bl + self._alpha_sz[0] * self._step.s_bl, self._result.z_bl + self._alpha_sz[1] * self._step.z_bl)
-                self._result.info.sigma += cp.dot(self._result.s_bu + self._alpha_sz[0] * self._step.s_bu, self._result.z_bu + self._alpha_sz[1] * self._step.z_bu)
-                self._result.info.sigma /= self._result.info.mu[0] * cp.float64(self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)
-                self._result.info.sigma[:] = cp.maximum(0., cp.minimum(1., self._result.info.sigma[0]))
-                self._result.info.sigma[:] = self._result.info.sigma ** 3
-
+                self._calculate_sigma()
 
                 # ------------------ corrector step ------------------
                 with nvtx.annotate("Solver::prepare_corrector_step"):
@@ -498,6 +490,40 @@ class SolverBase:
                 + cp.dot(self._result.s_bu, self._result.z_bu)) \
                 / (self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)
         return mu
+
+    @nvtx.annotate("Solver::_calculate_sigma")
+    def _calculate_sigma(self) -> None:
+        if not hasattr(self, '_calculate_sigma_cuda_graphs'):
+            self._calculate_sigma_cuda_graphs = {}
+            self._calculate_sigma_cuda_graphs_capture_count = 0
+
+        key = (self._alpha_sz.data.ptr,
+                self._result.buffer_ptr,
+                self._step.buffer_ptr,
+                self._result.info.sigma.data.ptr,
+                self._result.info.mu.data.ptr
+            )
+        
+        if key not in self._calculate_sigma_cuda_graphs:
+            self._calculate_sigma_cuda_graphs_capture_count += 1
+            print(f"KKTSystems::_calculate_sigma capturing CUDA graph (occurrence {self._calculate_sigma_cuda_graphs_capture_count})...")
+            stream = cp.cuda.Stream(non_blocking=True)
+            stream.begin_capture()
+            with stream:
+                self._result.info.sigma[:] = 0.
+                self._result.info.sigma += cp.dot(self._result.s_l + self._alpha_sz[0] * self._step.s_l, self._result.z_l + self._alpha_sz[1] * self._step.z_l)
+                self._result.info.sigma += cp.dot(self._result.s_u + self._alpha_sz[0] * self._step.s_u, self._result.z_u + self._alpha_sz[1] * self._step.z_u)
+                self._result.info.sigma += cp.dot(self._result.s_bl + self._alpha_sz[0] * self._step.s_bl, self._result.z_bl + self._alpha_sz[1] * self._step.z_bl)
+                self._result.info.sigma += cp.dot(self._result.s_bu + self._alpha_sz[0] * self._step.s_bu, self._result.z_bu + self._alpha_sz[1] * self._step.z_bu)
+                
+                cp.divide(self._result.info.sigma, self._result.info.mu, out=self._result.info.sigma)
+                self._result.info.sigma /= self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu
+                cp.clip(self._result.info.sigma, 0., 1., out=self._result.info.sigma)
+                cp.power(self._result.info.sigma, 3., out=self._result.info.sigma)
+
+            self._calculate_sigma_cuda_graphs[key] = stream.end_capture()
+
+        self._calculate_sigma_cuda_graphs[key].launch()
 
 
     @nvtx.annotate("Solver::_update_residuals_nr")
