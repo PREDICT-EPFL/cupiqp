@@ -1,4 +1,5 @@
 import cupy as cp
+import warp as wp
 from typing import Tuple
 import nvtx
 
@@ -56,6 +57,9 @@ class SolverBase:
         self._work_residual = cp.empty(())
         self._work_reduce = cp.empty(8)  # used to hold the intermediate results of the reductions related to s_l, s_u, s_bl, s_bu and z_l, z_u, z_bl, z_bu
         
+        self._update_residuals_r_kernel = create_update_residual_r_kernel(
+            self._data.n, self._data.p, self._data.num_hl, self._data.num_hu, self._data.num_xl, self._data.num_xu
+        )
 
     def solve(self) -> Status:
         if self.settings.verbose:
@@ -703,7 +707,7 @@ class SolverBase:
             self._update_residuals_nr_cuda_graphs[key] = stream.end_capture()
 
         self._update_residuals_nr_cuda_graphs[key].launch()
-        
+
 
     @nvtx.annotate("Solver::_update_residuals_r")
     def _update_residuals_r(self):
@@ -724,7 +728,8 @@ class SolverBase:
         if key not in self._update_residuals_r_cuda_graphs:
             self._update_residuals_r_cuda_graphs_capture_count += 1
             print(f"Solver::_update_residuals_r capturing CUDA graph (occurrence {self._update_residuals_r_cuda_graphs_capture_count})...")
-            stream = cp.cuda.Stream(non_blocking=True)
+            # !IMPORTANT! Use the same stream for warp and cupy to make sure the captured graph contains both the warp kernel and the cupy operations, and they can be executed together without unnecessary stream synchronization
+            stream = cp.cuda.ExternalStream(wp.get_stream().cuda_stream)
             stream.begin_capture()
             with stream:
 
@@ -735,26 +740,40 @@ class SolverBase:
                 # self._res.z_u[:] = self._res_nr.z_u - self._result.info.delta * (self._prox_vars.z_u - self._result.z_u)
                 # self._res.z_bl[:] = self._res_nr.z_bl - self._result.info.delta * (self._prox_vars.z_bl - self._result.z_bl)
                 # self._res.z_bu[:] = self._res_nr.z_bu - self._result.info.delta * (self._prox_vars.z_bu - self._result.z_bu)
-                cp.subtract(self._result.x, self._prox_vars.x, out=self._res.x)
-                self._res.x *= self._result.info.rho
-                cp.subtract(self._res_nr.x, self._res.x, out=self._res.x)
-                cp.subtract(self._prox_vars.y, self._result.y, out=self._res.y)
-                self._res.y *= self._result.info.delta
-                cp.subtract(self._res_nr.y, self._res.y, out=self._res.y)
-                cp.subtract(self._prox_vars.z_l, self._result.z_l, out=self._res.z_l)
-                self._res.z_l *= self._result.info.delta
-                cp.subtract(self._res_nr.z_l, self._res.z_l, out=self._res.z_l)
-                cp.subtract(self._prox_vars.z_u, self._result.z_u, out=self._res.z_u)
-                self._res.z_u *= self._result.info.delta
-                cp.subtract(self._res_nr.z_u, self._res.z_u, out=self._res.z_u)
-                cp.subtract(self._prox_vars.z_bl, self._result.z_bl, out=self._res.z_bl)
-                self._res.z_bl *= self._result.info.delta
-                cp.subtract(self._res_nr.z_bl, self._res.z_bl, out=self._res.z_bl)
-                cp.subtract(self._prox_vars.z_bu, self._result.z_bu, out=self._res.z_bu)
-                self._res.z_bu *= self._result.info.delta
-                cp.subtract(self._res_nr.z_bu, self._res.z_bu, out=self._res.z_bu)
+                USE_WARP_IMPLEMENTATION = True
+                if USE_WARP_IMPLEMENTATION:
+                    wp.launch(
+                        kernel=self._update_residuals_r_kernel,
+                        dim=self._data.n + self._data.p + self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu,
+                        inputs=[
+                            self._result.info.rho, self._result.info.delta,
+                            self._res_nr.x, self._res_nr.y, self._res_nr.z_l, self._res_nr.z_u, self._res_nr.z_bl, self._res_nr.z_bu,
+                            self._result.x, self._result.y, self._result.z_l, self._result.z_u, self._result.z_bl, self._result.z_bu,
+                            self._prox_vars.x, self._prox_vars.y, self._prox_vars.z_l, self._prox_vars.z_u, self._prox_vars.z_bl, self._prox_vars.z_bu,
+                            self._res.x, self._res.y, self._res.z_l, self._res.z_u, self._res.z_bl, self._res.z_bu
+                        ],
+                        device="cuda",
+                    )
+                else:
+                    cp.subtract(self._result.x, self._prox_vars.x, out=self._res.x)
+                    self._res.x *= self._result.info.rho
+                    cp.subtract(self._res_nr.x, self._res.x, out=self._res.x)
+                    cp.subtract(self._prox_vars.y, self._result.y, out=self._res.y)
+                    self._res.y *= self._result.info.delta
+                    cp.subtract(self._res_nr.y, self._res.y, out=self._res.y)
+                    cp.subtract(self._prox_vars.z_l, self._result.z_l, out=self._res.z_l)
+                    self._res.z_l *= self._result.info.delta
+                    cp.subtract(self._res_nr.z_l, self._res.z_l, out=self._res.z_l)
+                    cp.subtract(self._prox_vars.z_u, self._result.z_u, out=self._res.z_u)
+                    self._res.z_u *= self._result.info.delta
+                    cp.subtract(self._res_nr.z_u, self._res.z_u, out=self._res.z_u)
+                    cp.subtract(self._prox_vars.z_bl, self._result.z_bl, out=self._res.z_bl)
+                    self._res.z_bl *= self._result.info.delta
+                    cp.subtract(self._res_nr.z_bl, self._res.z_bl, out=self._res.z_bl)
+                    cp.subtract(self._prox_vars.z_bu, self._result.z_bu, out=self._res.z_bu)
+                    self._res.z_bu *= self._result.info.delta
+                    cp.subtract(self._res_nr.z_bu, self._res.z_bu, out=self._res.z_bu)
 
-                
                 self._result.info.primal_res_reg[:] = self._primal_res_r()
                 # primal_rel_scaling = self._result.info.primal_res / self._result.info.primal_res_rel if self._result.info.primal_res_rel > 0 else 1.
                 # self._result.info.primal_res_reg_rel[:] = self._result.info.primal_res_reg / primal_rel_scaling
@@ -850,3 +869,73 @@ class SolverBase:
         cp.absolute(self._work_primals, out=self._work_primals)
         cp.max(self._work_primals, out=self._work_residual)
         return self._work_residual
+
+
+def create_update_residual_r_kernel(n: int, p: int, num_hl: int, num_hu: int, num_xl: int, num_xu: int):
+    """
+    Perform the following operations:
+        self._res.x[:] = self._res_nr.x - self._result.info.rho * (self._result.x - self._prox_vars.x)
+        self._res.y[:] = self._res_nr.y - self._result.info.delta * (self._prox_vars.y - self._result.y)
+        self._res.z_l[:] = self._res_nr.z_l - self._result.info.delta * (self._prox_vars.z_l - self._result.z_l)
+        self._res.z_u[:] = self._res_nr.z_u - self._result.info.delta * (self._prox_vars.z_u - self._result.z_u)
+        self._res.z_bl[:] = self._res_nr.z_bl - self._result.info.delta * (self._prox_vars.z_bl - self._result.z_bl)
+        self._res.z_bu[:] = self._res_nr.z_bu - self._result.info.delta * (self._prox_vars.z_bu - self._result.z_bu)
+    """
+    @wp.kernel
+    def update_residual_r_kernel(
+        rho: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        delta: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        res_nr_x: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        res_nr_y: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        res_nr_z_l: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        res_nr_z_u: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        res_nr_z_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        res_nr_z_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        result_x: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        result_y: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        result_z_l: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        result_z_u: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        result_z_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        result_z_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        prox_var_x: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        prox_var_y: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        prox_var_z_l: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        prox_var_z_u: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        prox_var_z_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        prox_var_z_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        res_r_x: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        res_r_y: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        res_r_z_l: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        res_r_z_u: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        res_r_z_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        res_r_z_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+    ):
+        t = wp.tid()
+        n_static = wp.static(n)
+        p_static = wp.static(p)
+        num_hl_static = wp.static(num_hl)
+        num_hu_static = wp.static(num_hu)
+        num_xl_static = wp.static(num_xl)
+        num_xu_static = wp.static(num_xu)
+
+        if t < n_static:
+            res_r_x[t] = -rho[0] * (result_x[t] - prox_var_x[t]) + res_nr_x[t]
+        elif t < n_static + p_static:
+            idx = t - n_static
+            res_r_y[idx] = delta[0] * (result_y[idx] - prox_var_y[idx]) + res_nr_y[idx]
+        elif t < n_static + p_static + num_hl_static:
+            idx = t - n_static - p_static
+            res_r_z_l[idx] = delta[0] * (result_z_l[idx] - prox_var_z_l[idx]) + res_nr_z_l[idx]
+        elif t < n_static + p_static + num_hl_static + num_hu_static:
+            idx = t - n_static - p_static - num_hl_static
+            res_r_z_u[idx] = delta[0] * (result_z_u[idx] - prox_var_z_u[idx]) + res_nr_z_u[idx]
+        elif t < n_static + p_static + num_hl_static + num_hu_static + num_xl_static:
+            idx = t - n_static - p_static - num_hl_static - num_hu_static
+            res_r_z_bl[idx] = delta[0] * (result_z_bl[idx] - prox_var_z_bl[idx]) + res_nr_z_bl[idx]
+        elif t < n_static + p_static + num_hl_static + num_hu_static + num_xl_static + num_xu_static:
+            idx = t - n_static - p_static - num_hl_static - num_hu_static - num_xl_static
+            res_r_z_bu[idx] = delta[0] * (result_z_bu[idx] - prox_var_z_bu[idx]) + res_nr_z_bu[idx]
+        else:
+            return
+
+    return update_residual_r_kernel
