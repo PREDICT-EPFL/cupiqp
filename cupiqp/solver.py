@@ -54,7 +54,7 @@ class SolverBase:
         self._work_primals = cp.empty(self._data.n)
         self._work_duals = cp.empty(self._data.p + self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)  # used to hold the concatenated dual variables for computing the residuals in _update_residuals_nr
         self._work_residual = cp.empty(())
-        self._work_reduce = cp.empty(4)  # used to hold the intermediate results of the reductions related to s_l, s_u, s_bl, s_bu and z_l, z_u, z_bl, z_bu
+        self._work_reduce = cp.empty(8)  # used to hold the intermediate results of the reductions related to s_l, s_u, s_bl, s_bu and z_l, z_u, z_bl, z_bu
         
 
     def solve(self) -> Status:
@@ -97,7 +97,6 @@ class SolverBase:
         with nvtx.annotate("Solver::initialization"):
             self._result.x.fill(0.0)
             self._result.y.fill(0.0)
-
             self._result.s_l.fill(1.0)
             self._result.z_l.fill(1.0)
             self._result.s_u.fill(1.0)
@@ -501,7 +500,7 @@ class SolverBase:
                 cp.dot(self._result.s_u, self._result.z_u, out=self._work_reduce[1:2])
                 cp.dot(self._result.s_bl, self._result.z_bl, out=self._work_reduce[2:3])
                 cp.dot(self._result.s_bu, self._result.z_bu, out=self._work_reduce[3:4])
-                cp.sum(self._work_reduce, out=self._result.info.mu[:], keepdims=True)
+                cp.sum(self._work_reduce[0:4], out=self._result.info.mu[:], keepdims=True)
                 self._result.info.mu /= (self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)
             self._calculate_mu_cuda_graphs[key] = stream.end_capture()
 
@@ -601,39 +600,46 @@ class SolverBase:
                 # primal objective: 0.5 x^T P x + c^T x
                 # dual objective is: -0.5 x^T P x - b^T y - h_u^T z_u + h_l^T z_l - x_u^T z_bu + x_l^T z_bl
 
-                # -x^T P x
-                tmp = cp.dot(self._res_nr.x, self._result.x)  # self._res_nr.x currently holds -P*x
-                self._result.info.primal_obj[:] = -0.5 * tmp
-                self._result.info.dual_obj[:] = 0.5 * tmp
-                duality_gap_rel_norm = cp.abs(tmp)
-                # c^T x
-                tmp = cp.dot(self._data.c, self._result.x)
-                self._result.info.primal_obj += tmp
-                duality_gap_rel_norm = cp.maximum(cp.abs(tmp), duality_gap_rel_norm)
-                # -b^T y
-                tmp = -cp.dot(self._data.b, self._result.y)
-                self._result.info.dual_obj += tmp
-                duality_gap_rel_norm = cp.maximum(cp.abs(tmp), duality_gap_rel_norm)
-                # h_l^T z_l
-                tmp = cp.dot(self._data.h_l[self._data.idx_hl], self._result.z_l)
-                self._result.info.dual_obj += tmp
-                duality_gap_rel_norm = cp.maximum(cp.abs(tmp), duality_gap_rel_norm)
-                # -h_u^T z_u
-                tmp = -cp.dot(self._data.h_u[self._data.idx_hu], self._result.z_u)
-                self._result.info.dual_obj += tmp
-                duality_gap_rel_norm = cp.maximum(cp.abs(tmp), duality_gap_rel_norm)
-                # x_l^T z_bl
-                tmp = cp.dot(self._data.x_l[self._data.idx_xl], self._result.z_bl)
-                self._result.info.dual_obj += tmp
-                duality_gap_rel_norm = cp.maximum(cp.abs(tmp), duality_gap_rel_norm)
-                # -x_u^T z_bu
-                tmp = -cp.dot(self._data.x_u[self._data.idx_xu], self._result.z_bu)
-                self._result.info.dual_obj += tmp
-                duality_gap_rel_norm = cp.maximum(cp.abs(tmp), duality_gap_rel_norm)
-                
-                self._result.info.duality_gap[:] = cp.abs(self._result.info.primal_obj - self._result.info.dual_obj)
-                self._result.info.duality_gap_rel[:] = self._result.info.duality_gap / cp.maximum(1., duality_gap_rel_norm)
+                # use self._work_reduce to hold intermediate terms for primal and dual objectives:
+                # index |  content
+                #  0    |   0.5 * x^T P x
+                #  1    |   c^T x
+                #  2    |   0.5 * x^T P x (copy of idx 0 for easier reduction)
+                #  3    |   b^T y
+                #  4    |   -h_l^T z_l
+                #  5    |   h_u^T z_u
+                #  6    |   -x_l^T z_bl
+                #  7    |   x_u^T z_bu
 
+                cp.dot(self._res_nr.x, self._result.x, out=self._work_reduce[0:1])
+                self._work_reduce[0:1] *= -0.5  # hold 0.5 * x^T P x
+                cp.dot(self._data.c, self._result.x, out=self._work_reduce[1:2]) # hold c^T x
+
+                cp.multiply(self._work_reduce[0:1], 1., out=self._work_reduce[2:3])  # hold 0.5 * x^T P x
+                cp.dot(self._data.b, self._result.y, out=self._work_reduce[3:4]) # hold b^T y
+                cp.dot(self._data.h_l[self._data.idx_hl], self._result.z_l, out=self._work_reduce[4:5])  # hold h_l^T z_l
+                self._work_reduce[4:5] *= -1.  # hold - h_l^T z_l
+                cp.dot(self._data.h_u[self._data.idx_hu], self._result.z_u, out=self._work_reduce[5:6])  # hold h_u^T z_u
+                cp.dot(self._data.x_l[self._data.idx_xl], self._result.z_bl, out=self._work_reduce[6:7])
+                self._work_reduce[6:7] *= -1.  # hold - x_l^T z_bl
+                cp.dot(self._data.x_u[self._data.idx_xu], self._result.z_bu, out=self._work_reduce[7:8])  # hold x_u^T z_bu
+
+                cp.sum(self._work_reduce[0:2], out=self._result.info.primal_obj, keepdims=True)  # primal_obj = 0.5 x^T P x + c^T x
+                cp.sum(self._work_reduce[2:8], out=self._result.info.dual_obj, keepdims=True)
+                self._result.info.dual_obj *= -1.  # dual_obj = -b^T y - h_u^T z_u + h_l^T z_l - x_u^T z_bu + x_l^T z_bl
+
+                # duality_gap = abs(primal_obj - dual_obj)
+                cp.subtract(self._result.info.primal_obj, self._result.info.dual_obj, out=self._result.info.duality_gap)
+                
+                # duality_gap_rel_norm = max(abs(0.5 x'Px, b'y, h_u'z_u, h_l'z_l, x_u'z_bu, x_l'z_bl))
+                # duality_gap_relative = duality_gap / maximum(1., duality_gap_rel_norm)
+                cp.abs(self._work_reduce, out=self._work_reduce)
+                cp.max(self._work_reduce[0:8], out=self._result.info.duality_gap_rel, keepdims=True)
+                cp.abs(self._result.info.duality_gap, out=self._result.info.duality_gap)
+                cp.maximum(self._result.info.duality_gap_rel, 1., out=self._result.info.duality_gap_rel)
+                cp.divide(self._result.info.duality_gap, self._result.info.duality_gap_rel, out=self._result.info.duality_gap_rel)
+
+                # ------------ update non-regulerized residuals ------------
                 # res_nr.x = -(P*x + c + A^T*y + G^T*(z_u - z_l) + z_bu - z_bl)
                 # self._res_nr.x is computed as -P*x above
                 self._res_nr.x -= self._data.c
@@ -779,7 +785,7 @@ class SolverBase:
     def _primal_res_nr(self) -> float:
         offset = 0
         self._work_duals[:self._data.p] = self._res_nr.y
-        offset = self._data.p
+        offset += self._data.p
         self._work_duals[offset : offset+self._data.num_hu] = self._res_nr.z_u
         offset += self._data.num_hu
         self._work_duals[offset : offset+self._data.num_hl] = self._res_nr.z_l
