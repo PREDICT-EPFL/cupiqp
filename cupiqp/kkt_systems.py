@@ -60,6 +60,8 @@ class KKTSystem:
         self._updated_rhs_z_bl = cp.zeros(self._data.num_xl)
 
         # create kernels
+        self._update_regulerization_step_1_kernel = create_update_regularizations_step_1_kernel(self._data.num_hu, self._data.num_hl, self._data.num_xu, self._data.num_xl)
+        self._update_regulerization_step_2_kernel = create_update_regularizations_step_2_kernel(self._data.n, self._data.m, self._data.num_hu, self._data.num_hl, self._data.num_xu, self._data.num_xl)
         self._eliminate_slacks_kernel = create_eliminate_slacks_kernel(self._data.num_hu, self._data.num_hl, self._data.num_xu, self._data.num_xl)
         self._eliminate_duals_kernel = create_eliminate_duals_kernel(self._data.n, self._data.m, self._data.num_hu, self._data.num_hl, self._data.num_xu, self._data.num_xl)
         self._recover_duals_kernel = create_recover_duals_kernel(self._data.num_hu, self._data.num_hl, self._data.num_xu, self._data.num_xl)
@@ -87,45 +89,80 @@ class KKTSystem:
             if key not in self._update_scaling_and_factor_cuda_graphs:
                 self._update_scaling_and_factor_cuda_graphs_capture_count += 1
                 print(f"KKTSystems::_update_scaling_and_factor capturing CUDA graph (occurrence {self._update_scaling_and_factor_cuda_graphs_capture_count})...")
-                stream = cp.cuda.Stream(non_blocking=True)
+                stream = cp.cuda.ExternalStream(wp.get_stream().cuda_stream)
                 stream.begin_capture()
                 with stream:
 
-                    # store the current slack and dual variable values at this iteration
-                    self._m_s_u[:] = vars.s_u
-                    self._m_s_l[:] = vars.s_l
-                    self._m_s_bu[:] = vars.s_bu
-                    self._m_s_bl[:] = vars.s_bl
-                    cp.reciprocal(vars.z_u, out=self._m_z_u_inv)  # better than self._m_z_u_inv[:] = 1. / vars.z_u since it avoids temporary allocation
-                    cp.reciprocal(vars.z_l, out=self._m_z_l_inv)
-                    cp.reciprocal(vars.z_bu, out=self._m_z_bu_inv)
-                    cp.reciprocal(vars.z_bl, out=self._m_z_bl_inv)
+                    USE_WARP_IMPLEMENTATION = True  # set to False to use pure cupy implementation for updating regularization, which is easier to debug but slower.
+                    if USE_WARP_IMPLEMENTATION:
+                        wp.launch(
+                            kernel=self._update_regulerization_step_1_kernel,
+                            dim=self._data.num_hu + self._data.num_hl + self._data.num_xu + self._data.num_xl,
+                            inputs=[vars.s_u, vars.s_l, vars.s_bu, vars.s_bl,
+                                    vars.z_u, vars.z_l, vars.z_bu, vars.z_bl,
+                                    self._m_s_u, self._m_s_l, self._m_s_bu, self._m_s_bl,
+                                    self._m_z_u_inv, self._m_z_l_inv, self._m_z_bu_inv, self._m_z_bl_inv,
+                                    self._w_u_delta_inv, self._w_l_delta_inv, self._w_bu_delta_inv, self._w_bl_delta_inv,
+                                    delta],
+                            device="cuda",
+                        )
 
-                    # eliminate the box constraints by adding their contribution to x_reg and z_reg
-                    # self._w_bu_delta_inv[:] = 1. / (self._m_s_bu * self._m_z_bu_inv + delta)
-                    cp.multiply(self._m_s_bu, self._m_z_bu_inv, out=self._w_bu_delta_inv)
-                    cp.add(self._w_bu_delta_inv, delta, out=self._w_bu_delta_inv)
-                    cp.reciprocal(self._w_bu_delta_inv, out=self._w_bu_delta_inv)
-                    # self._w_bl_delta_inv[:] = 1. / (self._m_s_bl * self._m_z_bl_inv + delta)
-                    cp.multiply(self._m_s_bl, self._m_z_bl_inv, out=self._w_bl_delta_inv)
-                    cp.add(self._w_bl_delta_inv, delta, out=self._w_bl_delta_inv)
-                    cp.reciprocal(self._w_bl_delta_inv, out=self._w_bl_delta_inv)
-                    # self._w_u_delta_inv[:] = 1. / (vars.s_u / vars.z_u + delta)
-                    cp.multiply(self._m_s_u, self._m_z_u_inv, out=self._w_u_delta_inv)
-                    cp.add(self._w_u_delta_inv, delta, out=self._w_u_delta_inv)
-                    cp.reciprocal(self._w_u_delta_inv, out=self._w_u_delta_inv)
-                    # self._w_l_delta_inv[:] = 1. / (vars.s_l / vars.z_l + delta)
-                    cp.multiply(self._m_s_l, self._m_z_l_inv, out=self._w_l_delta_inv)
-                    cp.add(self._w_l_delta_inv, delta, out=self._w_l_delta_inv)
-                    cp.reciprocal(self._w_l_delta_inv, out=self._w_l_delta_inv)
+                        wp.launch(
+                            kernel=self._update_regulerization_step_2_kernel,
+                            dim=self._data.n + self._data.m,
+                            inputs=[
+                                self._data.idx_xu,
+                                self._data.idx_xl,
+                                self._w_bu_delta_inv,
+                                self._w_bl_delta_inv,
+                                rho,
+                                self._x_reg,
+                                self._data.idx_hu,
+                                self._data.idx_hl,
+                                self._w_u_delta_inv,
+                                self._w_l_delta_inv,
+                                self._z_reg,
+                            ],
+                            device="cuda",
+                        )
 
-                    self._x_reg[:] = rho[0]
-                    self._x_reg[data.idx_xu] += self._w_bu_delta_inv
-                    self._x_reg[data.idx_xl] += self._w_bl_delta_inv
-                    self._z_reg.fill(0.)
-                    self._z_reg[data.idx_hu] += self._w_u_delta_inv
-                    self._z_reg[data.idx_hl] += self._w_l_delta_inv
-                    cp.reciprocal(self._z_reg, out=self._z_reg)
+                    else:
+
+                        # store the current slack and dual variable values at this iteration
+                        self._m_s_u[:] = vars.s_u
+                        self._m_s_l[:] = vars.s_l
+                        self._m_s_bu[:] = vars.s_bu
+                        self._m_s_bl[:] = vars.s_bl
+                        cp.reciprocal(vars.z_u, out=self._m_z_u_inv)  # better than self._m_z_u_inv[:] = 1. / vars.z_u since it avoids temporary allocation
+                        cp.reciprocal(vars.z_l, out=self._m_z_l_inv)
+                        cp.reciprocal(vars.z_bu, out=self._m_z_bu_inv)
+                        cp.reciprocal(vars.z_bl, out=self._m_z_bl_inv)
+
+                        # eliminate the box constraints by adding their contribution to x_reg and z_reg
+                        # self._w_bu_delta_inv[:] = 1. / (self._m_s_bu * self._m_z_bu_inv + delta)
+                        cp.multiply(self._m_s_bu, self._m_z_bu_inv, out=self._w_bu_delta_inv)
+                        cp.add(self._w_bu_delta_inv, delta, out=self._w_bu_delta_inv)
+                        cp.reciprocal(self._w_bu_delta_inv, out=self._w_bu_delta_inv)
+                        # self._w_bl_delta_inv[:] = 1. / (self._m_s_bl * self._m_z_bl_inv + delta)
+                        cp.multiply(self._m_s_bl, self._m_z_bl_inv, out=self._w_bl_delta_inv)
+                        cp.add(self._w_bl_delta_inv, delta, out=self._w_bl_delta_inv)
+                        cp.reciprocal(self._w_bl_delta_inv, out=self._w_bl_delta_inv)
+                        # self._w_u_delta_inv[:] = 1. / (vars.s_u / vars.z_u + delta)
+                        cp.multiply(self._m_s_u, self._m_z_u_inv, out=self._w_u_delta_inv)
+                        cp.add(self._w_u_delta_inv, delta, out=self._w_u_delta_inv)
+                        cp.reciprocal(self._w_u_delta_inv, out=self._w_u_delta_inv)
+                        # self._w_l_delta_inv[:] = 1. / (vars.s_l / vars.z_l + delta)
+                        cp.multiply(self._m_s_l, self._m_z_l_inv, out=self._w_l_delta_inv)
+                        cp.add(self._w_l_delta_inv, delta, out=self._w_l_delta_inv)
+                        cp.reciprocal(self._w_l_delta_inv, out=self._w_l_delta_inv)
+
+                        self._x_reg[:] = rho[0]
+                        self._x_reg[data.idx_xu] += self._w_bu_delta_inv
+                        self._x_reg[data.idx_xl] += self._w_bl_delta_inv
+                        self._z_reg.fill(0.)
+                        self._z_reg[data.idx_hu] += self._w_u_delta_inv
+                        self._z_reg[data.idx_hl] += self._w_l_delta_inv
+                        cp.reciprocal(self._z_reg, out=self._z_reg)
 
                 self._update_scaling_and_factor_cuda_graphs[key] = stream.end_capture()
 
@@ -251,6 +288,9 @@ class KKTSystem:
             # lhs.z_bl -= rhs.z_bl
             # lhs.z_bl *= self._w_bl_delta_inv
 
+            stream_cp = cp.cuda.get_current_stream()
+            stream_wp = wp.Stream(cuda_stream=stream_cp.ptr)
+
             wp.launch(
                 kernel=self._recover_duals_kernel,
                 dim=self._data.num_hu+self._data.num_hl+self._data.num_xu+self._data.num_xl,
@@ -261,6 +301,7 @@ class KKTSystem:
                     self._data.idx_xu, self._w_bu_delta_inv, self._m_z_bu_inv, rhs.z_bu, rhs.s_bu, lhs.z_bu,
                     self._data.idx_xl, self._w_bl_delta_inv, self._m_z_bl_inv, rhs.z_bl, rhs.s_bl, lhs.z_bl],
                 device="cuda",
+                stream=stream_wp,
             )
 
             # ----- recover slack variable on lhs
@@ -416,6 +457,133 @@ class KKTSystem:
         return lhs
     
 
+def create_update_regularizations_step_1_kernel(num_hu: int, num_hl: int, num_xu: int, num_xl: int):
+    """Create kernel specialized for ..., which will be used in factor and solve. Performs the operation:
+
+        self._m_s_u[:] = vars.s_u
+        self._m_s_l[:] = vars.s_l
+        self._m_s_bu[:] = vars.s_bu
+        self._m_s_bl[:] = vars.s_bl
+
+        self._m_z_u_inv[:] = 1. / vars.z_u
+        self._m_z_l_inv[:] = 1. / vars.z_l
+        self._m_z_bu_inv[:] = 1. / vars.z_bu
+        self._m_z_bl_inv[:] = 1. / vars.z_bl
+
+        self._w_bu_delta_inv[:] = 1. / (self._m_s_bu * self._m_z_bu_inv + delta)
+        self._w_bl_delta_inv[:] = 1. / (self._m_s_bl * self._m_z_bl_inv + delta)
+        self._w_u_delta_inv[:] = 1. / (self._m_s_u * self._m_z_u_inv + delta)
+        self._w_l_delta_inv[:] = 1. / (self._m_s_l * self._m_z_l_inv + delta)
+    """
+    @wp.kernel
+    def update_regularizations_step_1_kernel(
+        vars_s_u: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        vars_s_l: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        vars_s_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        vars_s_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        vars_z_u: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        vars_z_l: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        vars_z_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        vars_z_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        m_s_u: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        m_s_l: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        m_s_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        m_s_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        m_z_u_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        m_z_l_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        m_z_bu_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        m_z_bl_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        w_u_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        w_l_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        w_bu_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        w_bl_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        delta: wp.array(dtype=wp.float64)  # pyright: ignore[reportInvalidTypeForm]
+    ):
+        t = wp.tid()
+        num_hu_static = wp.static(num_hu)
+        num_hl_static = wp.static(num_hl)
+        num_xu_static = wp.static(num_xu)
+        num_xl_static = wp.static(num_xl)
+
+        if t < num_hu_static:
+            m_s_u[t] = vars_s_u[t]
+            m_z_u_inv[t] = wp.float64(1.0) / vars_z_u[t]
+            w_u_delta_inv[t] = wp.float64(1.0) / (m_s_u[t] * m_z_u_inv[t] + delta[0])
+        elif t < num_hu_static + num_hl_static:
+            t_hl = t - num_hu_static
+            m_s_l[t_hl] = vars_s_l[t_hl]
+            m_z_l_inv[t_hl] = wp.float64(1.0) / vars_z_l[t_hl]
+            w_l_delta_inv[t_hl] = wp.float64(1.0) / (m_s_l[t_hl] * m_z_l_inv[t_hl] + delta[0])
+        elif t < num_hu_static + num_hl_static + num_xu_static:
+            t_xu = t - num_hu_static - num_hl_static
+            m_s_bu[t_xu] = vars_s_bu[t_xu]
+            m_z_bu_inv[t_xu] = wp.float64(1.0) / vars_z_bu[t_xu]
+            w_bu_delta_inv[t_xu] = wp.float64(1.0) / (m_s_bu[t_xu] * m_z_bu_inv[t_xu] + delta[0])
+        elif t < num_hu_static + num_hl_static + num_xu_static + num_xl_static:
+            t_xl = t - num_hu_static - num_hl_static - num_xu_static
+            m_s_bl[t_xl] = vars_s_bl[t_xl]
+            m_z_bl_inv[t_xl] = wp.float64(1.0) / vars_z_bl[t_xl]
+            w_bl_delta_inv[t_xl] = wp.float64(1.0) / (m_s_bl[t_xl] * m_z_bl_inv[t_xl] + delta[0])
+        else:
+            return
+    return update_regularizations_step_1_kernel
+
+
+def create_update_regularizations_step_2_kernel(nx: int, nz: int, num_hu: int, num_hl: int, num_xu: int, num_xl: int):
+    """Create kernel specialized for computing the regularization terms for x and z. Performs the operation:
+
+        eliminate the box constraints by adding their contribution to x_reg and z_reg
+        self._x_reg[:] = rho
+        self._x_reg[data.idx_xu] += self._w_bu_delta_inv
+        self._x_reg[data.idx_xl] += self._w_bl_delta_inv
+        
+        self._z_reg[:] = 0.
+        self._z_reg[data.idx_hu] += self._w_u_delta_inv
+        self._z_reg[data.idx_hl] += self._w_l_delta_inv
+        self._z_reg[:] = 1. / self._z_reg
+    """
+    @wp.kernel
+    def update_regularizations_step_2_kernel(
+        idx_xu: wp.array(dtype=wp.int32),  # pyright: ignore[reportInvalidTypeForm]
+        idx_xl: wp.array(dtype=wp.int32),  # pyright: ignore[reportInvalidTypeForm]
+        w_bu_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        w_bl_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        rho: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        x_reg: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        idx_hu: wp.array(dtype=wp.int32),  # pyright: ignore[reportInvalidTypeForm]
+        idx_hl: wp.array(dtype=wp.int32),  # pyright: ignore[reportInvalidTypeForm]
+        w_u_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        w_l_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        z_reg: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+    ):
+        t = wp.tid()
+        nx_static = wp.static(nx)
+        nz_static = wp.static(nz)
+        num_hu_static = wp.static(num_hu)
+        num_hl_static = wp.static(num_hl)
+        num_xu_static = wp.static(num_xu)
+        num_xl_static = wp.static(num_xl)
+
+        if t < nx_static:
+            x_reg[t] = rho[0]
+            if t < num_xu_static:
+                x_reg[idx_xu[t]] += w_bu_delta_inv[t]
+            if t < num_xl_static:
+                x_reg[idx_xl[t]] += w_bl_delta_inv[t]
+        elif t < nx_static + nz_static:
+            tz = t - nx_static
+            z_reg[tz] = wp.float64(0.)
+            if tz < num_hu_static:
+                z_reg[idx_hu[tz]] += w_u_delta_inv[tz]
+            if tz < num_hl_static:
+                z_reg[idx_hl[tz]] += w_l_delta_inv[tz]
+            z_reg[tz] = wp.float64(1.0) / z_reg[tz]
+        else:
+            return
+
+    return update_regularizations_step_2_kernel
+
+
 def create_eliminate_duals_kernel(nx: int, nz: int, num_hu: int, num_hl: int, num_xu: int, num_xl: int):
     """Create kernel specialized for eliminating duals. Performs the operation:
 
@@ -430,23 +598,23 @@ def create_eliminate_duals_kernel(nx: int, nz: int, num_hu: int, num_hl: int, nu
     @wp.kernel
     def eliminate_duals_kernel(
         # prepare new rhs_x
-        idx_xu: wp.array(dtype=wp.int32),
-        idx_xl: wp.array(dtype=wp.int32),
-        rhs_x: wp.array(dtype=wp.float64),
-        w_bu_delta_inv: wp.array(dtype=wp.float64),
-        w_bl_delta_inv: wp.array(dtype=wp.float64),
-        rhs_z_bu: wp.array(dtype=wp.float64),
-        rhs_z_bl: wp.array(dtype=wp.float64),
-        rhs_x_updated: wp.array(dtype=wp.float64),  # placeholder for the updated rhs_x
+        idx_xu: wp.array(dtype=wp.int32),  # pyright: ignore[reportInvalidTypeForm]
+        idx_xl: wp.array(dtype=wp.int32),  # pyright: ignore[reportInvalidTypeForm]
+        rhs_x: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        w_bu_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        w_bl_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        rhs_z_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        rhs_z_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        rhs_x_updated: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
         # prepare new rhs_z
-        idx_hu: wp.array(dtype=wp.int32),
-        idx_hl: wp.array(dtype=wp.int32),
-        w_u_delta_inv: wp.array(dtype=wp.float64),
-        w_l_delta_inv: wp.array(dtype=wp.float64),
-        rhs_z_u: wp.array(dtype=wp.float64),
-        rhs_z_l: wp.array(dtype=wp.float64),
-        z_reg: wp.array(dtype=wp.float64),
-        rhs_z_updated: wp.array(dtype=wp.float64),  # placeholder for the updated rhs_z
+        idx_hu: wp.array(dtype=wp.int32),  # pyright: ignore[reportInvalidTypeForm]
+        idx_hl: wp.array(dtype=wp.int32),  # pyright: ignore[reportInvalidTypeForm]
+        w_u_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        w_l_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        rhs_z_u: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        rhs_z_l: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        z_reg: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        rhs_z_updated: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
     ):
         t = wp.tid()
         nx_static = wp.static(nx)
@@ -495,25 +663,25 @@ def create_eliminate_slacks_kernel(num_hu: int, num_hl: int, num_xu: int, num_xl
     @wp.kernel
     def eliminate_slacks_kernel(
         # h_u
-        rhs_z_u: wp.array(dtype=wp.float64),
-        rhs_s_u: wp.array(dtype=wp.float64),
-        result_z_u_inv: wp.array(dtype=wp.float64),
-        updated_rhs_z_u: wp.array(dtype=wp.float64),
+        rhs_z_u: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        rhs_s_u: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        result_z_u_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        updated_rhs_z_u: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
         # h_l
-        rhs_z_l: wp.array(dtype=wp.float64),
-        rhs_s_l: wp.array(dtype=wp.float64),
-        result_z_l_inv: wp.array(dtype=wp.float64),
-        updated_rhs_z_l: wp.array(dtype=wp.float64),
+        rhs_z_l: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        rhs_s_l: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        result_z_l_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        updated_rhs_z_l: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
         # x_u
-        rhs_z_bu: wp.array(dtype=wp.float64),
-        rhs_s_bu: wp.array(dtype=wp.float64),
-        result_z_bu_inv: wp.array(dtype=wp.float64),
-        updated_rhs_z_bu: wp.array(dtype=wp.float64),
+        rhs_z_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        rhs_s_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        result_z_bu_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        updated_rhs_z_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
         # x_l
-        rhs_z_bl: wp.array(dtype=wp.float64),
-        rhs_s_bl: wp.array(dtype=wp.float64),
-        result_z_bl_inv: wp.array(dtype=wp.float64),
-        updated_rhs_z_bl: wp.array(dtype=wp.float64),
+        rhs_z_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        rhs_s_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        result_z_bl_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        updated_rhs_z_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
     ):
         t = wp.tid()
         num_hu_static = wp.static(num_hu)
@@ -548,32 +716,32 @@ def create_recover_duals_kernel(num_hu: int, num_hl: int, num_xu: int, num_xl: i
     """
     @wp.kernel
     def recover_duals_kernel(
-        G_dx: wp.array(dtype=wp.float64),
-        lhs_x: wp.array(dtype=wp.float64),
+        G_dx: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        lhs_x: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
         # h_u
-        idx_hu: wp.array(dtype=wp.int32),
-        w_u_delta_inv: wp.array(dtype=wp.float64),
-        rhs_z_u: wp.array(dtype=wp.float64),
-        lhs_z_u: wp.array(dtype=wp.float64),
+        idx_hu: wp.array(dtype=wp.int32),  # pyright: ignore[reportInvalidTypeForm]
+        w_u_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        rhs_z_u: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        lhs_z_u: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
         # h_l
-        idx_hl: wp.array(dtype=wp.int32),
-        w_l_delta_inv: wp.array(dtype=wp.float64),
-        rhs_z_l: wp.array(dtype=wp.float64),
-        lhs_z_l: wp.array(dtype=wp.float64),
+        idx_hl: wp.array(dtype=wp.int32),  # pyright: ignore[reportInvalidTypeForm]
+        w_l_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        rhs_z_l: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        lhs_z_l: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
         # x_u
-        idx_xu: wp.array(dtype=wp.int32),
-        w_bu_delta_inv: wp.array(dtype=wp.float64),
-        m_z_bu_inv: wp.array(dtype=wp.float64),
-        rhs_z_bu: wp.array(dtype=wp.float64),
-        rhs_s_bu: wp.array(dtype=wp.float64),
-        lhs_z_bu: wp.array(dtype=wp.float64),
+        idx_xu: wp.array(dtype=wp.int32),  # pyright: ignore[reportInvalidTypeForm]
+        w_bu_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        m_z_bu_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        rhs_z_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        rhs_s_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        lhs_z_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
         # x_l
-        idx_xl: wp.array(dtype=wp.int32),
-        w_bl_delta_inv: wp.array(dtype=wp.float64),
-        m_z_bl_inv: wp.array(dtype=wp.float64),
-        rhs_z_bl: wp.array(dtype=wp.float64),
-        rhs_s_bl: wp.array(dtype=wp.float64),
-        lhs_z_bl: wp.array(dtype=wp.float64),
+        idx_xl: wp.array(dtype=wp.int32),  # pyright: ignore[reportInvalidTypeForm]
+        w_bl_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        m_z_bl_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        rhs_z_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        rhs_s_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        lhs_z_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
     ):
         t = wp.tid()
         num_hu_static = wp.static(num_hu)
@@ -617,29 +785,29 @@ def create_recover_slacks_kernel(num_hu: int, num_hl: int, num_xu: int, num_xl: 
     @wp.kernel
     def recover_slacks_kernel(
         # h_u
-        rhs_s_u: wp.array(dtype=wp.float64),
-        lhs_z_u: wp.array(dtype=wp.float64),
-        result_s_u: wp.array(dtype=wp.float64),
-        result_z_u_inv: wp.array(dtype=wp.float64),
-        updated_lhs_s_u: wp.array(dtype=wp.float64),
+        rhs_s_u: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        lhs_z_u: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        result_s_u: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        result_z_u_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        updated_lhs_s_u: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
         # h_l
-        rhs_s_l: wp.array(dtype=wp.float64),
-        lhs_z_l: wp.array(dtype=wp.float64),
-        result_s_l: wp.array(dtype=wp.float64),
-        result_z_l_inv: wp.array(dtype=wp.float64),
-        updated_lhs_s_l: wp.array(dtype=wp.float64),
+        rhs_s_l: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        lhs_z_l: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        result_s_l: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        result_z_l_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        updated_lhs_s_l: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
         # x_u
-        rhs_s_bu: wp.array(dtype=wp.float64),
-        lhs_z_bu: wp.array(dtype=wp.float64),
-        result_s_bu: wp.array(dtype=wp.float64),
-        result_z_bu_inv: wp.array(dtype=wp.float64),
-        updated_lhs_s_bu: wp.array(dtype=wp.float64),
+        rhs_s_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        lhs_z_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        result_s_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        result_z_bu_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        updated_lhs_s_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
         # x_l
-        rhs_s_bl: wp.array(dtype=wp.float64),
-        lhs_z_bl: wp.array(dtype=wp.float64),
-        result_s_bl: wp.array(dtype=wp.float64),
-        result_z_bl_inv: wp.array(dtype=wp.float64),
-        updated_lhs_s_bl: wp.array(dtype=wp.float64),
+        rhs_s_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        lhs_z_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        result_s_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        result_z_bl_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        updated_lhs_s_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
     ):
         t = wp.tid()
         num_hu_static = wp.static(num_hu)
