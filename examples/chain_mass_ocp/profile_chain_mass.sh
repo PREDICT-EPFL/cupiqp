@@ -21,6 +21,7 @@ echo "  Output: ${OUTPUT_NAME}.nsys-rep"
 # Run nsys profile
 # We use --force-overwrite true to avoid errors if rerunning
 nsys profile --force-overwrite true -o "$OUTPUT_NAME" \
+    --cuda-graph-trace=node \
     python example_chain_mass.py \
     --num_masses "$NUM_MASSES" \
     --horizon "$HORIZON" \
