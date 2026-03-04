@@ -185,3 +185,7 @@ class DenseKKTSolver(KKTSolverBase):
     def eval_G_xn_and_GT_xt(self, data: DenseData, alpha_n: float, xn: cp.ndarray, alpha_t: float, xt: cp.ndarray, zn: cp.ndarray, zt: cp.ndarray):
         gemv(transa='N', alpha=alpha_n, a=data.G, x=xn, beta=0.0, y=zn)
         gemv(transa='T', alpha=alpha_t, a=data.G, x=xt, beta=0.0, y=zt)
+
+    @nvtx.annotate("DenseKKTSolver::eval_G_xn")
+    def eval_G_xn(self, data: DenseData, alpha_n: float, xn: cp.ndarray, zn: cp.ndarray):
+        gemv(transa='N', alpha=alpha_n, a=data.G, x=xn, beta=0.0, y=zn)

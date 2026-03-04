@@ -178,3 +178,7 @@ class SparseKKTSolver(KKTSolverBase):
     def eval_G_xn_and_GT_xt(self, data: SparseData, alpha_n: float, xn: cp.ndarray, alpha_t: float, xt: cp.ndarray, zn: cp.ndarray, zt: cp.ndarray):
         spmv(data.G, xn, zn, alpha=alpha_n, beta=0.0)
         spmv(data.G, xt, zt, alpha=alpha_t, beta=0.0, transa=True)
+
+    @nvtx.annotate("SparseKKTSolver::eval_G_xn")
+    def eval_G_xn(self, data: SparseData, alpha_n: float, xn: cp.ndarray, zn: cp.ndarray):
+        spmv(data.G, xn, zn, alpha=alpha_n, beta=0.0)

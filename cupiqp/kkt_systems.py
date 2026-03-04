@@ -264,8 +264,7 @@ class KKTSystem:
         self._kkt_solver.solve(data, self._work_x, rhs.y, self._work_z, lhs.x, lhs.y, self._work_z)  # ! the second _work_z is used to hold delta_z, but useless anyway. Can be further optimized.
 
         with nvtx.annotate("KKTSystem::solve::recover_lhs"):
-            # ! Optimize this
-            self._work_z[:] = data.G @ lhs.x  # G * delta_x, where delta_x is stored in lhs.x
+            self.eval_G_xn(data, 1., lhs.x, self._work_z)  # G * delta_x, where delta_x is stored in lhs.x
 
             # ----- recover dual variables on lhs
             # The below code is equivalent to:
@@ -367,6 +366,14 @@ class KKTSystem:
         zt = alpha_t * G^T * xt
         """
         self._kkt_solver.eval_G_xn_and_GT_xt(data, alpha_n, xn, alpha_t, xt, zn, zt)
+
+    @nvtx.annotate("KKTSystem::eval_G_xn")
+    def eval_G_xn(self, data: Data, alpha_n: float, xn: cp.ndarray, zn: cp.ndarray):
+        """
+        Evaluate Gx with scaling factor alpha_n:
+        zn = alpha_n * G * xn
+        """
+        self._kkt_solver.eval_G_xn(data, alpha_n, xn, zn)
     
     def kkt_matrix(self, rho: float, delta: float, vars: Variables) -> cp.ndarray:
         """
