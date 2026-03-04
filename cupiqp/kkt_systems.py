@@ -173,6 +173,9 @@ class KKTSystem:
     
     @nvtx.annotate("KKTSystem::solve")
     def solve(self, data: Data, settings: Settings, rhs: Variables, lhs: Variables) -> None:
+        stream_cp = cp.cuda.get_current_stream()
+        stream_wp = wp.Stream(cuda_stream=stream_cp.ptr)
+        
         with nvtx.annotate("KKTSystem::solve::prepare_rhs"):
             # ------ elliminate slack variables from rhs
             # # ! ALTERNATIVE IMPLEMENTATION (pure cupy operations)
@@ -197,6 +200,7 @@ class KKTSystem:
                         rhs.z_bu, rhs.s_bu, self._m_z_bu_inv, self._updated_rhs_z_bu,
                         rhs.z_bl, rhs.s_bl, self._m_z_bl_inv, self._updated_rhs_z_bl],
                 device="cuda",
+                stream=stream_wp,
             )
 
             # ------ elliminate dual variables from rhs to yield one single rhs_z passing to kkt solver
@@ -254,11 +258,13 @@ class KKTSystem:
                     self._work_z,  # placeholder for the updated rhs_z
                 ],
                 device="cuda",
+                stream=stream_wp,
             )
 
         self._kkt_solver.solve(data, self._work_x, rhs.y, self._work_z, lhs.x, lhs.y, self._work_z)  # ! the second _work_z is used to hold delta_z, but useless anyway. Can be further optimized.
 
         with nvtx.annotate("KKTSystem::solve::recover_lhs"):
+            # ! Optimize this
             self._work_z[:] = data.G @ lhs.x  # G * delta_x, where delta_x is stored in lhs.x
 
             # ----- recover dual variables on lhs
@@ -287,9 +293,7 @@ class KKTSystem:
             # lhs.z_bl -= lhs.x[data.idx_xl]
             # lhs.z_bl -= rhs.z_bl
             # lhs.z_bl *= self._w_bl_delta_inv
-
-            stream_cp = cp.cuda.get_current_stream()
-            stream_wp = wp.Stream(cuda_stream=stream_cp.ptr)
+            
 
             wp.launch(
                 kernel=self._recover_duals_kernel,
@@ -336,6 +340,7 @@ class KKTSystem:
                         rhs.s_bu, lhs.z_bu, self._m_s_bu, self._m_z_bu_inv, lhs.s_bu,
                         rhs.s_bl, lhs.z_bl, self._m_s_bl, self._m_z_bl_inv, lhs.s_bl],
                 device="cuda",
+                stream=stream_wp,
             )
 
     @nvtx.annotate("KKTSystem::eval_P_x")
