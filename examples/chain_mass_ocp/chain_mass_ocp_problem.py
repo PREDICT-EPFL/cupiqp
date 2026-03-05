@@ -12,7 +12,8 @@ class ChainMassOCPProblem(QPProblem, OCPProblem):
         self.use_u_diff_constr = use_u_diff_constr
         self._randomize_x0 = randomize_x0
         
-        self._setup_qp()
+        self._setup_qp_general()
+        self._setup_qp_multistage()
         self._setup_ocp()
 
     def randomize_x0(self):
@@ -21,7 +22,7 @@ class ChainMassOCPProblem(QPProblem, OCPProblem):
         self.xlb[0:self.system.nx] = self.x0
         self.xub[0:self.system.nx] = self.x0
 
-    def _setup_qp(self):
+    def _setup_qp_general(self):
         N = self.system.N
         nx = self.system.nx
         nu = self.system.nu
@@ -90,6 +91,127 @@ class ChainMassOCPProblem(QPProblem, OCPProblem):
         # Terminal cost
         self.P[N*(nx+nu):N*(nx+nu)+nx, 
                N*(nx+nu):N*(nx+nu)+nx] = self.system.P
+
+    def _setup_qp_multistage(self):
+        import warp as wp
+        from cupiqp.multistage.multistage_utils import BlockTridiagMat, BlockBidiagMat, BlockVec
+
+        system = self.system
+        N = system.N
+        nx = system.nx
+        nu = system.nu
+        bs = nx + nu        # block size
+        N_blk = N + 1       # number of variable blocks (stages 0 .. N)
+
+        self.ms_block_size = bs
+
+        # ===================== P (block tridiagonal) =====================
+        P = BlockTridiagMat(num_diag_blocks=N_blk, block_size=bs)
+
+        P_D_np = np.zeros((N_blk, bs, bs))
+        for k in range(N):
+            P_D_np[k, :nx, :nx] = system.Q
+            P_D_np[k, nx:, nx:] = system.R + (system.R_diff if self.use_u_diff_cost else 0)
+        P_D_np[N, :nx, :nx] = system.P  # terminal cost
+        P.diag_blocks.data = wp.from_numpy(P_D_np, dtype=wp.float64, device="cuda")
+
+        P_E_np = np.zeros((N_blk - 1, bs, bs))
+        if self.use_u_diff_cost:
+            for k in range(N - 1):
+                P_E_np[k, nx:, nx:] = -system.R_diff
+        P.off_diag_blocks_lower.data = wp.from_numpy(P_E_np, dtype=wp.float64, device="cuda")
+
+        # ===================== c (linear cost = 0) =====================
+        c = BlockVec(num_blocks=N_blk, rows=bs)
+
+        # ===================== A, b (equality: initial condition + dynamics) =====================
+        A_eq = BlockBidiagMat(rows_of_blocks=nx, cols_of_blocks=bs, N=N_blk)
+
+        A_D_np = np.zeros((N_blk, nx, bs))
+        A_E_np = np.zeros((N_blk, nx, bs))
+
+        # Initial condition: [I, 0] * y_0 = x0
+        A_D_np[0, :nx, :nx] = np.eye(nx)
+
+        # Dynamics: [Ad, Bd] * y_k + [-I, 0] * y_{k+1} = 0
+        for k in range(N):
+            A_E_np[k, :, :nx] = system.Ad
+            A_E_np[k, :, nx:] = system.Bd
+            A_D_np[k + 1, :nx, :nx] = -np.eye(nx)
+
+        A_eq.D = wp.from_numpy(A_D_np, dtype=wp.float64, device="cuda")
+        A_eq.E = wp.from_numpy(A_E_np, dtype=wp.float64, device="cuda")
+
+        # RHS b: (N_blk+1) blocks of size nx
+        b = BlockVec(num_blocks=N_blk + 1, rows=nx)
+        b_np = np.zeros((N_blk + 1, nx))
+        b_np[0, :] = self.x0
+        b.data = wp.from_numpy(b_np, dtype=wp.float64, device="cuda")
+
+        # ===================== G, h_l, h_u (inequality: input rate constraints) =====================
+        if self.use_u_diff_constr:
+            G_ineq = BlockBidiagMat(rows_of_blocks=nu, cols_of_blocks=bs, N=N_blk)
+
+            G_D_np = np.zeros((N_blk, nu, bs))
+            G_E_np = np.zeros((N_blk, nu, bs))
+
+            for k in range(N - 1):
+                G_E_np[k, :, nx:] = np.eye(nu)       # E[k] = [0, I]
+                G_D_np[k + 1, :, nx:] = -np.eye(nu)  # D[k+1] = [0, -I]
+
+            G_ineq.D = wp.from_numpy(G_D_np, dtype=wp.float64, device="cuda")
+            G_ineq.E = wp.from_numpy(G_E_np, dtype=wp.float64, device="cuda")
+
+            n_ineq_blk = N_blk + 1
+            h_l_np = np.full((n_ineq_blk, nu), -np.inf)
+            h_u_np = np.full((n_ineq_blk, nu), np.inf)
+
+            for k in range(N - 1):
+                h_l_np[k + 1, :] = -system.nu_diff_max
+                h_u_np[k + 1, :] = system.nu_diff_max
+
+            h_l = BlockVec(num_blocks=n_ineq_blk, rows=nu)
+            h_u = BlockVec(num_blocks=n_ineq_blk, rows=nu)
+            h_l.data = wp.from_numpy(h_l_np, dtype=wp.float64, device="cuda")
+            h_u.data = wp.from_numpy(h_u_np, dtype=wp.float64, device="cuda")
+        else:
+            G_ineq = None
+            h_l = None
+            h_u = None
+
+        # ===================== x_l, x_u (box constraints) =====================
+        x_l_np = np.full((N_blk, bs), -np.inf)
+        x_u_np = np.full((N_blk, bs), np.inf)
+
+        # Stage 0: x_0 is free (fixed by equality constraint), u_0 bounded
+        x_l_np[0, nx:] = -system.nu_max
+        x_u_np[0, nx:] = system.nu_max
+
+        # Stages 1..N-1: state and input bounded
+        for k in range(1, N):
+            x_l_np[k, :nx] = -system.nx_max
+            x_u_np[k, :nx] = system.nx_max
+            x_l_np[k, nx:] = -system.nu_max
+            x_u_np[k, nx:] = system.nu_max
+
+        # Terminal stage N: x_N bounded, u padding unbounded
+        x_l_np[N, :nx] = -system.nx_max
+        x_u_np[N, :nx] = system.nx_max
+
+        x_l = BlockVec(num_blocks=N_blk, rows=bs)
+        x_u = BlockVec(num_blocks=N_blk, rows=bs)
+        x_l.data = wp.from_numpy(x_l_np, dtype=wp.float64, device="cuda")
+        x_u.data = wp.from_numpy(x_u_np, dtype=wp.float64, device="cuda")
+
+        self.ms_P = P
+        self.ms_c = c
+        self.ms_A = A_eq
+        self.ms_b = b
+        self.ms_G = G_ineq
+        self.ms_h_u = h_u
+        self.ms_h_l = h_l
+        self.ms_x_u = x_u
+        self.ms_x_l = x_l
         
     def _setup_ocp(self):
         self.N = self.system.N
