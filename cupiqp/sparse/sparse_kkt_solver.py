@@ -23,12 +23,7 @@ class SparseKKTSolver(KKTSolverBase):
     """
     def __init__(self, data: SparseData):
         super().__init__()
-        # self._delta = cp.nan
-        # self._x_reg = cp.zeros(data.n)
-        # self._z_reg = cp.zeros(data.m)
-
         self._kkt_mat = self._initialize_kkt_csr(data.P, data.A, data.G)
-
         self._rhs = cp.zeros(self._kkt_mat.shape[0], dtype=cp.float64)
         self._sol = cp.zeros(self._kkt_mat.shape[0], dtype=cp.float64)
 
@@ -52,6 +47,8 @@ class SparseKKTSolver(KKTSolverBase):
         with nvtx.annotate("SparseKKTSolver::cudss_plan"):
             plan_info = self._ldlt_solver.plan()  # precompute reordering and symbolic factorization
             cp.cuda.get_current_stream().synchronize()
+
+        self._stream_cp = cp.cuda.get_current_stream()
 
     def __del__(self):
         ldlt_solver = getattr(self, "_ldlt_solver", None)
@@ -128,7 +125,7 @@ class SparseKKTSolver(KKTSolverBase):
             with nvtx.annotate("SparseKKTSolver::cudss_factorize"):
                 fac_info = self._ldlt_solver.factorize()
                 # surface async device-side failures here so info is meaningful now
-                cp.cuda.get_current_stream().synchronize()
+                self._stream_cp.synchronize()
 
             # TODO: this causes a D2H synchronization, which can be inefficient.
             if fac_info.info != 0:
@@ -149,21 +146,23 @@ class SparseKKTSolver(KKTSolverBase):
         """
         Solve the KKT system using the factorized KKT matrix.
         """
-        n, p, m = data.n, data.p, data.m
-        self._rhs[:n] = rhs_x
-        self._rhs[n:n+p] = rhs_y
-        self._rhs[n+p:n+p+m] = rhs_z
+        # ! cp.cuda.runtime.memcpyAsync has lower launch overhead than multiple small cp.copyto() calls
+        # self._rhs <= [rhs_x, rhs_y, rhs_z]
+        cp.cuda.runtime.memcpyAsync(self._rhs.data.ptr, rhs_x.data.ptr, data.n * 8, 1, self._stream_cp.ptr)
+        cp.cuda.runtime.memcpyAsync(self._rhs.data.ptr + data.n * 8, rhs_y.data.ptr, data.p * 8, 1, self._stream_cp.ptr)
+        cp.cuda.runtime.memcpyAsync(self._rhs.data.ptr + (data.n+data.p) * 8, rhs_z.data.ptr, data.m * 8, 1, self._stream_cp.ptr)
 
         # update RHS in-place to reuse factorization results. See here: https://docs.nvidia.com/cuda/nvmath-python/0.6.0/host-apis/sparse/generated/nvmath.sparse.advanced.DirectSolver.html.
         # Also see: https://github.com/NVIDIA/nvmath-python/blob/main/examples/sparse/advanced/direct_solver/example05_reset_operands.py
         with nvtx.annotate("SparseKKTSolver::cudss_solve"):
-            cp.cuda.get_current_stream().synchronize()
+            self._stream_cp.synchronize()
             self._sol[:] = self._ldlt_solver.solve()
-            cp.cuda.get_current_stream().synchronize()
+            self._stream_cp.synchronize()
 
-        cp.copyto(delta_x, self._sol[:n])
-        cp.copyto(delta_y, self._sol[n:n+p])
-        cp.copyto(delta_z, self._sol[n+p:n+p+m])
+        # [delta_x, delta_y, delta_z] <= self._sol
+        cp.cuda.runtime.memcpyAsync(delta_x.data.ptr, self._sol.data.ptr, data.n * 8, 1, self._stream_cp.ptr)
+        cp.cuda.runtime.memcpyAsync(delta_y.data.ptr, self._sol.data.ptr + data.n * 8, data.p * 8, 1, self._stream_cp.ptr)
+        cp.cuda.runtime.memcpyAsync(delta_z.data.ptr, self._sol.data.ptr + (data.n+data.p) * 8, data.m * 8, 1, self._stream_cp.ptr)
     
 
     @nvtx.annotate("SparseKKTSolver::eval_P_x")
@@ -183,3 +182,4 @@ class SparseKKTSolver(KKTSolverBase):
     @nvtx.annotate("SparseKKTSolver::eval_G_xn")
     def eval_G_xn(self, data: SparseData, alpha_n: float, xn: cp.ndarray, zn: cp.ndarray):
         spmv(data.G, xn, zn, alpha=alpha_n, beta=0.0)
+
