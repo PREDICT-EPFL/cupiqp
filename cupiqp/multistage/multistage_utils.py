@@ -381,6 +381,7 @@ class BlockTridiagMat:
       - off_diag_blocks_lower: rectangular blocks below the diagonal
     """
     def __init__(self, num_diag_blocks: int, block_size: int, dtype=wp.float64, device="cuda"):
+        self.block_size = block_size
         self.diag_blocks = DenseBlocks(num_blocks=num_diag_blocks, rows=block_size, cols=block_size, dtype=dtype, device=device)
         self.off_diag_blocks_lower = DenseBlocks(num_blocks=num_diag_blocks-1, rows=block_size, cols=block_size, dtype=dtype, device=device)
         

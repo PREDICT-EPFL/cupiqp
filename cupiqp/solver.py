@@ -68,11 +68,19 @@ class SolverBase:
                 print(f"variables n = {self._data.n}")
                 print(f"equality constraints p = {self._data.p}")
                 print(f"inequality constraints m = {self._data.m}")
-            else:
+            elif self.settings.kkt_solver == "sparse_ldlt":
                 print("sparse backend:")
                 print(f"variables n = {self._data.n}, nnz(P) = {self._data.P.nnz}")
                 print(f"equality constraints p = {self._data.p}, nnz(A) = {self._data.A.nnz}")
                 print(f"inequality constraints m = {self._data.m}, nnz(G) = {self._data.G.nnz}")
+            elif self.settings.kkt_solver == "multistage_block_cholesky":
+                print("multistage backend:")
+                print(f"variables n = {self._data.n}, num_diag_blocks(P) = {self._data.P.num_diag_blocks}, block_size(P) = ({self._data.P.block_size}, {self._data.P.block_size})")
+                print(f"equality constraints p = {self._data.p}, num_diag_blocks(A) = {self._data.A.N}, block_size(A) = ({self._data.A.rows_of_blocks}, {self._data.A.cols_of_blocks})")
+                print(f"inequality constraints m = {self._data.m}, num_diag_blocks(G) = {self._data.G.N}, block_size(G) = ({self._data.G.rows_of_blocks}, {self._data.G.cols_of_blocks})")
+            else:
+                raise ValueError(f"Unsupported kkt_solver type: {self.settings.kkt_solver}")
+            
             print(f"inequality lower bounds n_h_l = {self._data.num_hl}")
             print(f"inequality upper bounds n_h_u = {self._data.num_hu}")
             print(f"variable lower bounds n_x_l = {self._data.num_xl}")
