@@ -114,45 +114,45 @@ class Info:
     status: Status = Status.PIQP_UNSOLVED
 
     iter: int = 0
-    rho: float = None
-    delta: float = None
-    mu: float = None
-    sigma: float = None
-    primal_step: float = 0.0
-    dual_step: float = 0.0
+    rho: cp.ndarray = None # using array to allow in-place updates without CUDA graph cache misses
+    delta: cp.ndarray = None
+    mu: cp.ndarray = None
+    sigma: cp.ndarray = None
+    primal_step: cp.ndarray = None
+    dual_step: cp.ndarray = None
     
-    primal_res: float = None
-    primal_res_rel: float = None
-    dual_res: float = None
-    dual_res_rel: float = None
+    primal_res: cp.ndarray = None
+    primal_res_rel: cp.ndarray = None
+    dual_res: cp.ndarray = None
+    dual_res_rel: cp.ndarray = None
     
-    primal_res_reg: float = None
-    primal_res_reg_rel: float = None  # relative primal residual with regularization
-    dual_res_reg: float = None
-    dual_res_reg_rel: float = None
+    primal_res_reg: cp.ndarray = None
+    primal_res_reg_rel: cp.ndarray = None  # relative primal residual with regularization
+    dual_res_reg: cp.ndarray = None
+    dual_res_reg_rel: cp.ndarray = None
     
-    primal_prox_inf: float = None
-    dual_prox_inf: float = None
+    primal_prox_inf: cp.ndarray = None
+    dual_prox_inf: cp.ndarray = None
     
-    prev_primal_res: float = None  # primal residual from previous iteration
-    prev_dual_res: float = None  # dual residual from previous iteration
+    prev_primal_res: cp.ndarray = None  # primal residual from previous iteration
+    prev_dual_res: cp.ndarray = None  # dual residual from previous iteration
     
-    primal_obj: float = None
-    dual_obj: float = None
-    duality_gap: float = None      # duality gap
-    duality_gap_rel: float = None  # relative duality gap
+    primal_obj: cp.ndarray = None
+    dual_obj: cp.ndarray = None
+    duality_gap: cp.ndarray = None      # duality gap
+    duality_gap_rel: cp.ndarray = None  # relative duality gap
     
     factor_retires: int = 0
-    reg_limit: float = None
+    reg_limit: cp.ndarray = None
     no_primal_update: int = 0  # dual infeasibility detection counter
     no_dual_update: int = 0    # primal infeasibility detection counter
     
-    setup_time: float = None
-    update_time: float = None
-    solve_time: float = None
-    kkt_factor_time: float = None
-    kkt_solve_time: float = None
-    run_time: float = None
+    setup_time: cp.ndarray = None
+    update_time: cp.ndarray = None
+    solve_time: cp.ndarray = None
+    kkt_factor_time: cp.ndarray = None
+    kkt_solve_time: cp.ndarray = None
+    run_time: cp.ndarray = None
 
 
 class Result(Variables):
@@ -162,3 +162,32 @@ class Result(Variables):
 
     def init(self, data: Data):
         super().init(data)
+        self.info.rho = cp.zeros(1, dtype=cp.float64)
+        self.info.delta = cp.zeros(1, dtype=cp.float64)
+        self.info.mu = cp.zeros(1, dtype=cp.float64)
+        self.info.sigma = cp.zeros(1, dtype=cp.float64)
+        self.info.primal_step = cp.zeros(1, dtype=cp.float64)
+        self.info.dual_step = cp.zeros(1, dtype=cp.float64)
+        self.info.primal_res = cp.zeros(1, dtype=cp.float64)
+        self.info.primal_res_rel = cp.zeros(1, dtype=cp.float64)
+        self.info.dual_res = cp.zeros(1, dtype=cp.float64)
+        self.info.dual_res_rel = cp.zeros(1, dtype=cp.float64)
+        self.info.primal_res_reg = cp.zeros(1, dtype=cp.float64)
+        self.info.primal_res_reg_rel = cp.zeros(1, dtype=cp.float64)
+        self.info.dual_res_reg = cp.zeros(1, dtype=cp.float64)
+        self.info.dual_res_reg_rel = cp.zeros(1, dtype=cp.float64)
+        self.info.primal_prox_inf = cp.zeros(1, dtype=cp.float64)
+        self.info.dual_prox_inf = cp.zeros(1, dtype=cp.float64)
+        self.info.prev_primal_res = cp.zeros(1, dtype=cp.float64)
+        self.info.prev_dual_res = cp.zeros(1, dtype=cp.float64)
+        self.info.primal_obj = cp.zeros(1, dtype=cp.float64)
+        self.info.dual_obj = cp.zeros(1, dtype=cp.float64)
+        self.info.duality_gap = cp.zeros(1, dtype=cp.float64)
+        self.info.duality_gap_rel = cp.zeros(1, dtype=cp.float64)
+        self.info.reg_limit = cp.zeros(1, dtype=cp.float64)
+        self.info.setup_time = cp.zeros(1, dtype=cp.float64)
+        self.info.update_time = cp.zeros(1, dtype=cp.float64)
+        self.info.solve_time = cp.zeros(1, dtype=cp.float64)
+        self.info.kkt_factor_time = cp.zeros(1, dtype=cp.float64)
+        self.info.kkt_solve_time = cp.zeros(1, dtype=cp.float64)
+        self.info.run_time = cp.zeros(1, dtype=cp.float64)

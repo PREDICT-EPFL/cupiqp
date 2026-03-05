@@ -1,4 +1,5 @@
 import cupy as cp
+import warp as wp
 from typing import Tuple
 import nvtx
 
@@ -22,10 +23,20 @@ class SolverBase:
     
     @nvtx.annotate("Solver::setup")
     def setup(self, P, c, A, b, G, h_u, h_l, x_u, x_l):
-        self._data = Data(P, c, A, b, G, h_u, h_l, x_u, x_l)
+        if self.settings.kkt_solver == "dense_cholesky":
+            from .dense.dense_data import DenseData
+            self._data = DenseData(P, c, A, b, G, h_u, h_l, x_u, x_l)
+        elif self.settings.kkt_solver == "sparse_ldlt":
+            from .sparse.sparse_data import SparseData
+            self._data = SparseData(P, c, A, b, G, h_u, h_l, x_u, x_l)
+        elif self.settings.kkt_solver == "multistage_block_cholesky":
+            from .multistage.multistage_data import MultistageData
+            self._data = MultistageData(P, c, A, b, G, h_u, h_l, x_u, x_l)
+        else:
+            raise ValueError(f"Unknown kkt_solver type: {self.settings.kkt_solver}")
         self._result.init(self._data)
-        self._result.info.rho = self.settings.rho_init
-        self._result.info.delta = self.settings.delta_init
+        self._result.info.rho[0] = self.settings.rho_init
+        self._result.info.delta[0] = self.settings.delta_init
         self._result.init(self._data)
         
         self._step.init(self._data)
@@ -41,8 +52,14 @@ class SolverBase:
         self._work_z = cp.empty(self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)  # used in _calculate_step to hold all concatenated slack or dual steps / results
         self._work_s = cp.empty(self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)  # used in _calculate_step to hold all concatenated slack or dual steps / results
         self._alpha_sz = cp.empty(2) # step lengths of slack and dual variables [alpha_s, alpha_z]
+        self._work_primals = cp.empty(self._data.n)
+        self._work_duals = cp.empty(self._data.p + self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)  # used to hold the concatenated dual variables for computing the residuals in _update_residuals_nr
+        self._work_residual = cp.empty(())
+        self._work_reduce = cp.empty(8)  # used to hold the intermediate results of the reductions related to s_l, s_u, s_bl, s_bu and z_l, z_u, z_bl, z_bu
         
-        
+        self._update_residuals_r_kernel = create_update_residual_r_kernel(
+            self._data.n, self._data.p, self._data.num_hl, self._data.num_hu, self._data.num_xl, self._data.num_xu
+        )
 
     def solve(self) -> Status:
         if self.settings.verbose:
@@ -51,11 +68,19 @@ class SolverBase:
                 print(f"variables n = {self._data.n}")
                 print(f"equality constraints p = {self._data.p}")
                 print(f"inequality constraints m = {self._data.m}")
-            else:
+            elif self.settings.kkt_solver == "sparse_ldlt":
                 print("sparse backend:")
                 print(f"variables n = {self._data.n}, nnz(P) = {self._data.P.nnz}")
                 print(f"equality constraints p = {self._data.p}, nnz(A) = {self._data.A.nnz}")
                 print(f"inequality constraints m = {self._data.m}, nnz(G) = {self._data.G.nnz}")
+            elif self.settings.kkt_solver == "multistage_block_cholesky":
+                print("multistage backend:")
+                print(f"variables n = {self._data.n}, num_diag_blocks(P) = {self._data.P.num_diag_blocks}, block_size(P) = ({self._data.P.block_size}, {self._data.P.block_size})")
+                print(f"equality constraints p = {self._data.p}, num_diag_blocks(A) = {self._data.A.N}, block_size(A) = ({self._data.A.rows_of_blocks}, {self._data.A.cols_of_blocks})")
+                print(f"inequality constraints m = {self._data.m}, num_diag_blocks(G) = {self._data.G.N}, block_size(G) = ({self._data.G.rows_of_blocks}, {self._data.G.cols_of_blocks})")
+            else:
+                raise ValueError(f"Unsupported kkt_solver type: {self.settings.kkt_solver}")
+            
             print(f"inequality lower bounds n_h_l = {self._data.num_hl}")
             print(f"inequality upper bounds n_h_u = {self._data.num_hu}")
             print(f"variable lower bounds n_x_l = {self._data.num_xl}")
@@ -66,15 +91,15 @@ class SolverBase:
     def _solve_impl(self) -> Status:
         self._result.info.status = Status.PIQP_UNSOLVED 
         self._result.info.iter = 0
-        self._result.info.reg_limit = self.settings.reg_lower_limit
+        self._result.info.reg_limit[0] = self.settings.reg_lower_limit
         self._result.info.factor_retires = 0
         self._result.info.no_primal_update = 0
         self._result.info.no_dual_update = 0
-        self._result.info.mu = 0.
-        self._result.info.primal_step = 0.
-        self._result.info.dual_step = 0.
-        self._result.info.rho = self.settings.rho_init
-        self._result.info.delta = self.settings.delta_init     
+        self._result.info.mu[0] = 0.
+        self._result.info.primal_step[0] = 0.
+        self._result.info.dual_step[0] = 0.
+        self._result.info.rho[0] = self.settings.rho_init
+        self._result.info.delta[0] = self.settings.delta_init
 
         if self.settings.verbose:
             print("iter  prim_obj       dual_obj       duality_gap   prim_res      dual_res      rho         delta       mu          p_step   d_step")  
@@ -84,7 +109,6 @@ class SolverBase:
         with nvtx.annotate("Solver::initialization"):
             self._result.x.fill(0.0)
             self._result.y.fill(0.0)
-
             self._result.s_l.fill(1.0)
             self._result.z_l.fill(1.0)
             self._result.s_u.fill(1.0)
@@ -150,7 +174,9 @@ class SolverBase:
                 self._result.z_bu += delta_z
 
                 # need to make sure mu is positive here, otherwise in the next step (put s and z on central path) sqrt(mu) the computed z_* will be zeros
-                self._result.info.mu = cp.maximum(self._calculate_mu(), 1e-10)
+                self._calculate_mu()
+                cp.clip(self._result.info.mu, 1e-10, None, out=self._result.info.mu)
+
                 if self.settings.debug:
                     print("Initial mu:", self._result.info.mu)
 
@@ -162,7 +188,7 @@ class SolverBase:
                     ):
                     cp.subtract(z, delta_z, out=s)
                     cp.power(s, 2, out=z)
-                    z += 4. * self._result.info.mu
+                    z += 4. * self._result.info.mu[0]
                     cp.sqrt(z, out=z)
                     z += s
                     z /= 2.
@@ -171,7 +197,7 @@ class SolverBase:
                 if self.settings.debug:
                     print("self._result:", self._result)
 
-                self._result.info.mu = self._calculate_mu()
+                self._calculate_mu()
 
             self._prox_vars.x[:] = self._result.x
             self._prox_vars.y[:] = self._result.y
@@ -180,8 +206,8 @@ class SolverBase:
             self._prox_vars.z_bl[:] = self._result.z_bl
             self._prox_vars.z_bu[:] = self._result.z_bu
 
-            if self.settings.debug:
-                print("Initial point set. Starting iterations...\n", self._prox_vars)
+            # if self.settings.debug:
+            #     print("Initial point set. Starting iterations...\n", self._prox_vars)
 
         ## ---------------------------------------------
         ## ---------- remaining iterations -------------
@@ -191,8 +217,8 @@ class SolverBase:
 
             if iter == 0:
                 self._update_residuals_nr()
-                self._result.info.prev_primal_res = self._result.info.primal_res
-                self._result.info.prev_dual_res = self._result.info.dual_res
+                self._result.info.prev_primal_res[:] = self._result.info.primal_res
+                self._result.info.prev_dual_res[:] = self._result.info.dual_res
 
             # ? The convergence criteria seems different from the one in the paper
             if ((self._result.info.primal_res < self.settings.eps_abs or self._result.info.primal_res_rel < self.settings.eps_rel) and
@@ -220,16 +246,16 @@ class SolverBase:
             if self.settings.verbose:
                 print(
                     f"{self._result.info.iter:3d}   "
-                    f"{float(self._result.info.primal_obj): .5e}   "
-                    f"{float(self._result.info.dual_obj): .5e}  "
-                    f"{float(self._result.info.duality_gap): .5e}  "
-                    f"{float(self._result.info.primal_res): .5e}  "
-                    f"{float(self._result.info.dual_res): .5e}  "
-                    f"{float(self._result.info.rho): .3e}  "
-                    f"{float(self._result.info.delta): .3e}  "
-                    f"{float(self._result.info.mu): .3e}  "
-                    f"{float(self._result.info.primal_step): .4f}  "
-                    f"{float(self._result.info.dual_step): .4f}",
+                    f"{float(self._result.info.primal_obj[0]): .5e}   "
+                    f"{float(self._result.info.dual_obj[0]): .5e}  "
+                    f"{float(self._result.info.duality_gap[0]): .5e}  "
+                    f"{float(self._result.info.primal_res[0]): .5e}  "
+                    f"{float(self._result.info.dual_res[0]): .5e}  "
+                    f"{float(self._result.info.rho[0]): .3e}  "
+                    f"{float(self._result.info.delta[0]): .3e}  "
+                    f"{float(self._result.info.mu[0]): .3e}  "
+                    f"{float(self._result.info.primal_step[0]): .4f}  "
+                    f"{float(self._result.info.dual_step[0]): .4f}",
                     flush=True
                 )
 
@@ -241,7 +267,7 @@ class SolverBase:
                     self._result.info.factor_retires += 1
                     self._result.info.rho *= 100.
                     self._result.info.delta *= 100.
-                    self._result.info.reg_limit = cp.minimum(10 * self._result.info.reg_limit, self.settings.eps_abs)
+                    self._result.info.reg_limit[:] = cp.minimum(10 * self._result.info.reg_limit, self.settings.eps_abs)
             
             if self._result.info.factor_retires >= self.settings.max_factor_retires:
                 self._result.info.status = Status.PIQP_NUMERICAL_ISSUES
@@ -256,8 +282,8 @@ class SolverBase:
                 # since there are no inequalities we can take full steps
                 self._kkt_system.solve(self._data, self.settings, self._res, self._step)
 
-                self._result.info.primal_step = cp.float64(1.0)
-                self._result.info.dual_step = cp.float64(1.0)
+                self._result.info.primal_step[:] = cp.float64(1.0)
+                self._result.info.dual_step[:] = cp.float64(1.0)
                 self._result.x += self._result.info.primal_step * self._step.x
                 self._result.y += self._result.info.dual_step * self._step.y
 
@@ -267,22 +293,22 @@ class SolverBase:
                     self._result.info.dual_res < self.settings.eps_abs or \
                         self._result.info.dual_res_rel < self.settings.eps_rel:                
                     self._prox_vars.x[:] = self._result.x
-                    self._result.info.rho = cp.maximum(self._result.info.reg_limit, 0.1 * self._result.info.rho)                
+                    self._result.info.rho[:] = cp.maximum(self._result.info.reg_limit, 0.1 * self._result.info.rho)                
                 else:                
                     self._result.info.no_primal_update += 1
                     if self._result.info.iter < 5 or self._result.info.dual_prox_inf < self.settings.infeasibility_threshold:
-                        self._result.info.rho = cp.maximum(self._result.info.reg_limit, 0.5 * self._result.info.rho)
+                        self._result.info.rho[:] = cp.maximum(self._result.info.reg_limit, 0.5 * self._result.info.rho)
                     
                 
                 if self._result.info.primal_res < 0.95 * self._result.info.prev_primal_res or \
                     self._result.info.primal_res < self.settings.eps_abs or \
                         self._result.info.primal_res_rel < self.settings.eps_rel:
                     self._prox_vars.y[:] = self._result.y
-                    self._result.info.delta = cp.maximum(self._result.info.reg_limit, 0.1 * self._result.info.delta)
+                    self._result.info.delta[:] = cp.maximum(self._result.info.reg_limit, 0.1 * self._result.info.delta)
                 else:
                     self._result.info.no_dual_update += 1
                     if self._result.info.iter < 5 or self._result.info.primal_prox_inf < self.settings.infeasibility_threshold:
-                        self._result.info.delta = cp.maximum(self._result.info.reg_limit, 0.5 * self._result.info.delta)
+                        self._result.info.delta[:] = cp.maximum(self._result.info.reg_limit, 0.5 * self._result.info.delta)
 
             # -------------------- Case with inequality constraints --------------------
             else:
@@ -298,12 +324,16 @@ class SolverBase:
                 # Drop the quadratic term Δs ∘ Δz (first‑order Newton linearization) to get the linear system S Δz + Z Δs = - s ∘ z.
                 # Thus the predictor RHS for the slack/dual complementarity equations is - s ∘ z (elementwise product), which is exactly what the four lines set for the different constraint groups.
                 # In words: those lines build the complementarity residual r_s = - s .* z so the KKT solve computes Δs, Δz satisfying S Δz + Z Δs = r_s (the linearized complementarity equation) for the predictor (affine) direction. The .array() calls implement the elementwise product s .* z.
-                self._res.s_l[:] = -self._result.s_l * self._result.z_l
-                self._res.s_u[:] = -self._result.s_u * self._result.z_u
-                self._res.s_bl[:] = -self._result.s_bl * self._result.z_bl
-                self._res.s_bu[:] = -self._result.s_bu * self._result.z_bu
-                
-                
+                with nvtx.annotate("Solver::prepare_predictor_step"):
+                    cp.multiply(self._result.s_l, self._result.z_l, out=self._res.s_l)
+                    self._res.s_l *= -1.
+                    cp.multiply(self._result.s_u, self._result.z_u, out=self._res.s_u)
+                    self._res.s_u *= -1.
+                    cp.multiply(self._result.s_bl, self._result.z_bl, out=self._res.s_bl)
+                    self._res.s_bl *= -1.
+                    cp.multiply(self._result.s_bu, self._result.z_bu, out=self._res.s_bu)
+                    self._res.s_bu *= -1.
+                    
 
                 if self.settings.debug:
                     print("predictor step rhs is: res= ", self._res)
@@ -320,21 +350,27 @@ class SolverBase:
                 self._alpha_sz *= self.settings.tau
 
                 # ------------------ compute centering parameter sigma ------------------
-                self._result.info.sigma = 0.
-                self._result.info.sigma += cp.dot(self._result.s_l + self._alpha_sz[0] * self._step.s_l, self._result.z_l + self._alpha_sz[1] * self._step.z_l)
-                self._result.info.sigma += cp.dot(self._result.s_u + self._alpha_sz[0] * self._step.s_u, self._result.z_u + self._alpha_sz[1] * self._step.z_u)
-                self._result.info.sigma += cp.dot(self._result.s_bl + self._alpha_sz[0] * self._step.s_bl, self._result.z_bl + self._alpha_sz[1] * self._step.z_bl)
-                self._result.info.sigma += cp.dot(self._result.s_bu + self._alpha_sz[0] * self._step.s_bu, self._result.z_bu + self._alpha_sz[1] * self._step.z_bu)
-                self._result.info.sigma /= self._result.info.mu * cp.float64(self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)
-                self._result.info.sigma = cp.maximum(0., cp.minimum(1., self._result.info.sigma))
-                self._result.info.sigma = self._result.info.sigma ** 3
-
+                self._calculate_sigma()
 
                 # ------------------ corrector step ------------------
-                self._res.s_l += -self._step.s_l * self._step.z_l + self._result.info.sigma * self._result.info.mu
-                self._res.s_u += -self._step.s_u * self._step.z_u + self._result.info.sigma * self._result.info.mu
-                self._res.s_bl += -self._step.s_bl * self._step.z_bl + self._result.info.sigma * self._result.info.mu
-                self._res.s_bu += -self._step.s_bu * self._step.z_bu + self._result.info.sigma * self._result.info.mu
+                with nvtx.annotate("Solver::prepare_corrector_step"):
+                    # self._res.s_l += -self._step.s_l * self._step.z_l + self._result.info.sigma * self._result.info.mu
+                    # self._res.s_u += -self._step.s_u * self._step.z_u + self._result.info.sigma * self._result.info.mu
+                    # self._res.s_bl += -self._step.s_bl * self._step.z_bl + self._result.info.sigma * self._result.info.mu
+                    # self._res.s_bu += -self._step.s_bu * self._step.z_bu + self._result.info.sigma * self._result.info.mu
+                    tmp_sigma_mu = self._result.info.sigma * self._result.info.mu
+                    cp.multiply(self._step.s_l, self._step.z_l, out=self._work_duals[:self._data.num_hl])
+                    self._res.s_l -= self._work_duals[:self._data.num_hl]
+                    self._res.s_l += tmp_sigma_mu
+                    cp.multiply(self._step.s_u, self._step.z_u, out=self._work_duals[:self._data.num_hu])
+                    self._res.s_u -= self._work_duals[:self._data.num_hu]
+                    self._res.s_u += tmp_sigma_mu
+                    cp.multiply(self._step.s_bl, self._step.z_bl, out=self._work_duals[:self._data.num_xl])
+                    self._res.s_bl -= self._work_duals[:self._data.num_xl]
+                    self._res.s_bl += tmp_sigma_mu
+                    cp.multiply(self._step.s_bu, self._step.z_bu, out=self._work_duals[:self._data.num_xu])
+                    self._res.s_bu -= self._work_duals[:self._data.num_xu]
+                    self._res.s_bu += tmp_sigma_mu
 
                 if self.settings.debug:
                     print("corrector step rhs is: res= ", self._res)
@@ -347,8 +383,8 @@ class SolverBase:
                 self._calculate_step()
                 # avoid getting too close to the boundary
                 self._alpha_sz *= self.settings.tau
-                self._result.info.primal_step = self._alpha_sz[0]
-                self._result.info.dual_step = self._alpha_sz[1]
+                self._result.info.primal_step[:] = self._alpha_sz[0]
+                self._result.info.dual_step[:] = self._alpha_sz[1]
 
                 # ------------------ update variables ------------------
                 self._result.x += self._result.info.primal_step * self._step.x
@@ -362,9 +398,9 @@ class SolverBase:
                 self._result.s_bl += self._result.info.primal_step * self._step.s_bl
                 self._result.s_bu += self._result.info.primal_step * self._step.s_bu
 
-                mu_prev = self._result.info.mu
-                self._result.info.mu = self._calculate_mu()
-                mu_rate = cp.maximum(0., (mu_prev - self._result.info.mu) / mu_prev)  # r in Algorithm 2 in Roland Schwan 2023 paper
+                mu_prev = self._result.info.mu.copy()
+                self._calculate_mu()
+                mu_rate = cp.maximum(0., (mu_prev - self._result.info.mu[0]) / mu_prev)  # r in Algorithm 2 in Roland Schwan 2023 paper
 
 
                 # ------------------ update regularization ------------------
@@ -374,11 +410,11 @@ class SolverBase:
                     (self._result.info.dual_res < self.settings.eps_abs or self._result.info.dual_res_rel < self.settings.eps_rel) or \
                     (self._result.info.rho == self.settings.reg_finetune_lower_limit and self._result.info.dual_prox_inf < self.settings.infeasibility_threshold) :
                     self._prox_vars.x[:] = self._result.x
-                    self._result.info.rho = cp.maximum(self._result.info.reg_limit, (1. - mu_rate) * self._result.info.rho)
+                    self._result.info.rho[:] = cp.maximum(self._result.info.reg_limit, (1. - mu_rate) * self._result.info.rho)
                 else:
                     self._result.info.no_primal_update += 1                
                     if self._result.info.iter < 5 or self._result.info.dual_prox_inf < self.settings.infeasibility_threshold:
-                        self._result.info.rho = cp.maximum(self._result.info.reg_limit, (1. - 0.666 * mu_rate) * self._result.info.rho)
+                        self._result.info.rho[:] = cp.maximum(self._result.info.reg_limit, (1. - 0.666 * mu_rate) * self._result.info.rho)
 
                 if self._result.info.primal_res < 0.95 * self._result.info.prev_primal_res or \
                     (self._result.info.primal_res < self.settings.eps_abs or self._result.info.primal_res_rel < self.settings.eps_rel) or \
@@ -389,11 +425,11 @@ class SolverBase:
                     self._prox_vars.z_bu[:] = self._result.z_bu
                     self._prox_vars.z_bl[:] = self._result.z_bl
                     
-                    self._result.info.delta = cp.maximum(self._result.info.reg_limit, (1. - mu_rate) * self._result.info.delta)
+                    self._result.info.delta[:] = cp.maximum(self._result.info.reg_limit, (1. - mu_rate) * self._result.info.delta)
                 else:
                     self._result.info.no_dual_update += 1
                     if self._result.info.iter < 5 or self._result.info.primal_prox_inf < self.settings.infeasibility_threshold:
-                        self._result.info.delta = cp.maximum(self._result.info.reg_limit, (1. - 0.666 * mu_rate) * self._result.info.delta)
+                        self._result.info.delta[:] = cp.maximum(self._result.info.reg_limit, (1. - 0.666 * mu_rate) * self._result.info.delta)
 
 
         self._result.info.status = Status.PIQP_MAX_ITER_REACHED
@@ -461,13 +497,60 @@ class SolverBase:
         self._calculate_step_cuda_graphs[key].launch()
 
     @nvtx.annotate("Solver::_calculate_mu")
-    def _calculate_mu(self) -> float:
-        mu = (cp.dot(self._result.s_l, self._result.z_l)
-                + cp.dot(self._result.s_u, self._result.z_u) \
-                + cp.dot(self._result.s_bl, self._result.z_bl) \
-                + cp.dot(self._result.s_bu, self._result.z_bu)) \
-                / (self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)
-        return mu
+    def _calculate_mu(self) -> None:
+        if not hasattr(self, '_calculate_mu_cuda_graphs'):
+            self._calculate_mu_cuda_graphs = {}
+            self._calculate_mu_cuda_graphs_capture_count = 0
+        key = (self._result.buffer_ptr, self._result.info.mu.data.ptr)
+        if key not in self._calculate_mu_cuda_graphs:
+            self._calculate_mu_cuda_graphs_capture_count += 1
+            print(f"KKTSystems::_calculate_mu capturing CUDA graph (occurrence {self._calculate_mu_cuda_graphs_capture_count})...")
+            stream = cp.cuda.Stream(non_blocking=True)
+            stream.begin_capture()
+            with stream:
+                cp.dot(self._result.s_l, self._result.z_l, out=self._work_reduce[0:1])
+                cp.dot(self._result.s_u, self._result.z_u, out=self._work_reduce[1:2])
+                cp.dot(self._result.s_bl, self._result.z_bl, out=self._work_reduce[2:3])
+                cp.dot(self._result.s_bu, self._result.z_bu, out=self._work_reduce[3:4])
+                cp.sum(self._work_reduce[0:4], out=self._result.info.mu[:], keepdims=True)
+                self._result.info.mu /= (self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)
+            self._calculate_mu_cuda_graphs[key] = stream.end_capture()
+
+        self._calculate_mu_cuda_graphs[key].launch()
+
+    @nvtx.annotate("Solver::_calculate_sigma")
+    def _calculate_sigma(self) -> None:
+        if not hasattr(self, '_calculate_sigma_cuda_graphs'):
+            self._calculate_sigma_cuda_graphs = {}
+            self._calculate_sigma_cuda_graphs_capture_count = 0
+
+        key = (self._alpha_sz.data.ptr,
+                self._result.buffer_ptr,
+                self._step.buffer_ptr,
+                self._result.info.sigma.data.ptr,
+                self._result.info.mu.data.ptr
+            )
+        
+        if key not in self._calculate_sigma_cuda_graphs:
+            self._calculate_sigma_cuda_graphs_capture_count += 1
+            print(f"KKTSystems::_calculate_sigma capturing CUDA graph (occurrence {self._calculate_sigma_cuda_graphs_capture_count})...")
+            stream = cp.cuda.Stream(non_blocking=True)
+            stream.begin_capture()
+            with stream:
+                self._result.info.sigma[:] = 0.
+                self._result.info.sigma += cp.dot(self._result.s_l + self._alpha_sz[0] * self._step.s_l, self._result.z_l + self._alpha_sz[1] * self._step.z_l)
+                self._result.info.sigma += cp.dot(self._result.s_u + self._alpha_sz[0] * self._step.s_u, self._result.z_u + self._alpha_sz[1] * self._step.z_u)
+                self._result.info.sigma += cp.dot(self._result.s_bl + self._alpha_sz[0] * self._step.s_bl, self._result.z_bl + self._alpha_sz[1] * self._step.z_bl)
+                self._result.info.sigma += cp.dot(self._result.s_bu + self._alpha_sz[0] * self._step.s_bu, self._result.z_bu + self._alpha_sz[1] * self._step.z_bu)
+                
+                cp.divide(self._result.info.sigma, self._result.info.mu, out=self._result.info.sigma)
+                self._result.info.sigma /= self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu
+                cp.clip(self._result.info.sigma, 0., 1., out=self._result.info.sigma)
+                cp.power(self._result.info.sigma, 3., out=self._result.info.sigma)
+
+            self._calculate_sigma_cuda_graphs[key] = stream.end_capture()
+
+        self._calculate_sigma_cuda_graphs[key].launch()
 
 
     @nvtx.annotate("Solver::_update_residuals_nr")
@@ -493,6 +576,16 @@ class SolverBase:
             - primal_obj = 0.5 x^T P x + c^T x
             - dual_obj = -0.5 x^T P x - b^T y - h_u^T z_u + h_l^T z_l - x_u^T z_bu + x_l^T z_bl
         """
+        if not hasattr(self, '_update_residuals_nr_cuda_graphs'):
+            self._update_residuals_nr_cuda_graphs = {}
+            self._update_residuals_nr_cuda_graphs_capture_count = 0
+
+        key = (self._res.buffer_ptr, 
+               self._result.buffer_ptr,
+               self._prox_vars.buffer_ptr,
+               self._res_nr.buffer_ptr)
+        # TODO: eval_P_x, eval_A_xn_and_AT_xt, eval_G_xn_and_GT_xt contain some cuSPARSE and cuBLAS operations that are not supported by CUDA graph capture. What can we do with it?
+
         # we calculate these term here first to be able to reuse temporary vectors
         self._kkt_system.eval_P_x(self._data, -1., self._result.x, self._res_nr.x)
         dual_res_norm = cp.linalg.norm(self._res_nr.x, ord=cp.inf) # dual_res_norm = max(||P*x||_inf, ||c||_inf, ||A^T*y + G^T*(z_u - z_l) + z_bu - z_bl||_inf), will be updated below
@@ -509,107 +602,120 @@ class SolverBase:
         GT_zu_minus_zl = self._step.x  # reuse self._step.x as temporary storage
         self._kkt_system.eval_G_xn_and_GT_xt(self._data, 1., 1., self._result.x, self._work_z_1, G_x, GT_zu_minus_zl)
 
-        # ------------ update primal / dual objectives and duality gap ------------
-        # primal objective: 0.5 x^T P x + c^T x
-        # dual objective is: -0.5 x^T P x - b^T y - h_u^T z_u + h_l^T z_l - x_u^T z_bu + x_l^T z_bl
+        if key not in self._update_residuals_nr_cuda_graphs:
+            self._update_residuals_nr_cuda_graphs_capture_count += 1
+            print(f"Solver::_update_residuals_nr capturing CUDA graph (occurrence {self._update_residuals_nr_cuda_graphs_capture_count})...")
+            stream = cp.cuda.Stream(non_blocking=True)
+            stream.begin_capture()
+            with stream:
+                # ------------ update primal / dual objectives and duality gap ------------
+                # primal objective: 0.5 x^T P x + c^T x
+                # dual objective is: -0.5 x^T P x - b^T y - h_u^T z_u + h_l^T z_l - x_u^T z_bu + x_l^T z_bl
 
-        # -x^T P x
-        tmp = cp.dot(self._res_nr.x, self._result.x)  # self._res_nr.x currently holds -P*x
-        self._result.info.primal_obj = -0.5 * tmp
-        self._result.info.dual_obj = 0.5 * tmp
-        duality_gap_rel_norm = cp.abs(tmp)
-        # c^T x
-        tmp = cp.dot(self._data.c, self._result.x)
-        self._result.info.primal_obj += tmp
-        duality_gap_rel_norm = cp.maximum(cp.abs(tmp), duality_gap_rel_norm)
-        # -b^T y
-        tmp = -cp.dot(self._data.b, self._result.y)
-        self._result.info.dual_obj += tmp
-        duality_gap_rel_norm = cp.maximum(cp.abs(tmp), duality_gap_rel_norm)
-        # h_l^T z_l
-        tmp = cp.dot(self._data.h_l[self._data.idx_hl], self._result.z_l)
-        self._result.info.dual_obj += tmp
-        duality_gap_rel_norm = cp.maximum(cp.abs(tmp), duality_gap_rel_norm)
-        # -h_u^T z_u
-        tmp = -cp.dot(self._data.h_u[self._data.idx_hu], self._result.z_u)
-        self._result.info.dual_obj += tmp
-        duality_gap_rel_norm = cp.maximum(cp.abs(tmp), duality_gap_rel_norm)
-        # x_l^T z_bl
-        tmp = cp.dot(self._data.x_l[self._data.idx_xl], self._result.z_bl)
-        self._result.info.dual_obj += tmp
-        duality_gap_rel_norm = cp.maximum(cp.abs(tmp), duality_gap_rel_norm)
-        # -x_u^T z_bu
-        tmp = -cp.dot(self._data.x_u[self._data.idx_xu], self._result.z_bu)
-        self._result.info.dual_obj += tmp
-        duality_gap_rel_norm = cp.maximum(cp.abs(tmp), duality_gap_rel_norm)
-        
-        self._result.info.duality_gap = cp.abs(self._result.info.primal_obj - self._result.info.dual_obj)
-        self._result.info.duality_gap_rel = self._result.info.duality_gap / cp.maximum(1., duality_gap_rel_norm)
+                # use self._work_reduce to hold intermediate terms for primal and dual objectives:
+                # index |  content
+                #  0    |   0.5 * x^T P x
+                #  1    |   c^T x
+                #  2    |   0.5 * x^T P x (copy of idx 0 for easier reduction)
+                #  3    |   b^T y
+                #  4    |   -h_l^T z_l
+                #  5    |   h_u^T z_u
+                #  6    |   -x_l^T z_bl
+                #  7    |   x_u^T z_bu
 
-        # res_nr.x = -(P*x + c + A^T*y + G^T*(z_u - z_l) + z_bu - z_bl)
-        # self._res_nr.x is computed as -P*x above
-        self._res_nr.x -= self._data.c
-        self._res_nr.x -= self._res.x  # self._res.x holds A^T*y
-        self._res_nr.x -= GT_zu_minus_zl
-        self._res_nr.x[self._data.idx_xl] += self._result.z_bl
-        self._res_nr.x[self._data.idx_xu] -= self._result.z_bu
-        
-        # res_nr.y = -(A*x - b)
-        self._res_nr.y += self._data.b
+                cp.dot(self._res_nr.x, self._result.x, out=self._work_reduce[0:1])
+                self._work_reduce[0:1] *= -0.5  # hold 0.5 * x^T P x
+                cp.dot(self._data.c, self._result.x, out=self._work_reduce[1:2]) # hold c^T x
 
-        # res_nr.z_l = G*x - s_l - hl  =>  self._res_nr.z_l[:] = (G_x[self._data.idx_hl] - self._result.s_l - self._data.h_l[self._data.idx_hl])
-        cp.take(G_x, self._data.idx_hl, out=self._res_nr.z_l)
-        cp.subtract(self._res_nr.z_l, self._result.s_l, out=self._res_nr.z_l)
-        cp.subtract(self._res_nr.z_l, self._data.h_l[self._data.idx_hl], out=self._res_nr.z_l)  # TODO: this creates a tmp array, optimize?
-        
-        # res_nr.z_u = -G*x - s_u + hu  =>  self._res_nr.z_u[:] = (-G_x[self._data.idx_hu] - self._result.s_u + self._data.h_u[self._data.idx_hu])
-        cp.take(G_x, self._data.idx_hu, out=self._res_nr.z_u)
-        cp.negative(self._res_nr.z_u, out=self._res_nr.z_u)
-        cp.subtract(self._res_nr.z_u, self._result.s_u, out=self._res_nr.z_u)
-        cp.add(self._res_nr.z_u, self._data.h_u[self._data.idx_hu], out=self._res_nr.z_u)  # TODO: this creates a tmp array, optimize?
+                cp.multiply(self._work_reduce[0:1], 1., out=self._work_reduce[2:3])  # hold 0.5 * x^T P x
+                cp.dot(self._data.b, self._result.y, out=self._work_reduce[3:4]) # hold b^T y
+                cp.dot(self._data.h_l[self._data.idx_hl], self._result.z_l, out=self._work_reduce[4:5])  # hold h_l^T z_l
+                self._work_reduce[4:5] *= -1.  # hold - h_l^T z_l
+                cp.dot(self._data.h_u[self._data.idx_hu], self._result.z_u, out=self._work_reduce[5:6])  # hold h_u^T z_u
+                cp.dot(self._data.x_l[self._data.idx_xl], self._result.z_bl, out=self._work_reduce[6:7])
+                self._work_reduce[6:7] *= -1.  # hold - x_l^T z_bl
+                cp.dot(self._data.x_u[self._data.idx_xu], self._result.z_bu, out=self._work_reduce[7:8])  # hold x_u^T z_bu
 
-        # res_nr.z_bl = x - s_bl - xl  =>  self._res_nr.z_bl[:] = (self._result.x[self._data.idx_xl] - self._result.s_bl - self._data.x_l[self._data.idx_xl])
-        cp.take(self._result.x, self._data.idx_xl, out=self._res_nr.z_bl)
-        cp.subtract(self._res_nr.z_bl, self._result.s_bl, out=self._res_nr.z_bl)
-        cp.subtract(self._res_nr.z_bl, self._data.x_l[self._data.idx_xl], out=self._res_nr.z_bl)  # TODO: this creates a tmp array, optimize?
+                cp.sum(self._work_reduce[0:2], out=self._result.info.primal_obj, keepdims=True)  # primal_obj = 0.5 x^T P x + c^T x
+                cp.sum(self._work_reduce[2:8], out=self._result.info.dual_obj, keepdims=True)
+                self._result.info.dual_obj *= -1.  # dual_obj = -b^T y - h_u^T z_u + h_l^T z_l - x_u^T z_bu + x_l^T z_bl
 
-        # res_nr.z_bu = -(x + s_bu - xu)  =>  self._res_nr.z_bu[:] = - (self._result.x[self._data.idx_xu] + self._result.s_bu - self._data.x_u[self._data.idx_xu])
-        cp.take(self._result.x, self._data.idx_xu, out=self._res_nr.z_bu)
-        cp.add(self._res_nr.z_bu, self._result.s_bu, out=self._res_nr.z_bu)
-        cp.subtract(self._res_nr.z_bu, self._data.x_u[self._data.idx_xu], out=self._res_nr.z_bu)  # TODO: this creates a tmp array, optimize?
-        cp.negative(self._res_nr.z_bu, out=self._res_nr.z_bu)
+                # duality_gap = abs(primal_obj - dual_obj)
+                cp.subtract(self._result.info.primal_obj, self._result.info.dual_obj, out=self._result.info.duality_gap)
+                
+                # duality_gap_rel_norm = max(abs(0.5 x'Px, b'y, h_u'z_u, h_l'z_l, x_u'z_bu, x_l'z_bl))
+                # duality_gap_relative = duality_gap / maximum(1., duality_gap_rel_norm)
+                cp.abs(self._work_reduce, out=self._work_reduce)
+                cp.max(self._work_reduce[0:8], out=self._result.info.duality_gap_rel, keepdims=True)
+                cp.abs(self._result.info.duality_gap, out=self._result.info.duality_gap)
+                cp.maximum(self._result.info.duality_gap_rel, 1., out=self._result.info.duality_gap_rel)
+                cp.divide(self._result.info.duality_gap, self._result.info.duality_gap_rel, out=self._result.info.duality_gap_rel)
+
+                # ------------ update non-regulerized residuals ------------
+                # res_nr.x = -(P*x + c + A^T*y + G^T*(z_u - z_l) + z_bu - z_bl)
+                # self._res_nr.x is computed as -P*x above
+                self._res_nr.x -= self._data.c
+                self._res_nr.x -= self._res.x  # self._res.x holds A^T*y
+                self._res_nr.x -= GT_zu_minus_zl
+                self._res_nr.x[self._data.idx_xl] += self._result.z_bl
+                self._res_nr.x[self._data.idx_xu] -= self._result.z_bu
+                
+                # res_nr.y = -(A*x - b)
+                self._res_nr.y += self._data.b
+
+                # res_nr.z_l = G*x - s_l - hl  =>  self._res_nr.z_l[:] = (G_x[self._data.idx_hl] - self._result.s_l - self._data.h_l[self._data.idx_hl])
+                cp.take(G_x, self._data.idx_hl, out=self._res_nr.z_l)
+                cp.subtract(self._res_nr.z_l, self._result.s_l, out=self._res_nr.z_l)
+                cp.subtract(self._res_nr.z_l, self._data.h_l[self._data.idx_hl], out=self._res_nr.z_l)  # TODO: this creates a tmp array, optimize?
+                
+                # res_nr.z_u = -G*x - s_u + hu  =>  self._res_nr.z_u[:] = (-G_x[self._data.idx_hu] - self._result.s_u + self._data.h_u[self._data.idx_hu])
+                cp.take(G_x, self._data.idx_hu, out=self._res_nr.z_u)
+                cp.negative(self._res_nr.z_u, out=self._res_nr.z_u)
+                cp.subtract(self._res_nr.z_u, self._result.s_u, out=self._res_nr.z_u)
+                cp.add(self._res_nr.z_u, self._data.h_u[self._data.idx_hu], out=self._res_nr.z_u)  # TODO: this creates a tmp array, optimize?
+
+                # res_nr.z_bl = x - s_bl - xl  =>  self._res_nr.z_bl[:] = (self._result.x[self._data.idx_xl] - self._result.s_bl - self._data.x_l[self._data.idx_xl])
+                cp.take(self._result.x, self._data.idx_xl, out=self._res_nr.z_bl)
+                cp.subtract(self._res_nr.z_bl, self._result.s_bl, out=self._res_nr.z_bl)
+                cp.subtract(self._res_nr.z_bl, self._data.x_l[self._data.idx_xl], out=self._res_nr.z_bl)  # TODO: this creates a tmp array, optimize?
+
+                # res_nr.z_bu = -(x + s_bu - xu)  =>  self._res_nr.z_bu[:] = - (self._result.x[self._data.idx_xu] + self._result.s_bu - self._data.x_u[self._data.idx_xu])
+                cp.take(self._result.x, self._data.idx_xu, out=self._res_nr.z_bu)
+                cp.add(self._res_nr.z_bu, self._result.s_bu, out=self._res_nr.z_bu)
+                cp.subtract(self._res_nr.z_bu, self._data.x_u[self._data.idx_xu], out=self._res_nr.z_bu)  # TODO: this creates a tmp array, optimize?
+                cp.negative(self._res_nr.z_bu, out=self._res_nr.z_bu)
 
 
-        # ------------ update primal and dual residuals ------------
-        self._result.info.prev_primal_res = self._result.info.primal_res
-        self._result.info.prev_dual_res = self._result.info.dual_res
+                # ------------ update primal and dual residuals ------------
+                self._result.info.prev_primal_res[:] = self._result.info.primal_res
+                self._result.info.prev_dual_res[:] = self._result.info.dual_res
 
-        self._result.info.primal_res = self._primal_res_nr()
+                self._result.info.primal_res[:] = self._primal_res_nr()
 
-        # primal_rel_norm is computed as ||-A*x||_inf above, now update it with other terms
-        primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._data.b, ord=cp.inf)) if self._data.p > 0 else primal_rel_norm
-        primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(G_x[self._data.idx_hu], ord=cp.inf)) if self._data.num_hu > 0 else primal_rel_norm
-        primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(G_x[self._data.idx_hl], ord=cp.inf)) if self._data.num_hl > 0 else primal_rel_norm
-        primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._data.h_u[self._data.idx_hu], ord=cp.inf)) if self._data.num_hu > 0 else primal_rel_norm
-        primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._data.h_l[self._data.idx_hl], ord=cp.inf)) if self._data.num_hl > 0 else primal_rel_norm
-        primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._data.x_u[self._data.idx_xu], ord=cp.inf)) if self._data.num_xu > 0 else primal_rel_norm
-        primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._data.x_l[self._data.idx_xl], ord=cp.inf)) if self._data.num_xl > 0 else primal_rel_norm
-        primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._result.s_u, ord=cp.inf)) if self._data.num_hu > 0 else primal_rel_norm
-        primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._result.s_l, ord=cp.inf)) if self._data.num_hl > 0 else primal_rel_norm
-        primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._result.s_bu, ord=cp.inf)) if self._data.num_xu > 0 else primal_rel_norm
-        primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._result.s_bl, ord=cp.inf)) if self._data.num_xl > 0 else primal_rel_norm
-        self._result.info.primal_res_rel = self._result.info.primal_res / cp.maximum(1., primal_rel_norm)
+                # primal_rel_norm is computed as ||-A*x||_inf above, now update it with other terms
+                primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(G_x[self._data.idx_hu], ord=cp.inf)) if self._data.num_hu > 0 else primal_rel_norm
+                primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(G_x[self._data.idx_hl], ord=cp.inf)) if self._data.num_hl > 0 else primal_rel_norm
+                primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._result.s_u, ord=cp.inf)) if self._data.num_hu > 0 else primal_rel_norm
+                primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._result.s_l, ord=cp.inf)) if self._data.num_hl > 0 else primal_rel_norm
+                primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._result.s_bu, ord=cp.inf)) if self._data.num_xu > 0 else primal_rel_norm
+                primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._result.s_bl, ord=cp.inf)) if self._data.num_xl > 0 else primal_rel_norm
+                primal_rel_norm = cp.maximum(primal_rel_norm, self._data._constraints_rhs_inf_norm)
+                self._result.info.primal_res_rel[:] = self._result.info.primal_res / cp.maximum(1., primal_rel_norm)
 
-        # dual_res_norm = max(||P*x||_inf, ||c||_inf, ||A^T*y + G^T*(z_u - z_l) + z_bu - z_bl||_inf)
-        self._result.info.dual_res = self._dual_res_nr()
-        dual_res_norm = cp.maximum(dual_res_norm, cp.linalg.norm(self._data.c, ord=cp.inf))  # ||P*x||_inf was calculated before
-        # self._res.x currently holds A^T*y
-        self._res.x += GT_zu_minus_zl
-        self._res.x[self._data.idx_xl] -= self._result.z_bl
-        self._res.x[self._data.idx_xu] += self._result.z_bu
-        dual_res_norm = cp.maximum(dual_res_norm, cp.linalg.norm(self._res.x, ord=cp.inf))
-        self._result.info.dual_res_rel = self._result.info.dual_res / cp.maximum(1., dual_res_norm)
-        
+                # dual_res_norm = max(||P*x||_inf, ||c||_inf, ||A^T*y + G^T*(z_u - z_l) + z_bu - z_bl||_inf)
+                self._result.info.dual_res[:] = self._dual_res_nr()
+                dual_res_norm = cp.maximum(dual_res_norm, cp.linalg.norm(self._data.c, ord=cp.inf))  # ||P*x||_inf was calculated before
+                # self._res.x currently holds A^T*y
+                self._res.x += GT_zu_minus_zl
+                self._res.x[self._data.idx_xl] -= self._result.z_bl
+                self._res.x[self._data.idx_xu] += self._result.z_bu
+                dual_res_norm = cp.maximum(dual_res_norm, cp.linalg.norm(self._res.x, ord=cp.inf))
+                self._result.info.dual_res_rel[:] = self._result.info.dual_res / cp.maximum(1., dual_res_norm)
+
+            self._update_residuals_nr_cuda_graphs[key] = stream.end_capture()
+
+        self._update_residuals_nr_cuda_graphs[key].launch()
+
 
     @nvtx.annotate("Solver::_update_residuals_r")
     def _update_residuals_r(self):
@@ -617,69 +723,227 @@ class SolverBase:
         Compute the regularized primal and dual residuals. The computation is based on the non-regularized residuals computed in _update_residuals_nr.
         It adds the regularization terms to the non-regularized residuals to obtain the regularized residuals.
         """
-        # update the rhs of the KKT system
-        # r_x = -(P*x + c + A^T*y + G^T*(z_u - z_l)) - rho * (x - x_prox)
+
+        if not hasattr(self, '_update_residuals_r_cuda_graphs'):
+            self._update_residuals_r_cuda_graphs = {}
+            self._update_residuals_r_cuda_graphs_capture_count = 0
+
+        key = (self._res.buffer_ptr, 
+               self._result.buffer_ptr,
+               self._prox_vars.buffer_ptr,
+               self._res_nr.buffer_ptr)
+        
+        if key not in self._update_residuals_r_cuda_graphs:
+            self._update_residuals_r_cuda_graphs_capture_count += 1
+            print(f"Solver::_update_residuals_r capturing CUDA graph (occurrence {self._update_residuals_r_cuda_graphs_capture_count})...")
+            # !IMPORTANT! Use the same stream for warp and cupy to make sure the captured graph contains both the warp kernel and the cupy operations, and they can be executed together without unnecessary stream synchronization
+            stream = cp.cuda.ExternalStream(wp.get_stream().cuda_stream)
+            stream.begin_capture()
+            with stream:
+
+                # update the rhs of the KKT system
+                # self._res.x[:] = self._res_nr.x - self._result.info.rho * (self._result.x - self._prox_vars.x)
+                # self._res.y[:] = self._res_nr.y - self._result.info.delta * (self._prox_vars.y - self._result.y)
+                # self._res.z_l[:] = self._res_nr.z_l - self._result.info.delta * (self._prox_vars.z_l - self._result.z_l)
+                # self._res.z_u[:] = self._res_nr.z_u - self._result.info.delta * (self._prox_vars.z_u - self._result.z_u)
+                # self._res.z_bl[:] = self._res_nr.z_bl - self._result.info.delta * (self._prox_vars.z_bl - self._result.z_bl)
+                # self._res.z_bu[:] = self._res_nr.z_bu - self._result.info.delta * (self._prox_vars.z_bu - self._result.z_bu)
+                USE_WARP_IMPLEMENTATION = True
+                if USE_WARP_IMPLEMENTATION:
+                    wp.launch(
+                        kernel=self._update_residuals_r_kernel,
+                        dim=self._data.n + self._data.p + self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu,
+                        inputs=[
+                            self._result.info.rho, self._result.info.delta,
+                            self._res_nr.x, self._res_nr.y, self._res_nr.z_l, self._res_nr.z_u, self._res_nr.z_bl, self._res_nr.z_bu,
+                            self._result.x, self._result.y, self._result.z_l, self._result.z_u, self._result.z_bl, self._result.z_bu,
+                            self._prox_vars.x, self._prox_vars.y, self._prox_vars.z_l, self._prox_vars.z_u, self._prox_vars.z_bl, self._prox_vars.z_bu,
+                            self._res.x, self._res.y, self._res.z_l, self._res.z_u, self._res.z_bl, self._res.z_bu
+                        ],
+                        device="cuda",
+                    )
+                else:
+                    cp.subtract(self._result.x, self._prox_vars.x, out=self._res.x)
+                    self._res.x *= self._result.info.rho
+                    cp.subtract(self._res_nr.x, self._res.x, out=self._res.x)
+                    cp.subtract(self._prox_vars.y, self._result.y, out=self._res.y)
+                    self._res.y *= self._result.info.delta
+                    cp.subtract(self._res_nr.y, self._res.y, out=self._res.y)
+                    cp.subtract(self._prox_vars.z_l, self._result.z_l, out=self._res.z_l)
+                    self._res.z_l *= self._result.info.delta
+                    cp.subtract(self._res_nr.z_l, self._res.z_l, out=self._res.z_l)
+                    cp.subtract(self._prox_vars.z_u, self._result.z_u, out=self._res.z_u)
+                    self._res.z_u *= self._result.info.delta
+                    cp.subtract(self._res_nr.z_u, self._res.z_u, out=self._res.z_u)
+                    cp.subtract(self._prox_vars.z_bl, self._result.z_bl, out=self._res.z_bl)
+                    self._res.z_bl *= self._result.info.delta
+                    cp.subtract(self._res_nr.z_bl, self._res.z_bl, out=self._res.z_bl)
+                    cp.subtract(self._prox_vars.z_bu, self._result.z_bu, out=self._res.z_bu)
+                    self._res.z_bu *= self._result.info.delta
+                    cp.subtract(self._res_nr.z_bu, self._res.z_bu, out=self._res.z_bu)
+
+                self._result.info.primal_res_reg[:] = self._primal_res_r()
+                # primal_rel_scaling = self._result.info.primal_res / self._result.info.primal_res_rel if self._result.info.primal_res_rel > 0 else 1.
+                # self._result.info.primal_res_reg_rel[:] = self._result.info.primal_res_reg / primal_rel_scaling
+                cp.divide(self._result.info.primal_res, self._result.info.primal_res_rel, out=self._result.info.primal_res_reg_rel)
+                self._result.info.primal_res_reg_rel[:] = cp.where(self._result.info.primal_res_rel > 0,
+                        self._result.info.primal_res_reg_rel, cp.asarray(1.0, dtype=self._result.info.primal_res_reg_rel.dtype))
+                cp.divide(self._result.info.primal_res_reg, self._result.info.primal_res_reg_rel, out=self._result.info.primal_res_reg_rel)
+
+                self._result.info.dual_res_reg[:] = self._dual_res_r()
+                # dual_rel_scaling = self._result.info.dual_res / self._result.info.dual_res_rel if self._result.info.dual_res_rel > 0 else 1.
+                # self._result.info.dual_res_reg_rel[:] = self._result.info.dual_res_reg / dual_rel_scaling
+                cp.divide(self._result.info.dual_res, self._result.info.dual_res_rel, out=self._result.info.dual_res_reg_rel)
+                self._result.info.dual_res_reg_rel[:] = cp.where(self._result.info.dual_res_rel > 0,
+                        self._result.info.dual_res_reg_rel, cp.asarray(1.0, dtype=self._result.info.dual_res_reg_rel.dtype))
+                cp.divide(self._result.info.dual_res_reg, self._result.info.dual_res_reg_rel, out=self._result.info.dual_res_reg_rel)
+
+                self._result.info.primal_prox_inf[:] = self._primal_prox_inf()
+                self._result.info.primal_prox_inf *= self._result.info.delta
+                self._result.info.dual_prox_inf[:] = self._dual_prox_inf()
+                self._result.info.dual_prox_inf *= self._result.info.rho
+        
+            self._update_residuals_r_cuda_graphs[key] = stream.end_capture()
+
+        self._update_residuals_r_cuda_graphs[key].launch()
+        
+
+    @nvtx.annotate("Solver::_primal_res_nr")
+    def _primal_res_nr(self) -> float:
+        offset = 0
+        self._work_duals[:self._data.p] = self._res_nr.y
+        offset += self._data.p
+        self._work_duals[offset : offset+self._data.num_hu] = self._res_nr.z_u
+        offset += self._data.num_hu
+        self._work_duals[offset : offset+self._data.num_hl] = self._res_nr.z_l
+        offset += self._data.num_hl
+        self._work_duals[offset : offset+self._data.num_xu] = self._res_nr.z_bu
+        offset += self._data.num_xu
+        self._work_duals[offset : offset+self._data.num_xl] = self._res_nr.z_bl
+        offset += self._data.num_xl
+        # inf-norm without allocating a scalar output
+        cp.absolute(self._work_duals[:offset], out=self._work_duals[:offset])
+        cp.max(self._work_duals[:offset], out=self._work_residual)
+        return self._work_residual
+
+    @nvtx.annotate("Solver::_primal_res_r")
+    def _primal_res_r(self) -> float:
+        offset = 0
+        self._work_duals[:self._data.p] = self._res.y
+        offset = self._data.p
+        self._work_duals[offset : offset+self._data.num_hu] = self._res.z_u
+        offset += self._data.num_hu
+        self._work_duals[offset : offset+self._data.num_hl] = self._res.z_l
+        offset += self._data.num_hl
+        self._work_duals[offset : offset+self._data.num_xu] = self._res.z_bu
+        offset += self._data.num_xu
+        self._work_duals[offset : offset+self._data.num_xl] = self._res.z_bl
+        offset += self._data.num_xl
+        cp.absolute(self._work_duals[:offset], out=self._work_duals[:offset])
+        cp.max(self._work_duals[:offset], out=self._work_residual)
+        return self._work_residual
+    
+    @nvtx.annotate("Solver::_dual_res_nr")
+    def _dual_res_nr(self) -> float:
+        cp.absolute(self._res_nr.x, out=self._work_primals)
+        cp.max(self._work_primals, out=self._work_residual)
+        return self._work_residual
+    
+    @nvtx.annotate("Solver::_dual_res_r")
+    def _dual_res_r(self) -> float:
+        cp.absolute(self._res.x, out=self._work_primals)
+        cp.max(self._work_primals, out=self._work_residual)
+        return self._work_residual
+    
+    @nvtx.annotate("Solver::_primal_prox_inf")
+    def _primal_prox_inf(self) -> float:
+        cp.subtract(self._result.y, self._prox_vars.y, out=self._work_duals[:self._data.p])
+        offset = self._data.p
+        cp.subtract(self._result.z_l, self._prox_vars.z_l, out=self._work_duals[offset : offset+self._data.num_hl])
+        offset += self._data.num_hl
+        cp.subtract(self._result.z_u, self._prox_vars.z_u, out=self._work_duals[offset : offset+self._data.num_hu])
+        offset += self._data.num_hu
+        cp.subtract(self._result.z_bl, self._prox_vars.z_bl, out=self._work_duals[offset : offset+self._data.num_xl])
+        offset += self._data.num_xl
+        cp.subtract(self._result.z_bu, self._prox_vars.z_bu, out=self._work_duals[offset : offset+self._data.num_xu])
+        offset += self._data.num_xu
+        cp.absolute(self._work_duals[:offset], out=self._work_duals[:offset])
+        cp.max(self._work_duals[:offset], out=self._work_residual)
+        return self._work_residual
+
+    @nvtx.annotate("Solver::_dual_prox_inf")
+    def _dual_prox_inf(self) -> float:
+        cp.subtract(self._result.x, self._prox_vars.x, out=self._work_primals)
+        cp.absolute(self._work_primals, out=self._work_primals)
+        cp.max(self._work_primals, out=self._work_residual)
+        return self._work_residual
+
+
+def create_update_residual_r_kernel(n: int, p: int, num_hl: int, num_hu: int, num_xl: int, num_xu: int):
+    """
+    Perform the following operations:
         self._res.x[:] = self._res_nr.x - self._result.info.rho * (self._result.x - self._prox_vars.x)
-        # r_y = -(A*x - b - delta*(y - lamda))  # TODO: I understand the formula, but why is it computed this way? I copied the following line from the original C++ code.
         self._res.y[:] = self._res_nr.y - self._result.info.delta * (self._prox_vars.y - self._result.y)
         self._res.z_l[:] = self._res_nr.z_l - self._result.info.delta * (self._prox_vars.z_l - self._result.z_l)
         self._res.z_u[:] = self._res_nr.z_u - self._result.info.delta * (self._prox_vars.z_u - self._result.z_u)
         self._res.z_bl[:] = self._res_nr.z_bl - self._result.info.delta * (self._prox_vars.z_bl - self._result.z_bl)
         self._res.z_bu[:] = self._res_nr.z_bu - self._result.info.delta * (self._prox_vars.z_bu - self._result.z_bu)
-        
-        primal_rel_scaling = self._result.info.primal_res / self._result.info.primal_res_rel if self._result.info.primal_res_rel > 0 else 1.
-        dual_rel_scaling = self._result.info.dual_res / self._result.info.dual_res_rel if self._result.info.dual_res_rel > 0 else 1.
+    """
+    @wp.kernel
+    def update_residual_r_kernel(
+        rho: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        delta: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        res_nr_x: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        res_nr_y: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        res_nr_z_l: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        res_nr_z_u: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        res_nr_z_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        res_nr_z_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        result_x: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        result_y: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        result_z_l: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        result_z_u: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        result_z_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        result_z_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        prox_var_x: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        prox_var_y: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        prox_var_z_l: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        prox_var_z_u: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        prox_var_z_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        prox_var_z_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        res_r_x: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        res_r_y: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        res_r_z_l: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        res_r_z_u: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        res_r_z_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        res_r_z_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+    ):
+        t = wp.tid()
+        n_static = wp.static(n)
+        p_static = wp.static(p)
+        num_hl_static = wp.static(num_hl)
+        num_hu_static = wp.static(num_hu)
+        num_xl_static = wp.static(num_xl)
+        num_xu_static = wp.static(num_xu)
 
-        self._result.info.primal_res_reg = self._primal_res_r()
-        self._result.info.primal_res_reg_rel = self._result.info.primal_res_reg / primal_rel_scaling
-        self._result.info.dual_res_reg = self._dual_res_r()
-        self._result.info.dual_res_reg_rel = self._result.info.dual_res_reg / dual_rel_scaling
+        if t < n_static:
+            res_r_x[t] = -rho[0] * (result_x[t] - prox_var_x[t]) + res_nr_x[t]
+        elif t < n_static + p_static:
+            idx = t - n_static
+            res_r_y[idx] = delta[0] * (result_y[idx] - prox_var_y[idx]) + res_nr_y[idx]
+        elif t < n_static + p_static + num_hl_static:
+            idx = t - n_static - p_static
+            res_r_z_l[idx] = delta[0] * (result_z_l[idx] - prox_var_z_l[idx]) + res_nr_z_l[idx]
+        elif t < n_static + p_static + num_hl_static + num_hu_static:
+            idx = t - n_static - p_static - num_hl_static
+            res_r_z_u[idx] = delta[0] * (result_z_u[idx] - prox_var_z_u[idx]) + res_nr_z_u[idx]
+        elif t < n_static + p_static + num_hl_static + num_hu_static + num_xl_static:
+            idx = t - n_static - p_static - num_hl_static - num_hu_static
+            res_r_z_bl[idx] = delta[0] * (result_z_bl[idx] - prox_var_z_bl[idx]) + res_nr_z_bl[idx]
+        elif t < n_static + p_static + num_hl_static + num_hu_static + num_xl_static + num_xu_static:
+            idx = t - n_static - p_static - num_hl_static - num_hu_static - num_xl_static
+            res_r_z_bu[idx] = delta[0] * (result_z_bu[idx] - prox_var_z_bu[idx]) + res_nr_z_bu[idx]
+        else:
+            return
 
-        self._result.info.primal_prox_inf = self._primal_prox_inf() * self._result.info.delta
-        self._result.info.dual_prox_inf = self._dual_prox_inf() * self._result.info.rho
-
-    @nvtx.annotate("Solver::_primal_res_nr")
-    def _primal_res_nr(self) -> float:
-        inf = cp.float64(0.)
-        inf = cp.maximum(inf, cp.linalg.norm(self._res_nr.y, ord=cp.inf)) if self._data.p > 0 else inf
-        inf = cp.maximum(inf, cp.linalg.norm(self._res_nr.z_u, ord=cp.inf)) if self._data.num_hu > 0 else inf
-        inf = cp.maximum(inf, cp.linalg.norm(self._res_nr.z_l, ord=cp.inf)) if self._data.num_hl > 0 else inf
-        #! The values of z_u, z_l, z_bu, z_bl with active indices should all be positive.
-        #! can optionally use cp.maximum, if more efficient
-        inf = cp.maximum(inf, cp.linalg.norm(self._res_nr.z_bu, ord=cp.inf)) if self._data.num_xu > 0 else inf
-        inf = cp.maximum(inf, cp.linalg.norm(self._res_nr.z_bl, ord=cp.inf)) if self._data.num_xl > 0 else inf
-        return inf
-
-
-    @nvtx.annotate("Solver::_primal_res_r")
-    def _primal_res_r(self) -> float:
-        inf = cp.float64(0.)
-        inf = cp.maximum(inf, cp.linalg.norm(self._res.y, ord=cp.inf)) if self._data.p > 0 else inf
-        inf = cp.maximum(inf, cp.linalg.norm(self._res.z_u, ord=cp.inf)) if self._data.num_hu > 0 else inf
-        inf = cp.maximum(inf, cp.linalg.norm(self._res.z_l, ord=cp.inf)) if self._data.num_hl > 0 else inf
-        inf = cp.maximum(inf, cp.linalg.norm(self._res.z_bu, ord=cp.inf)) if self._data.num_xu > 0 else inf
-        inf = cp.maximum(inf, cp.linalg.norm(self._res.z_bl, ord=cp.inf)) if self._data.num_xl > 0 else inf
-        return inf
-    
-    @nvtx.annotate("Solver::_dual_res_nr")
-    def _dual_res_nr(self) -> float:
-        return cp.linalg.norm(self._res_nr.x, ord=cp.inf)
-    
-    @nvtx.annotate("Solver::_dual_res_r")
-    def _dual_res_r(self) -> float:
-        return cp.linalg.norm(self._res.x, ord=cp.inf)
-    
-    @nvtx.annotate("Solver::_primal_prox_inf")
-    def _primal_prox_inf(self) -> float:
-        inf = cp.float64(0.)
-        inf = cp.maximum(inf, cp.linalg.norm(self._result.y - self._prox_vars.y, ord=cp.inf)) if self._data.p > 0 else inf
-        inf = cp.maximum(inf, cp.linalg.norm(self._result.z_l - self._prox_vars.z_l, ord=cp.inf)) if self._data.num_hl > 0 else inf
-        inf = cp.maximum(inf, cp.linalg.norm(self._result.z_u - self._prox_vars.z_u, ord=cp.inf)) if self._data.num_hu > 0 else inf
-        inf = cp.maximum(inf, cp.linalg.norm(self._result.z_bl - self._prox_vars.z_bl, ord=cp.inf)) if self._data.num_xl > 0 else inf
-        inf = cp.maximum(inf, cp.linalg.norm(self._result.z_bu - self._prox_vars.z_bu, ord=cp.inf)) if self._data.num_xu > 0 else inf
-        return inf
-    
-    @nvtx.annotate("Solver::_dual_prox_inf")
-    def _dual_prox_inf(self) -> float:
-        return cp.linalg.norm(self._result.x - self._prox_vars.x, ord=cp.inf)
-    
+    return update_residual_r_kernel

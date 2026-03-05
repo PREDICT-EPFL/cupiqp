@@ -9,6 +9,7 @@ import scipy.sparse as sp
 import scipy.io
 import numpy as np
 
+import piqp
 from cupiqp import SolverBase
 
 
@@ -17,8 +18,8 @@ PROBLEM_FILE = "PRIMALC5"
 # PROBLEM_FILE = "TAME"
 PROBLEM_FILE = "QSHARE1B"
 # PROBLEM_FILE = "DPKLO1"  # no constraints
-# PROBLEM_FILE = "QADLITTL"
-PROBLEM_FILE = "YAO"
+PROBLEM_FILE = "QADLITTL"
+# PROBLEM_FILE = "YAO"
 
 SPARSE = True
 # SPARSE = False
@@ -42,6 +43,8 @@ if not SPARSE:
 	x_l = np.array(data['x_l'].flatten(), dtype=np.float64) if 'x_l' in data else None
 	x_u = np.array(data['x_u'].flatten(), dtype=np.float64) if 'x_u' in data else None
 
+	solve_cpu = piqp.DenseSolver()
+
 else:
 	# -------- sparse data --------
 	P = sp.csc_matrix(data['P'], dtype=np.float64)
@@ -54,10 +57,18 @@ else:
 	x_l = np.array(data['x_l'].flatten(), dtype=np.float64) if 'x_l' in data else None
 	x_u = np.array(data['x_u'].flatten(), dtype=np.float64) if 'x_u' in data else None
 
+	solver_cpu = piqp.SparseSolver()
+
+
+solver_cpu.settings.verbose = True
+solver_cpu.setup(P=P, c=c, A=A, b=b, G=G, h_u=h_u, h_l=h_l, x_u=x_u, x_l=x_l)
+status_cpu = solver_cpu.solve()
+print("CPU solver status: ", status_cpu)
+
 
 solver = SolverBase()
 solver.settings.kkt_solver = 'dense_cholesky' if not SPARSE else 'sparse_ldlt'
-solver.settings.debug = False
+# solver.settings.debug = True
 solver.settings.verbose = True
 solver.settings.max_iter = 200
 
@@ -88,4 +99,4 @@ with cp.cuda.Device(0):
 		)
 	status = solver.solve()
 
-print("Solver status: ", status)
+print("GPU solver status: ", status)
