@@ -61,11 +61,31 @@ class KKTSystem:
 
         # create kernels
         self._update_regulerization_step_1_kernel = create_update_regularizations_step_1_kernel(self._data.num_hu, self._data.num_hl, self._data.num_xu, self._data.num_xl)
-        self._update_regulerization_step_2_kernel = create_update_regularizations_step_2_kernel(self._data.n, self._data.m, self._data.num_hu, self._data.num_hl, self._data.num_xu, self._data.num_xl)
+        self._update_regulerization_step_2_kernel = create_update_regularizations_step_2_kernel(self._data.n, self._data.m)
         self._eliminate_slacks_kernel = create_eliminate_slacks_kernel(self._data.num_hu, self._data.num_hl, self._data.num_xu, self._data.num_xl)
-        self._eliminate_duals_kernel = create_eliminate_duals_kernel(self._data.n, self._data.m, self._data.num_hu, self._data.num_hl, self._data.num_xu, self._data.num_xl)
+        self._eliminate_duals_kernel = create_eliminate_duals_kernel(self._data.n, self._data.m)
         self._recover_duals_kernel = create_recover_duals_kernel(self._data.num_hu, self._data.num_hl, self._data.num_xu, self._data.num_xl)
         self._recover_slacks_kernel = create_recover_slacks_kernel(self._data.num_hu, self._data.num_hl, self._data.num_xu, self._data.num_xl)
+
+        # Precompute inverse index maps for gather-pattern kernels.
+        # inv_idx_xu[j] = i such that idx_xu[i] == j, or -1 if variable j has no upper bound.
+        _build_inv_idx_kernel = create_build_inverse_index_kernel()
+        self._inv_idx_xu = wp.full(self._data.n, value=-1, dtype=wp.int32, device="cuda")
+        self._inv_idx_xl = wp.full(self._data.n, value=-1, dtype=wp.int32, device="cuda")
+        self._inv_idx_hu = wp.full(self._data.m, value=-1, dtype=wp.int32, device="cuda") if self._data.m > 0 else wp.zeros(0, dtype=wp.int32, device="cuda")
+        self._inv_idx_hl = wp.full(self._data.m, value=-1, dtype=wp.int32, device="cuda") if self._data.m > 0 else wp.zeros(0, dtype=wp.int32, device="cuda")
+        if self._data.num_xu > 0:
+            wp.launch(_build_inv_idx_kernel, dim=self._data.num_xu,
+                      inputs=[self._data.idx_xu, self._inv_idx_xu], device="cuda")
+        if self._data.num_xl > 0:
+            wp.launch(_build_inv_idx_kernel, dim=self._data.num_xl,
+                      inputs=[self._data.idx_xl, self._inv_idx_xl], device="cuda")
+        if self._data.num_hu > 0:
+            wp.launch(_build_inv_idx_kernel, dim=self._data.num_hu,
+                      inputs=[self._data.idx_hu, self._inv_idx_hu], device="cuda")
+        if self._data.num_hl > 0:
+            wp.launch(_build_inv_idx_kernel, dim=self._data.num_hl,
+                      inputs=[self._data.idx_hl, self._inv_idx_hl], device="cuda")
 
     @nvtx.annotate("KKTSystem::update_scalings_and_factor")
     def update_scalings_and_factor(self, data: Data, rho: cp.ndarray, delta: cp.ndarray, vars: Variables) -> bool:
@@ -111,14 +131,14 @@ class KKTSystem:
                             kernel=self._update_regulerization_step_2_kernel,
                             dim=self._data.n + self._data.m,
                             inputs=[
-                                self._data.idx_xu,
-                                self._data.idx_xl,
+                                self._inv_idx_xu,
+                                self._inv_idx_xl,
+                                self._inv_idx_hu,
+                                self._inv_idx_hl,
                                 self._w_bu_delta_inv,
                                 self._w_bl_delta_inv,
                                 rho,
                                 self._x_reg,
-                                self._data.idx_hu,
-                                self._data.idx_hl,
                                 self._w_u_delta_inv,
                                 self._w_l_delta_inv,
                                 self._z_reg,
@@ -238,9 +258,12 @@ class KKTSystem:
                 kernel=self._eliminate_duals_kernel,
                 dim=self._data.n + self._data.m,
                 inputs=[
+                    # inverse index maps
+                    self._inv_idx_xu,
+                    self._inv_idx_xl,
+                    self._inv_idx_hu,
+                    self._inv_idx_hl,
                     # for updating rhs_x
-                    self._data.idx_xu,
-                    self._data.idx_xl,
                     rhs.x,
                     self._w_bu_delta_inv,
                     self._w_bl_delta_inv,
@@ -248,8 +271,6 @@ class KKTSystem:
                     self._updated_rhs_z_bl,
                     self._work_x,
                     # for updating rhs_z
-                    self._data.idx_hu,
-                    self._data.idx_hl,
                     self._w_u_delta_inv,
                     self._w_l_delta_inv,
                     self._updated_rhs_z_u,
@@ -469,6 +490,18 @@ class KKTSystem:
         return lhs
     
 
+def create_build_inverse_index_kernel():
+    """Create a kernel that builds an inverse index map: inv_idx[idx[t]] = t."""
+    @wp.kernel
+    def build_inverse_index_kernel(
+        idx: wp.array(dtype=wp.int32),      # pyright: ignore[reportInvalidTypeForm]
+        inv_idx: wp.array(dtype=wp.int32),   # pyright: ignore[reportInvalidTypeForm]
+    ):
+        t = wp.tid()
+        inv_idx[idx[t]] = t
+    return build_inverse_index_kernel
+
+
 def create_update_regularizations_step_1_kernel(num_hu: int, num_hl: int, num_xu: int, num_xl: int):
     """Create kernel specialized for ..., which will be used in factor and solve. Performs the operation:
 
@@ -541,29 +574,33 @@ def create_update_regularizations_step_1_kernel(num_hu: int, num_hl: int, num_xu
     return update_regularizations_step_1_kernel
 
 
-def create_update_regularizations_step_2_kernel(nx: int, nz: int, num_hu: int, num_hl: int, num_xu: int, num_xl: int):
-    """Create kernel specialized for computing the regularization terms for x and z. Performs the operation:
+def create_update_regularizations_step_2_kernel(nx: int, nz: int):
+    """Create kernel specialized for computing the regularization terms for x and z
+    using a gather pattern.
 
-        eliminate the box constraints by adding their contribution to x_reg and z_reg
-        self._x_reg[:] = rho
-        self._x_reg[data.idx_xu] += self._w_bu_delta_inv
-        self._x_reg[data.idx_xl] += self._w_bl_delta_inv
-        
-        self._z_reg[:] = 0.
-        self._z_reg[data.idx_hu] += self._w_u_delta_inv
-        self._z_reg[data.idx_hl] += self._w_l_delta_inv
-        self._z_reg[:] = 1. / self._z_reg
+    Equivalent to:
+        x_reg[:] = rho
+        x_reg[idx_xu] += w_bu_delta_inv
+        x_reg[idx_xl] += w_bl_delta_inv
+
+        z_reg[:] = 0.
+        z_reg[idx_hu] += w_u_delta_inv
+        z_reg[idx_hl] += w_l_delta_inv
+        z_reg[:] = 1. / z_reg
+
+    Each thread writes only to its own unique slot (x_reg[t] or z_reg[tz]),
+    using inverse index maps to gather contributions.
     """
     @wp.kernel
     def update_regularizations_step_2_kernel(
-        idx_xu: wp.array(dtype=wp.int32),  # pyright: ignore[reportInvalidTypeForm]
-        idx_xl: wp.array(dtype=wp.int32),  # pyright: ignore[reportInvalidTypeForm]
+        inv_idx_xu: wp.array(dtype=wp.int32),  # pyright: ignore[reportInvalidTypeForm]
+        inv_idx_xl: wp.array(dtype=wp.int32),  # pyright: ignore[reportInvalidTypeForm]
+        inv_idx_hu: wp.array(dtype=wp.int32),  # pyright: ignore[reportInvalidTypeForm]
+        inv_idx_hl: wp.array(dtype=wp.int32),  # pyright: ignore[reportInvalidTypeForm]
         w_bu_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
         w_bl_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
         rho: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
         x_reg: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        idx_hu: wp.array(dtype=wp.int32),  # pyright: ignore[reportInvalidTypeForm]
-        idx_hl: wp.array(dtype=wp.int32),  # pyright: ignore[reportInvalidTypeForm]
         w_u_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
         w_l_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
         z_reg: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
@@ -571,47 +608,54 @@ def create_update_regularizations_step_2_kernel(nx: int, nz: int, num_hu: int, n
         t = wp.tid()
         nx_static = wp.static(nx)
         nz_static = wp.static(nz)
-        num_hu_static = wp.static(num_hu)
-        num_hl_static = wp.static(num_hl)
-        num_xu_static = wp.static(num_xu)
-        num_xl_static = wp.static(num_xl)
 
         if t < nx_static:
-            x_reg[t] = rho[0]
-            if t < num_xu_static:
-                x_reg[idx_xu[t]] += w_bu_delta_inv[t]
-            if t < num_xl_static:
-                x_reg[idx_xl[t]] += w_bl_delta_inv[t]
+            val = rho[0]
+            ixu = inv_idx_xu[t]
+            ixl = inv_idx_xl[t]
+            if ixu >= 0:
+                val = val + w_bu_delta_inv[ixu]
+            if ixl >= 0:
+                val = val + w_bl_delta_inv[ixl]
+            x_reg[t] = val
         elif t < nx_static + nz_static:
             tz = t - nx_static
-            z_reg[tz] = wp.float64(0.)
-            if tz < num_hu_static:
-                z_reg[idx_hu[tz]] += w_u_delta_inv[tz]
-            if tz < num_hl_static:
-                z_reg[idx_hl[tz]] += w_l_delta_inv[tz]
-            z_reg[tz] = wp.float64(1.0) / z_reg[tz]
-        else:
-            return
+            val = wp.float64(0.)
+            ihu = inv_idx_hu[tz]
+            ihl = inv_idx_hl[tz]
+            if ihu >= 0:
+                val = val + w_u_delta_inv[ihu]
+            if ihl >= 0:
+                val = val + w_l_delta_inv[ihl]
+            z_reg[tz] = wp.float64(1.0) / val
 
     return update_regularizations_step_2_kernel
 
 
-def create_eliminate_duals_kernel(nx: int, nz: int, num_hu: int, num_hl: int, num_xu: int, num_xl: int):
-    """Create kernel specialized for eliminating duals. Performs the operation:
+def create_eliminate_duals_kernel(nx: int, nz: int):
+    """Create kernel specialized for eliminating duals using a gather pattern.
 
-        rhs.x[data.idx_xu] += self._w_bu_delta_inv * self._updated_rhs_z_bu
-        rhs.x[data.idx_xl] -= self._w_bl_delta_inv * self._updated_rhs_z_bl
+    Equivalent to:
+        rhs_x_updated[:] = rhs_x
+        rhs_x_updated[idx_xu] += w_bu_delta_inv * rhs_z_bu
+        rhs_x_updated[idx_xl] -= w_bl_delta_inv * rhs_z_bl
 
-        rhs.z = 0.
-        rhs.z[data.idx_hu] += self._w_u_delta_inv * self._updated_rhs_z_u
-        rhs.z[data.idx_hl] -= self._w_l_delta_inv * self._updated_rhs_z_l
-        rhs.z[:] *= self._z_reg
+        rhs_z_updated[:] = 0.
+        rhs_z_updated[idx_hu] += w_u_delta_inv * rhs_z_u
+        rhs_z_updated[idx_hl] -= w_l_delta_inv * rhs_z_l
+        rhs_z_updated[:] *= z_reg
+
+    Each thread writes only to its own unique slot (rhs_x_updated[t] or
+    rhs_z_updated[tz]), using inverse index maps to gather contributions.
     """
     @wp.kernel
     def eliminate_duals_kernel(
+        # inverse index maps (gather lookups)
+        inv_idx_xu: wp.array(dtype=wp.int32),  # pyright: ignore[reportInvalidTypeForm]
+        inv_idx_xl: wp.array(dtype=wp.int32),  # pyright: ignore[reportInvalidTypeForm]
+        inv_idx_hu: wp.array(dtype=wp.int32),  # pyright: ignore[reportInvalidTypeForm]
+        inv_idx_hl: wp.array(dtype=wp.int32),  # pyright: ignore[reportInvalidTypeForm]
         # prepare new rhs_x
-        idx_xu: wp.array(dtype=wp.int32),  # pyright: ignore[reportInvalidTypeForm]
-        idx_xl: wp.array(dtype=wp.int32),  # pyright: ignore[reportInvalidTypeForm]
         rhs_x: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
         w_bu_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
         w_bl_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
@@ -619,8 +663,6 @@ def create_eliminate_duals_kernel(nx: int, nz: int, num_hu: int, num_hl: int, nu
         rhs_z_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
         rhs_x_updated: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
         # prepare new rhs_z
-        idx_hu: wp.array(dtype=wp.int32),  # pyright: ignore[reportInvalidTypeForm]
-        idx_hl: wp.array(dtype=wp.int32),  # pyright: ignore[reportInvalidTypeForm]
         w_u_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
         w_l_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
         rhs_z_u: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
@@ -631,35 +673,27 @@ def create_eliminate_duals_kernel(nx: int, nz: int, num_hu: int, num_hl: int, nu
         t = wp.tid()
         nx_static = wp.static(nx)
         nz_static = wp.static(nz)
-        num_hu_static = wp.static(num_hu)
-        num_hl_static = wp.static(num_hl)
-        num_xu_static = wp.static(num_xu)
-        num_xl_static = wp.static(num_xl)
 
-        # rhs.x[data.idx_xu] += self._w_bu_delta_inv * self._updated_rhs_z_bu
-        # rhs.x[data.idx_xl] -= self._w_bl_delta_inv * self._updated_rhs_z_bl
         if t < nx_static:
-            rhs_x_updated[t] = rhs_x[t]
-            if t < num_xu_static:
-                rhs_x_updated[idx_xu[t]] += w_bu_delta_inv[t] * rhs_z_bu[t]
-            if t < num_xl_static:
-                rhs_x_updated[idx_xl[t]] -= w_bl_delta_inv[t] * rhs_z_bl[t]
+            val = rhs_x[t]
+            ixu = inv_idx_xu[t]
+            ixl = inv_idx_xl[t]
+            if ixu >= 0:
+                val = val + w_bu_delta_inv[ixu] * rhs_z_bu[ixu]
+            if ixl >= 0:
+                val = val - w_bl_delta_inv[ixl] * rhs_z_bl[ixl]
+            rhs_x_updated[t] = val
 
-        # rhs.z = 0.
-        # rhs.z[data.idx_hu] += self._w_u_delta_inv * self._updated_rhs_z_u
-        # rhs.z[data.idx_hl] -= self._w_l_delta_inv * self._updated_rhs_z_l
-        # rhs.z[:] *= self._z_reg
         elif t < nx_static + nz_static:
             tz = t - nx_static
-            rhs_z_updated[tz] = wp.float64(0.)
-            if tz < num_hu_static:
-                rhs_z_updated[idx_hu[tz]] += w_u_delta_inv[tz] * rhs_z_u[tz]
-            if tz < num_hl_static:
-                rhs_z_updated[idx_hl[tz]] -= w_l_delta_inv[tz] * rhs_z_l[tz]
-            rhs_z_updated[tz] *= z_reg[tz]
-
-        else:
-            return
+            val = wp.float64(0.)
+            ihu = inv_idx_hu[tz]
+            ihl = inv_idx_hl[tz]
+            if ihu >= 0:
+                val = val + w_u_delta_inv[ihu] * rhs_z_u[ihu]
+            if ihl >= 0:
+                val = val - w_l_delta_inv[ihl] * rhs_z_l[ihl]
+            rhs_z_updated[tz] = val * z_reg[tz]
 
     return eliminate_duals_kernel
 
