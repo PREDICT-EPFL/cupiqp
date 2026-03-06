@@ -1,7 +1,6 @@
 from typing import Optional
 import cupy as cp
 from cupyx.scipy.sparse import csr_matrix, diags, bmat
-from cupyx.cusparse import spmv
 from nvmath.sparse.advanced import (
     DirectSolver,
     DirectSolverAlgType,
@@ -16,6 +15,7 @@ import nvtx
 
 from ..kkt_solver import KKTSolverBase
 from .sparse_data import SparseData
+from .sparse_matvec import SparseMatVecProduct
 
 class SparseKKTSolver(KKTSolverBase):
     """
@@ -32,6 +32,13 @@ class SparseKKTSolver(KKTSolverBase):
         self._diag_y_indices = cp.empty(data.p, dtype=cp.int32)
         self._diag_z_indices = cp.empty(data.m, dtype=cp.int32)
         self._find_diagonal_indices()
+
+        # setup spmv operator for evaluating P, A, G matvecs
+        self._spmv_P = SparseMatVecProduct(data.P, transa=False)
+        self._spmv_A = SparseMatVecProduct(data.A, transa=False)
+        self._spmv_AT = SparseMatVecProduct(data.A, transa=True)
+        self._spmv_G = SparseMatVecProduct(data.G, transa=False)
+        self._spmv_GT = SparseMatVecProduct(data.G, transa=True)
 
         # setup cuDSS solver
         # TODO: can change this to LOWER if only update lower part of KKT
@@ -163,23 +170,22 @@ class SparseKKTSolver(KKTSolverBase):
         cp.cuda.runtime.memcpyAsync(delta_x.data.ptr, self._sol.data.ptr, data.n * 8, 1, self._stream_cp.ptr)
         cp.cuda.runtime.memcpyAsync(delta_y.data.ptr, self._sol.data.ptr + data.n * 8, data.p * 8, 1, self._stream_cp.ptr)
         cp.cuda.runtime.memcpyAsync(delta_z.data.ptr, self._sol.data.ptr + (data.n+data.p) * 8, data.m * 8, 1, self._stream_cp.ptr)
-    
 
     @nvtx.annotate("SparseKKTSolver::eval_P_x")
     def eval_P_x(self, data: SparseData, alpha: float, x: cp.ndarray, z: cp.ndarray):
-        spmv(data.P, x, z, alpha=alpha, beta=0.0)
+        self._spmv_P(x, z, alpha=alpha, beta=0.0)
     
     @nvtx.annotate("SparseKKTSolver::eval_A_xn_and_AT_xt")
     def eval_A_xn_and_AT_xt(self, data: SparseData, alpha_n: float, xn: cp.ndarray, alpha_t: float, xt: cp.ndarray, zn: cp.ndarray, zt: cp.ndarray):
-        spmv(data.A, xn, zn, alpha=alpha_n, beta=0.0)
-        spmv(data.A, xt, zt, alpha=alpha_t, beta=0.0, transa=True)
+        self._spmv_A(xn, zn, alpha=alpha_n, beta=0.0)
+        self._spmv_AT(xt, zt, alpha=alpha_t, beta=0.0)
     
     @nvtx.annotate("SparseKKTSolver::eval_G_xn_and_GT_xt")
     def eval_G_xn_and_GT_xt(self, data: SparseData, alpha_n: float, xn: cp.ndarray, alpha_t: float, xt: cp.ndarray, zn: cp.ndarray, zt: cp.ndarray):
-        spmv(data.G, xn, zn, alpha=alpha_n, beta=0.0)
-        spmv(data.G, xt, zt, alpha=alpha_t, beta=0.0, transa=True)
+        self._spmv_G(xn, zn, alpha=alpha_n, beta=0.0)
+        self._spmv_GT(xt, zt, alpha=alpha_t, beta=0.0)
 
     @nvtx.annotate("SparseKKTSolver::eval_G_xn")
     def eval_G_xn(self, data: SparseData, alpha_n: float, xn: cp.ndarray, zn: cp.ndarray):
-        spmv(data.G, xn, zn, alpha=alpha_n, beta=0.0)
+        self._spmv_G(xn, zn, alpha=alpha_n, beta=0.0)
 
