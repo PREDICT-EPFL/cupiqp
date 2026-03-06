@@ -107,109 +107,7 @@ class SolverBase:
             print("iter  prim_obj       dual_obj       duality_gap   prim_res      dual_res      rho         delta       mu          p_step   d_step")  
 
         ## ----------- initial iteration --------------
-        # eq(12) in Roland Schwan 2023 paper
-        with nvtx.annotate("Solver::initialization"):
-            self._result.x.fill(0.0)
-            self._result.y.fill(0.0)
-            self._result.s_l.fill(1.0)
-            self._result.z_l.fill(1.0)
-            self._result.s_u.fill(1.0)
-            self._result.z_u.fill(1.0)
-            self._result.s_bl.fill(1.0)
-            self._result.z_bl.fill(1.0)
-            self._result.s_bu.fill(1.0)
-            self._result.z_bu.fill(1.0)
-
-            self._kkt_system.update_scalings_and_factor(
-                self._data,
-                self._result.info.rho,
-                self._result.info.delta,
-                self._result
-            )
-
-            self._res.x[:] = self._data.c
-            self._res.x *= -1.0
-            self._res.y[:] = self._data.b
-            cp.take(self._data.h_l, self._data.idx_hl, out=self._res.z_l)
-            self._res.z_l *= -1.0
-            cp.take(self._data.h_u, self._data.idx_hu, out=self._res.z_u)
-            cp.take(self._data.x_l, self._data.idx_xl, out=self._res.z_bl)
-            self._res.z_bl *= -1.0
-            cp.take(self._data.x_u, self._data.idx_xu, out=self._res.z_bu)
-            self._res.s_l[:] = 0.
-            self._res.s_u[:] = 0.
-            self._res.s_bl[:] = 0.
-            self._res.s_bu[:] = 0.
-
-            self._kkt_system.solve(self._data, self.settings, self._res, self._result)  # getting an initial point of _result
-
-            if self.settings.debug:
-                print("Initial point after solving KKT system:", self._result)
-
-            if self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu > 0:
-                ## ----------- keep z and s non-negative --------------
-                # this is according to the IV.A part of Roland Schwan 2023 paper
-                offset = 0
-                self._work_s[offset:offset+self._data.num_hl] = self._result.s_l
-                self._work_z[offset:offset+self._data.num_hl] = self._result.z_l
-                offset += self._data.num_hl
-                self._work_s[offset:offset+self._data.num_hu] = self._result.s_u
-                self._work_z[offset:offset+self._data.num_hu] = self._result.z_u
-                offset += self._data.num_hu
-                self._work_s[offset:offset+self._data.num_xl] = self._result.s_bl
-                self._work_z[offset:offset+self._data.num_xl] = self._result.z_bl
-                offset += self._data.num_xl
-                self._work_s[offset:offset+self._data.num_xu] = self._result.s_bu
-                self._work_z[offset:offset+self._data.num_xu] = self._result.z_bu
-                offset += self._data.num_xu
-                delta_s = -cp.min(self._work_s[:offset]) # single D2H transfer
-                delta_z = -cp.min(self._work_z[:offset]) # single D2H transfer
-
-                self._result.s_l += delta_s
-                self._result.z_l += delta_z
-                self._result.s_u += delta_s
-                self._result.z_u += delta_z
-
-                self._result.s_bl += delta_s
-                self._result.z_bl += delta_z
-                self._result.s_bu += delta_s
-                self._result.z_bu += delta_z
-
-                # need to make sure mu is positive here, otherwise in the next step (put s and z on central path) sqrt(mu) the computed z_* will be zeros
-                self._calculate_mu()
-                cp.clip(self._result.info.mu, 1e-10, None, out=self._result.info.mu)
-
-                if self.settings.debug:
-                    print("Initial mu:", self._result.info.mu)
-
-                # put s and z on the central path
-                # Do the following: c = z* - delta-z; z = (c + sqrt(c^2 + 4*mu)) / 2; s = z - c
-                for s, z in zip(
-                    [self._result.s_l, self._result.s_u, self._result.s_bl, self._result.s_bu], 
-                    [self._result.z_l, self._result.z_u, self._result.z_bl, self._result.z_bu]
-                    ):
-                    cp.subtract(z, delta_z, out=s)
-                    cp.power(s, 2, out=z)
-                    z += 4. * self._result.info.mu[0]
-                    cp.sqrt(z, out=z)
-                    z += s
-                    z /= 2.
-                    cp.subtract(z, s, out=s)
-
-                if self.settings.debug:
-                    print("self._result:", self._result)
-
-                self._calculate_mu()
-
-            self._prox_vars.x[:] = self._result.x
-            self._prox_vars.y[:] = self._result.y
-            self._prox_vars.z_l[:] = self._result.z_l
-            self._prox_vars.z_u[:] = self._result.z_u
-            self._prox_vars.z_bl[:] = self._result.z_bl
-            self._prox_vars.z_bu[:] = self._result.z_bu
-
-            # if self.settings.debug:
-            #     print("Initial point set. Starting iterations...\n", self._prox_vars)
+        self._initial_guess()
 
         ## ---------------------------------------------
         ## ---------- remaining iterations -------------
@@ -261,10 +159,112 @@ class SolverBase:
                     self._update_residuals_nr()
                     self._update_rho_delta_with_ineq()
                 
-
         self._result.info.status = Status.PIQP_MAX_ITER_REACHED
         return self._result.info.status        
         
+
+    @nvtx.annotate("Solver::_initial_guess")
+    def _initial_guess(self):
+        # eq(12) in Roland Schwan 2023 paper
+        self._result.x.fill(0.0)
+        self._result.y.fill(0.0)
+        self._result.s_l.fill(1.0)
+        self._result.z_l.fill(1.0)
+        self._result.s_u.fill(1.0)
+        self._result.z_u.fill(1.0)
+        self._result.s_bl.fill(1.0)
+        self._result.z_bl.fill(1.0)
+        self._result.s_bu.fill(1.0)
+        self._result.z_bu.fill(1.0)
+
+        self._kkt_system.update_scalings_and_factor(
+            self._data,
+            self._result.info.rho,
+            self._result.info.delta,
+            self._result
+        )
+
+        self._res.x[:] = self._data.c
+        self._res.x *= -1.0
+        self._res.y[:] = self._data.b
+        cp.take(self._data.h_l, self._data.idx_hl, out=self._res.z_l)
+        self._res.z_l *= -1.0
+        cp.take(self._data.h_u, self._data.idx_hu, out=self._res.z_u)
+        cp.take(self._data.x_l, self._data.idx_xl, out=self._res.z_bl)
+        self._res.z_bl *= -1.0
+        cp.take(self._data.x_u, self._data.idx_xu, out=self._res.z_bu)
+        self._res.s_l[:] = 0.
+        self._res.s_u[:] = 0.
+        self._res.s_bl[:] = 0.
+        self._res.s_bu[:] = 0.
+
+        self._kkt_system.solve(self._data, self.settings, self._res, self._result)  # getting an initial point of _result
+
+        if self.settings.debug:
+            print("Initial point after solving KKT system:", self._result)
+
+        if self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu > 0:
+            ## ----------- keep z and s non-negative --------------
+            # this is according to the IV.A part of Roland Schwan 2023 paper
+            offset = 0
+            self._work_s[offset:offset+self._data.num_hl] = self._result.s_l
+            self._work_z[offset:offset+self._data.num_hl] = self._result.z_l
+            offset += self._data.num_hl
+            self._work_s[offset:offset+self._data.num_hu] = self._result.s_u
+            self._work_z[offset:offset+self._data.num_hu] = self._result.z_u
+            offset += self._data.num_hu
+            self._work_s[offset:offset+self._data.num_xl] = self._result.s_bl
+            self._work_z[offset:offset+self._data.num_xl] = self._result.z_bl
+            offset += self._data.num_xl
+            self._work_s[offset:offset+self._data.num_xu] = self._result.s_bu
+            self._work_z[offset:offset+self._data.num_xu] = self._result.z_bu
+            offset += self._data.num_xu
+            delta_s = -cp.min(self._work_s[:offset]) # single D2H transfer
+            delta_z = -cp.min(self._work_z[:offset]) # single D2H transfer
+
+            self._result.s_l += delta_s
+            self._result.z_l += delta_z
+            self._result.s_u += delta_s
+            self._result.z_u += delta_z
+
+            self._result.s_bl += delta_s
+            self._result.z_bl += delta_z
+            self._result.s_bu += delta_s
+            self._result.z_bu += delta_z
+
+            # need to make sure mu is positive here, otherwise in the next step (put s and z on central path) sqrt(mu) the computed z_* will be zeros
+            self._calculate_mu()
+            cp.clip(self._result.info.mu, 1e-10, None, out=self._result.info.mu)
+
+            if self.settings.debug:
+                print("Initial mu:", self._result.info.mu)
+
+            # put s and z on the central path
+            # Do the following: c = z* - delta-z; z = (c + sqrt(c^2 + 4*mu)) / 2; s = z - c
+            for s, z in zip(
+                [self._result.s_l, self._result.s_u, self._result.s_bl, self._result.s_bu], 
+                [self._result.z_l, self._result.z_u, self._result.z_bl, self._result.z_bu]
+                ):
+                cp.subtract(z, delta_z, out=s)
+                cp.power(s, 2, out=z)
+                z += 4. * self._result.info.mu[0]
+                cp.sqrt(z, out=z)
+                z += s
+                z /= 2.
+                cp.subtract(z, s, out=s)
+
+            if self.settings.debug:
+                print("self._result:", self._result)
+
+            self._calculate_mu()
+
+        self._prox_vars.x[:] = self._result.x
+        self._prox_vars.y[:] = self._result.y
+        self._prox_vars.z_l[:] = self._result.z_l
+        self._prox_vars.z_u[:] = self._result.z_u
+        self._prox_vars.z_bl[:] = self._result.z_bl
+        self._prox_vars.z_bu[:] = self._result.z_bu
+
     @nvtx.annotate("Solver::_print_iteration_info")
     def _print_iteration_info(self):
         """Print iteration verbose info."""
