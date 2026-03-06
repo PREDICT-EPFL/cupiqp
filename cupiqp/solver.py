@@ -215,72 +215,75 @@ class SolverBase:
         ## ---------- remaining iterations -------------
         ## ---------------------------------------------
         for iter in range(self.settings.max_iter):
-            self._result.info.iter = iter
+            with nvtx.annotate(f"Solver::ipm_iteration"):
+                self._result.info.iter = iter
+                if iter == 0:
+                    self._update_residuals_nr()
+                    self._result.info.prev_primal_res[:] = self._result.info.primal_res
+                    self._result.info.prev_dual_res[:] = self._result.info.dual_res
 
-            if iter == 0:
-                self._update_residuals_nr()
-                self._result.info.prev_primal_res[:] = self._result.info.primal_res
-                self._result.info.prev_dual_res[:] = self._result.info.dual_res
+                # ? The convergence criteria seems different from the one in the paper
+                if ((self._result.info.primal_res < self.settings.eps_abs or self._result.info.primal_res_rel < self.settings.eps_rel) and
+                    (self._result.info.dual_res < self.settings.eps_abs or self._result.info.dual_res_rel < self.settings.eps_rel) and
+                    (not self.settings.check_duality_gap or self._result.info.duality_gap < self.settings.eps_duality_gap_abs or self._result.info.duality_gap_rel < self.settings.eps_duality_gap_rel)):
+                    self._result.info.status = Status.PIQP_SOLVED
+                    return self._result.info.status
+                
+                self._update_residuals_r()
 
-            # ? The convergence criteria seems different from the one in the paper
-            if ((self._result.info.primal_res < self.settings.eps_abs or self._result.info.primal_res_rel < self.settings.eps_rel) and
-                (self._result.info.dual_res < self.settings.eps_abs or self._result.info.dual_res_rel < self.settings.eps_rel) and
-                (not self.settings.check_duality_gap or self._result.info.duality_gap < self.settings.eps_duality_gap_abs or self._result.info.duality_gap_rel < self.settings.eps_duality_gap_rel)):
-                self._result.info.status = Status.PIQP_SOLVED
-                return self._result.info.status
-            
-            # ? why not update both here?
-            self._update_residuals_r()
+                if (self._result.info.no_dual_update > cp.minimum(5., self.settings.reg_finetune_dual_update_threshold) and
+                    self._result.info.primal_prox_inf > self.settings.infeasibility_threshold and
+                    (self._result.info.primal_res_reg < self.settings.eps_abs or self._result.info.primal_res_reg_rel < self.settings.eps_rel)):
+                    self._result.info.status = Status.PIQP_PRIMAL_INFEASIBLE
+                    return self._result.info.status
+                
+                if (self._result.info.no_primal_update > cp.minimum(5., self.settings.reg_finetune_primal_update_threshold) and
+                    self._result.info.dual_prox_inf > self.settings.infeasibility_threshold and
+                    (self._result.info.dual_res_reg < self.settings.eps_abs or self._result.info.dual_res_reg_rel < self.settings.eps_rel)):
+                    self._result.info.status = Status.PIQP_DUAL_INFEASIBLE
+                    return self._result.info.status
+                
 
-            if (self._result.info.no_dual_update > cp.minimum(5., self.settings.reg_finetune_dual_update_threshold) and
-                self._result.info.primal_prox_inf > self.settings.infeasibility_threshold and
-                (self._result.info.primal_res_reg < self.settings.eps_abs or self._result.info.primal_res_reg_rel < self.settings.eps_rel)):
-                self._result.info.status = Status.PIQP_PRIMAL_INFEASIBLE
-                return self._result.info.status
-            
-            if (self._result.info.no_primal_update > cp.minimum(5., self.settings.reg_finetune_primal_update_threshold) and
-                self._result.info.dual_prox_inf > self.settings.infeasibility_threshold and
-                (self._result.info.dual_res_reg < self.settings.eps_abs or self._result.info.dual_res_reg_rel < self.settings.eps_rel)):
-                self._result.info.status = Status.PIQP_DUAL_INFEASIBLE
-                return self._result.info.status
-            
+                if self.settings.verbose:
+                    self._print_iteration_info()
 
-            if self.settings.verbose:
-                print(
-                    f"{self._result.info.iter:3d}   "
-                    f"{float(self._result.info.primal_obj[0]): .5e}   "
-                    f"{float(self._result.info.dual_obj[0]): .5e}  "
-                    f"{float(self._result.info.duality_gap[0]): .5e}  "
-                    f"{float(self._result.info.primal_res[0]): .5e}  "
-                    f"{float(self._result.info.dual_res[0]): .5e}  "
-                    f"{float(self._result.info.rho[0]): .3e}  "
-                    f"{float(self._result.info.delta[0]): .3e}  "
-                    f"{float(self._result.info.mu[0]): .3e}  "
-                    f"{float(self._result.info.primal_step[0]): .4f}  "
-                    f"{float(self._result.info.dual_step[0]): .4f}",
-                    flush=True
-                )
+                self._update_and_factorize_kkt()
+                if self._result.info.status == Status.PIQP_NUMERICAL_ISSUES:
+                    return self._result.info.status
 
-            self._update_and_factorize_kkt()
-            if self._result.info.status == Status.PIQP_NUMERICAL_ISSUES:
-                return self._result.info.status
-
-            if self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu == 0:
-                # since there are no inequalities we can take full Newton steps
-                self._run_newton_step()
-                self._update_residuals_nr()
-                self._update_rho_delta_without_ineq()
-            else:
-                self._run_predictor_corrector()
-                self._update_residuals_nr()
-                self._update_rho_delta_with_ineq()
+                if self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu == 0:
+                    # since there are no inequalities we can take full Newton steps
+                    self._run_full_newton_step()
+                    self._update_residuals_nr()
+                    self._update_rho_delta_without_ineq()
+                else:
+                    self._run_predictor_corrector()
+                    self._update_residuals_nr()
+                    self._update_rho_delta_with_ineq()
                 
 
         self._result.info.status = Status.PIQP_MAX_ITER_REACHED
-        return self._result.info.status
+        return self._result.info.status        
         
-    
-    @nvtx.annotate("Solver::_calculate_sigma")
+    @nvtx.annotate("Solver::_print_iteration_info")
+    def _print_iteration_info(self):
+        """Print iteration verbose info."""
+        print(
+            f"{self._result.info.iter:3d}   "
+            f"{float(self._result.info.primal_obj[0]): .5e}   "
+            f"{float(self._result.info.dual_obj[0]): .5e}  "
+            f"{float(self._result.info.duality_gap[0]): .5e}  "
+            f"{float(self._result.info.primal_res[0]): .5e}  "
+            f"{float(self._result.info.dual_res[0]): .5e}  "
+            f"{float(self._result.info.rho[0]): .3e}  "
+            f"{float(self._result.info.delta[0]): .3e}  "
+            f"{float(self._result.info.mu[0]): .3e}  "
+            f"{float(self._result.info.primal_step[0]): .4f}  "
+            f"{float(self._result.info.dual_step[0]): .4f}",
+            flush=True
+        )
+
+    @nvtx.annotate("Solver::_update_and_factorize_kkt")
     def _update_and_factorize_kkt(self) -> None:
         """Update the KKT matrix and refactorize."""
         while self._result.info.factor_retires < self.settings.max_factor_retires:
@@ -299,8 +302,8 @@ class SolverBase:
         # reset factor retires for next iteration
         self._result.info.factor_retires = 0
 
-    @nvtx.annotate("Solver::_run_newton_step")
-    def _run_newton_step(self):
+    @nvtx.annotate("Solver::_run_full_newton_step")
+    def _run_full_newton_step(self):
         self._kkt_system.solve(self._data, self.settings, self._res, self._step)
         self._result.info.primal_step[:] = 1.0
         self._result.info.dual_step[:] = 1.0
