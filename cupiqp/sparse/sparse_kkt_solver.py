@@ -134,9 +134,10 @@ class SparseKKTSolver(KKTSolverBase):
                 # surface async device-side failures here so info is meaningful now
                 self._stream_cp.synchronize()
 
-            # TODO: this causes a D2H synchronization, which can be inefficient.
-            if fac_info.info != 0:
-                return False
+            # # TODO: this causes a D2H synchronization, which can be inefficient.
+            # TODO: more importantly, this prevents us from capturing cuda graphs. We give up checking the factorization success for now.
+            # if fac_info.info != 0:
+            #     return False
             
             # check inertia (causes D2H synchronization, inefficient)
             # if fac_info.inertia[0] != data.n or fac_info.inertia[1] != data.p + data.m:
