@@ -60,6 +60,8 @@ class SolverBase:
         self._update_residuals_r_kernel = create_update_residual_r_kernel(
             self._data.n, self._data.p, self._data.num_hl, self._data.num_hu, self._data.num_xl, self._data.num_xu
         )
+        self._mu_prev = cp.empty(1)
+        self._mu_rate = cp.empty(1)
 
     def solve(self) -> Status:
         if self.settings.verbose:
@@ -259,181 +261,147 @@ class SolverBase:
                     flush=True
                 )
 
-            while self._result.info.factor_retires < self.settings.max_factor_retires:
-                factor_succeeded = self._kkt_system.update_scalings_and_factor(self._data, self._result.info.rho, self._result.info.delta, self._result)
-                if factor_succeeded:
-                    break
-                else:
-                    self._result.info.factor_retires += 1
-                    self._result.info.rho *= 100.
-                    self._result.info.delta *= 100.
-                    self._result.info.reg_limit[:] = cp.minimum(10 * self._result.info.reg_limit, self.settings.eps_abs)
-            
-            if self._result.info.factor_retires >= self.settings.max_factor_retires:
-                self._result.info.status = Status.PIQP_NUMERICAL_ISSUES
+            self._update_and_factorize_kkt()
+            if self._result.info.status == Status.PIQP_NUMERICAL_ISSUES:
                 return self._result.info.status
-            
-            # reset factor retires for next iteration
-            self._result.info.factor_retires = 0
 
-
-            # -------------------- Case without inequality constraints --------------------
             if self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu == 0:
-                # since there are no inequalities we can take full steps
-                self._kkt_system.solve(self._data, self.settings, self._res, self._step)
-
-                self._result.info.primal_step[:] = cp.float64(1.0)
-                self._result.info.dual_step[:] = cp.float64(1.0)
-                self._result.x += self._result.info.primal_step * self._step.x
-                self._result.y += self._result.info.dual_step * self._step.y
-
+                # since there are no inequalities we can take full Newton steps
+                self._run_newton_step()
                 self._update_residuals_nr()
-
-                if self._result.info.dual_res < 0.95 * self._result.info.prev_dual_res or \
-                    self._result.info.dual_res < self.settings.eps_abs or \
-                        self._result.info.dual_res_rel < self.settings.eps_rel:                
-                    self._prox_vars.x[:] = self._result.x
-                    self._result.info.rho[:] = cp.maximum(self._result.info.reg_limit, 0.1 * self._result.info.rho)                
-                else:                
-                    self._result.info.no_primal_update += 1
-                    if self._result.info.iter < 5 or self._result.info.dual_prox_inf < self.settings.infeasibility_threshold:
-                        self._result.info.rho[:] = cp.maximum(self._result.info.reg_limit, 0.5 * self._result.info.rho)
-                    
-                
-                if self._result.info.primal_res < 0.95 * self._result.info.prev_primal_res or \
-                    self._result.info.primal_res < self.settings.eps_abs or \
-                        self._result.info.primal_res_rel < self.settings.eps_rel:
-                    self._prox_vars.y[:] = self._result.y
-                    self._result.info.delta[:] = cp.maximum(self._result.info.reg_limit, 0.1 * self._result.info.delta)
-                else:
-                    self._result.info.no_dual_update += 1
-                    if self._result.info.iter < 5 or self._result.info.primal_prox_inf < self.settings.infeasibility_threshold:
-                        self._result.info.delta[:] = cp.maximum(self._result.info.reg_limit, 0.5 * self._result.info.delta)
-
-            # -------------------- Case with inequality constraints --------------------
+                self._update_rho_delta_without_ineq()
             else:
-                # ------------------ predictor step ------------------
-                if self.settings.debug:
-                    print("before predictor step, result is: ", self._result)
-                    print("before predictor step, res is: ", self._res)
-
-                # Short derivation:
-                # Complementarity (elementwise): s_i * z_i = mu (usually written s * z = mu e).
-                # Predictor (affine) aims for the affine step that drives complementarity to zero, so require (s + Δs) ∘ (z + Δz) = 0.
-                # Expand: s ∘ z + S Δz + Z Δs + Δs ∘ Δz = 0, where S = diag(s), Z = diag(z).
-                # Drop the quadratic term Δs ∘ Δz (first‑order Newton linearization) to get the linear system S Δz + Z Δs = - s ∘ z.
-                # Thus the predictor RHS for the slack/dual complementarity equations is - s ∘ z (elementwise product), which is exactly what the four lines set for the different constraint groups.
-                # In words: those lines build the complementarity residual r_s = - s .* z so the KKT solve computes Δs, Δz satisfying S Δz + Z Δs = r_s (the linearized complementarity equation) for the predictor (affine) direction. The .array() calls implement the elementwise product s .* z.
-                with nvtx.annotate("Solver::prepare_predictor_step"):
-                    cp.multiply(self._result.s_l, self._result.z_l, out=self._res.s_l)
-                    self._res.s_l *= -1.
-                    cp.multiply(self._result.s_u, self._result.z_u, out=self._res.s_u)
-                    self._res.s_u *= -1.
-                    cp.multiply(self._result.s_bl, self._result.z_bl, out=self._res.s_bl)
-                    self._res.s_bl *= -1.
-                    cp.multiply(self._result.s_bu, self._result.z_bu, out=self._res.s_bu)
-                    self._res.s_bu *= -1.
-                    
-
-                if self.settings.debug:
-                    print("predictor step rhs is: res= ", self._res)
-
-                self._kkt_system.solve(self._data, self.settings, self._res, self._step)
-
-                if self.settings.debug:
-                    print("predictor step is:", self._step)
-
-                # step in the non-negative orthant
-                self._calculate_step()
-
-                # avoid getting to close to the boundary
-                self._alpha_sz *= self.settings.tau
-
-                # ------------------ compute centering parameter sigma ------------------
-                self._calculate_sigma()
-
-                # ------------------ corrector step ------------------
-                with nvtx.annotate("Solver::prepare_corrector_step"):
-                    # self._res.s_l += -self._step.s_l * self._step.z_l + self._result.info.sigma * self._result.info.mu
-                    # self._res.s_u += -self._step.s_u * self._step.z_u + self._result.info.sigma * self._result.info.mu
-                    # self._res.s_bl += -self._step.s_bl * self._step.z_bl + self._result.info.sigma * self._result.info.mu
-                    # self._res.s_bu += -self._step.s_bu * self._step.z_bu + self._result.info.sigma * self._result.info.mu
-                    tmp_sigma_mu = self._result.info.sigma * self._result.info.mu
-                    cp.multiply(self._step.s_l, self._step.z_l, out=self._work_duals[:self._data.num_hl])
-                    self._res.s_l -= self._work_duals[:self._data.num_hl]
-                    self._res.s_l += tmp_sigma_mu
-                    cp.multiply(self._step.s_u, self._step.z_u, out=self._work_duals[:self._data.num_hu])
-                    self._res.s_u -= self._work_duals[:self._data.num_hu]
-                    self._res.s_u += tmp_sigma_mu
-                    cp.multiply(self._step.s_bl, self._step.z_bl, out=self._work_duals[:self._data.num_xl])
-                    self._res.s_bl -= self._work_duals[:self._data.num_xl]
-                    self._res.s_bl += tmp_sigma_mu
-                    cp.multiply(self._step.s_bu, self._step.z_bu, out=self._work_duals[:self._data.num_xu])
-                    self._res.s_bu -= self._work_duals[:self._data.num_xu]
-                    self._res.s_bu += tmp_sigma_mu
-
-                if self.settings.debug:
-                    print("corrector step rhs is: res= ", self._res)
-                self._kkt_system.solve(self._data, self.settings, self._res, self._step)
-
-                if self.settings.debug:
-                    print("corrector step is:", self._step)
-
-                # step in the non-negative orthant
-                self._calculate_step()
-                # avoid getting too close to the boundary
-                self._alpha_sz *= self.settings.tau
-                self._result.info.primal_step[:] = self._alpha_sz[0]
-                self._result.info.dual_step[:] = self._alpha_sz[1]
-
-                # ------------------ update variables ------------------
-                self._result.x += self._result.info.primal_step * self._step.x
-                self._result.y += self._result.info.dual_step * self._step.y
-                self._result.z_l += self._result.info.dual_step * self._step.z_l
-                self._result.z_u += self._result.info.dual_step * self._step.z_u
-                self._result.z_bl += self._result.info.dual_step * self._step.z_bl
-                self._result.z_bu += self._result.info.dual_step * self._step.z_bu
-                self._result.s_l += self._result.info.primal_step * self._step.s_l
-                self._result.s_u += self._result.info.primal_step * self._step.s_u
-                self._result.s_bl += self._result.info.primal_step * self._step.s_bl
-                self._result.s_bu += self._result.info.primal_step * self._step.s_bu
-
-                mu_prev = self._result.info.mu.copy()
-                self._calculate_mu()
-                mu_rate = cp.maximum(0., (mu_prev - self._result.info.mu[0]) / mu_prev)  # r in Algorithm 2 in Roland Schwan 2023 paper
-
-
-                # ------------------ update regularization ------------------
+                self._run_predictor_corrector()
                 self._update_residuals_nr()
-
-                if self._result.info.dual_res < 0.95 * self._result.info.prev_dual_res or \
-                    (self._result.info.dual_res < self.settings.eps_abs or self._result.info.dual_res_rel < self.settings.eps_rel) or \
-                    (self._result.info.rho == self.settings.reg_finetune_lower_limit and self._result.info.dual_prox_inf < self.settings.infeasibility_threshold) :
-                    self._prox_vars.x[:] = self._result.x
-                    self._result.info.rho[:] = cp.maximum(self._result.info.reg_limit, (1. - mu_rate) * self._result.info.rho)
-                else:
-                    self._result.info.no_primal_update += 1                
-                    if self._result.info.iter < 5 or self._result.info.dual_prox_inf < self.settings.infeasibility_threshold:
-                        self._result.info.rho[:] = cp.maximum(self._result.info.reg_limit, (1. - 0.666 * mu_rate) * self._result.info.rho)
-
-                if self._result.info.primal_res < 0.95 * self._result.info.prev_primal_res or \
-                    (self._result.info.primal_res < self.settings.eps_abs or self._result.info.primal_res_rel < self.settings.eps_rel) or \
-                    (self._result.info.delta == self.settings.reg_finetune_lower_limit and self._result.info.primal_prox_inf < self.settings.infeasibility_threshold):
-                    self._prox_vars.y[:] = self._result.y
-                    self._prox_vars.z_l[:] = self._result.z_l
-                    self._prox_vars.z_u[:] = self._result.z_u
-                    self._prox_vars.z_bu[:] = self._result.z_bu
-                    self._prox_vars.z_bl[:] = self._result.z_bl
-                    
-                    self._result.info.delta[:] = cp.maximum(self._result.info.reg_limit, (1. - mu_rate) * self._result.info.delta)
-                else:
-                    self._result.info.no_dual_update += 1
-                    if self._result.info.iter < 5 or self._result.info.primal_prox_inf < self.settings.infeasibility_threshold:
-                        self._result.info.delta[:] = cp.maximum(self._result.info.reg_limit, (1. - 0.666 * mu_rate) * self._result.info.delta)
-
+                self._update_rho_delta_with_ineq()
+                
 
         self._result.info.status = Status.PIQP_MAX_ITER_REACHED
         return self._result.info.status
+        
+    
+    @nvtx.annotate("Solver::_calculate_sigma")
+    def _update_and_factorize_kkt(self) -> None:
+        """Update the KKT matrix and refactorize."""
+        while self._result.info.factor_retires < self.settings.max_factor_retires:
+            factor_succeeded = self._kkt_system.update_scalings_and_factor(self._data, self._result.info.rho, self._result.info.delta, self._result)
+            if factor_succeeded:
+                break
+            else:
+                self._result.info.factor_retires += 1
+                self._result.info.rho *= 100.
+                self._result.info.delta *= 100.
+                self._result.info.reg_limit[:] = cp.minimum(10 * self._result.info.reg_limit, self.settings.eps_abs)
+        
+        if self._result.info.factor_retires >= self.settings.max_factor_retires:
+            self._result.info.status = Status.PIQP_NUMERICAL_ISSUES
+        
+        # reset factor retires for next iteration
+        self._result.info.factor_retires = 0
+
+    @nvtx.annotate("Solver::_run_newton_step")
+    def _run_newton_step(self):
+        self._kkt_system.solve(self._data, self.settings, self._res, self._step)
+        self._result.info.primal_step[:] = 1.0
+        self._result.info.dual_step[:] = 1.0
+        self._result.x += self._result.info.primal_step * self._step.x
+        self._result.y += self._result.info.dual_step * self._step.y
+
+    @nvtx.annotate("Solver::_run_predictor_corrector")
+    def _run_predictor_corrector(self):
+        """Predictor-corrector steps + variable update + mu calculation."""
+        # ------------------ predictor step ------------------
+        if self.settings.debug:
+            print("before predictor step, result is: ", self._result)
+            print("before predictor step, res is: ", self._res)
+
+        # Short derivation:
+        # Complementarity (elementwise): s_i * z_i = mu (usually written s * z = mu e).
+        # Predictor (affine) aims for the affine step that drives complementarity to zero, so require (s + Δs) ∘ (z + Δz) = 0.
+        # Expand: s ∘ z + S Δz + Z Δs + Δs ∘ Δz = 0, where S = diag(s), Z = diag(z).
+        # Drop the quadratic term Δs ∘ Δz (first‑order Newton linearization) to get the linear system S Δz + Z Δs = - s ∘ z.
+        # Thus the predictor RHS for the slack/dual complementarity equations is - s ∘ z (elementwise product), which is exactly what the four lines set for the different constraint groups.
+        # In words: those lines build the complementarity residual r_s = - s .* z so the KKT solve computes Δs, Δz satisfying S Δz + Z Δs = r_s (the linearized complementarity equation) for the predictor (affine) direction. The .array() calls implement the elementwise product s .* z.
+        with nvtx.annotate("Solver::prepare_predictor_step"):
+            cp.multiply(self._result.s_l, self._result.z_l, out=self._res.s_l)
+            self._res.s_l *= -1.
+            cp.multiply(self._result.s_u, self._result.z_u, out=self._res.s_u)
+            self._res.s_u *= -1.
+            cp.multiply(self._result.s_bl, self._result.z_bl, out=self._res.s_bl)
+            self._res.s_bl *= -1.
+            cp.multiply(self._result.s_bu, self._result.z_bu, out=self._res.s_bu)
+            self._res.s_bu *= -1.
+            
+
+        if self.settings.debug:
+            print("predictor step rhs is: res= ", self._res)
+
+        self._kkt_system.solve(self._data, self.settings, self._res, self._step)
+
+        if self.settings.debug:
+            print("predictor step is:", self._step)
+
+        # step in the non-negative orthant
+        self._calculate_step()
+
+        # avoid getting too close to the boundary
+        self._alpha_sz *= self.settings.tau
+
+        # ------------------ compute centering parameter sigma ------------------
+        self._calculate_sigma()
+
+        # ------------------ corrector step ------------------
+        with nvtx.annotate("Solver::prepare_corrector_step"):
+            # self._res.s_l += -self._step.s_l * self._step.z_l + self._result.info.sigma * self._result.info.mu
+            # self._res.s_u += -self._step.s_u * self._step.z_u + self._result.info.sigma * self._result.info.mu
+            # self._res.s_bl += -self._step.s_bl * self._step.z_bl + self._result.info.sigma * self._result.info.mu
+            # self._res.s_bu += -self._step.s_bu * self._step.z_bu + self._result.info.sigma * self._result.info.mu
+            tmp_sigma_mu = self._result.info.sigma * self._result.info.mu
+            cp.multiply(self._step.s_l, self._step.z_l, out=self._work_duals[:self._data.num_hl])
+            self._res.s_l -= self._work_duals[:self._data.num_hl]
+            self._res.s_l += tmp_sigma_mu
+            cp.multiply(self._step.s_u, self._step.z_u, out=self._work_duals[:self._data.num_hu])
+            self._res.s_u -= self._work_duals[:self._data.num_hu]
+            self._res.s_u += tmp_sigma_mu
+            cp.multiply(self._step.s_bl, self._step.z_bl, out=self._work_duals[:self._data.num_xl])
+            self._res.s_bl -= self._work_duals[:self._data.num_xl]
+            self._res.s_bl += tmp_sigma_mu
+            cp.multiply(self._step.s_bu, self._step.z_bu, out=self._work_duals[:self._data.num_xu])
+            self._res.s_bu -= self._work_duals[:self._data.num_xu]
+            self._res.s_bu += tmp_sigma_mu
+
+        if self.settings.debug:
+            print("corrector step rhs is: res= ", self._res)
+        self._kkt_system.solve(self._data, self.settings, self._res, self._step)
+
+        if self.settings.debug:
+            print("corrector step is:", self._step)
+
+        # step in the non-negative orthant
+        self._calculate_step()
+        # avoid getting too close to the boundary
+        self._alpha_sz *= self.settings.tau
+        self._result.info.primal_step[:] = self._alpha_sz[0]
+        self._result.info.dual_step[:] = self._alpha_sz[1]
+
+        # ------------------ update variables ------------------
+        self._result.x += self._result.info.primal_step * self._step.x
+        self._result.y += self._result.info.dual_step * self._step.y
+        self._result.z_l += self._result.info.dual_step * self._step.z_l
+        self._result.z_u += self._result.info.dual_step * self._step.z_u
+        self._result.z_bl += self._result.info.dual_step * self._step.z_bl
+        self._result.z_bu += self._result.info.dual_step * self._step.z_bu
+        self._result.s_l += self._result.info.primal_step * self._step.s_l
+        self._result.s_u += self._result.info.primal_step * self._step.s_u
+        self._result.s_bl += self._result.info.primal_step * self._step.s_bl
+        self._result.s_bu += self._result.info.primal_step * self._step.s_bu
+
+        # ------------------ update mu and mu_rate for adaptive regularization ------------------
+        self._mu_prev[:] = self._result.info.mu
+        self._calculate_mu()
+        cp.subtract(self._mu_prev, self._result.info.mu, out=self._mu_rate)
+        cp.divide(self._mu_rate, self._mu_prev, out=self._mu_rate)
+        cp.maximum(self._mu_rate, 0., out=self._mu_rate)
 
     @nvtx.annotate("Solver::_calculate_step")
     def _calculate_step(self) -> None:
@@ -877,6 +845,57 @@ class SolverBase:
         cp.absolute(self._work_primals, out=self._work_primals)
         cp.max(self._work_primals, out=self._work_residual)
         return self._work_residual
+    
+    @nvtx.annotate("Solver::_update_rho_delta_with_ineq")
+    def _update_rho_delta_with_ineq(self) -> None:
+        """Update rho/delta based on residual progress (host-side branching)."""
+        if self._result.info.dual_res < 0.95 * self._result.info.prev_dual_res or \
+            (self._result.info.dual_res < self.settings.eps_abs or self._result.info.dual_res_rel < self.settings.eps_rel) or \
+            (self._result.info.rho == self.settings.reg_finetune_lower_limit and self._result.info.dual_prox_inf < self.settings.infeasibility_threshold):
+            self._prox_vars.x[:] = self._result.x
+            self._result.info.rho[:] = cp.maximum(self._result.info.reg_limit, (1. - self._mu_rate) * self._result.info.rho)
+        else:
+            self._result.info.no_primal_update += 1
+            if self._result.info.iter < 5 or self._result.info.dual_prox_inf < self.settings.infeasibility_threshold:
+                self._result.info.rho[:] = cp.maximum(self._result.info.reg_limit, (1. - 0.666 * self._mu_rate) * self._result.info.rho)
+
+        if self._result.info.primal_res < 0.95 * self._result.info.prev_primal_res or \
+            (self._result.info.primal_res < self.settings.eps_abs or self._result.info.primal_res_rel < self.settings.eps_rel) or \
+            (self._result.info.delta == self.settings.reg_finetune_lower_limit and self._result.info.primal_prox_inf < self.settings.infeasibility_threshold):
+            self._prox_vars.y[:] = self._result.y
+            self._prox_vars.z_l[:] = self._result.z_l
+            self._prox_vars.z_u[:] = self._result.z_u
+            self._prox_vars.z_bu[:] = self._result.z_bu
+            self._prox_vars.z_bl[:] = self._result.z_bl
+            self._result.info.delta[:] = cp.maximum(self._result.info.reg_limit, (1. - self._mu_rate) * self._result.info.delta)
+        else:
+            self._result.info.no_dual_update += 1
+            if self._result.info.iter < 5 or self._result.info.primal_prox_inf < self.settings.infeasibility_threshold:
+                self._result.info.delta[:] = cp.maximum(self._result.info.reg_limit, (1. - 0.666 * self._mu_rate) * self._result.info.delta)
+
+    @nvtx.annotate("Solver::_update_rho_delta_without_ineq")
+    def _update_rho_delta_without_ineq(self) -> None:
+        """Update rho/delta based on residual progress (host-side branching)."""
+        if self._result.info.dual_res < 0.95 * self._result.info.prev_dual_res or \
+            self._result.info.dual_res < self.settings.eps_abs or \
+                self._result.info.dual_res_rel < self.settings.eps_rel:                
+            self._prox_vars.x[:] = self._result.x
+            self._result.info.rho[:] = cp.maximum(self._result.info.reg_limit, 0.1 * self._result.info.rho)                
+        else:                
+            self._result.info.no_primal_update += 1
+            if self._result.info.iter < 5 or self._result.info.dual_prox_inf < self.settings.infeasibility_threshold:
+                self._result.info.rho[:] = cp.maximum(self._result.info.reg_limit, 0.5 * self._result.info.rho)
+                    
+        if self._result.info.primal_res < 0.95 * self._result.info.prev_primal_res or \
+            self._result.info.primal_res < self.settings.eps_abs or \
+                self._result.info.primal_res_rel < self.settings.eps_rel:
+            self._prox_vars.y[:] = self._result.y
+            self._result.info.delta[:] = cp.maximum(self._result.info.reg_limit, 0.1 * self._result.info.delta)
+        else:
+            self._result.info.no_dual_update += 1
+            if self._result.info.iter < 5 or self._result.info.primal_prox_inf < self.settings.infeasibility_threshold:
+                self._result.info.delta[:] = cp.maximum(self._result.info.reg_limit, 0.5 * self._result.info.delta)
+
 
 
 def create_update_residual_r_kernel(n: int, p: int, num_hl: int, num_hu: int, num_xl: int, num_xu: int):
