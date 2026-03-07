@@ -188,7 +188,8 @@ class KKTSystem:
 
             self._update_scaling_and_factor_cuda_graphs[key].launch()
 
-        factor_success = self._kkt_solver.update_scalings_and_factor(data, delta, self._x_reg, self._z_reg) # ! this is implicitly assuming idx_hu and idx_hl cover all indices of inequalities 0:m
+        self._kkt_solver.update_kkt(data, delta, self._x_reg, self._z_reg)
+        factor_success = self._kkt_solver.factor() # ! this is implicitly assuming idx_hu and idx_hl cover all indices of inequalities 0:m
         return factor_success
     
     @nvtx.annotate("KKTSystem::solve")

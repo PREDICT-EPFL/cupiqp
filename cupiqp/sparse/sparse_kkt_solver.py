@@ -117,17 +117,15 @@ class SparseKKTSolver(KKTSolverBase):
         self._diag_y_indices = diag_idx[n : n+p]
         self._diag_z_indices = diag_idx[n+p : n+p+m]
     
-    @nvtx.annotate("SparseKKTSolver::_update_kkt")
-    def _update_kkt(self, data: SparseData, delta: cp.ndarray, x_reg: cp.ndarray, z_reg: cp.ndarray) -> None:
+    @nvtx.annotate("SparseKKTSolver::update_kkt")
+    def update_kkt(self, data: SparseData, delta: cp.ndarray, x_reg: cp.ndarray, z_reg: cp.ndarray) -> None:
         self._kkt_mat.data[self._diag_x_indices] = data.P.diagonal()
         self._kkt_mat.data[self._diag_x_indices] += x_reg        
         self._kkt_mat.data[self._diag_y_indices] = -delta
         self._kkt_mat.data[self._diag_z_indices] = -z_reg
     
-    @nvtx.annotate("SparseKKTSolver::update_scalings_and_factor")
-    def update_scalings_and_factor(self, data: SparseData, delta: cp.ndarray, x_reg: cp.ndarray, z_reg: cp.ndarray) -> bool:
-        self._update_kkt(data, delta, x_reg, z_reg)
-
+    @nvtx.annotate("SparseKKTSolver::factor")
+    def factor(self) -> bool:
         try:
             with nvtx.annotate("SparseKKTSolver::cudss_factorize"):
                 fac_info = self._ldlt_solver.factorize()

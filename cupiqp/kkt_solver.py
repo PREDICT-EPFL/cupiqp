@@ -20,7 +20,11 @@ class KKTSolverBase(ABC):
         pass
 
     @abstractmethod
-    def update_scalings_and_factor(self, data: Data, delta: float, x_reg: Vector, z_reg: Vector) -> bool:
+    def update_kkt(self, data: Data, delta: float, x_reg: Vector, z_reg: Vector) -> bool:
+        pass
+
+    @abstractmethod
+    def factor(self) -> bool:
         pass
 
     @abstractmethod

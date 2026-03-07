@@ -81,12 +81,14 @@ class DenseKKTSolver(KKTSolverBase):
         if update_options == KKTUpdateOptions.KKT_UPDATE_A and data.p > 0:
             self._AtA[:, :] = data.A.T @ data.A
 
-    @nvtx.annotate("DenseKKTSolver::_update_kkt")
-    def _update_kkt(self, data: DenseData, x_reg: cp.ndarray) -> None:
+    @nvtx.annotate("DenseKKTSolver::update_kkt")
+    def update_kkt(self, data: DenseData, delta: float, x_reg: cp.ndarray, z_reg: cp.ndarray) -> None:
         """
         Efficiently assemble Lower Triangular KKT Matrix.
         """
         n = data.n
+        self._delta = delta
+        cp.reciprocal(z_reg, out=self._z_reg_inv)
         wp.launch(
             self._update_kkt_P_A_parts_kernel,
             dim = n*n,
@@ -134,11 +136,8 @@ class DenseKKTSolver(KKTSolverBase):
                 n                         
             )
 
-    @nvtx.annotate("DenseKKTSolver::update_scalings_and_factor")
-    def update_scalings_and_factor(self, data: DenseData, delta: float, x_reg: cp.ndarray, z_reg: cp.ndarray) -> bool:
-        self._delta = delta
-        cp.reciprocal(z_reg, out=self._z_reg_inv)
-        self._update_kkt(data, x_reg)
+    @nvtx.annotate("DenseKKTSolver::factor")
+    def factor(self) -> bool:
         # try:
         #     with cupyx.errstate(linalg='raise'):  # raise exception on factorization failure
         #         self._kkt_mat[:, :] = cp.linalg.cholesky(self._kkt_mat)

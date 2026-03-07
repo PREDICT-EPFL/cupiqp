@@ -85,11 +85,15 @@ class MultistageKKTSolver(KKTSolverBase):
             self._eval_G_xn_kernel = create_block_bidiag_gemv_n_kernel(N, data._G.rows_of_blocks, d, wp.float64)
             self._eval_GT_xt_kernel = create_block_bidiag_gemv_t_kernel(N, data._G.rows_of_blocks, d, wp.float64)
 
-    @nvtx.annotate("MultistageKKTSolver::_update_kkt")
-    def _update_kkt(self, data: MultistageData) -> None:
+    @nvtx.annotate("MultistageKKTSolver::update_kkt")
+    def update_kkt(self, data: MultistageData, delta: float, x_reg: cp.ndarray, z_reg: cp.ndarray) -> None:
         """
         KKT = P + diag(x_reg) + (1/delta)*A^T*A + G^T*diag(z_reg_inv)*G
         """
+        cp.reciprocal(delta, out=self._delta_inv)
+        self._x_reg[:] = x_reg
+        cp.reciprocal(z_reg, out=self._z_reg_inv)
+
         N = self.num_stages
         d = self._block_size
 
@@ -145,13 +149,8 @@ class MultistageKKTSolver(KKTSolverBase):
                 ],
             )
 
-    @nvtx.annotate("MultistageKKTSolver::update_scalings_and_factor")
-    def update_scalings_and_factor(self, data: MultistageData, delta: cp.ndarray, x_reg: cp.ndarray, z_reg: cp.ndarray) -> bool:
-        cp.reciprocal(delta, out=self._delta_inv)
-        self._x_reg[:] = x_reg
-        cp.reciprocal(z_reg, out=self._z_reg_inv)
-
-        self._update_kkt(data)
+    @nvtx.annotate("MultistageKKTSolver::factor")
+    def factor(self) -> bool:
         self._cholesky_factor_launch()
 
         diag_has_nan = cp.isnan(cp.from_dlpack(self._kkt_diag_blocks)).any()
