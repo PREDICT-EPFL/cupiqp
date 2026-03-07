@@ -60,6 +60,11 @@ class SolverBase:
         self._update_residuals_r_kernel = create_update_residual_r_kernel(
             self._data.n, self._data.p, self._data.num_hl, self._data.num_hu, self._data.num_xl, self._data.num_xu
         )
+        # Pre-allocated scalar buffers for CUDA-graph-safe norm computations in _update_residuals_nr / _update_residuals_r
+        self._work_primal_rel_norm = cp.empty(1, dtype=cp.float64)  # running max of primal relative norm terms
+        self._work_dual_res_norm = cp.empty(1, dtype=cp.float64)    # running max of dual residual norm terms
+        self._work_norm_temp = cp.empty(1, dtype=cp.float64)        # temp scalar for individual norm results
+
         self._mu_prev = cp.empty(1)
         self._mu_rate = cp.empty(1)
 
@@ -555,20 +560,24 @@ class SolverBase:
                self._result.buffer_ptr,
                self._prox_vars.buffer_ptr,
                self._res_nr.buffer_ptr)
-        # TODO: eval_P_x, eval_A_xn_and_AT_xt, eval_G_xn_and_GT_xt contain some cuSPARSE and cuBLAS operations that are not supported by CUDA graph capture. What can we do with it?
-
-        # we calculate these term here first to be able to reuse temporary vectors
+        # cuSPARSE/cuBLAS operations (outside graph capture for now)
         self._kkt_system.eval_P_x(self._data, -1., self._result.x, self._res_nr.x)
-        dual_res_norm = cp.linalg.norm(self._res_nr.x, ord=cp.inf) # dual_res_norm = max(||P*x||_inf, ||c||_inf, ||A^T*y + G^T*(z_u - z_l) + z_bu - z_bl||_inf), will be updated below
-        
-        # AT_y = self._res.x  # use self._step.x as temporary storage
+        # ||P*x||_inf -> _work_dual_res_norm (will be updated further inside graph)
+        cp.absolute(self._res_nr.x, out=self._work_primals)
+        cp.max(self._work_primals, out=self._work_dual_res_norm, keepdims=True)
+
         self._kkt_system.eval_A_xn_and_AT_xt(self._data, -1., 1., self._result.x, self._result.y, self._res_nr.y, self._res.x)  # store -A*x in res_nr.y
-        primal_rel_norm = cp.linalg.norm(self._res_nr.y, ord=cp.inf) if self._data.p > 0 else 0.  # primal_rel_norm will be updated below
+        # ||A*x||_inf -> _work_primal_rel_norm (will be updated further inside graph)
+        if self._data.p > 0:
+            cp.absolute(self._res_nr.y, out=self._work_duals[:self._data.p])
+            cp.max(self._work_duals[:self._data.p], out=self._work_primal_rel_norm, keepdims=True)
+        else:
+            self._work_primal_rel_norm.fill(0.)
 
         self._work_z_1.fill(0.)
         self._work_z_1[self._data.idx_hu] += self._result.z_u
         self._work_z_1[self._data.idx_hl] -= self._result.z_l
-        
+
         G_x = self._work_z_2 # reuse self._work_z_2 to store G*x
         GT_zu_minus_zl = self._step.x  # reuse self._step.x as temporary storage
         self._kkt_system.eval_G_xn_and_GT_xt(self._data, 1., 1., self._result.x, self._work_z_1, G_x, GT_zu_minus_zl)
@@ -663,25 +672,64 @@ class SolverBase:
 
                 self._result.info.primal_res[:] = self._primal_res_nr()
 
-                # primal_rel_norm is computed as ||-A*x||_inf above, now update it with other terms
-                primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(G_x[self._data.idx_hu], ord=cp.inf)) if self._data.num_hu > 0 else primal_rel_norm
-                primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(G_x[self._data.idx_hl], ord=cp.inf)) if self._data.num_hl > 0 else primal_rel_norm
-                primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._result.s_u, ord=cp.inf)) if self._data.num_hu > 0 else primal_rel_norm
-                primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._result.s_l, ord=cp.inf)) if self._data.num_hl > 0 else primal_rel_norm
-                primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._result.s_bu, ord=cp.inf)) if self._data.num_xu > 0 else primal_rel_norm
-                primal_rel_norm = cp.maximum(primal_rel_norm, cp.linalg.norm(self._result.s_bl, ord=cp.inf)) if self._data.num_xl > 0 else primal_rel_norm
-                primal_rel_norm = cp.maximum(primal_rel_norm, self._data._constraints_rhs_inf_norm)
-                self._result.info.primal_res_rel[:] = self._result.info.primal_res / cp.maximum(1., primal_rel_norm)
+                # primal_rel_norm: update running max (initialized outside graph with ||A*x||_inf)
+                # _work_z_1 is free at this point (only used before graph for cuSPARSE input)
+                if self._data.num_hu > 0:
+                    cp.take(G_x, self._data.idx_hu, out=self._work_z_1[:self._data.num_hu])
+                    cp.absolute(self._work_z_1[:self._data.num_hu], out=self._work_z_1[:self._data.num_hu])
+                    cp.max(self._work_z_1[:self._data.num_hu], out=self._work_norm_temp, keepdims=True)
+                    cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
 
-                # dual_res_norm = max(||P*x||_inf, ||c||_inf, ||A^T*y + G^T*(z_u - z_l) + z_bu - z_bl||_inf)
+                if self._data.num_hl > 0:
+                    cp.take(G_x, self._data.idx_hl, out=self._work_z_1[:self._data.num_hl])
+                    cp.absolute(self._work_z_1[:self._data.num_hl], out=self._work_z_1[:self._data.num_hl])
+                    cp.max(self._work_z_1[:self._data.num_hl], out=self._work_norm_temp, keepdims=True)
+                    cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
+
+                if self._data.num_hu > 0:
+                    cp.absolute(self._result.s_u, out=self._work_z_1[:self._data.num_hu])
+                    cp.max(self._work_z_1[:self._data.num_hu], out=self._work_norm_temp, keepdims=True)
+                    cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
+
+                if self._data.num_hl > 0:
+                    cp.absolute(self._result.s_l, out=self._work_z_1[:self._data.num_hl])
+                    cp.max(self._work_z_1[:self._data.num_hl], out=self._work_norm_temp, keepdims=True)
+                    cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
+
+                if self._data.num_xu > 0:
+                    cp.absolute(self._result.s_bu, out=self._work_z[:self._data.num_xu])
+                    cp.max(self._work_z[:self._data.num_xu], out=self._work_norm_temp, keepdims=True)
+                    cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
+
+                if self._data.num_xl > 0:
+                    cp.absolute(self._result.s_bl, out=self._work_z[:self._data.num_xl])
+                    cp.max(self._work_z[:self._data.num_xl], out=self._work_norm_temp, keepdims=True)
+                    cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
+
+                cp.maximum(self._work_primal_rel_norm, self._data._constraints_rhs_inf_norm, out=self._work_primal_rel_norm)
+                # Store max(1, primal_rel_norm) for use by _update_residuals_r
+                cp.maximum(self._work_primal_rel_norm, 1., out=self._work_primal_rel_norm)
+                cp.divide(self._result.info.primal_res, self._work_primal_rel_norm, out=self._result.info.primal_res_rel)
+
+                # dual_res_norm: update running max (initialized outside graph with ||P*x||_inf)
                 self._result.info.dual_res[:] = self._dual_res_nr()
-                dual_res_norm = cp.maximum(dual_res_norm, cp.linalg.norm(self._data.c, ord=cp.inf))  # ||P*x||_inf was calculated before
-                # self._res.x currently holds A^T*y
+
+                # ||c||_inf
+                cp.absolute(self._data.c, out=self._work_primals)
+                cp.max(self._work_primals, out=self._work_norm_temp, keepdims=True)
+                cp.maximum(self._work_dual_res_norm, self._work_norm_temp, out=self._work_dual_res_norm)
+
+                # ||A^T*y + G^T*(z_u - z_l) + z_bu - z_bl||_inf
                 self._res.x += GT_zu_minus_zl
                 self._res.x[self._data.idx_xl] -= self._result.z_bl
                 self._res.x[self._data.idx_xu] += self._result.z_bu
-                dual_res_norm = cp.maximum(dual_res_norm, cp.linalg.norm(self._res.x, ord=cp.inf))
-                self._result.info.dual_res_rel[:] = self._result.info.dual_res / cp.maximum(1., dual_res_norm)
+                cp.absolute(self._res.x, out=self._work_primals)
+                cp.max(self._work_primals, out=self._work_norm_temp, keepdims=True)
+                cp.maximum(self._work_dual_res_norm, self._work_norm_temp, out=self._work_dual_res_norm)
+
+                # store max(1, dual_res_norm) for use by _update_residuals_r
+                cp.maximum(self._work_dual_res_norm, 1., out=self._work_dual_res_norm)
+                cp.divide(self._result.info.dual_res, self._work_dual_res_norm, out=self._result.info.dual_res_rel)
 
             self._update_residuals_nr_cuda_graphs[key] = stream.end_capture()
 
