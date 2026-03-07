@@ -566,7 +566,8 @@ class SolverBase:
         cp.absolute(self._res_nr.x, out=self._work_primals)
         cp.max(self._work_primals, out=self._work_dual_res_norm, keepdims=True)
 
-        self._kkt_system.eval_A_xn_and_AT_xt(self._data, -1., 1., self._result.x, self._result.y, self._res_nr.y, self._res.x)  # store -A*x in res_nr.y
+        self._kkt_system.eval_A_xn(self._data, -1., self._result.x, self._res_nr.y)  # store -A*x in res_nr.y
+        self._kkt_system.eval_AT_xt(self._data, 1., self._result.y, self._res.x)  # add -A^T*y to res_nr.y
         # ||A*x||_inf -> _work_primal_rel_norm (will be updated further inside graph)
         if self._data.p > 0:
             cp.absolute(self._res_nr.y, out=self._work_duals[:self._data.p])
@@ -580,7 +581,8 @@ class SolverBase:
 
         G_x = self._work_z_2 # reuse self._work_z_2 to store G*x
         GT_zu_minus_zl = self._step.x  # reuse self._step.x as temporary storage
-        self._kkt_system.eval_G_xn_and_GT_xt(self._data, 1., 1., self._result.x, self._work_z_1, G_x, GT_zu_minus_zl)
+        self._kkt_system.eval_G_xn(self._data, 1., self._result.x, G_x)
+        self._kkt_system.eval_GT_xt(self._data, 1., self._work_z_1, GT_zu_minus_zl)
 
         if key not in self._update_residuals_nr_cuda_graphs:
             self._update_residuals_nr_cuda_graphs_capture_count += 1

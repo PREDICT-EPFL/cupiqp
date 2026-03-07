@@ -250,8 +250,8 @@ class MultistageKKTSolver(KKTSolverBase):
             ],
         )
 
-    @nvtx.annotate("MultistageKKTSolver::eval_A_xn_and_AT_xt")
-    def eval_A_xn_and_AT_xt(self, data: MultistageData, alpha_n: float, xn: cp.ndarray, alpha_t: float, xt: cp.ndarray, zn: cp.ndarray, zt: cp.ndarray):
+    @nvtx.annotate("MultistageKKTSolver::eval_A_xn")
+    def eval_A_xn(self, data: MultistageData, alpha_n: float, xn: cp.ndarray, zn: cp.ndarray):
         N = self.num_stages
         d = self._block_size
         # zn = alpha_n * A * xn
@@ -266,6 +266,11 @@ class MultistageKKTSolver(KKTSolverBase):
                 zn,
             ],
         )
+
+    @nvtx.annotate("MultistageKKTSolver::eval_AT_xt")
+    def eval_AT_xt(self, data: MultistageData, alpha_t: float, xt: cp.ndarray, zt: cp.ndarray):
+        N = self.num_stages
+        d = self._block_size
         # zt = alpha_t * A^T * xt
         wp.launch(
             self._eval_AT_xt_kernel, dim=(N, d),
@@ -273,37 +278,6 @@ class MultistageKKTSolver(KKTSolverBase):
                 wp.float64(alpha_t),
                 data._A.D,
                 data._A.E,
-                xt,
-                wp.float64(0.0),
-                zt,
-            ],
-        )
-
-    @nvtx.annotate("MultistageKKTSolver::eval_G_xn_and_GT_xt")
-    def eval_G_xn_and_GT_xt(self, data: MultistageData, alpha_n: float, xn: cp.ndarray, alpha_t: float, xt: cp.ndarray, zn: cp.ndarray, zt: cp.ndarray):
-        N = self.num_stages
-        d = self._block_size
-        # zn = alpha_n * G * xn
-        wp.launch(
-            self._eval_G_xn_kernel,
-            dim=(N + 1, data._G.rows_of_blocks),
-            inputs=[
-                wp.float64(alpha_n),
-                data._G.D,
-                data._G.E,
-                xn,
-                wp.float64(0.0),
-                zn,
-            ],
-        )
-        # zt = alpha_t * G^T * xt
-        wp.launch(
-            self._eval_GT_xt_kernel,
-            dim=(N, d),
-            inputs=[
-                wp.float64(alpha_t),
-                data._G.D,
-                data._G.E,
                 xt,
                 wp.float64(0.0),
                 zt,
@@ -324,5 +298,23 @@ class MultistageKKTSolver(KKTSolverBase):
                 xn,
                 wp.float64(0.0),
                 zn,
+            ],
+        )
+
+    @nvtx.annotate("MultistageKKTSolver::eval_GT_xt")
+    def eval_GT_xt(self, data: MultistageData, alpha_t: float, xt: cp.ndarray, zt: cp.ndarray):
+        N = self.num_stages
+        d = self._block_size
+        # zt = alpha_t * G^T * xt
+        wp.launch(
+            self._eval_GT_xt_kernel,
+            dim=(N, d),
+            inputs=[
+                wp.float64(alpha_t),
+                data._G.D,
+                data._G.E,
+                xt,
+                wp.float64(0.0),
+                zt,
             ],
         )

@@ -174,17 +174,19 @@ class SparseKKTSolver(KKTSolverBase):
     def eval_P_x(self, data: SparseData, alpha: float, x: cp.ndarray, z: cp.ndarray):
         self._spmv_P(x, z, alpha=alpha, beta=0.0)
     
-    @nvtx.annotate("SparseKKTSolver::eval_A_xn_and_AT_xt")
-    def eval_A_xn_and_AT_xt(self, data: SparseData, alpha_n: float, xn: cp.ndarray, alpha_t: float, xt: cp.ndarray, zn: cp.ndarray, zt: cp.ndarray):
+    @nvtx.annotate("SparseKKTSolver::eval_A_xn")
+    def eval_A_xn(self, data: SparseData, alpha_n: float, xn: cp.ndarray, zn: cp.ndarray):
         self._spmv_A(xn, zn, alpha=alpha_n, beta=0.0)
+
+    @nvtx.annotate("SparseKKTSolver::eval_AT_xt")
+    def eval_AT_xt(self, data: SparseData, alpha_t: float, xt: cp.ndarray, zt: cp.ndarray):
         self._spmv_AT(xt, zt, alpha=alpha_t, beta=0.0)
-    
-    @nvtx.annotate("SparseKKTSolver::eval_G_xn_and_GT_xt")
-    def eval_G_xn_and_GT_xt(self, data: SparseData, alpha_n: float, xn: cp.ndarray, alpha_t: float, xt: cp.ndarray, zn: cp.ndarray, zt: cp.ndarray):
-        self._spmv_G(xn, zn, alpha=alpha_n, beta=0.0)
-        self._spmv_GT(xt, zt, alpha=alpha_t, beta=0.0)
 
     @nvtx.annotate("SparseKKTSolver::eval_G_xn")
     def eval_G_xn(self, data: SparseData, alpha_n: float, xn: cp.ndarray, zn: cp.ndarray):
         self._spmv_G(xn, zn, alpha=alpha_n, beta=0.0)
+
+    @nvtx.annotate("SparseKKTSolver::eval_GT_xt")
+    def eval_GT_xt(self, data: SparseData, alpha_t: float, xt: cp.ndarray, zt: cp.ndarray):
+        self._spmv_GT(xt, zt, alpha=alpha_t, beta=0.0)
 

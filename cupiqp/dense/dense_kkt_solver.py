@@ -174,17 +174,19 @@ class DenseKKTSolver(KKTSolverBase):
     @nvtx.annotate("DenseKKTSolver::eval_P_x")
     def eval_P_x(self, data: DenseData, alpha: float, x: cp.ndarray, z: cp.ndarray):
         gemv(transa='N', alpha=alpha, a=data.P, x=x, beta=0.0, y=z)
-    
-    @nvtx.annotate("DenseKKTSolver::eval_G_xn_and_GT_xt")
-    def eval_A_xn_and_AT_xt(self, data: DenseData, alpha_n: float, xn: cp.ndarray, alpha_t: float, xt: cp.ndarray, zn: cp.ndarray, zt: cp.ndarray):
+
+    @nvtx.annotate("DenseKKTSolver::eval_A_xn")
+    def eval_A_xn(self, data: DenseData, alpha_n: float, xn: cp.ndarray, zn: cp.ndarray):
         gemv(transa='N', alpha=alpha_n, a=data.A, x=xn, beta=0.0, y=zn)
+
+    @nvtx.annotate("DenseKKTSolver::eval_AT_xt")
+    def eval_AT_xt(self, data: DenseData, alpha_t: float, xt: cp.ndarray, zt: cp.ndarray):
         gemv(transa='T', alpha=alpha_t, a=data.A, x=xt, beta=0.0, y=zt)
-    
-    @nvtx.annotate("DenseKKTSolver::eval_G_xn_and_GT_xt")
-    def eval_G_xn_and_GT_xt(self, data: DenseData, alpha_n: float, xn: cp.ndarray, alpha_t: float, xt: cp.ndarray, zn: cp.ndarray, zt: cp.ndarray):
-        gemv(transa='N', alpha=alpha_n, a=data.G, x=xn, beta=0.0, y=zn)
-        gemv(transa='T', alpha=alpha_t, a=data.G, x=xt, beta=0.0, y=zt)
 
     @nvtx.annotate("DenseKKTSolver::eval_G_xn")
     def eval_G_xn(self, data: DenseData, alpha_n: float, xn: cp.ndarray, zn: cp.ndarray):
         gemv(transa='N', alpha=alpha_n, a=data.G, x=xn, beta=0.0, y=zn)
+
+    @nvtx.annotate("DenseKKTSolver::eval_GT_xt")
+    def eval_GT_xt(self, data: DenseData, alpha_t: float, xt: cp.ndarray, zt: cp.ndarray):
+        gemv(transa='T', alpha=alpha_t, a=data.G, x=xt, beta=0.0, y=zt)
