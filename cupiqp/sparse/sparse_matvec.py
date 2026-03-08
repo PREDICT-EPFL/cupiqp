@@ -60,6 +60,10 @@ _cusparse_lib.cusparseDnVecSetValues.argtypes = [
     ctypes.c_void_p,  # values
 ]
 
+# cusparseStatus_t cusparseSetStream(cusparseHandle_t handle, cudaStream_t streamId)
+_cusparse_lib.cusparseSetStream.restype = ctypes.c_int
+_cusparse_lib.cusparseSetStream.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -219,6 +223,8 @@ class SparseMatVecProduct:
         beta : float
             Scalar multiplier for the initial value of ``y``.  Defaults to ``0.0``.
         """
+        _cusparse_lib.cusparseSetStream(self._handle, cp.cuda.get_current_stream().ptr)
+
         _alpha = ctypes.c_double(alpha)
         _beta = ctypes.c_double(beta)
 

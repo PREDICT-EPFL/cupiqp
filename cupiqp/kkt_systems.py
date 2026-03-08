@@ -109,7 +109,9 @@ class KKTSystem:
             if key not in self._update_scaling_and_factor_cuda_graphs:
                 self._update_scaling_and_factor_cuda_graphs_capture_count += 1
                 print(f"KKTSystems::_update_scaling_and_factor capturing CUDA graph (occurrence {self._update_scaling_and_factor_cuda_graphs_capture_count})...")
-                stream = cp.cuda.ExternalStream(wp.get_stream().cuda_stream)
+                stream = cp.cuda.Stream(non_blocking=True)
+                wp_stream = wp.Stream(cuda_stream=stream.ptr)
+
                 stream.begin_capture()
                 with stream:
 
@@ -125,6 +127,7 @@ class KKTSystem:
                                     self._w_u_delta_inv, self._w_l_delta_inv, self._w_bu_delta_inv, self._w_bl_delta_inv,
                                     delta],
                             device="cuda",
+                            stream=wp_stream,
                         )
 
                         wp.launch(
@@ -144,10 +147,10 @@ class KKTSystem:
                                 self._z_reg,
                             ],
                             device="cuda",
+                            stream=wp_stream,
                         )
 
                     else:
-
                         # store the current slack and dual variable values at this iteration
                         self._m_s_u[:] = vars.s_u
                         self._m_s_l[:] = vars.s_l

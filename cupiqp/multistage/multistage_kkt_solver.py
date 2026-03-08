@@ -45,6 +45,12 @@ class MultistageKKTSolver(KKTSolverBase):
         )
         self._kkt_rhs = wp.zeros((N, d, 1), dtype=wp.float64, device="cuda")
 
+        # pre-allocate CuPy views of the Warp arrays so that we can call
+        # .fill(0) during CUDA graph capture without invoking from_dlpack
+        # (whose __dlpack__ may trigger CUDA ops that invalidate capture).
+        self._kkt_diag_blocks_cp = cp.from_dlpack(self._kkt_diag_blocks)
+        self._kkt_offdiag_blocks_cp = cp.from_dlpack(self._kkt_offdiag_blocks)
+
         self._cholesky_factor_launch = create_cholesky_factor_launch(
             self._kkt_diag_blocks, self._kkt_offdiag_blocks,
             device="cuda", dtype=wp.float64, use_cuda_graph=True,
@@ -90,6 +96,11 @@ class MultistageKKTSolver(KKTSolverBase):
         """
         KKT = P + diag(x_reg) + (1/delta)*A^T*A + G^T*diag(z_reg_inv)*G
         """
+        # Wrap CuPy's current stream as a Warp stream so that wp.launch()
+        # targets the same stream CuPy operations already use (important for
+        # CUDA graph capture on a non-default stream).
+        stream = wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr)
+
         cp.reciprocal(delta, out=self._delta_inv)
         self._x_reg[:] = x_reg
         cp.reciprocal(z_reg, out=self._z_reg_inv)
@@ -97,8 +108,10 @@ class MultistageKKTSolver(KKTSolverBase):
         N = self.num_stages
         d = self._block_size
 
-        self._kkt_diag_blocks.zero_()
-        self._kkt_offdiag_blocks.zero_()
+        # Use cupy's fill() instead of warp's zero_() to run on cupy's default stream
+        # warp.zero_() targets Warp's default stream.
+        self._kkt_diag_blocks_cp.fill(0)
+        self._kkt_offdiag_blocks_cp.fill(0)
 
         # kkt += P
         wp.launch(
@@ -111,6 +124,7 @@ class MultistageKKTSolver(KKTSolverBase):
                 self._kkt_diag_blocks,
                 self._kkt_offdiag_blocks,
             ],
+            stream=stream,
         )
 
         # kkt += diag(x_reg)
@@ -118,6 +132,7 @@ class MultistageKKTSolver(KKTSolverBase):
             kernel=self._btd_diaad_kernel,
             dim=(data.n,),
             inputs=[self._x_reg, self._kkt_diag_blocks],
+            stream=stream,
         )
 
         # kkt += (1/delta) * A^T A
@@ -132,6 +147,7 @@ class MultistageKKTSolver(KKTSolverBase):
                     self._kkt_diag_blocks,
                     self._kkt_offdiag_blocks,
                 ],
+                stream=stream,
             )
 
         # kkt += G^T diag(z_reg_inv) G  (weighted SYRK, accumulated directly)
@@ -147,6 +163,7 @@ class MultistageKKTSolver(KKTSolverBase):
                     self._kkt_diag_blocks,
                     self._kkt_offdiag_blocks,
                 ],
+                stream=stream,
             )
 
     @nvtx.annotate("MultistageKKTSolver::factor")
