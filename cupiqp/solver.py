@@ -480,7 +480,7 @@ class SolverBase:
         key = (self._result.buffer_ptr, self._result.info.mu.data.ptr)
         if key not in self._calculate_mu_cuda_graphs:
             self._calculate_mu_cuda_graphs_capture_count += 1
-            print(f"KKTSystems::_calculate_mu capturing CUDA graph (occurrence {self._calculate_mu_cuda_graphs_capture_count})...")
+            print(f"Solver::_calculate_mu capturing CUDA graph (occurrence {self._calculate_mu_cuda_graphs_capture_count})...")
             stream = cp.cuda.Stream(non_blocking=True)
             stream.begin_capture()
             with stream:
@@ -509,7 +509,7 @@ class SolverBase:
         
         if key not in self._calculate_sigma_cuda_graphs:
             self._calculate_sigma_cuda_graphs_capture_count += 1
-            print(f"KKTSystems::_calculate_sigma capturing CUDA graph (occurrence {self._calculate_sigma_cuda_graphs_capture_count})...")
+            print(f"Solver::_calculate_sigma capturing CUDA graph (occurrence {self._calculate_sigma_cuda_graphs_capture_count})...")
             stream = cp.cuda.Stream(non_blocking=True)
             stream.begin_capture()
             with stream:
