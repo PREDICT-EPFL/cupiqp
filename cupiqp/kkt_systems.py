@@ -187,11 +187,12 @@ class KKTSystem:
                         self._z_reg[data.idx_hl] += self._w_l_delta_inv
                         cp.reciprocal(self._z_reg, out=self._z_reg)
 
+                    self._kkt_solver.update_kkt(data, delta, self._x_reg, self._z_reg)
+
                 self._update_scaling_and_factor_cuda_graphs[key] = stream.end_capture()
 
             self._update_scaling_and_factor_cuda_graphs[key].launch()
 
-        self._kkt_solver.update_kkt(data, delta, self._x_reg, self._z_reg)
         factor_success = self._kkt_solver.factor() # ! this is implicitly assuming idx_hu and idx_hl cover all indices of inequalities 0:m
         return factor_success
     
