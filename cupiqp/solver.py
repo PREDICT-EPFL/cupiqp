@@ -20,6 +20,10 @@ class SolverBase:
         self._prox_vars = Variables()  # used to store the proximal variables
 
         self._kkt_system = None
+
+    @property
+    def result(self):
+        return self._result
     
     @nvtx.annotate("Solver::setup")
     def setup(self, P, c, A, b, G, h_u, h_l, x_u, x_l):
