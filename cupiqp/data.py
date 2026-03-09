@@ -1,3 +1,5 @@
+from typing import Any
+from abc import ABC, abstractmethod
 import cupy as cp
 from typing import Optional, Union
 import cupyx.scipy.sparse as sp
@@ -7,7 +9,7 @@ from .typedef import PIQP_INF
 ArrayLike = Union[cp.ndarray, sp.spmatrix]
 
 
-class Data:
+class Data(ABC):
     def __init__(self, 
                  P: ArrayLike, 
                  c: ArrayLike, 
@@ -81,62 +83,104 @@ class Data:
             return cp.array(M, dtype=cp.float64)
 
     def _preprocess(self):
-        self.set_h_l()
-        self.set_h_u()
+        self._init_h_l()
+        self._init_h_u()
         self.disable_inf_constraints()
-        self.set_h_l()
-        self.set_h_u()
-        self.set_x_l()
-        self.set_x_u()
+        self._init_h_l()
+        self._init_h_u()
+        self._init_x_l()
+        self._init_x_u()
 
     def _compute_constraints_rhs_inf_norm(self):
         """
         Compute the infinity norm of the right-hand side of the constraints,
-        used in computing the relative residuals in the solver. 
+        used in computing the relative residuals in the solver.
         """
-        self._constraints_rhs_inf_norm[:] = 0.
-        inf = self._constraints_rhs_inf_norm  # reference
-        inf = cp.maximum(inf, cp.linalg.norm(self.b, ord=cp.inf)) if self.p > 0 else inf
-        inf = cp.maximum(inf, cp.linalg.norm(self.h_u[self.idx_hu], ord=cp.inf)) if self.num_hu > 0 else inf
-        inf = cp.maximum(inf, cp.linalg.norm(self.h_l[self.idx_hl], ord=cp.inf)) if self.num_hl > 0 else inf
-        inf = cp.maximum(inf, cp.linalg.norm(self.x_u[self.idx_xu], ord=cp.inf)) if self.num_xu > 0 else inf
-        inf = cp.maximum(inf, cp.linalg.norm(self.x_l[self.idx_xl], ord=cp.inf)) if self.num_xl > 0 else inf
+        inf_norm = self._constraints_rhs_inf_norm
+        inf_norm[:] = 0.
+        if self.p > 0:
+            cp.maximum(inf_norm, cp.linalg.norm(self.b, ord=cp.inf), out=inf_norm)
+        if self.num_hu > 0:
+            cp.maximum(inf_norm, cp.linalg.norm(self.h_u[self.idx_hu], ord=cp.inf), out=inf_norm)
+        if self.num_hl > 0:
+            cp.maximum(inf_norm, cp.linalg.norm(self.h_l[self.idx_hl], ord=cp.inf), out=inf_norm)
+        if self.num_xu > 0:
+            cp.maximum(inf_norm, cp.linalg.norm(self.x_u[self.idx_xu], ord=cp.inf), out=inf_norm)
+        if self.num_xl > 0:
+            cp.maximum(inf_norm, cp.linalg.norm(self.x_l[self.idx_xl], ord=cp.inf), out=inf_norm)
 
     @property
     def P(self):
         return self._P
-    
+
     @property
     def c(self):
         return self._c
-    
+
     @property
     def A(self):
         return self._A
-    
+
     @property
     def b(self):
         return self._b
-    
+
     @property
     def G(self):
         return self._G
-    
+
     @property
     def h_u(self):
         return self._h_u
-    
+
     @property
     def h_l(self):
         return self._h_l
-    
+
     @property
     def x_u(self):
         return self._x_u
-    
+
     @property
     def x_l(self):
         return self._x_l
+
+    @abstractmethod
+    def set_P(self, value: Any, check: bool = True):
+        """Update P values in-place. If check=True, validate dimensions/sparsity."""
+        pass
+
+    @abstractmethod
+    def set_c(self, value: Any, check: bool = True):
+        pass
+
+    @abstractmethod
+    def set_A(self, value: Any, check: bool = True):
+        pass
+
+    @abstractmethod
+    def set_b(self, value: Any, check: bool = True):
+        pass
+
+    @abstractmethod
+    def set_G(self, value: Any, check: bool = True):
+        pass
+
+    @abstractmethod
+    def set_h_l(self, value: Any, check: bool = True):
+        pass
+
+    @abstractmethod
+    def set_h_u(self, value: Any, check: bool = True):
+        pass
+
+    @abstractmethod
+    def set_x_l(self, value: Any, check: bool = True):
+        pass
+
+    @abstractmethod
+    def set_x_u(self, value: Any, check: bool = True):
+        pass
     
     @property
     def n(self):
@@ -193,15 +237,15 @@ class Data:
         """Indices of upper bound constraints."""
         return self._idx_xu
     
-    def set_h_l(self):
+    def _init_h_l(self):
         if self._h_l is not None:
             self._idx_hl = cp.where(self._h_l > -PIQP_INF)[0].astype(cp.int32)
             self._h_l = cp.array(self._h_l, dtype=cp.float64)
         else:
             self._idx_hl = cp.empty((0,), dtype=cp.int32)
             self._h_l = -2 * PIQP_INF * cp.ones((self.m,))
-        
-    def set_h_u(self):
+
+    def _init_h_u(self):
         if self._h_u is not None:
             self._idx_hu = cp.where(self._h_u < PIQP_INF)[0].astype(cp.int32)
             self._h_u = cp.array(self._h_u, dtype=cp.float64)
@@ -219,7 +263,7 @@ class Data:
                 self._h_l[i] = -1.
                 self._h_u[i] = 1.
         
-    def set_x_l(self):
+    def _init_x_l(self):
         if self._x_l is not None:
             self._idx_xl = cp.where(self._x_l > -PIQP_INF)[0].astype(cp.int32)
             self._x_l = cp.array(self._x_l, dtype=cp.float64)
@@ -227,7 +271,7 @@ class Data:
             self._idx_xl = cp.empty((0,), dtype=cp.int32)
             self._x_l = -2 * PIQP_INF * cp.ones((self.n,))
 
-    def set_x_u(self):
+    def _init_x_u(self):
         if self._x_u is not None:
             self._idx_xu = cp.where(self._x_u < PIQP_INF)[0].astype(cp.int32)
             self._x_u = cp.array(self._x_u, dtype=cp.float64)
