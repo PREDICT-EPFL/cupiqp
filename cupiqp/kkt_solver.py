@@ -20,7 +20,11 @@ class KKTSolverBase(ABC):
         pass
 
     @abstractmethod
-    def update_scalings_and_factor(self, data: Data, delta: float, x_reg: Vector, z_reg: Vector) -> bool:
+    def update_kkt(self, data: Data, delta: float, x_reg: Vector, z_reg: Vector) -> bool:
+        pass
+
+    @abstractmethod
+    def factor(self) -> bool:
         pass
 
     @abstractmethod
@@ -35,18 +39,34 @@ class KKTSolverBase(ABC):
         pass
 
     @abstractmethod
-    def eval_A_xn_and_AT_xt(self, data: Data, alpha_n: float, alpha_t: float, xn: Vector, xt: Vector, zn: Vector, zt: Vector) -> None:
+    def eval_A_xn(self, data: Data, alpha_n: float, xn: Vector, zn: Vector) -> None:
         """
-        Evaluate Ax and A^T xt with scaling factors alpha_n and alpha_t
-        zn = alpha_n * A * xn, zt = alpha_t * A^T * xt
+        Evaluate Ax with scaling factor alpha_n
+        zn = alpha_n * A * xn
+        """
+        pass
+
+    @abstractmethod
+    def eval_AT_xt(self, data: Data, alpha_t: float, xt: Vector, zt: Vector) -> None:
+        """
+        Evaluate A^T xt with scaling factor alpha_t
+        zt = alpha_t * A^T * xt
         """
         pass
     
     @abstractmethod
-    def eval_G_xn_and_GT_xt(self, data: Data, alpha_n: float, alpha_t: float, xn: Vector, xt: Vector, zn: Vector, zt: Vector) -> None:
+    def eval_G_xn(self, data: Data, alpha_n: float, xn: Vector, zn: Vector) -> None:
         """
-        Evaluate Gx and G^T xt with scaling factors alpha_n and alpha_t
-        zn = alpha_n * G * xn, zt = alpha_t * G^T * xt
+        Evaluate Gx with scaling factor alpha_n
+        zn = alpha_n * G * xn
+        """
+        pass
+
+    @abstractmethod
+    def eval_GT_xt(self, data: Data, alpha_t: float, xt: Vector, zt: Vector) -> None:
+        """
+        Evaluate G^T xt with scaling factor alpha_t
+        zt = alpha_t * G^T * xt
         """
         pass
 

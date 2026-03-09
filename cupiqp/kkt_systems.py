@@ -109,7 +109,9 @@ class KKTSystem:
             if key not in self._update_scaling_and_factor_cuda_graphs:
                 self._update_scaling_and_factor_cuda_graphs_capture_count += 1
                 print(f"KKTSystems::_update_scaling_and_factor capturing CUDA graph (occurrence {self._update_scaling_and_factor_cuda_graphs_capture_count})...")
-                stream = cp.cuda.ExternalStream(wp.get_stream().cuda_stream)
+                stream = cp.cuda.Stream(non_blocking=True)
+                wp_stream = wp.Stream(cuda_stream=stream.ptr)
+
                 stream.begin_capture()
                 with stream:
 
@@ -125,6 +127,7 @@ class KKTSystem:
                                     self._w_u_delta_inv, self._w_l_delta_inv, self._w_bu_delta_inv, self._w_bl_delta_inv,
                                     delta],
                             device="cuda",
+                            stream=wp_stream,
                         )
 
                         wp.launch(
@@ -144,10 +147,10 @@ class KKTSystem:
                                 self._z_reg,
                             ],
                             device="cuda",
+                            stream=wp_stream,
                         )
 
                     else:
-
                         # store the current slack and dual variable values at this iteration
                         self._m_s_u[:] = vars.s_u
                         self._m_s_l[:] = vars.s_l
@@ -184,11 +187,13 @@ class KKTSystem:
                         self._z_reg[data.idx_hl] += self._w_l_delta_inv
                         cp.reciprocal(self._z_reg, out=self._z_reg)
 
+                    self._kkt_solver.update_kkt(data, delta, self._x_reg, self._z_reg)
+
                 self._update_scaling_and_factor_cuda_graphs[key] = stream.end_capture()
 
             self._update_scaling_and_factor_cuda_graphs[key].launch()
 
-        factor_success = self._kkt_solver.update_scalings_and_factor(data, delta, self._x_reg, self._z_reg) # ! this is implicitly assuming idx_hu and idx_hl cover all indices of inequalities 0:m
+        factor_success = self._kkt_solver.factor() # ! this is implicitly assuming idx_hu and idx_hl cover all indices of inequalities 0:m
         return factor_success
     
     @nvtx.annotate("KKTSystem::solve")
@@ -370,23 +375,21 @@ class KKTSystem:
         """
         self._kkt_solver.eval_P_x(data, alpha, x, z)
     
-    @nvtx.annotate("KKTSystem::eval_A_xn_and_AT_xt")
-    def eval_A_xn_and_AT_xt(self, data: Data, alpha_n: float, alpha_t: float, xn: cp.ndarray, xt: cp.ndarray, zn: cp.ndarray, zt: cp.ndarray):
+    @nvtx.annotate("KKTSystem::eval_A_xn")
+    def eval_A_xn(self, data: Data, alpha_n: float, xn: cp.ndarray, zn: cp.ndarray):
         """
-        Evaluate Ax and A^T xt with scaling factors alpha_n and alpha_t:
-        zn = alpha_n * A * xn, 
+        Evaluate Ax with scaling factor alpha_n:
+        zn = alpha_n * A * xn
+        """
+        self._kkt_solver.eval_A_xn(data, alpha_n, xn, zn)
+
+    @nvtx.annotate("KKTSystem::eval_AT_xt")
+    def eval_AT_xt(self, data: Data, alpha_t: float, xt: cp.ndarray, zt: cp.ndarray):
+        """
+        Evaluate A^T xt with scaling factor alpha_t:
         zt = alpha_t * A^T * xt
         """
-        self._kkt_solver.eval_A_xn_and_AT_xt(data, alpha_n, xn, alpha_t, xt, zn, zt)
-    
-    @nvtx.annotate("KKTSystem::eval_G_xn_and_GT_xt")
-    def eval_G_xn_and_GT_xt(self, data: Data, alpha_n: float, alpha_t: float, xn: cp.ndarray, xt: cp.ndarray, zn: cp.ndarray, zt: cp.ndarray):
-        """
-        Evaluate Gx and G^T xt with scaling factors alpha_n and alpha_t:
-        zn = alpha_n * G * xn, 
-        zt = alpha_t * G^T * xt
-        """
-        self._kkt_solver.eval_G_xn_and_GT_xt(data, alpha_n, xn, alpha_t, xt, zn, zt)
+        self._kkt_solver.eval_AT_xt(data, alpha_t, xt, zt)
 
     @nvtx.annotate("KKTSystem::eval_G_xn")
     def eval_G_xn(self, data: Data, alpha_n: float, xn: cp.ndarray, zn: cp.ndarray):
@@ -395,6 +398,14 @@ class KKTSystem:
         zn = alpha_n * G * xn
         """
         self._kkt_solver.eval_G_xn(data, alpha_n, xn, zn)
+
+    @nvtx.annotate("KKTSystem::eval_GT_xt")
+    def eval_GT_xt(self, data: Data, alpha_t: float, xt: cp.ndarray, zt: cp.ndarray):
+        """
+        Evaluate G^T xt with scaling factor alpha_t:
+        zt = alpha_t * G^T * xt
+        """
+        self._kkt_solver.eval_GT_xt(data, alpha_t, xt, zt)
     
     def kkt_matrix(self, rho: float, delta: float, vars: Variables) -> cp.ndarray:
         """
