@@ -17,8 +17,13 @@ class KKTSystem:
     """
     The KKT system handles the full KKT condition.
     """
-    def __init__(self, data: Data, settings: Settings):
+    def __init__(self):
+        return
+    
+    def init(self, data: Data, settings: Settings):
         self._data = data
+        self._settings = settings
+
         self._x_reg = cp.nan * cp.ones(self._data.n)
         self._z_reg = cp.nan * cp.ones(self._data.m)
 
