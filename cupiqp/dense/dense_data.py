@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Union
 
 import cupy as cp
 
@@ -19,6 +19,10 @@ class DenseData(Data):
                  x_u: Optional[cp.ndarray] = None,
                  x_l: Optional[cp.ndarray] = None):
         super().__init__(P, c, A, b, G, h_u, h_l, x_u, x_l)
+
+    @staticmethod
+    def _as_float64_mat(M: Union[cp.ndarray, None]) -> cp.ndarray:
+        return M.astype(cp.float64) if M is not None else cp.zeros((0,), dtype=cp.float64)
 
     def set_P(self, value: cp.ndarray, check: bool = True):
         if check and value.shape != self._P.shape:
@@ -46,13 +50,21 @@ class DenseData(Data):
         self._G[:] = value
 
     def set_h_l(self, value: cp.ndarray, check: bool = True):
+        if check and value.shape != self._h_l.shape:
+            raise ValueError(f"h_l has wrong dimension. Got {value.shape} but expected {self._h_l.shape}")
         self._h_l[:] = value
 
     def set_h_u(self, value: cp.ndarray, check: bool = True):
+        if check and value.shape != self._h_u.shape:
+            raise ValueError(f"h_u has wrong dimension. Got {value.shape} but expected {self._h_u.shape}")
         self._h_u[:] = value
 
     def set_x_l(self, value: cp.ndarray, check: bool = True):
+        if check and value.shape != self._x_l.shape:
+            raise ValueError(f"x_l has wrong dimension. Got {value.shape} but expected {self._x_l.shape}")
         self._x_l[:] = value
 
     def set_x_u(self, value: cp.ndarray, check: bool = True):
+        if check and value.shape != self._x_u.shape:
+            raise ValueError(f"x_u has wrong dimension. Got {value.shape} but expected {self._x_u.shape}")
         self._x_u[:] = value

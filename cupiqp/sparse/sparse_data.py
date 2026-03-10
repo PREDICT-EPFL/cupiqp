@@ -1,6 +1,6 @@
-from typing import Optional
+from typing import Optional, Union
 import cupy as cp
-from cupyx.scipy.sparse import csr_matrix
+from cupyx.scipy.sparse import csr_matrix, isspmatrix_csr
 
 
 from ..data import Data
@@ -12,7 +12,7 @@ class SparseData(Data):
     """
     def __init__(self,
                  P: csr_matrix,
-                 q: cp.ndarray,
+                 c: cp.ndarray,
                  A: Optional[csr_matrix] = None,
                  b: Optional[cp.ndarray] = None,
                  G: Optional[csr_matrix] = None,
@@ -20,7 +20,11 @@ class SparseData(Data):
                  h_l: Optional[cp.ndarray] = None,
                  x_u: Optional[cp.ndarray] = None,
                  x_l: Optional[cp.ndarray] = None):
-        super().__init__(P, q, A, b, G, h_u, h_l, x_u, x_l)
+        super().__init__(P, c, A, b, G, h_u, h_l, x_u, x_l)
+
+    @staticmethod
+    def _as_float64_mat(M: Union[csr_matrix, None]) -> csr_matrix:
+        return csr_matrix(M, dtype=cp.float64) if M is not None else csr_matrix((0, 0), dtype=cp.float64)
 
     @staticmethod
     def _check_same_sparsity(old: csr_matrix, new: csr_matrix):
@@ -29,14 +33,12 @@ class SparseData(Data):
         NOTE: cp.array_equal causes D2H synchronisation.  Pass check=False
         to the set_* methods in the hot path to skip this validation.
         """
+        if not isspmatrix_csr(new):
+            raise ValueError(f"Expected csr_matrix, got {type(new)}")
         if new.shape != old.shape:
-            raise ValueError(
-                f"Shape changed: expected {old.shape}, got {new.shape}"
-            )
+            raise ValueError(f"Shape changed: expected {old.shape}, got {new.shape}")
         if new.nnz != old.nnz:
-            raise ValueError(
-                f"Nnz changed: expected {old.nnz}, got {new.nnz}"
-            )
+            raise ValueError(f"Nnz changed: expected {old.nnz}, got {new.nnz}")
         if not cp.array_equal(new.indptr, old.indptr):
             raise ValueError("Sparsity pattern changed (indptr mismatch)")
         if not cp.array_equal(new.indices, old.indices):
