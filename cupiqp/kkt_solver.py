@@ -1,9 +1,6 @@
 from abc import ABC, abstractmethod
-import cupy as cp
-
 
 from .data import Data
-from .kkt_fwd import KKTUpdateOptions
 from .typedef import Vector, Matrix
 
 
@@ -17,6 +14,12 @@ class KKTSolverBase(ABC):
     Actually we should note the delta*I as regularization term since it's not necessarily delta*I if there are contributions from the box constriants, which are denoted as reg_x and reg_z.
     """
     def __init__(self):
+        pass
+
+    @abstractmethod
+    def update_data(self, data: Data, update_P: bool, update_A: bool, update_G: bool) -> None:
+        """Notify the KKT solver that problem data has changed.
+        """
         pass
 
     @abstractmethod
