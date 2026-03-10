@@ -43,9 +43,6 @@ class Settings:
     debug: bool = False
     compute_timings: bool = False
 
-    # TODO: this is a temporary setting for the multistage solver, we should find a better way to pass this information or detect the structure of the problem automatically
-    multistage_block_size: int = 1
-
     def verify_settings(self) -> bool:
         return (self.rho_init > 0 and
                self.delta_init > 0 and
