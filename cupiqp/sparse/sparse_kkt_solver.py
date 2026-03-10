@@ -1,4 +1,6 @@
 from typing import Optional
+import os
+import importlib.util
 import cupy as cp
 from cupyx.scipy.sparse import csr_matrix, diags, bmat
 from nvmath.sparse.advanced import (
@@ -16,6 +18,29 @@ import nvtx
 from ..kkt_solver import KKTSolverBase
 from .sparse_data import SparseData
 from .sparse_matvec import SparseMatVecProduct
+
+
+def _find_cudss_mt_lib():
+    """Auto-discover the cuDSS multithreading layer library.
+
+    Searches across CUDA version packages (nvidia.cu11, nvidia.cu12, nvidia.cu13, ...)
+    since the package name depends on the installed CUDA toolkit version.
+    """
+    for cuda_version in range(13, 10, -1):  # try 13, 12, 11
+        spec = importlib.util.find_spec(f"nvidia.cu{cuda_version}")
+        if spec is None:
+            continue
+        # nvidia.cuXX is a namespace package (no __init__.py), so spec.origin is None.
+        # Use submodule_search_locations to find the package directory instead.
+        search_paths = spec.submodule_search_locations
+        if search_paths:
+            for base in search_paths:
+                lib = os.path.join(base, "lib", "libcudss_mtlayer_gomp.so.0")
+                if os.path.isfile(lib):
+                    return lib
+    return None
+
+_CUDSS_MT_LIB = _find_cudss_mt_lib()
 
 class SparseKKTSolver(KKTSolverBase):
     """
@@ -42,8 +67,9 @@ class SparseKKTSolver(KKTSolverBase):
 
         # setup cuDSS solver
         # TODO: can change this to LOWER if only update lower part of KKT
-        opts = DirectSolverOptions(sparse_system_type=DirectSolverMatrixType.SYMMETRIC, 
-                                   sparse_system_view=DirectSolverMatrixViewType.FULL)
+        opts = DirectSolverOptions(sparse_system_type=DirectSolverMatrixType.SYMMETRIC,
+                                   sparse_system_view=DirectSolverMatrixViewType.FULL,
+                                   multithreading_lib=_CUDSS_MT_LIB)
         exe = ExecutionHybrid()  # allow both CPU and GPU execution. Optional: ExecutionCUDA()
         self._ldlt_solver = DirectSolver(a=self._kkt_mat, b=self._rhs, options=opts, execution=exe)
         self._ldlt_solver.plan_config.reordering_algorithm = DirectSolverAlgType.ALG_DEFAULT
