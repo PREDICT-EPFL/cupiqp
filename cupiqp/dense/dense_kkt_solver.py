@@ -1,7 +1,7 @@
 import cupy as cp
 import nvtx
 
-from ..kkt_solver import KKTSolverBase, KKTUpdateOptions
+from ..kkt_solver import KKTSolverBase
 from .dense_data import DenseData
 from .dense_cholesky import CholeskyInplaceSolver
 from .cublas_wrappers import (
@@ -30,12 +30,15 @@ class DenseKKTSolver(KKTSolverBase):
         self._z_reg_inv_sqrt = cp.empty(m, dtype=cp.float64) if m > 0 else cp.empty(0, dtype=cp.float64)
 
         self._kkt_mat = cp.empty((n, n), dtype=cp.float64)
-        self._AtA = data.A.T @ data.A if p > 0 else cp.zeros((0, 0), dtype=cp.float64)
+        self._AtA = cp.empty((n, n), dtype=cp.float64) if p > 0 else cp.zeros((0, 0), dtype=cp.float64)
         self._G_scaled = cp.zeros_like(data.G) if m > 0 else cp.zeros((0, 0), dtype=cp.float64)
 
         self._cholesky_solver = CholeskyInplaceSolver(n, dtype=cp.float64)
 
         self._cublas_handle = cp.cuda.Device().cublas_handle
+
+        if p > 0:
+            self._compute_AtA(data)
 
     def _sync_cublas_stream(self):
         """Point the cuBLAS handle at cupy's current stream.
@@ -45,9 +48,22 @@ class DenseKKTSolver(KKTSolverBase):
         """
         set_stream(self._cublas_handle, cp.cuda.get_current_stream().ptr)
 
-    def update_data(self, data: DenseData, update_options: KKTUpdateOptions):
-        if update_options == KKTUpdateOptions.KKT_UPDATE_A and data.p > 0:
-            self._AtA[:, :] = data.A.T @ data.A
+    def _compute_AtA(self, data: DenseData):
+        """Compute AtA = A^T * A via cuBLAS dsyrk to reduce overhead.
+
+        For C-contiguous A of shape (p, n):
+        - cuBLAS sees column-major layout as an nxp matrix (call it A_cm)
+        - dsyrk with OP_N computes C = A_cm * A_cm^T = A^T * A  (nxn)
+        """
+        self._sync_cublas_stream()
+        n, p = data.n, data.p
+        dsyrk(self._cublas_handle, FILL_UPPER, OP_N, n, p,
+              1.0, data.A.data.ptr, n,
+              0.0, self._AtA.data.ptr, n)
+
+    def update_data(self, data: DenseData, update_P: bool, update_A: bool, update_G: bool):
+        if update_A and data.p > 0:
+            self._compute_AtA(data)
 
     @nvtx.annotate("DenseKKTSolver::update_kkt")
     def update_kkt(self, data: DenseData, delta: cp.ndarray, x_reg: cp.ndarray, z_reg: cp.ndarray) -> None:
