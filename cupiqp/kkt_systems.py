@@ -10,9 +10,6 @@ from .multistage.multistage_kkt_solver import MultistageKKTSolver
 from .results import Variables
 
 
-wp.config.enable_backward = False  # disable backward mode, cut down kernel compile time
-
-
 class KKTSystem:
     """
     The KKT system handles the full KKT condition.

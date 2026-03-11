@@ -8,6 +8,12 @@ from .data import Data
 from .results import Result, Status, Variables
 from .kkt_systems import KKTSystem
 
+
+wp.config.quiet = True  # disable warp module initialization messages.
+wp.config.enable_backward = False  # disable backward mode, cut down kernel compile time
+wp.init()
+
+
 class SolverBase:
     def __init__(self):
 
