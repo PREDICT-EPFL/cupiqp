@@ -22,9 +22,8 @@ class SparseData(Data):
                  x_l: Optional[cp.ndarray] = None):
         super().__init__(P, c, A, b, G, h_u, h_l, x_u, x_l)
 
-    @staticmethod
-    def _as_float64_mat(M: Union[csr_matrix, None]) -> csr_matrix:
-        return csr_matrix(M, dtype=cp.float64) if M is not None else csr_matrix((0, 0), dtype=cp.float64)
+    def _as_float64_mat(self, M: Union[csr_matrix, None]) -> csr_matrix:
+        return csr_matrix(M, dtype=cp.float64) if M is not None else csr_matrix((0, self.n), dtype=cp.float64)
 
     @staticmethod
     def _check_same_sparsity(old: csr_matrix, new: csr_matrix):
