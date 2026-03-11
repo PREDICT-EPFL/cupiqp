@@ -140,13 +140,32 @@ function main(; problem_name::String = "", n_runs::Int = 10)
     # Pass CPU data; Clarabel transfers to GPU internally when cudss is used
     warmup_settings = Clarabel.Settings(
         direct_solve_method = :cudss,
-        verbose = false,
+        verbose = true,
     )
 
     solver = Clarabel.Solver(P_cl, q_cl, A_cl, b_cl, cones, warmup_settings)
 
-    # Warmup solve
+    # Warmup / profiling solve (verbose)
     Clarabel.solve!(solver)
+    solver.settings.verbose = false
+
+    if n_runs == 0
+        CUDA.synchronize()
+        CUDA.@profile Clarabel.solve!(solver)
+        CUDA.synchronize()
+
+        status = solver.solution.status
+        obj = solver.solution.obj_val
+        iters = solver.solution.iterations
+
+        println("\n===== Results (profiling mode) =====")
+        println("Problem:    $problem_name")
+        println("Status:     $status")
+        println("Objective:  $obj")
+        println("Iterations: $iters")
+        return
+    end
+
     println("Warmup solve finished.")
 
     # Timed solves
