@@ -113,7 +113,7 @@ class KKTSystem:
 
             if key not in self._update_scaling_and_factor_cuda_graphs:
                 self._update_scaling_and_factor_cuda_graphs_capture_count += 1
-                print(f"KKTSystems::_update_scaling_and_factor capturing CUDA graph (occurrence {self._update_scaling_and_factor_cuda_graphs_capture_count})...")
+                # print(f"KKTSystems::_update_scaling_and_factor capturing CUDA graph (occurrence {self._update_scaling_and_factor_cuda_graphs_capture_count})...")
                 stream = cp.cuda.Stream(non_blocking=True)
                 wp_stream = wp.Stream(cuda_stream=stream.ptr)
 
@@ -207,171 +207,190 @@ class KKTSystem:
         stream_wp = wp.Stream(cuda_stream=stream_cp.ptr)
         
         with nvtx.annotate("KKTSystem::solve::prepare_rhs"):
-            # ------ elliminate slack variables from rhs
-            # # ! ALTERNATIVE IMPLEMENTATION (pure cupy operations)
-            # # rhs_z_u - inv(Z_u) * r_s_u
-            # cp.multiply(self._m_z_u_inv, rhs.s_u, out=self._updated_rhs_z_u)
-            # cp.subtract(rhs.z_u, self._updated_rhs_z_u, out=self._updated_rhs_z_u)
-            # # rhs_z_l - inv(Z_l) * r_s_l
-            # cp.multiply(self._m_z_l_inv, rhs.s_l, out=self._updated_rhs_z_l)
-            # cp.subtract(rhs.z_l, self._updated_rhs_z_l, out=self._updated_rhs_z_l)
-            # # rhs_z_bu - inv(Z_bu) * r_s_bu
-            # cp.multiply(self._m_z_bu_inv, rhs.s_bu, out=self._updated_rhs_z_bu)
-            # cp.subtract(rhs.z_bu, self._updated_rhs_z_bu, out=self._updated_rhs_z_bu)
-            # # rhs_z_bl - inv(Z_bl) * r_s_bl
-            # cp.multiply(self._m_z_bl_inv, rhs.s_bl, out=self._updated_rhs_z_bl)
-            # cp.subtract(rhs.z_bl, self._updated_rhs_z_bl, out=self._updated_rhs_z_bl)
+            if not hasattr(self, '_prepare_rhs_cuda_graphs'):
+                self._prepare_rhs_cuda_graphs = {}
 
-            wp.launch(
-                kernel=self._eliminate_slacks_kernel,
-                dim=data.num_hu+data.num_hl+data.num_xu+data.num_xl,
-                inputs=[rhs.z_u, rhs.s_u, self._m_z_u_inv, self._updated_rhs_z_u,
-                        rhs.z_l, rhs.s_l, self._m_z_l_inv, self._updated_rhs_z_l,
-                        rhs.z_bu, rhs.s_bu, self._m_z_bu_inv, self._updated_rhs_z_bu,
-                        rhs.z_bl, rhs.s_bl, self._m_z_bl_inv, self._updated_rhs_z_bl],
-                device="cuda",
-                stream=stream_wp,
-            )
+            key = (rhs.buffer_ptr,)
 
-            # ------ elliminate dual variables from rhs to yield one single rhs_z passing to kkt solver
-            
-            # To avoid avoid extra allocation, we use:
-            # self._work_x to hold modified rhs_x (to be passed to KKTSolver), self._work_z to hold modified rhs_z (to be passed to KKTSolver)
-            # use lhs.z_* to hold temporary value self._w_u_delta_inv * self._updated_rhs_z_u, and so on
+            if key not in self._prepare_rhs_cuda_graphs:
+                # stream_cp_capture and stream_wp_capture are used to launch kernels to capture cuda graph, but the actual computation is captured in stream_cp and stream_wp
+                stream_cp_capture = cp.cuda.Stream(non_blocking=True)
+                stream_wp_capture = wp.Stream(cuda_stream=stream_cp_capture.ptr)
 
-            # The below code is equivalent to:
-            # self._work_x[:] = rhs.x
-            # self._work_x[data.idx_xu] += self._w_bu_delta_inv * self._updated_rhs_z_bu
-            # self._work_x[data.idx_xl] -= self._w_bl_delta_inv * self._updated_rhs_z_bl
-            # self._work_z[:] = 0.
-            # self._work_z[data.idx_hu] += self._w_u_delta_inv * self._updated_rhs_z_u
-            # self._work_z[data.idx_hl] -= self._w_l_delta_inv * self._updated_rhs_z_l
-            # self._work_z[:] *= self._z_reg
+                stream_cp_capture.begin_capture()
+                with stream_cp_capture:
+                    wp.launch(
+                        kernel=self._eliminate_slacks_kernel,
+                        dim=data.num_hu+data.num_hl+data.num_xu+data.num_xl,
+                        inputs=[rhs.z_u, rhs.s_u, self._m_z_u_inv, self._updated_rhs_z_u,
+                                rhs.z_l, rhs.s_l, self._m_z_l_inv, self._updated_rhs_z_l,
+                                rhs.z_bu, rhs.s_bu, self._m_z_bu_inv, self._updated_rhs_z_bu,
+                                rhs.z_bl, rhs.s_bl, self._m_z_bl_inv, self._updated_rhs_z_bl],
+                        device="cuda",
+                        stream=stream_wp_capture,
+                    )
+                    wp.launch(
+                        kernel=self._eliminate_duals_kernel,
+                        dim=data.n + data.m,
+                        inputs=[
+                            self._inv_idx_xu, self._inv_idx_xl,
+                            self._inv_idx_hu, self._inv_idx_hl,
+                            rhs.x,
+                            self._w_bu_delta_inv, self._w_bl_delta_inv,
+                            self._updated_rhs_z_bu, self._updated_rhs_z_bl,
+                            self._work_x,
+                            self._w_u_delta_inv, self._w_l_delta_inv,
+                            self._updated_rhs_z_u, self._updated_rhs_z_l,
+                            self._z_reg,
+                            self._work_z,
+                        ],
+                        device="cuda",
+                        stream=stream_wp_capture,
+                    )
 
-            # # ! ALTERNATIVE IMPLEMENTATION (pure cupy operations)
-            # self._work_x[:] = rhs.x
-            # cp.multiply(self._w_bu_delta_inv, self._updated_rhs_z_bu, out=lhs.z_bu)
-            # cp.add.at(self._work_x, data.idx_xu, lhs.z_bu)
-            # cp.multiply(self._w_bl_delta_inv, self._updated_rhs_z_bl, out=lhs.z_bl)
-            # cp.negative(lhs.z_bl, out=lhs.z_bl)
-            # cp.add.at(self._work_x, data.idx_xl, lhs.z_bl)
+                    # # ! ALTERNATIVE IMPLEMENTATION (pure cupy operations)
+                    # ------ elliminate slack variables from rhs
+                    # # rhs_z_u - inv(Z_u) * r_s_u
+                    # cp.multiply(self._m_z_u_inv, rhs.s_u, out=self._updated_rhs_z_u)
+                    # cp.subtract(rhs.z_u, self._updated_rhs_z_u, out=self._updated_rhs_z_u)
+                    # # rhs_z_l - inv(Z_l) * r_s_l
+                    # cp.multiply(self._m_z_l_inv, rhs.s_l, out=self._updated_rhs_z_l)
+                    # cp.subtract(rhs.z_l, self._updated_rhs_z_l, out=self._updated_rhs_z_l)
+                    # # rhs_z_bu - inv(Z_bu) * r_s_bu
+                    # cp.multiply(self._m_z_bu_inv, rhs.s_bu, out=self._updated_rhs_z_bu)
+                    # cp.subtract(rhs.z_bu, self._updated_rhs_z_bu, out=self._updated_rhs_z_bu)
+                    # # rhs_z_bl - inv(Z_bl) * r_s_bl
+                    # cp.multiply(self._m_z_bl_inv, rhs.s_bl, out=self._updated_rhs_z_bl)
+                    # cp.subtract(rhs.z_bl, self._updated_rhs_z_bl, out=self._updated_rhs_z_bl)
 
-            # self._work_z.fill(0)  # faster than cp.zeros assignment
-            # cp.multiply(self._w_u_delta_inv, self._updated_rhs_z_u, out=lhs.z_u) # use lhs.z_u as temporary storage
-            # cp.add.at(self._work_z, data.idx_hu, lhs.z_u)
-            # cp.multiply(self._w_l_delta_inv, self._updated_rhs_z_l, out=lhs.z_l)
-            # cp.negative(lhs.z_l, out=lhs.z_l)
-            # cp.add.at(self._work_z, data.idx_hl, lhs.z_l)
-            # self._work_z[:] *= self._z_reg
+                    # ------ elliminate dual variables from rhs to yield one single rhs_z passing to kkt solver
+                    # To avoid avoid extra allocation, we use:
+                    # self._work_x to hold modified rhs_x (to be passed to KKTSolver), self._work_z to hold modified rhs_z (to be passed to KKTSolver)
+                    # use lhs.z_* to hold temporary value self._w_u_delta_inv * self._updated_rhs_z_u, and so on
 
-            wp.launch(
-                kernel=self._eliminate_duals_kernel,
-                dim=data.n + data.m,
-                inputs=[
-                    # inverse index maps
-                    self._inv_idx_xu,
-                    self._inv_idx_xl,
-                    self._inv_idx_hu,
-                    self._inv_idx_hl,
-                    # for updating rhs_x
-                    rhs.x,
-                    self._w_bu_delta_inv,
-                    self._w_bl_delta_inv,
-                    self._updated_rhs_z_bu,
-                    self._updated_rhs_z_bl,
-                    self._work_x,
-                    # for updating rhs_z
-                    self._w_u_delta_inv,
-                    self._w_l_delta_inv,
-                    self._updated_rhs_z_u,
-                    self._updated_rhs_z_l,
-                    self._z_reg,
-                    self._work_z,  # placeholder for the updated rhs_z
-                ],
-                device="cuda",
-                stream=stream_wp,
-            )
+                    # The below code is equivalent to:
+                    # self._work_x[:] = rhs.x
+                    # self._work_x[data.idx_xu] += self._w_bu_delta_inv * self._updated_rhs_z_bu
+                    # self._work_x[data.idx_xl] -= self._w_bl_delta_inv * self._updated_rhs_z_bl
+                    # self._work_z[:] = 0.
+                    # self._work_z[data.idx_hu] += self._w_u_delta_inv * self._updated_rhs_z_u
+                    # self._work_z[data.idx_hl] -= self._w_l_delta_inv * self._updated_rhs_z_l
+                    # self._work_z[:] *= self._z_reg
+                    
+                    # self._work_x[:] = rhs.x
+                    # cp.multiply(self._w_bu_delta_inv, self._updated_rhs_z_bu, out=lhs.z_bu)
+                    # cp.add.at(self._work_x, data.idx_xu, lhs.z_bu)
+                    # cp.multiply(self._w_bl_delta_inv, self._updated_rhs_z_bl, out=lhs.z_bl)
+                    # cp.negative(lhs.z_bl, out=lhs.z_bl)
+                    # cp.add.at(self._work_x, data.idx_xl, lhs.z_bl)
+                    # self._work_z.fill(0)  # faster than cp.zeros assignment
+                    # cp.multiply(self._w_u_delta_inv, self._updated_rhs_z_u, out=lhs.z_u) # use lhs.z_u as temporary storage
+                    # cp.add.at(self._work_z, data.idx_hu, lhs.z_u)
+                    # cp.multiply(self._w_l_delta_inv, self._updated_rhs_z_l, out=lhs.z_l)
+                    # cp.negative(lhs.z_l, out=lhs.z_l)
+                    # cp.add.at(self._work_z, data.idx_hl, lhs.z_l)
+                    # self._work_z[:] *= self._z_reg
+
+                self._prepare_rhs_cuda_graphs[key] = stream_cp_capture.end_capture()
+
+            self._prepare_rhs_cuda_graphs[key].launch()
 
         self._kkt_solver.solve(data, self._work_x, rhs.y, self._work_z, lhs.x, lhs.y, self._work_z)  # ! the second _work_z is used to hold delta_z, but useless anyway. Can be further optimized.
 
         with nvtx.annotate("KKTSystem::solve::recover_lhs"):
-            self.eval_G_xn(data, 1., lhs.x, self._work_z)  # G * delta_x, where delta_x is stored in lhs.x
+            if not hasattr(self, '_recover_lhs_cuda_graphs'):
+                self._recover_lhs_cuda_graphs = {}
 
-            # ----- recover dual variables on lhs
-            # The below code is equivalent to:
-            # lhs.z_u[:] = self._w_u_delta_inv * (G_dx[data.idx_hu] - self._updated_rhs_z_u)   # delta_z_u
-            # lhs.z_l[:] = self._w_l_delta_inv * (-G_dx[data.idx_hl] - self._updated_rhs_z_l)  # delta_z_l
-            # lhs.z_bu[:] = self._w_bu_delta_inv * (lhs.x[data.idx_xu] - rhs.z_bu + self._m_z_bu_inv * rhs.s_bu)  # delta_z_bu
-            # lhs.z_bl[:] = -self._w_bl_delta_inv * (lhs.x[data.idx_xl] + rhs.z_bl - self._m_z_bl_inv * rhs.s_bl)  # delta_z_bl
+            key = (
+                rhs.buffer_ptr, lhs.buffer_ptr, self._work_z.data.ptr, 
+                self._w_u_delta_inv.data.ptr, self._w_l_delta_inv.data.ptr, 
+                self._w_bu_delta_inv.data.ptr, self._w_bl_delta_inv.data.ptr,
+                )
 
-            # # ! ALTERNATIVE IMPLEMENTATION (pure cupy operations)
-            # lhs.z_u[:] = self._work_z[data.idx_hu]
-            # lhs.z_u -= self._updated_rhs_z_u
-            # lhs.z_u *= self._w_u_delta_inv
+            if key not in self._recover_lhs_cuda_graphs:
+                stream_cp_capture = cp.cuda.Stream(non_blocking=True)
+                stream_wp_capture = wp.Stream(cuda_stream=stream_cp_capture.ptr)
 
-            # lhs.z_l[:] = self._work_z[data.idx_hl]
-            # lhs.z_l *= -1.
-            # lhs.z_l -= self._updated_rhs_z_l
-            # lhs.z_l *= self._w_l_delta_inv
+                stream_cp_capture.begin_capture()
+                with stream_cp_capture:
+                    self.eval_G_xn(data, 1., lhs.x, self._work_z)  # G * delta_x, where delta_x is stored in lhs.x
+                    wp.launch(
+                        kernel=self._recover_duals_kernel,
+                        dim=data.num_hu+data.num_hl+data.num_xu+data.num_xl,
+                        inputs=[
+                            self._work_z, lhs.x,
+                            data.idx_hu, self._w_u_delta_inv, self._updated_rhs_z_u, lhs.z_u,
+                            data.idx_hl, self._w_l_delta_inv, self._updated_rhs_z_l, lhs.z_l,
+                            data.idx_xu, self._w_bu_delta_inv, self._m_z_bu_inv, rhs.z_bu, rhs.s_bu, lhs.z_bu,
+                            data.idx_xl, self._w_bl_delta_inv, self._m_z_bl_inv, rhs.z_bl, rhs.s_bl, lhs.z_bl],
+                        device="cuda",
+                        stream=stream_wp_capture,
+                    )
+                    wp.launch(
+                        kernel=self._recover_slacks_kernel,
+                        dim=data.num_hu+data.num_hl+data.num_xu+data.num_xl,
+                        inputs=[rhs.s_u, lhs.z_u, self._m_s_u, self._m_z_u_inv, lhs.s_u,
+                                rhs.s_l, lhs.z_l, self._m_s_l, self._m_z_l_inv, lhs.s_l,
+                                rhs.s_bu, lhs.z_bu, self._m_s_bu, self._m_z_bu_inv, lhs.s_bu,
+                                rhs.s_bl, lhs.z_bl, self._m_s_bl, self._m_z_bl_inv, lhs.s_bl],
+                        device="cuda",
+                        stream=stream_wp_capture,
+                    )
 
-            # cp.multiply(self._m_z_bu_inv, rhs.s_bu, out=lhs.z_bu)
-            # lhs.z_bu += lhs.x[data.idx_xu]
-            # lhs.z_bu -= rhs.z_bu
-            # lhs.z_bu *= self._w_bu_delta_inv
+                    # # ! ALTERNATIVE IMPLEMENTATION (pure cupy operations)
 
-            # cp.multiply(self._m_z_bl_inv, rhs.s_bl, out=lhs.z_bl)
-            # lhs.z_bl -= lhs.x[data.idx_xl]
-            # lhs.z_bl -= rhs.z_bl
-            # lhs.z_bl *= self._w_bl_delta_inv
-            
+                    # ----- recover dual variables on lhs
+                    # The below code is equivalent to:
+                    # lhs.z_u[:] = self._w_u_delta_inv * (G_dx[data.idx_hu] - self._updated_rhs_z_u)   # delta_z_u
+                    # lhs.z_l[:] = self._w_l_delta_inv * (-G_dx[data.idx_hl] - self._updated_rhs_z_l)  # delta_z_l
+                    # lhs.z_bu[:] = self._w_bu_delta_inv * (lhs.x[data.idx_xu] - rhs.z_bu + self._m_z_bu_inv * rhs.s_bu)  # delta_z_bu
+                    # lhs.z_bl[:] = -self._w_bl_delta_inv * (lhs.x[data.idx_xl] + rhs.z_bl - self._m_z_bl_inv * rhs.s_bl)  # delta_z_bl
+                    
+                    # lhs.z_u[:] = self._work_z[data.idx_hu]
+                    # lhs.z_u -= self._updated_rhs_z_u
+                    # lhs.z_u *= self._w_u_delta_inv
 
-            wp.launch(
-                kernel=self._recover_duals_kernel,
-                dim=data.num_hu+data.num_hl+data.num_xu+data.num_xl,
-                inputs=[
-                    self._work_z, lhs.x,
-                    data.idx_hu, self._w_u_delta_inv, self._updated_rhs_z_u, lhs.z_u,
-                    data.idx_hl, self._w_l_delta_inv, self._updated_rhs_z_l, lhs.z_l,
-                    data.idx_xu, self._w_bu_delta_inv, self._m_z_bu_inv, rhs.z_bu, rhs.s_bu, lhs.z_bu,
-                    data.idx_xl, self._w_bl_delta_inv, self._m_z_bl_inv, rhs.z_bl, rhs.s_bl, lhs.z_bl],
-                device="cuda",
-                stream=stream_wp,
-            )
+                    # lhs.z_l[:] = self._work_z[data.idx_hl]
+                    # lhs.z_l *= -1.
+                    # lhs.z_l -= self._updated_rhs_z_l
+                    # lhs.z_l *= self._w_l_delta_inv
 
-            # ----- recover slack variable on lhs
-            # The below code is equivalent to:
-            # lhs.s_u[:] = self._m_z_u_inv * (rhs.s_u - self._m_s_u * lhs.z_u)  # delta_s_u = inv(Z_u) (r_s_u - S_u delta_z_u)
-            # lhs.s_l[:] = self._m_z_l_inv * (rhs.s_l - self._m_s_l * lhs.z_l)  # delta_s_l = inv(Z_l) (r_s_l - S_l delta_z_l)
-            # lhs.s_bu[:] = self._m_z_bu_inv * (rhs.s_bu - self._m_s_bu * lhs.z_bu)  # delta_s_bu = inv(Z_bu) (r_s_bu - S_bu delta_z_bu)
-            # lhs.s_bl[:] = self._m_z_bl_inv * (rhs.s_bl - self._m_s_bl * lhs.z_bl)  # delta_s_bl = inv(Z_bl) (r_s_bl - S_bl delta_z_bl)
+                    # cp.multiply(self._m_z_bu_inv, rhs.s_bu, out=lhs.z_bu)
+                    # lhs.z_bu += lhs.x[data.idx_xu]
+                    # lhs.z_bu -= rhs.z_bu
+                    # lhs.z_bu *= self._w_bu_delta_inv
 
-            # # ! ALTERNATIVE IMPLEMENTATION (pure cupy operations)
-            # cp.multiply(self._m_s_u, lhs.z_u, out=lhs.s_u)
-            # cp.subtract(rhs.s_u, lhs.s_u, out=lhs.s_u)
-            # cp.multiply(self._m_z_u_inv, lhs.s_u, out=lhs.s_u)
+                    # cp.multiply(self._m_z_bl_inv, rhs.s_bl, out=lhs.z_bl)
+                    # lhs.z_bl -= lhs.x[data.idx_xl]
+                    # lhs.z_bl -= rhs.z_bl
+                    # lhs.z_bl *= self._w_bl_delta_inv
+                    
+                    # ----- recover slack variable on lhs
+                    # The below code is equivalent to:
+                    # lhs.s_u[:] = self._m_z_u_inv * (rhs.s_u - self._m_s_u * lhs.z_u)  # delta_s_u = inv(Z_u) (r_s_u - S_u delta_z_u)
+                    # lhs.s_l[:] = self._m_z_l_inv * (rhs.s_l - self._m_s_l * lhs.z_l)  # delta_s_l = inv(Z_l) (r_s_l - S_l delta_z_l)
+                    # lhs.s_bu[:] = self._m_z_bu_inv * (rhs.s_bu - self._m_s_bu * lhs.z_bu)  # delta_s_bu = inv(Z_bu) (r_s_bu - S_bu delta_z_bu)
+                    # lhs.s_bl[:] = self._m_z_bl_inv * (rhs.s_bl - self._m_s_bl * lhs.z_bl)  # delta_s_bl = inv(Z_bl) (r_s_bl - S_bl delta_z_bl)
 
-            # cp.multiply(self._m_s_l, lhs.z_l, out=lhs.s_l)
-            # cp.subtract(rhs.s_l, lhs.s_l, out=lhs.s_l)
-            # cp.multiply(self._m_z_l_inv, lhs.s_l, out=lhs.s_l)
+                    # cp.multiply(self._m_s_u, lhs.z_u, out=lhs.s_u)
+                    # cp.subtract(rhs.s_u, lhs.s_u, out=lhs.s_u)
+                    # cp.multiply(self._m_z_u_inv, lhs.s_u, out=lhs.s_u)
 
-            # cp.multiply(self._m_s_bu, lhs.z_bu, out=lhs.s_bu)
-            # cp.subtract(rhs.s_bu, lhs.s_bu, out=lhs.s_bu)
-            # cp.multiply(self._m_z_bu_inv, lhs.s_bu, out=lhs.s_bu)
+                    # cp.multiply(self._m_s_l, lhs.z_l, out=lhs.s_l)
+                    # cp.subtract(rhs.s_l, lhs.s_l, out=lhs.s_l)
+                    # cp.multiply(self._m_z_l_inv, lhs.s_l, out=lhs.s_l)
 
-            # cp.multiply(self._m_s_bl, lhs.z_bl, out=lhs.s_bl)
-            # cp.subtract(rhs.s_bl, lhs.s_bl, out=lhs.s_bl)
-            # cp.multiply(self._m_z_bl_inv, lhs.s_bl, out=lhs.s_bl)
+                    # cp.multiply(self._m_s_bu, lhs.z_bu, out=lhs.s_bu)
+                    # cp.subtract(rhs.s_bu, lhs.s_bu, out=lhs.s_bu)
+                    # cp.multiply(self._m_z_bu_inv, lhs.s_bu, out=lhs.s_bu)
 
-            wp.launch(
-                kernel=self._recover_slacks_kernel,
-                dim=data.num_hu+data.num_hl+data.num_xu+data.num_xl,
-                inputs=[rhs.s_u, lhs.z_u, self._m_s_u, self._m_z_u_inv, lhs.s_u,
-                        rhs.s_l, lhs.z_l, self._m_s_l, self._m_z_l_inv, lhs.s_l,
-                        rhs.s_bu, lhs.z_bu, self._m_s_bu, self._m_z_bu_inv, lhs.s_bu,
-                        rhs.s_bl, lhs.z_bl, self._m_s_bl, self._m_z_bl_inv, lhs.s_bl],
-                device="cuda",
-                stream=stream_wp,
-            )
+                    # cp.multiply(self._m_s_bl, lhs.z_bl, out=lhs.s_bl)
+                    # cp.subtract(rhs.s_bl, lhs.s_bl, out=lhs.s_bl)
+                    # cp.multiply(self._m_z_bl_inv, lhs.s_bl, out=lhs.s_bl)
+
+                self._recover_lhs_cuda_graphs[key] = stream_cp_capture.end_capture()
+
+            self._recover_lhs_cuda_graphs[key].launch()
 
     @nvtx.annotate("KKTSystem::eval_P_x")
     def eval_P_x(self, data: Data, alpha: float, x: cp.ndarray, z: cp.ndarray):
