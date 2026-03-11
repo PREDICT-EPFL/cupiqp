@@ -86,7 +86,7 @@ class SparseKKTSolver(KKTSolverBase):
         self._ldlt_solver.plan_config.reordering_algorithm = DirectSolverAlgType.ALG_DEFAULT
         # self._ldlt_solver.plan_config.pivot_type = PivotType.PIVOT_NONE  # ! set to no pivoting, but seems don't work since changing pivot.eps still makes a difference
         # self._ldlt_solver.factorization_config.pivot_eps = 1e-10
-        self._ldlt_solver.solution_config.ir_num_steps = 1  # ! iterative refinement steps, to be tuned
+        self._ldlt_solver.solution_config.ir_num_steps = 0  # ! iterative refinement steps, to be tuned
         
         with nvtx.annotate("SparseKKTSolver::cudss_plan"):
             plan_info = self._ldlt_solver.plan()  # precompute reordering and symbolic factorization
