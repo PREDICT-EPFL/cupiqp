@@ -266,6 +266,7 @@ class MultistageKKTSolver(KKTSolverBase):
 
     @nvtx.annotate("MultistageKKTSolver::eval_P_x")
     def eval_P_x(self, data: MultistageData, alpha: float, x: cp.ndarray, z: cp.ndarray):
+        stream_wp = wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr)
         N = self.num_stages
         d = self._block_size
         wp.launch(
@@ -278,10 +279,12 @@ class MultistageKKTSolver(KKTSolverBase):
                 wp.float64(0.0),
                 z,
             ],
+            stream=stream_wp,
         )
 
     @nvtx.annotate("MultistageKKTSolver::eval_A_xn")
     def eval_A_xn(self, data: MultistageData, alpha_n: float, xn: cp.ndarray, zn: cp.ndarray):
+        stream_wp = wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr)
         N = self.num_stages
         d = self._block_size
         # zn = alpha_n * A * xn
@@ -295,10 +298,12 @@ class MultistageKKTSolver(KKTSolverBase):
                 wp.float64(0.0),
                 zn,
             ],
+            stream=stream_wp,
         )
 
     @nvtx.annotate("MultistageKKTSolver::eval_AT_xt")
     def eval_AT_xt(self, data: MultistageData, alpha_t: float, xt: cp.ndarray, zt: cp.ndarray):
+        stream_wp = wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr)
         N = self.num_stages
         d = self._block_size
         # zt = alpha_t * A^T * xt
@@ -312,10 +317,12 @@ class MultistageKKTSolver(KKTSolverBase):
                 wp.float64(0.0),
                 zt,
             ],
+            stream=stream_wp,
         )
 
     @nvtx.annotate("MultistageKKTSolver::eval_G_xn")
     def eval_G_xn(self, data: MultistageData, alpha_n: float, xn: cp.ndarray, zn: cp.ndarray):
+        stream_wp = wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr)
         N = self.num_stages
         r_G = data._G.rows_of_blocks
         # zn = alpha_n * G * xn
@@ -329,12 +336,14 @@ class MultistageKKTSolver(KKTSolverBase):
                 wp.float64(0.0),
                 zn,
             ],
+            stream=stream_wp,
         )
 
     @nvtx.annotate("MultistageKKTSolver::eval_GT_xt")
     def eval_GT_xt(self, data: MultistageData, alpha_t: float, xt: cp.ndarray, zt: cp.ndarray):
         N = self.num_stages
         d = self._block_size
+        stream_wp = wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr)
         # zt = alpha_t * G^T * xt
         wp.launch(
             self._eval_GT_xt_kernel,
@@ -347,4 +356,5 @@ class MultistageKKTSolver(KKTSolverBase):
                 wp.float64(0.0),
                 zt,
             ],
+            stream=stream_wp,
         )
