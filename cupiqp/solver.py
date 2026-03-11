@@ -1,6 +1,6 @@
 import cupy as cp
 import warp as wp
-from typing import Tuple
+from typing import Optional, Any
 import nvtx
 
 from .settings import Settings
@@ -70,6 +70,58 @@ class SolverBase:
 
         self._mu_prev = cp.empty(1)
         self._mu_rate = cp.empty(1)
+
+        self._setup_done = True
+
+    def update(self,
+               P: Optional[Any] = None,
+               c: Optional[Any] = None,
+               A: Optional[Any] = None,
+               b: Optional[Any] = None,
+               G: Optional[Any] = None,
+               h_u: Optional[Any] = None,
+               h_l: Optional[Any] = None,
+               x_u: Optional[Any] = None,
+               x_l: Optional[Any] = None,
+               check_validity: bool = False,
+               ):
+        """Update problem data between solves without a full setup().
+
+        Only numerical values are updated; dimensions and sparsity patterns
+        must remain unchanged.  Call ``solve()`` again after ``update()``.
+
+        Args:
+            check_validity: If True, validate dimensions/sparsity of the new data.
+                   Defaults to False for maximum performance (skips D2H syncs
+                   from sparsity pattern validation in the sparse backend).
+                   The caller must ensure that the finite/infinite bound
+                   structure is unchanged (same indices have finite bounds
+                   as in ``setup()``).
+        """
+        if not self._setup_done:
+            raise RuntimeError("Solver not setup yet. Call setup() first.")
+
+        if P is not None:
+            self._data.set_P(P, check=check_validity)
+        if c is not None:
+            self._data.set_c(c, check=check_validity)
+        if A is not None:
+            self._data.set_A(A, check=check_validity)
+        if b is not None:
+            self._data.set_b(b, check=check_validity)
+        if G is not None:
+            self._data.set_G(G, check=check_validity)
+        if h_u is not None:
+            self._data.set_h_u(h_u, check=check_validity)
+        if h_l is not None:
+            self._data.set_h_l(h_l, check=check_validity)
+        if x_u is not None:
+            self._data.set_x_u(x_u, check=check_validity)
+        if x_l is not None:
+            self._data.set_x_l(x_l, check=check_validity)
+
+        self._data._compute_constraints_rhs_inf_norm()
+        self._kkt_system.update_data(self._data, P is not None, A is not None, G is not None)
 
     def solve(self) -> Status:
         if self.settings.verbose:
