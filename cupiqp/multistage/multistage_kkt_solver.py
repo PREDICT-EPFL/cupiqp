@@ -91,6 +91,19 @@ class MultistageKKTSolver(KKTSolverBase):
             self._eval_G_xn_kernel = create_block_bidiag_gemv_n_kernel(N, data._G.rows_of_blocks, d, wp.float64)
             self._eval_GT_xt_kernel = create_block_bidiag_gemv_t_kernel(N, data._G.rows_of_blocks, d, wp.float64)
 
+    def update_data(self, data: MultistageData, update_P: bool, update_A: bool, update_G: bool):
+        if update_A and data.p > 0:
+            stream = wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr)
+            wp.launch(
+                kernel=self._eval_AT_A_kernel,
+                dim=(self.num_stages, self._block_size, self._block_size),
+                inputs=[
+                    wp.float64(1.0), data._A.D, data._A.E,
+                    wp.float64(0.0), self._AtA_diag, self._AtA_offdiag,
+                ],
+                stream=stream,
+            )
+
     @nvtx.annotate("MultistageKKTSolver::update_kkt")
     def update_kkt(self, data: MultistageData, delta: float, x_reg: cp.ndarray, z_reg: cp.ndarray) -> None:
         """
