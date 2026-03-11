@@ -18,8 +18,11 @@ class SolverBase:
         self._res_nr = Variables()  # used to store the non-regularized residuals
         self._res = Variables()  # used to store the regularized residuals
         self._prox_vars = Variables()  # used to store the proximal variables
+        self._kkt_system = KKTSystem()
 
-        self._kkt_system = None
+    @property
+    def result(self):
+        return self._result
     
     @nvtx.annotate("Solver::setup")
     def setup(self, P, c, A, b, G, h_u, h_l, x_u, x_l):
@@ -44,7 +47,7 @@ class SolverBase:
         self._res.init(self._data)
         self._prox_vars.init(self._data)
 
-        self._kkt_system = KKTSystem(self._data, self.settings)
+        self._kkt_system.init(self._data, self.settings)
 
         self._work_z_1 = cp.empty(self._data.m)  # used to store intermediate results in _update_residuals_nr
         self._work_z_2 = cp.empty(self._data.m)  # used to store intermediate results in _update_residuals_nr

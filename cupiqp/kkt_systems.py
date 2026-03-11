@@ -17,75 +17,83 @@ class KKTSystem:
     """
     The KKT system handles the full KKT condition.
     """
-    def __init__(self, data: Data, settings: Settings):
-        self._data = data
-        self._x_reg = cp.nan * cp.ones(self._data.n)
-        self._z_reg = cp.nan * cp.ones(self._data.m)
+    def __init__(self):
+        return
+    
+    def init(self, data: Data, settings: Settings):
+        self._settings = settings
 
-        self._work_x = cp.nan * cp.zeros(self._data.n)
-        self._work_z = cp.nan * cp.zeros(self._data.m)
+        self._x_reg = cp.nan * cp.ones(data.n)
+        self._z_reg = cp.nan * cp.ones(data.m)
+
+        self._work_x = cp.nan * cp.zeros(data.n)
+        self._work_z = cp.nan * cp.zeros(data.m)
 
         if settings.kkt_solver == "sparse_ldlt":
-            self._kkt_solver = SparseKKTSolver(self._data)
+            self._kkt_solver = SparseKKTSolver(data)
         elif settings.kkt_solver == "dense_cholesky":
-            self._kkt_solver = DenseKKTSolver(self._data)
+            self._kkt_solver = DenseKKTSolver(data)
         elif settings.kkt_solver == "multistage_block_cholesky":
-            self._kkt_solver = MultistageKKTSolver(self._data, settings.multistage_block_size)
+            self._kkt_solver = MultistageKKTSolver(data, settings.multistage_block_size)
         else:
             raise ValueError(f"Unsupported kkt_solver: {settings.kkt_solver}")
 
         # store the value of slack and dual variables value at this iteration, will be used in recovering the slack step: S*delta_z + Z*delta_s = r_s
         # allocate for max possible size, but we will only use part of them according to idx_hu and idx_hl. 
-        self._m_s_u = cp.zeros(self._data.num_hu)
-        self._m_s_l = cp.zeros(self._data.num_hl)
-        self._m_z_u_inv = cp.zeros(self._data.num_hu)
-        self._m_z_l_inv = cp.zeros(self._data.num_hl)
+        self._m_s_u = cp.zeros(data.num_hu)
+        self._m_s_l = cp.zeros(data.num_hl)
+        self._m_z_u_inv = cp.zeros(data.num_hu)
+        self._m_z_l_inv = cp.zeros(data.num_hl)
         # allocate for max possible size, but we will only use part of them according to idx_xu and idx_xl. 
         # TODO: can be optimized later to reduce memory usage
-        self._m_s_bu = cp.zeros(self._data.num_xu)
-        self._m_s_bl = cp.zeros(self._data.num_xl)
-        self._m_z_bu_inv = cp.zeros(self._data.num_xu)
-        self._m_z_bl_inv = cp.zeros(self._data.num_xl)
+        self._m_s_bu = cp.zeros(data.num_xu)
+        self._m_s_bl = cp.zeros(data.num_xl)
+        self._m_z_bu_inv = cp.zeros(data.num_xu)
+        self._m_z_bl_inv = cp.zeros(data.num_xl)
 
         # pre-allocate memory for some variables used in factor and solve
-        self._w_u_delta_inv = cp.zeros(self._data.num_hu)   # store 1./(s_u / z_u + delta)
-        self._w_l_delta_inv = cp.zeros(self._data.num_hl)   # store 1./(s_l / z_l + delta)
-        self._w_bu_delta_inv = cp.zeros(self._data.num_xu)  # store 1./(s_bu / z_bu + delta)
-        self._w_bl_delta_inv = cp.zeros(self._data.num_xl)  # store 1./(s_bl / z_bl + delta)
+        self._w_u_delta_inv = cp.zeros(data.num_hu)   # store 1./(s_u / z_u + delta)
+        self._w_l_delta_inv = cp.zeros(data.num_hl)   # store 1./(s_l / z_l + delta)
+        self._w_bu_delta_inv = cp.zeros(data.num_xu)  # store 1./(s_bu / z_bu + delta)
+        self._w_bl_delta_inv = cp.zeros(data.num_xl)  # store 1./(s_bl / z_bl + delta)
 
         # pre-allocate memory for some variables used to store updated rhs in solve
-        self._updated_rhs_z_u = cp.zeros(self._data.num_hu)
-        self._updated_rhs_z_l = cp.zeros(self._data.num_hl)
-        self._updated_rhs_z_bu = cp.zeros(self._data.num_xu)
-        self._updated_rhs_z_bl = cp.zeros(self._data.num_xl)
+        self._updated_rhs_z_u = cp.zeros(data.num_hu)
+        self._updated_rhs_z_l = cp.zeros(data.num_hl)
+        self._updated_rhs_z_bu = cp.zeros(data.num_xu)
+        self._updated_rhs_z_bl = cp.zeros(data.num_xl)
 
         # create kernels
-        self._update_regulerization_step_1_kernel = create_update_regularizations_step_1_kernel(self._data.num_hu, self._data.num_hl, self._data.num_xu, self._data.num_xl)
-        self._update_regulerization_step_2_kernel = create_update_regularizations_step_2_kernel(self._data.n, self._data.m)
-        self._eliminate_slacks_kernel = create_eliminate_slacks_kernel(self._data.num_hu, self._data.num_hl, self._data.num_xu, self._data.num_xl)
-        self._eliminate_duals_kernel = create_eliminate_duals_kernel(self._data.n, self._data.m)
-        self._recover_duals_kernel = create_recover_duals_kernel(self._data.num_hu, self._data.num_hl, self._data.num_xu, self._data.num_xl)
-        self._recover_slacks_kernel = create_recover_slacks_kernel(self._data.num_hu, self._data.num_hl, self._data.num_xu, self._data.num_xl)
+        self._update_regulerization_step_1_kernel = create_update_regularizations_step_1_kernel(data.num_hu, data.num_hl, data.num_xu, data.num_xl)
+        self._update_regulerization_step_2_kernel = create_update_regularizations_step_2_kernel(data.n, data.m)
+        self._eliminate_slacks_kernel = create_eliminate_slacks_kernel(data.num_hu, data.num_hl, data.num_xu, data.num_xl)
+        self._eliminate_duals_kernel = create_eliminate_duals_kernel(data.n, data.m)
+        self._recover_duals_kernel = create_recover_duals_kernel(data.num_hu, data.num_hl, data.num_xu, data.num_xl)
+        self._recover_slacks_kernel = create_recover_slacks_kernel(data.num_hu, data.num_hl, data.num_xu, data.num_xl)
 
         # Precompute inverse index maps for gather-pattern kernels.
         # inv_idx_xu[j] = i such that idx_xu[i] == j, or -1 if variable j has no upper bound.
         _build_inv_idx_kernel = create_build_inverse_index_kernel()
-        self._inv_idx_xu = wp.full(self._data.n, value=-1, dtype=wp.int32, device="cuda")
-        self._inv_idx_xl = wp.full(self._data.n, value=-1, dtype=wp.int32, device="cuda")
-        self._inv_idx_hu = wp.full(self._data.m, value=-1, dtype=wp.int32, device="cuda") if self._data.m > 0 else wp.zeros(0, dtype=wp.int32, device="cuda")
-        self._inv_idx_hl = wp.full(self._data.m, value=-1, dtype=wp.int32, device="cuda") if self._data.m > 0 else wp.zeros(0, dtype=wp.int32, device="cuda")
-        if self._data.num_xu > 0:
-            wp.launch(_build_inv_idx_kernel, dim=self._data.num_xu,
-                      inputs=[self._data.idx_xu, self._inv_idx_xu], device="cuda")
-        if self._data.num_xl > 0:
-            wp.launch(_build_inv_idx_kernel, dim=self._data.num_xl,
-                      inputs=[self._data.idx_xl, self._inv_idx_xl], device="cuda")
-        if self._data.num_hu > 0:
-            wp.launch(_build_inv_idx_kernel, dim=self._data.num_hu,
-                      inputs=[self._data.idx_hu, self._inv_idx_hu], device="cuda")
-        if self._data.num_hl > 0:
-            wp.launch(_build_inv_idx_kernel, dim=self._data.num_hl,
-                      inputs=[self._data.idx_hl, self._inv_idx_hl], device="cuda")
+        self._inv_idx_xu = wp.full(data.n, value=-1, dtype=wp.int32, device="cuda")
+        self._inv_idx_xl = wp.full(data.n, value=-1, dtype=wp.int32, device="cuda")
+        self._inv_idx_hu = wp.full(data.m, value=-1, dtype=wp.int32, device="cuda") if data.m > 0 else wp.zeros(0, dtype=wp.int32, device="cuda")
+        self._inv_idx_hl = wp.full(data.m, value=-1, dtype=wp.int32, device="cuda") if data.m > 0 else wp.zeros(0, dtype=wp.int32, device="cuda")
+        if data.num_xu > 0:
+            wp.launch(_build_inv_idx_kernel, dim=data.num_xu,
+                      inputs=[data.idx_xu, self._inv_idx_xu], device="cuda")
+        if data.num_xl > 0:
+            wp.launch(_build_inv_idx_kernel, dim=data.num_xl,
+                      inputs=[data.idx_xl, self._inv_idx_xl], device="cuda")
+        if data.num_hu > 0:
+            wp.launch(_build_inv_idx_kernel, dim=data.num_hu,
+                      inputs=[data.idx_hu, self._inv_idx_hu], device="cuda")
+        if data.num_hl > 0:
+            wp.launch(_build_inv_idx_kernel, dim=data.num_hl,
+                      inputs=[data.idx_hl, self._inv_idx_hl], device="cuda")
+            
+    @nvtx.annotate("KKTSystem::update_data")
+    def update_data(self, data: Data, update_P: bool = False, update_A: bool = False, update_G: bool = False):
+        self._kkt_solver.update_data(data, update_P, update_A, update_G)
 
     @nvtx.annotate("KKTSystem::update_scalings_and_factor")
     def update_scalings_and_factor(self, data: Data, rho: cp.ndarray, delta: cp.ndarray, vars: Variables) -> bool:
@@ -119,7 +127,7 @@ class KKTSystem:
                     if USE_WARP_IMPLEMENTATION:
                         wp.launch(
                             kernel=self._update_regulerization_step_1_kernel,
-                            dim=self._data.num_hu + self._data.num_hl + self._data.num_xu + self._data.num_xl,
+                            dim=data.num_hu + data.num_hl + data.num_xu + data.num_xl,
                             inputs=[vars.s_u, vars.s_l, vars.s_bu, vars.s_bl,
                                     vars.z_u, vars.z_l, vars.z_bu, vars.z_bl,
                                     self._m_s_u, self._m_s_l, self._m_s_bu, self._m_s_bl,
@@ -132,7 +140,7 @@ class KKTSystem:
 
                         wp.launch(
                             kernel=self._update_regulerization_step_2_kernel,
-                            dim=self._data.n + self._data.m,
+                            dim=data.n + data.m,
                             inputs=[
                                 self._inv_idx_xu,
                                 self._inv_idx_xl,
@@ -219,7 +227,7 @@ class KKTSystem:
 
             wp.launch(
                 kernel=self._eliminate_slacks_kernel,
-                dim=self._data.num_hu+self._data.num_hl+self._data.num_xu+self._data.num_xl,
+                dim=data.num_hu+data.num_hl+data.num_xu+data.num_xl,
                 inputs=[rhs.z_u, rhs.s_u, self._m_z_u_inv, self._updated_rhs_z_u,
                         rhs.z_l, rhs.s_l, self._m_z_l_inv, self._updated_rhs_z_l,
                         rhs.z_bu, rhs.s_bu, self._m_z_bu_inv, self._updated_rhs_z_bu,
@@ -261,7 +269,7 @@ class KKTSystem:
 
             wp.launch(
                 kernel=self._eliminate_duals_kernel,
-                dim=self._data.n + self._data.m,
+                dim=data.n + data.m,
                 inputs=[
                     # inverse index maps
                     self._inv_idx_xu,
@@ -322,13 +330,13 @@ class KKTSystem:
 
             wp.launch(
                 kernel=self._recover_duals_kernel,
-                dim=self._data.num_hu+self._data.num_hl+self._data.num_xu+self._data.num_xl,
+                dim=data.num_hu+data.num_hl+data.num_xu+data.num_xl,
                 inputs=[
                     self._work_z, lhs.x,
-                    self._data.idx_hu, self._w_u_delta_inv, self._updated_rhs_z_u, lhs.z_u,
-                    self._data.idx_hl, self._w_l_delta_inv, self._updated_rhs_z_l, lhs.z_l,
-                    self._data.idx_xu, self._w_bu_delta_inv, self._m_z_bu_inv, rhs.z_bu, rhs.s_bu, lhs.z_bu,
-                    self._data.idx_xl, self._w_bl_delta_inv, self._m_z_bl_inv, rhs.z_bl, rhs.s_bl, lhs.z_bl],
+                    data.idx_hu, self._w_u_delta_inv, self._updated_rhs_z_u, lhs.z_u,
+                    data.idx_hl, self._w_l_delta_inv, self._updated_rhs_z_l, lhs.z_l,
+                    data.idx_xu, self._w_bu_delta_inv, self._m_z_bu_inv, rhs.z_bu, rhs.s_bu, lhs.z_bu,
+                    data.idx_xl, self._w_bl_delta_inv, self._m_z_bl_inv, rhs.z_bl, rhs.s_bl, lhs.z_bl],
                 device="cuda",
                 stream=stream_wp,
             )
@@ -359,7 +367,7 @@ class KKTSystem:
 
             wp.launch(
                 kernel=self._recover_slacks_kernel,
-                dim=self._data.num_hu+self._data.num_hl+self._data.num_xu+self._data.num_xl,
+                dim=data.num_hu+data.num_hl+data.num_xu+data.num_xl,
                 inputs=[rhs.s_u, lhs.z_u, self._m_s_u, self._m_z_u_inv, lhs.s_u,
                         rhs.s_l, lhs.z_l, self._m_s_l, self._m_z_l_inv, lhs.s_l,
                         rhs.s_bu, lhs.z_bu, self._m_s_bu, self._m_z_bu_inv, lhs.s_bu,
@@ -411,15 +419,15 @@ class KKTSystem:
         """
         NOTICE: this method is only for testing purpose. It returns the full KKT matrix with given rho and delta
         """
-        n, p, m = self._data.n, self._data.p, self._data.m
-        data = self._data
-        kkt_mat = cp.zeros((self._data.n + self._data.p + 4*self._data.m + 2*(self._data.num_xl + self._data.num_xu),
-                            self._data.n + self._data.p + 4*self._data.m + 2*(self._data.num_xl + self._data.num_xu)))
+        n, p, m = data.n, data.p, data.m
+        data = data
+        kkt_mat = cp.zeros((data.n + data.p + 4*data.m + 2*(data.num_xl + data.num_xu),
+                            data.n + data.p + 4*data.m + 2*(data.num_xl + data.num_xu)))
         
         # fill in P, A related parts
-        kkt_mat[:n, :n] = self._data.P + rho * cp.eye(n)
-        kkt_mat[n:n+p, :n] = self._data.A
-        kkt_mat[:n, n:n+p] = self._data.A.T
+        kkt_mat[:n, :n] = data.P + rho * cp.eye(n)
+        kkt_mat[n:n+p, :n] = data.A
+        kkt_mat[:n, n:n+p] = data.A.T
         kkt_mat[n:n+p, n:n+p] = -delta * cp.eye(p)
 
         # fill in G related parts
@@ -469,34 +477,34 @@ class KKTSystem:
         """
         Only for testing purpose: return the KKT solution for given rhs
         """
-        n, p, m = self._data.n, self._data.p, self._data.m
+        n, p, m = data.n, data.p, data.m
         kkt_mat = self.kkt_matrix(rho, delta, vars)
         rhs_vector = cp.hstack((rhs.x, rhs.y, rhs.z_u, rhs.z_l, rhs.z_bu, rhs.z_bl, rhs.s_u, rhs.s_l, rhs.s_bu, rhs.s_bl))
         sol =  cp.linalg.solve(kkt_mat, rhs_vector)
         assert cp.abs(cp.max(kkt_mat @ sol - rhs_vector)) < 1e-8, "KKT solution verification failed!"
-        lhs = Variables(n, p, m, self._data.num_xu, self._data.num_xl)
+        lhs = Variables(n, p, m, data.num_xu, data.num_xl)
         lhs.x = sol[:n]
         lhs.y = sol[n:n + p]
         lhs.z_u = sol[n + p:n + p + m]
         lhs.z_l = sol[n + p + m:n + p + 2*m]
 
         idx = n + p + 2*m
-        lhs.z_bu = sol[idx : idx + self._data.num_xu]
+        lhs.z_bu = sol[idx : idx + data.num_xu]
 
-        idx += self._data.num_xu
-        lhs.z_bl = sol[idx : idx + self._data.num_xl]
+        idx += data.num_xu
+        lhs.z_bl = sol[idx : idx + data.num_xl]
 
-        idx += self._data.num_xl
+        idx += data.num_xl
         lhs.s_u = sol[idx : idx + m]
 
         idx += m
         lhs.s_l = sol[idx : idx + m]
 
         idx += m
-        lhs.s_bu = sol[idx : idx + self._data.num_xu]
+        lhs.s_bu = sol[idx : idx + data.num_xu]
 
-        idx += self._data.num_xu
-        lhs.s_bl = sol[idx : idx + self._data.num_xl]
+        idx += data.num_xu
+        lhs.s_bl = sol[idx : idx + data.num_xl]
 
         return lhs
     

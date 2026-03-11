@@ -145,10 +145,24 @@ class MultistageData(Data):
             self._x_l_block = None
             self._x_l = None
 
-        # ---- Preprocessing (reuses inherited set_h_l / set_h_u / set_x_l / set_x_u) ----
+        # preprocessing (reuses inherited _init_h_l / _init_h_u / _init_x_l / _init_x_u)
         self._preprocess()
         self._constraints_rhs_inf_norm = cp.empty(1, dtype=cp.float64)
         self._compute_constraints_rhs_inf_norm()
+
+        # Cache flat DLPack views for allocation-free update() path.
+        # These point directly into the Warp block data buffers.
+        self._c_flat_view = self._block_vec_to_flat(self._c_block)
+        if self._b_block is not None:
+            self._b_flat_view = self._block_vec_to_flat(self._b_block)
+        if self._h_l_block is not None:
+            self._h_l_flat_view = self._block_vec_to_flat(self._h_l_block)
+        if self._h_u_block is not None:
+            self._h_u_flat_view = self._block_vec_to_flat(self._h_u_block)
+        if self._x_l_block is not None:
+            self._x_l_flat_view = self._block_vec_to_flat(self._x_l_block)
+        if self._x_u_block is not None:
+            self._x_u_flat_view = self._block_vec_to_flat(self._x_u_block)
 
     @property
     def n(self):
@@ -207,6 +221,43 @@ class MultistageData(Data):
 
         self._h_l[inf_mask] = -1.0
         self._h_u[inf_mask] = 1.0
+
+    def set_P(self, value: BlockTridiagMat, check: bool = True):
+        wp.copy(self._P.diag_blocks.data, value.diag_blocks.data)
+        wp.copy(self._P.off_diag_blocks_lower.data, value.off_diag_blocks_lower.data)
+
+    def set_c(self, value: BlockVec, check: bool = True):
+        wp.copy(self._c_block.data, value.data)
+        # In-place update: _c_flat_view reflects updated Warp buffer (zero-copy)
+        self._c[:] = self._c_flat_view
+
+    def set_A(self, value: BlockBidiagMat, check: bool = True):
+        wp.copy(self._A.D, value.D)
+        wp.copy(self._A.E, value.E)
+
+    def set_b(self, value: BlockVec, check: bool = True):
+        wp.copy(self._b_block.data, value.data)
+        self._b[:] = self._b_flat_view
+
+    def set_G(self, value: BlockBidiagMat, check: bool = True):
+        wp.copy(self._G.D, value.D)
+        wp.copy(self._G.E, value.E)
+
+    def set_h_l(self, value: BlockVec, check: bool = True):
+        wp.copy(self._h_l_block.data, value.data)
+        self._h_l[:] = self._h_l_flat_view
+
+    def set_h_u(self, value: BlockVec, check: bool = True):
+        wp.copy(self._h_u_block.data, value.data)
+        self._h_u[:] = self._h_u_flat_view
+
+    def set_x_l(self, value: BlockVec, check: bool = True):
+        wp.copy(self._x_l_block.data, value.data)
+        self._x_l[:] = self._x_l_flat_view
+
+    def set_x_u(self, value: BlockVec, check: bool = True):
+        wp.copy(self._x_u_block.data, value.data)
+        self._x_u[:] = self._x_u_flat_view
 
     @staticmethod
     def _block_vec_to_flat(bv: BlockVec) -> cp.ndarray:

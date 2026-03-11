@@ -1,24 +1,98 @@
-from typing import Optional
+from typing import Optional, Union
 import cupy as cp
-from cupyx.scipy.sparse import csr_matrix, csc_matrix
+from cupyx.scipy.sparse import csr_matrix, isspmatrix_csr
 
 
 from ..data import Data
+
 
 class SparseData(Data):
     """
     Sparse data structure for optimization problems.
     """
-    def __init__(self, 
-                 P: csr_matrix, 
-                 q: cp.ndarray, 
-                 A: Optional[csr_matrix] = None, 
-                 b: Optional[cp.ndarray] = None, 
-                 G: Optional[csr_matrix] = None, 
+    def __init__(self,
+                 P: csr_matrix,
+                 c: cp.ndarray,
+                 A: Optional[csr_matrix] = None,
+                 b: Optional[cp.ndarray] = None,
+                 G: Optional[csr_matrix] = None,
                  h_u: Optional[cp.ndarray] = None,
                  h_l: Optional[cp.ndarray] = None,
                  x_u: Optional[cp.ndarray] = None,
                  x_l: Optional[cp.ndarray] = None):
-        super().__init__(P, q, A, b, G, h_u, h_l, x_u, x_l)
-        # Additional initialization for sparse data can be added here
-    
+        super().__init__(P, c, A, b, G, h_u, h_l, x_u, x_l)
+
+    @staticmethod
+    def _as_float64_mat(M: Union[csr_matrix, None]) -> csr_matrix:
+        return csr_matrix(M, dtype=cp.float64) if M is not None else csr_matrix((0, 0), dtype=cp.float64)
+
+    @staticmethod
+    def _check_same_sparsity(old: csr_matrix, new: csr_matrix):
+        """Raise ValueError if sparsity pattern (indptr, indices) changed.
+
+        NOTE: cp.array_equal causes D2H synchronisation.  Pass check=False
+        to the set_* methods in the hot path to skip this validation.
+        """
+        if not isspmatrix_csr(new):
+            raise ValueError(f"Expected csr_matrix, got {type(new)}")
+        if new.shape != old.shape:
+            raise ValueError(f"Shape changed: expected {old.shape}, got {new.shape}")
+        if new.nnz != old.nnz:
+            raise ValueError(f"Nnz changed: expected {old.nnz}, got {new.nnz}")
+        if not cp.array_equal(new.indptr, old.indptr):
+            raise ValueError("Sparsity pattern changed (indptr mismatch)")
+        if not cp.array_equal(new.indices, old.indices):
+            raise ValueError("Sparsity pattern changed (indices mismatch)")
+        
+    @staticmethod
+    def _check_same_dimension(old: cp.ndarray, new: cp.ndarray):
+        """Raise ValueError if dimension changed.  Check is optional (default: True)."""
+        if new.shape != old.shape:
+            raise ValueError(
+                f"Dimension changed: expected {old.shape}, got {new.shape}"
+            )
+
+    def set_P(self, value: csr_matrix, check: bool = True):
+        if check:
+            self._check_same_sparsity(self._P, value)
+        self._P.data[:] = value.data
+
+    def set_c(self, value: cp.ndarray, check: bool = True):
+        if check:
+            self._check_same_dimension(self._c, value)
+        self._c[:] = value
+
+    def set_A(self, value: csr_matrix, check: bool = True):
+        if check:
+            self._check_same_sparsity(self._A, value)
+        self._A.data[:] = value.data
+
+    def set_b(self, value: cp.ndarray, check: bool = True):
+        if check:
+            self._check_same_dimension(self._b, value)
+        self._b[:] = value
+
+    def set_G(self, value: csr_matrix, check: bool = True):
+        if check:
+            self._check_same_sparsity(self._G, value)
+        self._G.data[:] = value.data
+
+    def set_h_l(self, value: cp.ndarray, check: bool = True):
+        if check:
+            self._check_same_dimension(self._h_l, value)
+        self._h_l[:] = value
+
+    def set_h_u(self, value: cp.ndarray, check: bool = True):
+        if check:
+            self._check_same_dimension(self._h_u, value)
+        self._h_u[:] = value
+
+    def set_x_l(self, value: cp.ndarray, check: bool = True):
+        if check:
+            self._check_same_dimension(self._x_l, value)
+        self._x_l[:] = value
+
+    def set_x_u(self, value: cp.ndarray, check: bool = True):
+        if check:
+            self._check_same_dimension(self._x_u, value)
+        self._x_u[:] = value

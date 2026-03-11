@@ -1,4 +1,7 @@
 from typing import Optional
+import os
+import importlib.util
+import numpy as np
 import cupy as cp
 from cupyx.scipy.sparse import csr_matrix, diags, bmat
 from nvmath.sparse.advanced import (
@@ -17,6 +20,29 @@ from ..kkt_solver import KKTSolverBase
 from .sparse_data import SparseData
 from .sparse_matvec import SparseMatVecProduct
 
+
+def _find_cudss_mt_lib():
+    """Auto-discover the cuDSS multithreading layer library.
+
+    Searches across CUDA version packages (nvidia.cu11, nvidia.cu12, nvidia.cu13, ...)
+    since the package name depends on the installed CUDA toolkit version.
+    """
+    for cuda_version in range(13, 10, -1):  # try 13, 12, 11
+        spec = importlib.util.find_spec(f"nvidia.cu{cuda_version}")
+        if spec is None:
+            continue
+        # nvidia.cuXX is a namespace package (no __init__.py), so spec.origin is None.
+        # Use submodule_search_locations to find the package directory instead.
+        search_paths = spec.submodule_search_locations
+        if search_paths:
+            for base in search_paths:
+                lib = os.path.join(base, "lib", "libcudss_mtlayer_gomp.so.0")
+                if os.path.isfile(lib):
+                    return lib
+    return None
+
+_CUDSS_MT_LIB = _find_cudss_mt_lib()
+
 class SparseKKTSolver(KKTSolverBase):
     """
     Sparse KKT solver with LDLT factorization.
@@ -26,12 +52,22 @@ class SparseKKTSolver(KKTSolverBase):
         self._kkt_mat = self._initialize_kkt_csr(data.P, data.A, data.G)
         self._rhs = cp.zeros(self._kkt_mat.shape[0], dtype=cp.float64)
         self._sol = cp.zeros(self._kkt_mat.shape[0], dtype=cp.float64)
+        n, p, m = data.n, data.p, data.m
 
         # pre-compute diagonal indices for efficient in-place updates
-        self._diag_x_indices = cp.empty(data.n, dtype=cp.int32)
-        self._diag_y_indices = cp.empty(data.p, dtype=cp.int32)
-        self._diag_z_indices = cp.empty(data.m, dtype=cp.int32)
+        self._diag_x_indices = cp.empty(n, dtype=cp.int32)
+        self._diag_y_indices = cp.empty(p, dtype=cp.int32)
+        self._diag_z_indices = cp.empty(m, dtype=cp.int32)
         self._find_diagonal_indices()
+
+        # pre-compute block-to-KKT index maps for update_data()
+        self._P_indices = self._build_block_index_map(data.P, self._kkt_mat, 0, 0)
+        if p > 0:
+            self._A_indices = self._build_block_index_map(data.A, self._kkt_mat, n, 0)
+            self._AT_indices = self._build_transpose_index_map(data.A, self._kkt_mat, 0, n)
+        if m > 0:
+            self._G_indices = self._build_block_index_map(data.G, self._kkt_mat, n + p, 0)
+            self._GT_indices = self._build_transpose_index_map(data.G, self._kkt_mat, 0, n + p)
 
         # setup spmv operator for evaluating P, A, G matvecs
         self._spmv_P = SparseMatVecProduct(data.P, transa=False)
@@ -42,8 +78,9 @@ class SparseKKTSolver(KKTSolverBase):
 
         # setup cuDSS solver
         # TODO: can change this to LOWER if only update lower part of KKT
-        opts = DirectSolverOptions(sparse_system_type=DirectSolverMatrixType.SYMMETRIC, 
-                                   sparse_system_view=DirectSolverMatrixViewType.FULL)
+        opts = DirectSolverOptions(sparse_system_type=DirectSolverMatrixType.SYMMETRIC,
+                                   sparse_system_view=DirectSolverMatrixViewType.FULL,
+                                   multithreading_lib=_CUDSS_MT_LIB)
         exe = ExecutionHybrid()  # allow both CPU and GPU execution. Optional: ExecutionCUDA()
         self._ldlt_solver = DirectSolver(a=self._kkt_mat, b=self._rhs, options=opts, execution=exe)
         self._ldlt_solver.plan_config.reordering_algorithm = DirectSolverAlgType.ALG_DEFAULT
@@ -67,6 +104,79 @@ class SparseKKTSolver(KKTSolverBase):
             self._ldlt_solver = None
 
     @staticmethod
+    def _build_block_index_map(block: csr_matrix, kkt: csr_matrix,
+                               row_offset: int, col_offset: int) -> cp.ndarray:
+        """Map each non-zero of *block* to its position in *kkt*.data.
+
+        ``block[i, j]`` sits at ``kkt[row_offset + i, col_offset + j]``.
+        Returns a cupy int32 array of length ``block.nnz``.
+        """
+        b_indptr = block.indptr.get()
+        b_indices = block.indices.get()
+        k_indptr = kkt.indptr.get()
+        k_indices = kkt.indices.get()
+
+        idx_map = np.empty(block.nnz, dtype=np.int32)
+
+        for i in range(block.shape[0]):
+            kkt_row = row_offset + i
+            kkt_start = k_indptr[kkt_row]
+            kkt_end = k_indptr[kkt_row + 1]
+            kkt_cols = k_indices[kkt_start:kkt_end]
+
+            for k in range(b_indptr[i], b_indptr[i + 1]):
+                target_col = col_offset + b_indices[k]
+                local_pos = np.searchsorted(kkt_cols, target_col)
+                idx_map[k] = kkt_start + local_pos
+
+        return cp.asarray(idx_map)
+
+    @staticmethod
+    def _build_transpose_index_map(block: csr_matrix, kkt: csr_matrix,
+                                   row_offset: int, col_offset: int) -> cp.ndarray:
+        """Map each non-zero of *block* to the transposed position in *kkt*.data.
+
+        ``block[i, j]`` (value ``block.data[k]``) corresponds to
+        ``kkt[row_offset + j, col_offset + i]``  (the A^T / G^T entry).
+        Returns a cupy int32 array of length ``block.nnz``.
+        """
+        b_indptr = block.indptr.get()
+        b_indices = block.indices.get()
+        k_indptr = kkt.indptr.get()
+        k_indices = kkt.indices.get()
+
+        idx_map = np.empty(block.nnz, dtype=np.int32)
+
+        for i in range(block.shape[0]):
+            for k in range(b_indptr[i], b_indptr[i + 1]):
+                j = b_indices[k]
+                # transposed: kkt[row_offset + j, col_offset + i]
+                kkt_row = row_offset + j
+                kkt_start = k_indptr[kkt_row]
+                kkt_end = k_indptr[kkt_row + 1]
+                kkt_cols = k_indices[kkt_start:kkt_end]
+                local_pos = np.searchsorted(kkt_cols, col_offset + i)
+                idx_map[k] = kkt_start + local_pos
+
+        return cp.asarray(idx_map)
+
+    def update_data(self, data: SparseData, update_P: bool, update_A: bool, update_G: bool) -> None:
+        """Update the sparse KKT matrix when P, A, or G values change.
+
+        Uses precomputed index maps to scatter new values into the
+        correct positions of ``_kkt_mat.data`` without rebuilding the
+        full matrix.
+        """
+        if update_P:
+            self._kkt_mat.data[self._P_indices] = data.P.data
+        if update_A:
+            self._kkt_mat.data[self._A_indices] = data.A.data
+            self._kkt_mat.data[self._AT_indices] = data.A.data
+        if update_G:
+            self._kkt_mat.data[self._G_indices] = data.G.data
+            self._kkt_mat.data[self._GT_indices] = data.G.data
+
+    @staticmethod
     def _initialize_kkt_csr(P: csr_matrix, A: Optional[csr_matrix] = None, G: Optional[csr_matrix] = None) -> csr_matrix:
         """
         Initialize the KKT matrix based on the sparsity of P, A, G.
@@ -84,7 +194,7 @@ class SparseKKTSolver(KKTSolverBase):
         # Sparse diagonal placeholders (avoid cp.diag / cp.eye which create dense matrices)
         # Keep a diagonal entry present in each block so setdiag() won't change sparsity.
         P_diag_abs_max = cp.max(cp.abs(P.diagonal()))  # ensure diagonal exists
-        
+
         In = diags(2 * P_diag_abs_max * cp.ones(n, dtype=cp.float64), 0, shape=(n, n), format="csr")  # make sure the diagonal entries of P+In are non-zero
         Ip = diags(cp.ones(p, dtype=cp.float64), 0, shape=(p, p), format="csr") if p else None
         Im = diags(cp.ones(m, dtype=cp.float64), 0, shape=(m, m), format="csr") if m else None
