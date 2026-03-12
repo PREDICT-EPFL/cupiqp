@@ -141,6 +141,7 @@ function main(; problem_name::String = "", n_runs::Int = 10)
     warmup_settings = Clarabel.Settings(
         direct_solve_method = :cudss,
         verbose = true,
+        iterative_refinement_enable = false  # NOTE: disable iterative refinement for fair comparison with cupiqp
     )
 
     solver = Clarabel.Solver(P_cl, q_cl, A_cl, b_cl, cones, warmup_settings)
@@ -148,6 +149,8 @@ function main(; problem_name::String = "", n_runs::Int = 10)
     # Warmup / profiling solve (verbose)
     Clarabel.solve!(solver)
     solver.settings.verbose = false
+    solver.settings.direct_solve_method = :cudss
+    solver.settings.iterative_refinement_enable = false
 
     if n_runs == 0
         CUDA.synchronize()
