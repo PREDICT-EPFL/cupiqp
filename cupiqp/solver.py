@@ -207,7 +207,18 @@ class SolverBase:
                     self._result.info.status = Status.PIQP_DUAL_INFEASIBLE
                     return self._result.info.status
                 
-
+                # avoid possibility of converging to a local minimum -> decrease the minimum regularization value
+                if ((self._result.info.no_primal_update > self.settings.reg_finetune_primal_update_threshold and
+                    self._result.info.rho[0] == self._result.info.reg_limit[0] and
+                    self._result.info.reg_limit[0] != self.settings.reg_finetune_lower_limit) or
+                    (self._result.info.no_dual_update > self.settings.reg_finetune_dual_update_threshold and
+                    self._result.info.delta[0] == self._result.info.reg_limit[0] and
+                    self._result.info.reg_limit[0] != self.settings.reg_finetune_lower_limit)):
+                    if (self._result.info.dual_prox_inf < self.settings.infeasibility_threshold and self._result.info.primal_prox_inf < self.settings.infeasibility_threshold):
+                        self._result.info.reg_limit[0] = self.settings.reg_finetune_lower_limit
+                        self._result.info.no_primal_update = 0
+                        self._result.info.no_dual_update = 0
+                
                 if self.settings.verbose:
                     self._print_iteration_info()
 
