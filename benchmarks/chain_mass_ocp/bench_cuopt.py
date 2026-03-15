@@ -65,7 +65,7 @@ def build_problem(data):
             expr = sum(float(v) * variables[int(j)] for j, v in zip(cols, vals))
             prob.addConstraint(expr == float(beq[i]))
 
-    # Inequality constraints
+    # Inequality constraints (cuopt does not support double-sided inequalities, so we add separate constraints for upper and lower bounds)
     n_ineq = int(data['n_ineq'])
     if n_ineq > 0:
         Aineq_csr = sp.csr_matrix((data['Aineq_data'], data['Aineq_indices'],
