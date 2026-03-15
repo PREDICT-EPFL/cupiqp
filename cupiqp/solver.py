@@ -207,6 +207,25 @@ class SolverBase:
                     self._result.info.status = Status.PIQP_DUAL_INFEASIBLE
                     return self._result.info.status
                 
+                # avoid getting too close to boundary which can result in a division by zero
+                epsilon = float(cp.finfo(cp.float64).eps)
+                boundary_shifted = False
+                if self._data.num_hl > 0 and bool(cp.any(self._result.z_l < epsilon)):
+                    self._result.z_l += (self._result.z_l < epsilon) * epsilon
+                    boundary_shifted = True
+                if self._data.num_hu > 0 and bool(cp.any(self._result.z_u < epsilon)):
+                    self._result.z_u += (self._result.z_u < epsilon) * epsilon
+                    boundary_shifted = True
+                if self._data.num_xl > 0 and bool(cp.min(self._result.z_bl) < epsilon):
+                    self._result.z_bl += epsilon
+                    boundary_shifted = True
+                if self._data.num_xu > 0 and bool(cp.min(self._result.z_bu) < epsilon):
+                    self._result.z_bu += epsilon
+                    boundary_shifted = True
+                if boundary_shifted:
+                    print("Boundary shifted to avoid division by zero")
+                    self._calculate_mu()
+                
                 # avoid possibility of converging to a local minimum -> decrease the minimum regularization value
                 if ((self._result.info.no_primal_update > self.settings.reg_finetune_primal_update_threshold and
                     self._result.info.rho[0] == self._result.info.reg_limit[0] and
