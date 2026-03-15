@@ -245,14 +245,16 @@ class SparseKKTSolver(KKTSolverBase):
     def factor(self) -> bool:
         try:
             with nvtx.annotate("SparseKKTSolver::cudss_factorize"):
+                cp.cuda.Device().synchronize()
                 fac_info = self._ldlt_solver.factorize()
+                cp.cuda.Device().synchronize()
                 # surface async device-side failures here so info is meaningful now
-                self._stream_cp.synchronize()
+                # self._stream_cp.synchronize()
 
             # # TODO: this causes a D2H synchronization, which can be inefficient.
             # TODO: more importantly, this prevents us from capturing cuda graphs. We give up checking the factorization success for now.
-            # if fac_info.info != 0:
-            #     return False
+            if fac_info.info != 0:
+                return False
             
             # check inertia (causes D2H synchronization, inefficient)
             # if fac_info.inertia[0] != data.n or fac_info.inertia[1] != data.p + data.m:
@@ -278,9 +280,11 @@ class SparseKKTSolver(KKTSolverBase):
         # update RHS in-place to reuse factorization results. See here: https://docs.nvidia.com/cuda/nvmath-python/0.6.0/host-apis/sparse/generated/nvmath.sparse.advanced.DirectSolver.html.
         # Also see: https://github.com/NVIDIA/nvmath-python/blob/main/examples/sparse/advanced/direct_solver/example05_reset_operands.py
         with nvtx.annotate("SparseKKTSolver::cudss_solve"):
-            self._stream_cp.synchronize()
-            self._sol[:] = self._ldlt_solver.solve()
-            self._stream_cp.synchronize()
+            # self._stream_cp.synchronize()
+            cp.cuda.Device().synchronize()  # ensure any previous GPU work is done before solve
+            self._sol[:] = self._ldlt_solver.solve(stream=cp.cuda.get_current_stream().ptr)
+            # self._stream_cp.synchronize()
+            cp.cuda.Device().synchronize()  # ensure solve is done before accessing results
 
         # [delta_x, delta_y, delta_z] <= self._sol
         cp.cuda.runtime.memcpyAsync(delta_x.data.ptr, self._sol.data.ptr, data.n * 8, 1, self._stream_cp.ptr)
