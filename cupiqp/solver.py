@@ -499,7 +499,7 @@ class SolverBase:
         
         if key not in self._calculate_step_cuda_graphs:
             self._calculate_step_cuda_graphs_capture_count += 1
-            print(f"Solver::_calculate_step capturing CUDA graph (occurrence {self._calculate_step_cuda_graphs_capture_count})...")
+            # print(f"Solver::_calculate_step capturing CUDA graph (occurrence {self._calculate_step_cuda_graphs_capture_count})...")
             stream = cp.cuda.Stream(non_blocking=True)
             stream.begin_capture()
             with stream:
@@ -552,7 +552,7 @@ class SolverBase:
         key = (self._result.buffer_ptr, self._result.info.mu.data.ptr)
         if key not in self._calculate_mu_cuda_graphs:
             self._calculate_mu_cuda_graphs_capture_count += 1
-            print(f"Solver::_calculate_mu capturing CUDA graph (occurrence {self._calculate_mu_cuda_graphs_capture_count})...")
+            # print(f"Solver::_calculate_mu capturing CUDA graph (occurrence {self._calculate_mu_cuda_graphs_capture_count})...")
             stream = cp.cuda.Stream(non_blocking=True)
             stream.begin_capture()
             with stream:
@@ -581,7 +581,7 @@ class SolverBase:
         
         if key not in self._calculate_sigma_cuda_graphs:
             self._calculate_sigma_cuda_graphs_capture_count += 1
-            print(f"Solver::_calculate_sigma capturing CUDA graph (occurrence {self._calculate_sigma_cuda_graphs_capture_count})...")
+            # print(f"Solver::_calculate_sigma capturing CUDA graph (occurrence {self._calculate_sigma_cuda_graphs_capture_count})...")
             stream = cp.cuda.Stream(non_blocking=True)
             stream.begin_capture()
             with stream:
@@ -658,7 +658,7 @@ class SolverBase:
 
         if key not in self._update_residuals_nr_cuda_graphs:
             self._update_residuals_nr_cuda_graphs_capture_count += 1
-            print(f"Solver::_update_residuals_nr capturing CUDA graph (occurrence {self._update_residuals_nr_cuda_graphs_capture_count})...")
+            # print(f"Solver::_update_residuals_nr capturing CUDA graph (occurrence {self._update_residuals_nr_cuda_graphs_capture_count})...")
             stream = cp.cuda.Stream(non_blocking=True)
             stream.begin_capture()
             with stream:
@@ -828,7 +828,7 @@ class SolverBase:
         
         if key not in self._update_residuals_r_cuda_graphs:
             self._update_residuals_r_cuda_graphs_capture_count += 1
-            print(f"Solver::_update_residuals_r capturing CUDA graph (occurrence {self._update_residuals_r_cuda_graphs_capture_count})...")
+            # print(f"Solver::_update_residuals_r capturing CUDA graph (occurrence {self._update_residuals_r_cuda_graphs_capture_count})...")
             # !IMPORTANT! Use the same stream for warp and cupy to make sure the captured graph contains both the warp kernel and the cupy operations, and they can be executed together without unnecessary stream synchronization
             stream = cp.cuda.ExternalStream(wp.get_stream().cuda_stream)
             stream.begin_capture()
