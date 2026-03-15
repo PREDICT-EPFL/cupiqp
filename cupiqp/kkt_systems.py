@@ -12,7 +12,30 @@ from .results import Variables
 
 class KKTSystem:
     """
-    The KKT system handles the full KKT condition.
+    The KKT system handles the full KKT condition with non-symmetric matrix.
+
+    Solves the block linear system:
+
+        [ P+rho*I   A^T      G^T      -G^T     I_n      -I_n                                         ] [ dx    ]   [ r_x    ]
+        [ A        -d*I_p                                                                            ] [ dy    ]   [ r_y    ]
+        [ G                 -d*I_m                                I_m                                ] [ dz_hu ]   [ r_z_hu ]
+        [ -G                         -d*I_m                               I_m                        ] [ dz_hl ]   [ r_z_hl ]
+        [ I_n                                  -d*I_n                             I_n                ] [ dz_xu ]   [ r_z_xu ]
+        [ -I_n                                          -d*I_n                            I_n        ] [ dz_xl ]   [ r_z_xl ]
+        [                   S_hu                                  Z_hu                               ] [ ds_hu ] = [ r_s_hu ]
+        [                            S_hl                                  Z_hl                      ] [ ds_hl ]   [ r_s_hl ]
+        [                                      S_xu                                  Z_xu            ] [ ds_xu ]   [ r_s_xu ]
+        [                                               S_xl                                  Z_xl   ] [ ds_xl ]   [ r_s_xl ]
+
+    where:
+        - P, A, G        : problem data (cost, equality, inequality matrices)
+        - rho            : proximal regularization parameter
+        - d (delta)      : regularization on dual variables
+        - S_hu, S_hl     : diagonal slack matrices for inequality upper/lower bounds
+        - S_xu, S_xl     : diagonal slack matrices for variable upper/lower bounds
+        - Z_hu, Z_hl     : diagonal dual variable matrices for inequality upper/lower bounds
+        - Z_xu, Z_xl     : diagonal dual variable matrices for variable upper/lower bounds
+        - n, p, m        : number of primal variables, equality constraints, inequality constraints
     """
     def __init__(self):
         return
