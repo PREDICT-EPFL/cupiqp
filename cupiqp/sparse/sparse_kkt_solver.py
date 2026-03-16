@@ -14,10 +14,10 @@ class SparseKKTSolver(KKTSolverBase):
     """
     Sparse KKT solver with LDLT factorization.
     """
-    def __init__(self, data: SparseData):
+    def __init__(self, data: SparseData, use_deterministic_mode: bool = False):
         super().__init__()
         self._kkt_mat = self._initialize_kkt_csr(data.P, data.A, data.G)
-        n, p, m = data.n, data.p, data.m        
+        n, p, m = data.n, data.p, data.m
 
         # pre-compute diagonal indices for efficient in-place updates
         self._diag_x_indices = cp.empty(n, dtype=cp.int32)
@@ -42,7 +42,7 @@ class SparseKKTSolver(KKTSolverBase):
         self._spmv_GT = SparseMatVecProduct(data.G, transa=True)
 
         # setup direct solver for KKT factorization and solves
-        self._lin_sys_solver = CudssSparseDirectSolver(self._kkt_mat)
+        self._lin_sys_solver = CudssSparseDirectSolver(self._kkt_mat, use_deterministic_mode=use_deterministic_mode)
         plan_success = self._lin_sys_solver.plan()  # symbolic factorization and reordering
         if not plan_success:
             raise RuntimeError("Sparse direct solver planning failed.")

@@ -50,7 +50,7 @@ class KKTSystem:
         self._work_z = cp.nan * cp.zeros(data.m)
 
         if settings.kkt_solver == "sparse_ldlt":
-            self._kkt_solver = SparseKKTSolver(data)
+            self._kkt_solver = SparseKKTSolver(data, use_deterministic_mode=settings.use_deterministic_mode_for_cudss)
         elif settings.kkt_solver == "dense_cholesky":
             self._kkt_solver = DenseKKTSolver(data)
         elif settings.kkt_solver == "multistage_block_cholesky":

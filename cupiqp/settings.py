@@ -39,6 +39,8 @@ class Settings:
     iterative_refinement_static_regularization_eps: float = 1e-8
     iterative_refinement_static_regularization_rel: float = 2.220446049250313e-32  # Approximation of epsilon squared
 
+    use_deterministic_mode_for_cudss: bool = False  # Enable cuDSS deterministic mode for bit-wise reproducible results (slower)
+
     verbose: bool = False
     debug: bool = False
     compute_timings: bool = False
@@ -64,5 +66,5 @@ class Settings:
                self.iterative_refinement_min_improvement_rate >= 1.0 and
                self.iterative_refinement_static_regularization_eps > 0 and
                self.iterative_refinement_static_regularization_rel >= 0 and
-               self.kkt_solver in ["dense_cholesky", "sparse_ldlt"]
+               self.kkt_solver in ["dense_cholesky", "sparse_ldlt", "multistage_block_cholesky"]
                )

@@ -1,5 +1,6 @@
 import os, importlib.util
 from abc import ABC, abstractmethod
+import numpy as np
 import cupy as cp
 from cupyx.scipy.sparse import csr_matrix
 import nvtx
@@ -12,6 +13,7 @@ from nvmath.sparse.advanced import (
     ExecutionHybrid,
     ExecutionCUDA,
 )
+from nvmath.bindings import cudss as cudss_bindings
 
 from .sparse_matvec import SparseMatVecProduct
 
@@ -62,7 +64,7 @@ class SparseDirectSolver(ABC):
 
 
 class CudssSparseDirectSolver(SparseDirectSolver):
-    def __init__(self, matrix: csr_matrix, **cudss_kwargs):
+    def __init__(self, matrix: csr_matrix, use_deterministic_mode: bool = False, **cudss_kwargs):
         super().__init__(matrix)
 
         # setup cuDSS solver
@@ -71,8 +73,8 @@ class CudssSparseDirectSolver(SparseDirectSolver):
             sparse_system_view=DirectSolverMatrixViewType.FULL,
             multithreading_lib=self._find_cudss_mt_lib()
         )
-        exe = ExecutionHybrid()  # allow both CPU and GPU execution. Optional: ExecutionCUDA(). NOTE: hybrid mode seems more numerically stable
-        
+        exe = ExecutionCUDA()  # Optional: ExecutionCUDA(). NOTE: hybrid mode seems more numerically stable
+
         self._cudss_solver = DirectSolver(
             a=self._mat,
             b=self._rhs,
@@ -84,11 +86,17 @@ class CudssSparseDirectSolver(SparseDirectSolver):
         self._cudss_solver.solution_config.ir_num_steps = 0  # NOTE: iterative refinement steps, to be tuned
         # cudss has IR_TOL, but not implemented yet according to https://docs.nvidia.com/cuda/cudss/types.html#c.cudssConfigParam_t.CUDSS_CONFIG_IR_TOL
 
-        # self._iterative_refinement_enabled = True
-        # self._iterative_refinement_atol = 1e-12  # absolute tolerance on ||r||_inf
-        # self._iterative_refinement_rtol = 1e-12  # relative tolerance: converge when ||r|| < atol + rtol * ||b||
-        # self._iterative_refinement_max_itr = 10
-        # self._iterative_refinement_min_improvement_rate = 5.0
+        # Enable deterministic mode for bit-wise reproducible results across runs.
+        # Uses slower kernels but guarantees identical factorization every time.
+        # Not exposed by nvmath's high-level API, so we call config_set directly.
+        if use_deterministic_mode:
+            _det_flag = np.ones(1, dtype=np.int32)
+            cudss_bindings.config_set(
+                self._cudss_solver.config_ptr,
+                cudss_bindings.ConfigParam.DETERMINISTIC_MODE,
+                _det_flag.ctypes.data,
+                _det_flag.dtype.itemsize,
+            )
 
         self._mat_vec_prod = SparseMatVecProduct(self._mat, transa=False)
         self._res = cp.empty_like(self._rhs)
