@@ -1,47 +1,14 @@
 from typing import Optional
-import os
-import importlib.util
 import numpy as np
 import cupy as cp
 from cupyx.scipy.sparse import csr_matrix, diags, bmat
-from nvmath.sparse.advanced import (
-    DirectSolver,
-    DirectSolverAlgType,
-    DirectSolverOptions,
-    DirectSolverMatrixType,
-    DirectSolverMatrixViewType,
-    ExecutionHybrid,
-    ExecutionCUDA,
-)
-from nvmath.bindings.cudss import PivotType
 import nvtx
 
 from ..kkt_solver import KKTSolverBase
 from .sparse_data import SparseData
 from .sparse_matvec import SparseMatVecProduct
+from .sparse_direct_solver import CudssSparseDirectSolver
 
-
-def _find_cudss_mt_lib():
-    """Auto-discover the cuDSS multithreading layer library.
-
-    Searches across CUDA version packages (nvidia.cu11, nvidia.cu12, nvidia.cu13, ...)
-    since the package name depends on the installed CUDA toolkit version.
-    """
-    for cuda_version in range(13, 10, -1):  # try 13, 12, 11
-        spec = importlib.util.find_spec(f"nvidia.cu{cuda_version}")
-        if spec is None:
-            continue
-        # nvidia.cuXX is a namespace package (no __init__.py), so spec.origin is None.
-        # Use submodule_search_locations to find the package directory instead.
-        search_paths = spec.submodule_search_locations
-        if search_paths:
-            for base in search_paths:
-                lib = os.path.join(base, "lib", "libcudss_mtlayer_gomp.so.0")
-                if os.path.isfile(lib):
-                    return lib
-    return None
-
-_CUDSS_MT_LIB = _find_cudss_mt_lib()
 
 class SparseKKTSolver(KKTSolverBase):
     """
@@ -50,9 +17,7 @@ class SparseKKTSolver(KKTSolverBase):
     def __init__(self, data: SparseData):
         super().__init__()
         self._kkt_mat = self._initialize_kkt_csr(data.P, data.A, data.G)
-        self._rhs = cp.zeros(self._kkt_mat.shape[0], dtype=cp.float64)
-        self._sol = cp.zeros(self._kkt_mat.shape[0], dtype=cp.float64)
-        n, p, m = data.n, data.p, data.m
+        n, p, m = data.n, data.p, data.m        
 
         # pre-compute diagonal indices for efficient in-place updates
         self._diag_x_indices = cp.empty(n, dtype=cp.int32)
@@ -76,39 +41,16 @@ class SparseKKTSolver(KKTSolverBase):
         self._spmv_G = SparseMatVecProduct(data.G, transa=False)
         self._spmv_GT = SparseMatVecProduct(data.G, transa=True)
 
-        # setup cuDSS solver
-        # TODO: can change this to LOWER if only update lower part of KKT
-        opts = DirectSolverOptions(sparse_system_type=DirectSolverMatrixType.SYMMETRIC,
-                                   sparse_system_view=DirectSolverMatrixViewType.FULL,
-                                   multithreading_lib=_CUDSS_MT_LIB)
-        exe = ExecutionHybrid()  # allow both CPU and GPU execution. Optional: ExecutionCUDA(). NOTE: hybrid mode seems more numerically stable
-        self._ldlt_solver = DirectSolver(
-            a=self._kkt_mat,
-            b=self._rhs,
-            options=opts,
-            execution=exe,
-            stream=cp.cuda.get_current_stream().ptr,
-            )
-        self._ldlt_solver.plan_config.reordering_algorithm = DirectSolverAlgType.ALG_DEFAULT
-        # self._ldlt_solver.plan_config.pivot_type = PivotType.PIVOT_NONE  # ! set to no pivoting, but seems don't work since changing pivot.eps still makes a difference
-        # self._ldlt_solver.factorization_config.pivot_eps = 1e-10
-        self._ldlt_solver.solution_config.ir_num_steps = 0  # ! iterative refinement steps, to be tuned
-        # NOTE: cudss has IR_TOL, but not implemented yet according to https://docs.nvidia.com/cuda/cudss/types.html#c.cudssConfigParam_t.CUDSS_CONFIG_IR_TOL
-        
-        with nvtx.annotate("SparseKKTSolver::cudss_plan"):
-            plan_info = self._ldlt_solver.plan()  # precompute reordering and symbolic factorization
-            cp.cuda.get_current_stream().synchronize()
+        # setup direct solver for KKT factorization and solves
+        self._lin_sys_solver = CudssSparseDirectSolver(self._kkt_mat)
+        plan_success = self._lin_sys_solver.plan()  # symbolic factorization and reordering
+        if not plan_success:
+            raise RuntimeError("Sparse direct solver planning failed.")
 
         self._stream_cp = cp.cuda.get_current_stream()
 
     def __del__(self):
-        ldlt_solver = getattr(self, "_ldlt_solver", None)
-        if ldlt_solver is not None:
-            try:
-                ldlt_solver.free()
-            except Exception:
-                pass
-            self._ldlt_solver = None
+        self._lin_sys_solver.__del__()
 
     @staticmethod
     def _build_block_index_map(block: csr_matrix, kkt: csr_matrix,
@@ -243,29 +185,8 @@ class SparseKKTSolver(KKTSolverBase):
     
     @nvtx.annotate("SparseKKTSolver::factor")
     def factor(self) -> bool:
-        try:
-            with nvtx.annotate("SparseKKTSolver::cudss_factorize"):
-                cp.cuda.Device().synchronize()
-                fac_info = self._ldlt_solver.factorize()
-                cp.cuda.Device().synchronize()
-                # surface async device-side failures here so info is meaningful now
-                # self._stream_cp.synchronize()
+        return self._lin_sys_solver.factor()
 
-            # # TODO: this causes a D2H synchronization, which can be inefficient.
-            # TODO: more importantly, this prevents us from capturing cuda graphs. We give up checking the factorization success for now.
-            if fac_info.info != 0:
-                return False
-            
-            # check inertia (causes D2H synchronization, inefficient)
-            # if fac_info.inertia[0] != data.n or fac_info.inertia[1] != data.p + data.m:
-            #     return False
-
-        except Exception as e:
-            print(f"Factorization failed: {e}")
-            return False
-
-        return True
-    
     @nvtx.annotate("SparseKKTSolver::solve")
     def solve(self, data: SparseData, rhs_x: cp.ndarray, rhs_y: cp.ndarray, rhs_z: cp.ndarray, delta_x: cp.ndarray, delta_y: cp.ndarray, delta_z: cp.ndarray):
         """
@@ -273,23 +194,16 @@ class SparseKKTSolver(KKTSolverBase):
         """
         # ! cp.cuda.runtime.memcpyAsync has lower launch overhead than multiple small cp.copyto() calls
         # self._rhs <= [rhs_x, rhs_y, rhs_z]
-        cp.cuda.runtime.memcpyAsync(self._rhs.data.ptr, rhs_x.data.ptr, data.n * 8, 1, self._stream_cp.ptr)
-        cp.cuda.runtime.memcpyAsync(self._rhs.data.ptr + data.n * 8, rhs_y.data.ptr, data.p * 8, 1, self._stream_cp.ptr)
-        cp.cuda.runtime.memcpyAsync(self._rhs.data.ptr + (data.n+data.p) * 8, rhs_z.data.ptr, data.m * 8, 1, self._stream_cp.ptr)
+        cp.cuda.runtime.memcpyAsync(self._lin_sys_solver.rhs.data.ptr, rhs_x.data.ptr, data.n * 8, 1, self._stream_cp.ptr)
+        cp.cuda.runtime.memcpyAsync(self._lin_sys_solver.rhs.data.ptr + data.n * 8, rhs_y.data.ptr, data.p * 8, 1, self._stream_cp.ptr)
+        cp.cuda.runtime.memcpyAsync(self._lin_sys_solver.rhs.data.ptr + (data.n+data.p) * 8, rhs_z.data.ptr, data.m * 8, 1, self._stream_cp.ptr)
 
-        # update RHS in-place to reuse factorization results. See here: https://docs.nvidia.com/cuda/nvmath-python/0.6.0/host-apis/sparse/generated/nvmath.sparse.advanced.DirectSolver.html.
-        # Also see: https://github.com/NVIDIA/nvmath-python/blob/main/examples/sparse/advanced/direct_solver/example05_reset_operands.py
-        with nvtx.annotate("SparseKKTSolver::cudss_solve"):
-            # self._stream_cp.synchronize()
-            cp.cuda.Device().synchronize()  # ensure any previous GPU work is done before solve
-            self._sol[:] = self._ldlt_solver.solve(stream=cp.cuda.get_current_stream().ptr)
-            # self._stream_cp.synchronize()
-            cp.cuda.Device().synchronize()  # ensure solve is done before accessing results
+        self._lin_sys_solver.solve()
 
         # [delta_x, delta_y, delta_z] <= self._sol
-        cp.cuda.runtime.memcpyAsync(delta_x.data.ptr, self._sol.data.ptr, data.n * 8, 1, self._stream_cp.ptr)
-        cp.cuda.runtime.memcpyAsync(delta_y.data.ptr, self._sol.data.ptr + data.n * 8, data.p * 8, 1, self._stream_cp.ptr)
-        cp.cuda.runtime.memcpyAsync(delta_z.data.ptr, self._sol.data.ptr + (data.n+data.p) * 8, data.m * 8, 1, self._stream_cp.ptr)
+        cp.cuda.runtime.memcpyAsync(delta_x.data.ptr, self._lin_sys_solver.sol.data.ptr, data.n * 8, 1, self._stream_cp.ptr)
+        cp.cuda.runtime.memcpyAsync(delta_y.data.ptr, self._lin_sys_solver.sol.data.ptr + data.n * 8, data.p * 8, 1, self._stream_cp.ptr)
+        cp.cuda.runtime.memcpyAsync(delta_z.data.ptr, self._lin_sys_solver.sol.data.ptr + (data.n+data.p) * 8, data.m * 8, 1, self._stream_cp.ptr)
 
     @nvtx.annotate("SparseKKTSolver::eval_P_x")
     def eval_P_x(self, data: SparseData, alpha: float, x: cp.ndarray, z: cp.ndarray):
