@@ -13,6 +13,8 @@ from nvmath.sparse.advanced import (
     ExecutionCUDA,
 )
 
+from .sparse_matvec import SparseMatVecProduct
+
 
 class SparseDirectSolver(ABC):
     def __init__(self, matrix: csr_matrix):
@@ -79,8 +81,19 @@ class CudssSparseDirectSolver(SparseDirectSolver):
             stream=cp.cuda.get_current_stream().ptr,
             )
         self._cudss_solver.plan_config.reordering_algorithm = DirectSolverAlgType.ALG_DEFAULT
-        self._cudss_solver.solution_config.ir_num_steps = 5  # NOTE: iterative refinement steps, to be tuned
+        self._cudss_solver.solution_config.ir_num_steps = 0  # NOTE: iterative refinement steps, to be tuned
         # cudss has IR_TOL, but not implemented yet according to https://docs.nvidia.com/cuda/cudss/types.html#c.cudssConfigParam_t.CUDSS_CONFIG_IR_TOL
+
+        # self._iterative_refinement_enabled = True
+        # self._iterative_refinement_atol = 1e-12  # absolute tolerance on ||r||_inf
+        # self._iterative_refinement_rtol = 1e-12  # relative tolerance: converge when ||r|| < atol + rtol * ||b||
+        # self._iterative_refinement_max_itr = 10
+        # self._iterative_refinement_min_improvement_rate = 5.0
+
+        self._mat_vec_prod = SparseMatVecProduct(self._mat, transa=False)
+        self._res = cp.empty_like(self._rhs)
+        self._rhs_saved = cp.empty_like(self._rhs)
+        self._sol_ir = cp.empty_like(self._sol)
 
     def __del__(self):
         cudss_solver = getattr(self, "_cudss_solver", None)
@@ -117,11 +130,85 @@ class CudssSparseDirectSolver(SparseDirectSolver):
             return False
 
         return True
-    
-    def solve(self):
-        cp.cuda.Device().synchronize()  # ensure any previous GPU work is done before solve
+
+    def solve(self, 
+              iterative_refinement: bool = True, 
+              ir_abs_tol: float = 1e-12, 
+              ir_rel_tol: float = 1e-12,
+              ir_max_iter: int = 10, 
+              ir_min_improvement_rate: float = 5.0
+              ) -> None:
+        # initial solve
         self._sol[:] = self._cudss_solver.solve(stream=cp.cuda.get_current_stream().ptr)
-        cp.cuda.Device().synchronize()  # ensure any previous GPU work is done before solve
+        cp.cuda.Device().synchronize()
+
+        if iterative_refinement:
+            self.iterative_refinement(ir_abs_tol, ir_rel_tol, ir_max_iter, ir_min_improvement_rate)
+
+    @nvtx.annotate("SparseDirectSolver::iterative_refinement")
+    def iterative_refinement(self, abs_tol: float, rel_tol: float, max_iter: int, min_improvement_rate: float) -> None:
+        VERBOSE = False
+        USE_RHS_NORM = False  # True: tol = atol + rtol * ||b||,  False: tol = atol + rtol * ||r_0||
+
+        self._rhs_saved[:] = self._rhs
+
+        prev_res_norm = float('inf')
+
+        if USE_RHS_NORM:
+            rel_tol = 1e-16
+            rhs_norm = float(cp.max(cp.abs(self._rhs_saved)))
+            tol = abs_tol + rel_tol * rhs_norm
+            if VERBOSE:
+                print(f"      IR: ||b||={rhs_norm:.4e}, "
+                      f"tol={tol:.4e} (atol={abs_tol:.1e} + rtol={rel_tol:.1e} * ||b||)")
+
+        for itr in range(max_iter):
+            # residual: res = b - A*x
+            self._mat_vec_prod(x=self._sol, y=self._res)
+            cp.subtract(self._rhs_saved, self._res, out=self._res)
+
+            res_norm = float(cp.max(cp.abs(self._res)))
+
+            if not USE_RHS_NORM and itr == 0:
+                tol = abs_tol + rel_tol * res_norm
+                if VERBOSE:
+                    print(f"      IR: ||r_0||={res_norm:.4e}, "
+                          f"tol={tol:.4e} (atol={abs_tol:.1e} + rtol={rel_tol:.1e} * ||r_0||)")
+
+            improvement = prev_res_norm / max(res_norm, 1e-300)
+
+            if VERBOSE:
+                print(f"      IR iter {itr}: ||r||={res_norm:.4e}  improvement={improvement:.1f}x")
+
+            # Check convergence
+            if res_norm < tol:
+                if VERBOSE:
+                    print(f"      IR converged after {itr} iteration(s).")
+                break
+
+            # Check improvement rate — stop if not converging fast enough
+            if itr > 0 and improvement < min_improvement_rate:
+                if VERBOSE:
+                    print(f"      IR stalled after {itr} iteration(s) "
+                          f"(improvement {improvement:.1f}x < {min_improvement_rate:.1f}x threshold).")
+                break
+
+            prev_res_norm = res_norm
+
+            # Solve for correction: A*dx = res
+            self._rhs[:] = self._res
+            self._sol_ir[:] = self._cudss_solver.solve(stream=cp.cuda.get_current_stream().ptr)
+            cp.cuda.Device().synchronize()
+
+            self._sol += self._sol_ir
+
+        else:
+            if VERBOSE:
+                print(f"      IR reached max iterations ({max_iter}) "
+                  f"without convergence. Final ||r||={res_norm:.4e}, tol={tol:.4e}.")
+
+        # Restore original RHS
+        self._rhs[:] = self._rhs_saved
 
     @staticmethod    
     def _find_cudss_mt_lib():
