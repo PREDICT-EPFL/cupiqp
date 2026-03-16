@@ -54,7 +54,7 @@ class KKTSystem:
         elif settings.kkt_solver == "dense_cholesky":
             self._kkt_solver = DenseKKTSolver(data)
         elif settings.kkt_solver == "multistage_block_cholesky":
-            self._kkt_solver = MultistageKKTSolver(data, settings.multistage_block_size)
+            self._kkt_solver = MultistageKKTSolver(data)
         else:
             raise ValueError(f"Unsupported kkt_solver: {settings.kkt_solver}")
 
