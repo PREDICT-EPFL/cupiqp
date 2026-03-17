@@ -415,6 +415,74 @@ class KKTSystem:
 
             self._recover_lhs_cuda_graphs[key].launch()
 
+    @nvtx.annotate("KKTSystem::mul_condensed_kkt")
+    def mul_condensed_kkt(self, data: Data,
+                          lhs_x: cp.ndarray, lhs_y: cp.ndarray, lhs_z: cp.ndarray,
+                          rhs_x: cp.ndarray, rhs_y: cp.ndarray, rhs_z: cp.ndarray) -> None:
+        """
+        Compute the matrix-vector product with the condensed (reduced) KKT matrix:
+
+            [ P + x_reg*I   A^T       G^T    ] [ lhs_x ]   [ rhs_x ]
+            [ A            -delta*I    0     ] [ lhs_y ] = [ rhs_y ]
+            [ G              0       -z_reg  ] [ lhs_z ]   [ rhs_z ]
+
+        where x_reg and z_reg incorporate the eliminated slack/bound contributions.
+        Requires update_scalings_and_factor() to have been called first (sets _x_reg, _z_reg, _delta).
+
+        All output arrays (rhs_x, rhs_y, rhs_z) are overwritten.
+        """
+        # rhs_x = P*lhs_x
+        self.eval_P_x(data, 1., lhs_x, rhs_x)
+        # rhs_x += x_reg .* lhs_x
+        rhs_x += self._x_reg * lhs_x
+
+        # A block: rhs_y = A*lhs_x, rhs_x += A^T*lhs_y
+        if data.p > 0:
+            self.eval_A_xn(data, 1., lhs_x, rhs_y)
+            self.eval_AT_xt(data, 1., lhs_y, self._work_x)
+            rhs_x += self._work_x
+            rhs_y -= self._delta[0] * lhs_y
+
+        # G block: rhs_z = G*lhs_x, rhs_x += G^T*lhs_z
+        if data.m > 0:
+            self.eval_G_xn(data, 1., lhs_x, rhs_z)
+            self.eval_GT_xt(data, 1., lhs_z, self._work_x)
+            rhs_x += self._work_x
+            rhs_z -= self._z_reg * lhs_z
+
+    @nvtx.annotate("KKTSystem::get_refinement_error")
+    def get_refinement_error(self, data: Data,
+                         lhs_x: cp.ndarray, lhs_y: cp.ndarray, lhs_z: cp.ndarray,
+                         rhs_x: cp.ndarray, rhs_y: cp.ndarray, rhs_z: cp.ndarray,
+                         err_x: cp.ndarray, err_y: cp.ndarray, err_z: cp.ndarray) -> float:
+        """
+        Compute the residual error of the condensed KKT solve:
+            err = rhs - KKT * lhs
+        and return ||err||_inf = max(||err_x||_inf, ||err_y||_inf, ||err_z||_inf).
+
+        Args:
+            lhs_x, lhs_y, lhs_z: current solution (primal, eq dual, ineq dual)
+            rhs_x, rhs_y, rhs_z: right-hand side of condensed KKT system
+            err_x, err_y, err_z: output arrays overwritten with residual
+        Returns:
+            Infinity norm of the residual.
+        """
+        # err = KKT * lhs
+        self.mul_condensed_kkt(data, lhs_x, lhs_y, lhs_z, err_x, err_y, err_z)
+
+        # err = rhs - err
+        cp.subtract(rhs_x, err_x, out=err_x)
+        cp.subtract(rhs_y, err_y, out=err_y)
+        cp.subtract(rhs_z, err_z, out=err_z)
+
+        # return max(||err_x||_inf, ||err_y||_inf, ||err_z||_inf)
+        norm = float(cp.max(cp.abs(err_x)))
+        if err_y.size > 0:
+            norm = max(norm, float(cp.max(cp.abs(err_y))))
+        if err_z.size > 0:
+            norm = max(norm, float(cp.max(cp.abs(err_z))))
+        return norm
+
     @nvtx.annotate("KKTSystem::eval_P_x")
     def eval_P_x(self, data: Data, alpha: float, x: cp.ndarray, z: cp.ndarray):
         """
