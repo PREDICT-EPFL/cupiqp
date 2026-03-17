@@ -108,6 +108,12 @@ class Data(ABC):
         if self.num_xl > 0:
             cp.maximum(inf_norm, cp.linalg.norm(self.x_l[self.idx_xl], ord=cp.inf), out=inf_norm)
 
+    @abstractmethod
+    def extract_P_diag(self, diag_P: cp.ndarray) -> None:
+        """Extract the diagonal of P into diag_P
+        """
+        pass
+
     @property
     def P(self):
         return self._P
