@@ -65,12 +65,10 @@ class Data(ABC):
         self._x_l = self._as_float64_vec(x_l)
         self._finalize()
 
-    @staticmethod
-    def _as_float64_mat(M: Union[Any, None]) -> Any:
+    def _as_float64_mat(self, M: Union[Any, None]) -> Any:
         pass
 
-    @staticmethod
-    def _as_float64_vec(v: Union[cp.ndarray, None]) -> cp.ndarray:
+    def _as_float64_vec(self, v: Union[cp.ndarray, None]) -> cp.ndarray:
         return v.astype(cp.float64) if v is not None else cp.zeros((0,), dtype=cp.float64)
 
     def _finalize(self):
@@ -109,6 +107,12 @@ class Data(ABC):
             cp.maximum(inf_norm, cp.linalg.norm(self.x_u[self.idx_xu], ord=cp.inf), out=inf_norm)
         if self.num_xl > 0:
             cp.maximum(inf_norm, cp.linalg.norm(self.x_l[self.idx_xl], ord=cp.inf), out=inf_norm)
+
+    @abstractmethod
+    def extract_P_diag(self, diag_P: cp.ndarray) -> None:
+        """Extract the diagonal of P into diag_P
+        """
+        pass
 
     @property
     def P(self):

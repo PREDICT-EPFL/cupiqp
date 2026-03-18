@@ -1,40 +1,71 @@
+import math
+
 import cupy as cp
 import warp as wp
 import nvtx
 
+from .results import Variables
 from .data import Data
 from .settings import Settings
 from .sparse.sparse_kkt_solver import SparseKKTSolver
 from .dense.dense_kkt_solver import DenseKKTSolver
 from .multistage.multistage_kkt_solver import MultistageKKTSolver
-from .results import Variables
-
-
-wp.config.enable_backward = False  # disable backward mode, cut down kernel compile time
 
 
 class KKTSystem:
     """
-    The KKT system handles the full KKT condition.
+    The KKT system handles the full KKT condition with non-symmetric matrix.
+
+    Solves the block linear system:
+
+        [ P+rho*I   A^T      G^T      -G^T     I_n      -I_n                                         ] [ dx    ]   [ r_x    ]
+        [ A        -d*I_p                                                                            ] [ dy    ]   [ r_y    ]
+        [ G                 -d*I_m                                I_m                                ] [ dz_hu ]   [ r_z_hu ]
+        [ -G                         -d*I_m                               I_m                        ] [ dz_hl ]   [ r_z_hl ]
+        [ I_n                                  -d*I_n                             I_n                ] [ dz_xu ]   [ r_z_xu ]
+        [ -I_n                                          -d*I_n                            I_n        ] [ dz_xl ]   [ r_z_xl ]
+        [                   S_hu                                  Z_hu                               ] [ ds_hu ] = [ r_s_hu ]
+        [                            S_hl                                  Z_hl                      ] [ ds_hl ]   [ r_s_hl ]
+        [                                      S_xu                                  Z_xu            ] [ ds_xu ]   [ r_s_xu ]
+        [                                               S_xl                                  Z_xl   ] [ ds_xl ]   [ r_s_xl ]
+
+    where:
+        - P, A, G        : problem data (cost, equality, inequality matrices)
+        - rho            : proximal regularization parameter
+        - d (delta)      : regularization on dual variables
+        - S_hu, S_hl     : diagonal slack matrices for inequality upper/lower bounds
+        - S_xu, S_xl     : diagonal slack matrices for variable upper/lower bounds
+        - Z_hu, Z_hl     : diagonal dual variable matrices for inequality upper/lower bounds
+        - Z_xu, Z_xl     : diagonal dual variable matrices for variable upper/lower bounds
+        - n, p, m        : number of primal variables, equality constraints, inequality constraints
     """
     def __init__(self):
         return
     
     def init(self, data: Data, settings: Settings):
         self._settings = settings
+        self._use_iterative_refinement = False
 
         self._x_reg = cp.nan * cp.ones(data.n)
         self._z_reg = cp.nan * cp.ones(data.m)
+        self._P_diag = cp.empty(data.n)
+
+        # used to store the rhs of the condensed KKT system
+        # K_condensed * [dx; dy; dz] = [rhs_x_bar; rhs_y_bar; rhs_z_bar], 
+        # where K_condensed is the condensed KKT matrix after eliminating duals of inequalities and box constraints and all slacks.
+        # Since eliminating slacks and duals does not change rhs_y, we only need to store rhs_x_bar and rhs_z_bar.
+        self._rhs_x_bar = cp.empty(data.n)
+        self._rhs_z_bar = cp.empty(data.m)
 
         self._work_x = cp.nan * cp.zeros(data.n)
         self._work_z = cp.nan * cp.zeros(data.m)
 
         if settings.kkt_solver == "sparse_ldlt":
-            self._kkt_solver = SparseKKTSolver(data)
+            self._kkt_solver = SparseKKTSolver(data, use_deterministic_mode=settings.use_deterministic_mode_for_cudss)
         elif settings.kkt_solver == "dense_cholesky":
             self._kkt_solver = DenseKKTSolver(data)
         elif settings.kkt_solver == "multistage_block_cholesky":
-            self._kkt_solver = MultistageKKTSolver(data, settings.multistage_block_size)
+            self._kkt_solver = MultistageKKTSolver(data)
         else:
             raise ValueError(f"Unsupported kkt_solver: {settings.kkt_solver}")
 
@@ -62,6 +93,10 @@ class KKTSystem:
         self._updated_rhs_z_l = cp.zeros(data.num_hl)
         self._updated_rhs_z_bu = cp.zeros(data.num_xu)
         self._updated_rhs_z_bl = cp.zeros(data.num_xl)
+
+        # pre-allocate memory for condensed KKT iterative refinement (operates on x, y, z blocks only)
+        self._iter_refine_error_xyz = cp.zeros(data.n + data.p + data.m)
+        self._iter_refine_delta_xyz = cp.zeros(data.n+data.p+data.m)
 
         # create kernels
         self._update_regulerization_step_1_kernel = create_update_regularizations_step_1_kernel(data.num_hu, data.num_hl, data.num_xu, data.num_xl)
@@ -96,9 +131,11 @@ class KKTSystem:
         self._kkt_solver.update_data(data, update_P, update_A, update_G)
 
     @nvtx.annotate("KKTSystem::update_scalings_and_factor")
-    def update_scalings_and_factor(self, data: Data, rho: cp.ndarray, delta: cp.ndarray, vars: Variables) -> bool:
+    def update_scalings_and_factor(self, data: Data, settings: Settings, iterative_refinement: bool, rho: cp.ndarray, delta: cp.ndarray, vars: Variables) -> bool:
         """
         Update the scaling factors and refactor the KKT matrix.
+
+        TODO: When iterative_refinement (IR) is True, adds static regularization to improve factorization stability. The solve() method will then run IR.
 
         The variable vars is the current primal/dual variable values at this iteration, i.e., values of x, y, z_u, z_l, s_u, s_l, z_bu, z_bl, s_bu, s_bl at the current iteration.
         """
@@ -112,11 +149,12 @@ class KKTSystem:
                 self._m_z_u_inv.data.ptr, self._m_z_l_inv.data.ptr, self._m_z_bu_inv.data.ptr, self._m_z_bl_inv.data.ptr,
                 self._w_u_delta_inv.data.ptr, self._w_l_delta_inv.data.ptr, self._w_bu_delta_inv.data.ptr, self._w_bl_delta_inv.data.ptr,
                 self._x_reg.data.ptr, self._z_reg.data.ptr,
+                iterative_refinement,
                 )
 
             if key not in self._update_scaling_and_factor_cuda_graphs:
                 self._update_scaling_and_factor_cuda_graphs_capture_count += 1
-                print(f"KKTSystems::_update_scaling_and_factor capturing CUDA graph (occurrence {self._update_scaling_and_factor_cuda_graphs_capture_count})...")
+                # print(f"KKTSystems::_update_scaling_and_factor capturing CUDA graph (occurrence {self._update_scaling_and_factor_cuda_graphs_capture_count})...")
                 stream = cp.cuda.Stream(non_blocking=True)
                 wp_stream = wp.Stream(cuda_stream=stream.ptr)
 
@@ -195,12 +233,16 @@ class KKTSystem:
                         self._z_reg[data.idx_hl] += self._w_l_delta_inv
                         cp.reciprocal(self._z_reg, out=self._z_reg)
 
+                    # TODO: in PIQP, if iterative_refinement is enabled, they add a small perturbation to the diagonal for improved stability. We can consider adding this as well.
                     self._kkt_solver.update_kkt(data, delta, self._x_reg, self._z_reg)
 
                 self._update_scaling_and_factor_cuda_graphs[key] = stream.end_capture()
 
             self._update_scaling_and_factor_cuda_graphs[key].launch()
 
+        self._rho = rho
+        self._delta = delta
+        self._use_iterative_refinement = iterative_refinement
         factor_success = self._kkt_solver.factor() # ! this is implicitly assuming idx_hu and idx_hl cover all indices of inequalities 0:m
         return factor_success
     
@@ -210,171 +252,356 @@ class KKTSystem:
         stream_wp = wp.Stream(cuda_stream=stream_cp.ptr)
         
         with nvtx.annotate("KKTSystem::solve::prepare_rhs"):
-            # ------ elliminate slack variables from rhs
-            # # ! ALTERNATIVE IMPLEMENTATION (pure cupy operations)
-            # # rhs_z_u - inv(Z_u) * r_s_u
-            # cp.multiply(self._m_z_u_inv, rhs.s_u, out=self._updated_rhs_z_u)
-            # cp.subtract(rhs.z_u, self._updated_rhs_z_u, out=self._updated_rhs_z_u)
-            # # rhs_z_l - inv(Z_l) * r_s_l
-            # cp.multiply(self._m_z_l_inv, rhs.s_l, out=self._updated_rhs_z_l)
-            # cp.subtract(rhs.z_l, self._updated_rhs_z_l, out=self._updated_rhs_z_l)
-            # # rhs_z_bu - inv(Z_bu) * r_s_bu
-            # cp.multiply(self._m_z_bu_inv, rhs.s_bu, out=self._updated_rhs_z_bu)
-            # cp.subtract(rhs.z_bu, self._updated_rhs_z_bu, out=self._updated_rhs_z_bu)
-            # # rhs_z_bl - inv(Z_bl) * r_s_bl
-            # cp.multiply(self._m_z_bl_inv, rhs.s_bl, out=self._updated_rhs_z_bl)
-            # cp.subtract(rhs.z_bl, self._updated_rhs_z_bl, out=self._updated_rhs_z_bl)
+            if not hasattr(self, '_prepare_rhs_cuda_graphs'):
+                self._prepare_rhs_cuda_graphs = {}
 
-            wp.launch(
-                kernel=self._eliminate_slacks_kernel,
-                dim=data.num_hu+data.num_hl+data.num_xu+data.num_xl,
-                inputs=[rhs.z_u, rhs.s_u, self._m_z_u_inv, self._updated_rhs_z_u,
-                        rhs.z_l, rhs.s_l, self._m_z_l_inv, self._updated_rhs_z_l,
-                        rhs.z_bu, rhs.s_bu, self._m_z_bu_inv, self._updated_rhs_z_bu,
-                        rhs.z_bl, rhs.s_bl, self._m_z_bl_inv, self._updated_rhs_z_bl],
-                device="cuda",
-                stream=stream_wp,
-            )
+            key = (rhs.buffer_ptr,)
 
-            # ------ elliminate dual variables from rhs to yield one single rhs_z passing to kkt solver
-            
-            # To avoid avoid extra allocation, we use:
-            # self._work_x to hold modified rhs_x (to be passed to KKTSolver), self._work_z to hold modified rhs_z (to be passed to KKTSolver)
-            # use lhs.z_* to hold temporary value self._w_u_delta_inv * self._updated_rhs_z_u, and so on
+            if key not in self._prepare_rhs_cuda_graphs:
+                # stream_cp_capture and stream_wp_capture are used to launch kernels to capture cuda graph, but the actual computation is captured in stream_cp and stream_wp
+                stream_cp_capture = cp.cuda.Stream(non_blocking=True)
+                stream_wp_capture = wp.Stream(cuda_stream=stream_cp_capture.ptr)
 
-            # The below code is equivalent to:
-            # self._work_x[:] = rhs.x
-            # self._work_x[data.idx_xu] += self._w_bu_delta_inv * self._updated_rhs_z_bu
-            # self._work_x[data.idx_xl] -= self._w_bl_delta_inv * self._updated_rhs_z_bl
-            # self._work_z[:] = 0.
-            # self._work_z[data.idx_hu] += self._w_u_delta_inv * self._updated_rhs_z_u
-            # self._work_z[data.idx_hl] -= self._w_l_delta_inv * self._updated_rhs_z_l
-            # self._work_z[:] *= self._z_reg
+                stream_cp_capture.begin_capture()
+                with stream_cp_capture:
+                    wp.launch(
+                        kernel=self._eliminate_slacks_kernel,
+                        dim=data.num_hu+data.num_hl+data.num_xu+data.num_xl,
+                        inputs=[rhs.z_u, rhs.s_u, self._m_z_u_inv, self._updated_rhs_z_u,
+                                rhs.z_l, rhs.s_l, self._m_z_l_inv, self._updated_rhs_z_l,
+                                rhs.z_bu, rhs.s_bu, self._m_z_bu_inv, self._updated_rhs_z_bu,
+                                rhs.z_bl, rhs.s_bl, self._m_z_bl_inv, self._updated_rhs_z_bl],
+                        device="cuda",
+                        stream=stream_wp_capture,
+                    )
+                    wp.launch(
+                        kernel=self._eliminate_duals_kernel,
+                        dim=data.n + data.m,
+                        inputs=[
+                            self._inv_idx_xu, self._inv_idx_xl,
+                            self._inv_idx_hu, self._inv_idx_hl,
+                            rhs.x,
+                            self._w_bu_delta_inv, self._w_bl_delta_inv,
+                            self._updated_rhs_z_bu, self._updated_rhs_z_bl,
+                            self._rhs_x_bar,
+                            self._w_u_delta_inv, self._w_l_delta_inv,
+                            self._updated_rhs_z_u, self._updated_rhs_z_l,
+                            self._z_reg,
+                            self._rhs_z_bar,
+                        ],
+                        device="cuda",
+                        stream=stream_wp_capture,
+                    )
 
-            # # ! ALTERNATIVE IMPLEMENTATION (pure cupy operations)
-            # self._work_x[:] = rhs.x
-            # cp.multiply(self._w_bu_delta_inv, self._updated_rhs_z_bu, out=lhs.z_bu)
-            # cp.add.at(self._work_x, data.idx_xu, lhs.z_bu)
-            # cp.multiply(self._w_bl_delta_inv, self._updated_rhs_z_bl, out=lhs.z_bl)
-            # cp.negative(lhs.z_bl, out=lhs.z_bl)
-            # cp.add.at(self._work_x, data.idx_xl, lhs.z_bl)
+                    # # ! ALTERNATIVE IMPLEMENTATION (pure cupy operations)
+                    # ------ elliminate slack variables from rhs
+                    # # rhs_z_u - inv(Z_u) * r_s_u
+                    # cp.multiply(self._m_z_u_inv, rhs.s_u, out=self._updated_rhs_z_u)
+                    # cp.subtract(rhs.z_u, self._updated_rhs_z_u, out=self._updated_rhs_z_u)
+                    # # rhs_z_l - inv(Z_l) * r_s_l
+                    # cp.multiply(self._m_z_l_inv, rhs.s_l, out=self._updated_rhs_z_l)
+                    # cp.subtract(rhs.z_l, self._updated_rhs_z_l, out=self._updated_rhs_z_l)
+                    # # rhs_z_bu - inv(Z_bu) * r_s_bu
+                    # cp.multiply(self._m_z_bu_inv, rhs.s_bu, out=self._updated_rhs_z_bu)
+                    # cp.subtract(rhs.z_bu, self._updated_rhs_z_bu, out=self._updated_rhs_z_bu)
+                    # # rhs_z_bl - inv(Z_bl) * r_s_bl
+                    # cp.multiply(self._m_z_bl_inv, rhs.s_bl, out=self._updated_rhs_z_bl)
+                    # cp.subtract(rhs.z_bl, self._updated_rhs_z_bl, out=self._updated_rhs_z_bl)
 
-            # self._work_z.fill(0)  # faster than cp.zeros assignment
-            # cp.multiply(self._w_u_delta_inv, self._updated_rhs_z_u, out=lhs.z_u) # use lhs.z_u as temporary storage
-            # cp.add.at(self._work_z, data.idx_hu, lhs.z_u)
-            # cp.multiply(self._w_l_delta_inv, self._updated_rhs_z_l, out=lhs.z_l)
-            # cp.negative(lhs.z_l, out=lhs.z_l)
-            # cp.add.at(self._work_z, data.idx_hl, lhs.z_l)
-            # self._work_z[:] *= self._z_reg
+                    # ------ elliminate dual variables from rhs to yield one single rhs_z passing to kkt solver
+                    # To avoid avoid extra allocation, we use:
+                    # self._work_x to hold modified rhs_x (to be passed to KKTSolver), self._work_z to hold modified rhs_z (to be passed to KKTSolver)
+                    # use lhs.z_* to hold temporary value self._w_u_delta_inv * self._updated_rhs_z_u, and so on
 
-            wp.launch(
-                kernel=self._eliminate_duals_kernel,
-                dim=data.n + data.m,
-                inputs=[
-                    # inverse index maps
-                    self._inv_idx_xu,
-                    self._inv_idx_xl,
-                    self._inv_idx_hu,
-                    self._inv_idx_hl,
-                    # for updating rhs_x
-                    rhs.x,
-                    self._w_bu_delta_inv,
-                    self._w_bl_delta_inv,
-                    self._updated_rhs_z_bu,
-                    self._updated_rhs_z_bl,
-                    self._work_x,
-                    # for updating rhs_z
-                    self._w_u_delta_inv,
-                    self._w_l_delta_inv,
-                    self._updated_rhs_z_u,
-                    self._updated_rhs_z_l,
-                    self._z_reg,
-                    self._work_z,  # placeholder for the updated rhs_z
-                ],
-                device="cuda",
-                stream=stream_wp,
-            )
+                    # The below code is equivalent to:
+                    # self._work_x[:] = rhs.x
+                    # self._work_x[data.idx_xu] += self._w_bu_delta_inv * self._updated_rhs_z_bu
+                    # self._work_x[data.idx_xl] -= self._w_bl_delta_inv * self._updated_rhs_z_bl
+                    # self._work_z[:] = 0.
+                    # self._work_z[data.idx_hu] += self._w_u_delta_inv * self._updated_rhs_z_u
+                    # self._work_z[data.idx_hl] -= self._w_l_delta_inv * self._updated_rhs_z_l
+                    # self._work_z[:] *= self._z_reg
+                    
+                    # self._work_x[:] = rhs.x
+                    # cp.multiply(self._w_bu_delta_inv, self._updated_rhs_z_bu, out=lhs.z_bu)
+                    # cp.add.at(self._work_x, data.idx_xu, lhs.z_bu)
+                    # cp.multiply(self._w_bl_delta_inv, self._updated_rhs_z_bl, out=lhs.z_bl)
+                    # cp.negative(lhs.z_bl, out=lhs.z_bl)
+                    # cp.add.at(self._work_x, data.idx_xl, lhs.z_bl)
+                    # self._work_z.fill(0)  # faster than cp.zeros assignment
+                    # cp.multiply(self._w_u_delta_inv, self._updated_rhs_z_u, out=lhs.z_u) # use lhs.z_u as temporary storage
+                    # cp.add.at(self._work_z, data.idx_hu, lhs.z_u)
+                    # cp.multiply(self._w_l_delta_inv, self._updated_rhs_z_l, out=lhs.z_l)
+                    # cp.negative(lhs.z_l, out=lhs.z_l)
+                    # cp.add.at(self._work_z, data.idx_hl, lhs.z_l)
+                    # self._work_z[:] *= self._z_reg
 
-        self._kkt_solver.solve(data, self._work_x, rhs.y, self._work_z, lhs.x, lhs.y, self._work_z)  # ! the second _work_z is used to hold delta_z, but useless anyway. Can be further optimized.
+                self._prepare_rhs_cuda_graphs[key] = stream_cp_capture.end_capture()
+
+            self._prepare_rhs_cuda_graphs[key].launch()
+
+        self._kkt_solver.solve(data, self._rhs_x_bar, rhs.y, self._rhs_z_bar, lhs.x, lhs.y, self._work_z)  # ! the second _work_z is used to hold delta_z, but useless anyway. Can be further optimized.
+
+        if self._use_iterative_refinement and settings.iterative_refinement_max_iter > 0:
+            self.iterative_refinement(
+                data, settings,
+                self._rhs_x_bar, rhs.y, self._rhs_z_bar,
+                lhs.x, lhs.y, self._work_z)
 
         with nvtx.annotate("KKTSystem::solve::recover_lhs"):
-            self.eval_G_xn(data, 1., lhs.x, self._work_z)  # G * delta_x, where delta_x is stored in lhs.x
+            if not hasattr(self, '_recover_lhs_cuda_graphs'):
+                self._recover_lhs_cuda_graphs = {}
 
-            # ----- recover dual variables on lhs
-            # The below code is equivalent to:
-            # lhs.z_u[:] = self._w_u_delta_inv * (G_dx[data.idx_hu] - self._updated_rhs_z_u)   # delta_z_u
-            # lhs.z_l[:] = self._w_l_delta_inv * (-G_dx[data.idx_hl] - self._updated_rhs_z_l)  # delta_z_l
-            # lhs.z_bu[:] = self._w_bu_delta_inv * (lhs.x[data.idx_xu] - rhs.z_bu + self._m_z_bu_inv * rhs.s_bu)  # delta_z_bu
-            # lhs.z_bl[:] = -self._w_bl_delta_inv * (lhs.x[data.idx_xl] + rhs.z_bl - self._m_z_bl_inv * rhs.s_bl)  # delta_z_bl
+            key = (
+                rhs.buffer_ptr, lhs.buffer_ptr, self._work_z.data.ptr, 
+                self._w_u_delta_inv.data.ptr, self._w_l_delta_inv.data.ptr, 
+                self._w_bu_delta_inv.data.ptr, self._w_bl_delta_inv.data.ptr,
+                )
 
-            # # ! ALTERNATIVE IMPLEMENTATION (pure cupy operations)
-            # lhs.z_u[:] = self._work_z[data.idx_hu]
-            # lhs.z_u -= self._updated_rhs_z_u
-            # lhs.z_u *= self._w_u_delta_inv
+            if key not in self._recover_lhs_cuda_graphs:
+                stream_cp_capture = cp.cuda.Stream(non_blocking=True)
+                stream_wp_capture = wp.Stream(cuda_stream=stream_cp_capture.ptr)
 
-            # lhs.z_l[:] = self._work_z[data.idx_hl]
-            # lhs.z_l *= -1.
-            # lhs.z_l -= self._updated_rhs_z_l
-            # lhs.z_l *= self._w_l_delta_inv
+                stream_cp_capture.begin_capture()
+                with stream_cp_capture:
+                    self.eval_G_xn(data, 1., lhs.x, self._work_z)  # G * delta_x, where delta_x is stored in lhs.x
+                    wp.launch(
+                        kernel=self._recover_duals_kernel,
+                        dim=data.num_hu+data.num_hl+data.num_xu+data.num_xl,
+                        inputs=[
+                            self._work_z, lhs.x,
+                            data.idx_hu, self._w_u_delta_inv, self._updated_rhs_z_u, lhs.z_u,
+                            data.idx_hl, self._w_l_delta_inv, self._updated_rhs_z_l, lhs.z_l,
+                            data.idx_xu, self._w_bu_delta_inv, self._m_z_bu_inv, rhs.z_bu, rhs.s_bu, lhs.z_bu,
+                            data.idx_xl, self._w_bl_delta_inv, self._m_z_bl_inv, rhs.z_bl, rhs.s_bl, lhs.z_bl],
+                        device="cuda",
+                        stream=stream_wp_capture,
+                    )
+                    wp.launch(
+                        kernel=self._recover_slacks_kernel,
+                        dim=data.num_hu+data.num_hl+data.num_xu+data.num_xl,
+                        inputs=[rhs.s_u, lhs.z_u, self._m_s_u, self._m_z_u_inv, lhs.s_u,
+                                rhs.s_l, lhs.z_l, self._m_s_l, self._m_z_l_inv, lhs.s_l,
+                                rhs.s_bu, lhs.z_bu, self._m_s_bu, self._m_z_bu_inv, lhs.s_bu,
+                                rhs.s_bl, lhs.z_bl, self._m_s_bl, self._m_z_bl_inv, lhs.s_bl],
+                        device="cuda",
+                        stream=stream_wp_capture,
+                    )
 
-            # cp.multiply(self._m_z_bu_inv, rhs.s_bu, out=lhs.z_bu)
-            # lhs.z_bu += lhs.x[data.idx_xu]
-            # lhs.z_bu -= rhs.z_bu
-            # lhs.z_bu *= self._w_bu_delta_inv
+                    # # ! ALTERNATIVE IMPLEMENTATION (pure cupy operations)
 
-            # cp.multiply(self._m_z_bl_inv, rhs.s_bl, out=lhs.z_bl)
-            # lhs.z_bl -= lhs.x[data.idx_xl]
-            # lhs.z_bl -= rhs.z_bl
-            # lhs.z_bl *= self._w_bl_delta_inv
-            
+                    # ----- recover dual variables on lhs
+                    # The below code is equivalent to:
+                    # lhs.z_u[:] = self._w_u_delta_inv * (G_dx[data.idx_hu] - self._updated_rhs_z_u)   # delta_z_u
+                    # lhs.z_l[:] = self._w_l_delta_inv * (-G_dx[data.idx_hl] - self._updated_rhs_z_l)  # delta_z_l
+                    # lhs.z_bu[:] = self._w_bu_delta_inv * (lhs.x[data.idx_xu] - rhs.z_bu + self._m_z_bu_inv * rhs.s_bu)  # delta_z_bu
+                    # lhs.z_bl[:] = -self._w_bl_delta_inv * (lhs.x[data.idx_xl] + rhs.z_bl - self._m_z_bl_inv * rhs.s_bl)  # delta_z_bl
+                    
+                    # lhs.z_u[:] = self._work_z[data.idx_hu]
+                    # lhs.z_u -= self._updated_rhs_z_u
+                    # lhs.z_u *= self._w_u_delta_inv
 
-            wp.launch(
-                kernel=self._recover_duals_kernel,
-                dim=data.num_hu+data.num_hl+data.num_xu+data.num_xl,
-                inputs=[
-                    self._work_z, lhs.x,
-                    data.idx_hu, self._w_u_delta_inv, self._updated_rhs_z_u, lhs.z_u,
-                    data.idx_hl, self._w_l_delta_inv, self._updated_rhs_z_l, lhs.z_l,
-                    data.idx_xu, self._w_bu_delta_inv, self._m_z_bu_inv, rhs.z_bu, rhs.s_bu, lhs.z_bu,
-                    data.idx_xl, self._w_bl_delta_inv, self._m_z_bl_inv, rhs.z_bl, rhs.s_bl, lhs.z_bl],
-                device="cuda",
-                stream=stream_wp,
-            )
+                    # lhs.z_l[:] = self._work_z[data.idx_hl]
+                    # lhs.z_l *= -1.
+                    # lhs.z_l -= self._updated_rhs_z_l
+                    # lhs.z_l *= self._w_l_delta_inv
 
-            # ----- recover slack variable on lhs
-            # The below code is equivalent to:
-            # lhs.s_u[:] = self._m_z_u_inv * (rhs.s_u - self._m_s_u * lhs.z_u)  # delta_s_u = inv(Z_u) (r_s_u - S_u delta_z_u)
-            # lhs.s_l[:] = self._m_z_l_inv * (rhs.s_l - self._m_s_l * lhs.z_l)  # delta_s_l = inv(Z_l) (r_s_l - S_l delta_z_l)
-            # lhs.s_bu[:] = self._m_z_bu_inv * (rhs.s_bu - self._m_s_bu * lhs.z_bu)  # delta_s_bu = inv(Z_bu) (r_s_bu - S_bu delta_z_bu)
-            # lhs.s_bl[:] = self._m_z_bl_inv * (rhs.s_bl - self._m_s_bl * lhs.z_bl)  # delta_s_bl = inv(Z_bl) (r_s_bl - S_bl delta_z_bl)
+                    # cp.multiply(self._m_z_bu_inv, rhs.s_bu, out=lhs.z_bu)
+                    # lhs.z_bu += lhs.x[data.idx_xu]
+                    # lhs.z_bu -= rhs.z_bu
+                    # lhs.z_bu *= self._w_bu_delta_inv
 
-            # # ! ALTERNATIVE IMPLEMENTATION (pure cupy operations)
-            # cp.multiply(self._m_s_u, lhs.z_u, out=lhs.s_u)
-            # cp.subtract(rhs.s_u, lhs.s_u, out=lhs.s_u)
-            # cp.multiply(self._m_z_u_inv, lhs.s_u, out=lhs.s_u)
+                    # cp.multiply(self._m_z_bl_inv, rhs.s_bl, out=lhs.z_bl)
+                    # lhs.z_bl -= lhs.x[data.idx_xl]
+                    # lhs.z_bl -= rhs.z_bl
+                    # lhs.z_bl *= self._w_bl_delta_inv
+                    
+                    # ----- recover slack variable on lhs
+                    # The below code is equivalent to:
+                    # lhs.s_u[:] = self._m_z_u_inv * (rhs.s_u - self._m_s_u * lhs.z_u)  # delta_s_u = inv(Z_u) (r_s_u - S_u delta_z_u)
+                    # lhs.s_l[:] = self._m_z_l_inv * (rhs.s_l - self._m_s_l * lhs.z_l)  # delta_s_l = inv(Z_l) (r_s_l - S_l delta_z_l)
+                    # lhs.s_bu[:] = self._m_z_bu_inv * (rhs.s_bu - self._m_s_bu * lhs.z_bu)  # delta_s_bu = inv(Z_bu) (r_s_bu - S_bu delta_z_bu)
+                    # lhs.s_bl[:] = self._m_z_bl_inv * (rhs.s_bl - self._m_s_bl * lhs.z_bl)  # delta_s_bl = inv(Z_bl) (r_s_bl - S_bl delta_z_bl)
 
-            # cp.multiply(self._m_s_l, lhs.z_l, out=lhs.s_l)
-            # cp.subtract(rhs.s_l, lhs.s_l, out=lhs.s_l)
-            # cp.multiply(self._m_z_l_inv, lhs.s_l, out=lhs.s_l)
+                    # cp.multiply(self._m_s_u, lhs.z_u, out=lhs.s_u)
+                    # cp.subtract(rhs.s_u, lhs.s_u, out=lhs.s_u)
+                    # cp.multiply(self._m_z_u_inv, lhs.s_u, out=lhs.s_u)
 
-            # cp.multiply(self._m_s_bu, lhs.z_bu, out=lhs.s_bu)
-            # cp.subtract(rhs.s_bu, lhs.s_bu, out=lhs.s_bu)
-            # cp.multiply(self._m_z_bu_inv, lhs.s_bu, out=lhs.s_bu)
+                    # cp.multiply(self._m_s_l, lhs.z_l, out=lhs.s_l)
+                    # cp.subtract(rhs.s_l, lhs.s_l, out=lhs.s_l)
+                    # cp.multiply(self._m_z_l_inv, lhs.s_l, out=lhs.s_l)
 
-            # cp.multiply(self._m_s_bl, lhs.z_bl, out=lhs.s_bl)
-            # cp.subtract(rhs.s_bl, lhs.s_bl, out=lhs.s_bl)
-            # cp.multiply(self._m_z_bl_inv, lhs.s_bl, out=lhs.s_bl)
+                    # cp.multiply(self._m_s_bu, lhs.z_bu, out=lhs.s_bu)
+                    # cp.subtract(rhs.s_bu, lhs.s_bu, out=lhs.s_bu)
+                    # cp.multiply(self._m_z_bu_inv, lhs.s_bu, out=lhs.s_bu)
 
-            wp.launch(
-                kernel=self._recover_slacks_kernel,
-                dim=data.num_hu+data.num_hl+data.num_xu+data.num_xl,
-                inputs=[rhs.s_u, lhs.z_u, self._m_s_u, self._m_z_u_inv, lhs.s_u,
-                        rhs.s_l, lhs.z_l, self._m_s_l, self._m_z_l_inv, lhs.s_l,
-                        rhs.s_bu, lhs.z_bu, self._m_s_bu, self._m_z_bu_inv, lhs.s_bu,
-                        rhs.s_bl, lhs.z_bl, self._m_s_bl, self._m_z_bl_inv, lhs.s_bl],
-                device="cuda",
-                stream=stream_wp,
-            )
+                    # cp.multiply(self._m_s_bl, lhs.z_bl, out=lhs.s_bl)
+                    # cp.subtract(rhs.s_bl, lhs.s_bl, out=lhs.s_bl)
+                    # cp.multiply(self._m_z_bl_inv, lhs.s_bl, out=lhs.s_bl)
+
+                self._recover_lhs_cuda_graphs[key] = stream_cp_capture.end_capture()
+
+            self._recover_lhs_cuda_graphs[key].launch()
+
+    @nvtx.annotate("KKTSystem::iterative_refinement")
+    def iterative_refinement(self, data: Data, settings: Settings,
+                             rhs_x: cp.ndarray, rhs_y: cp.ndarray, rhs_z: cp.ndarray,
+                             lhs_x: cp.ndarray, lhs_y: cp.ndarray, lhs_z: cp.ndarray) -> bool:
+        """Iterative refinement on the condensed 3-block KKT system.
+
+        Refines (lhs_x, lhs_y, lhs_z) in-place so that
+            K_condensed * [lhs_x; lhs_y; lhs_z] ≈ [rhs_x; rhs_y; rhs_z].
+
+        Matches PIQP's solve() IR loop (kkt_system.tpp lines 294-339).
+        Returns False if a non-finite residual is encountered.
+        """
+        ref_err_x = self._iter_refine_error_xyz[:data.n]
+        ref_err_y = self._iter_refine_error_xyz[data.n:data.n+data.p]
+        ref_err_z = self._iter_refine_error_xyz[data.n+data.p:]
+        ref_lhs_x = self._iter_refine_delta_xyz[:data.n]
+        ref_lhs_y = self._iter_refine_delta_xyz[data.n:data.n+data.p]
+        ref_lhs_z = self._iter_refine_delta_xyz[data.n+data.p:]
+
+        rhs_norm = float(cp.max(cp.abs(rhs_x)))
+        if data.p > 0:
+            rhs_norm = max(rhs_norm, float(cp.max(cp.abs(rhs_y))))
+        if data.m > 0:
+            rhs_norm = max(rhs_norm, float(cp.max(cp.abs(rhs_z))))
+
+        # Initial error computed on first iteration; subsequent iterations
+        # reuse ref_err from candidate evaluation at end of previous iteration.
+        refine_error = math.inf
+        VERBOSE_IR = True
+        tol = settings.iterative_refinement_eps_abs + settings.iterative_refinement_eps_rel * rhs_norm
+
+        for i in range(settings.iterative_refinement_max_iter):
+            # Compute error: initial solve (i==0) or candidate (i>0)
+            if i == 0:
+                self.get_refinement_error(
+                    data, lhs_x, lhs_y, lhs_z, rhs_x, rhs_y, rhs_z,
+                    ref_err_x, ref_err_y, ref_err_z)
+            else:
+                self.get_refinement_error(
+                    data, ref_lhs_x, ref_lhs_y, ref_lhs_z, rhs_x, rhs_y, rhs_z,
+                    ref_err_x, ref_err_y, ref_err_z)
+
+            prev_refine_error = refine_error
+            refine_error = float(cp.linalg.norm(self._iter_refine_error_xyz[:data.n + data.p + data.m], ord=cp.inf))
+
+            if VERBOSE_IR:
+                if i == 0:
+                    print(f"  IR iter {i}: error={refine_error:.2e}, tol={tol:.2e}")
+                else:
+                    print(f"  IR iter {i}: error={refine_error:.2e}, improvement={prev_refine_error/refine_error:.2f}x")
+
+            if not math.isfinite(refine_error):
+                if VERBOSE_IR:
+                    print(f"  IR: non-finite error, aborting")
+                return False
+
+            if refine_error <= tol:
+                if VERBOSE_IR:
+                    print(f"  IR: converged at iter {i}")
+                if i > 0:
+                    cp.copyto(lhs_x, ref_lhs_x)
+                    cp.copyto(lhs_y, ref_lhs_y)
+                    cp.copyto(lhs_z, ref_lhs_z)
+                break
+
+            if i > 0:
+                improvement_rate = prev_refine_error / refine_error
+                if improvement_rate < settings.iterative_refinement_min_improvement_rate:
+                    if improvement_rate > 1.0:
+                        if VERBOSE_IR:
+                            print(f"  IR: slow improvement ({improvement_rate:.2f}x < {settings.iterative_refinement_min_improvement_rate:.1f}x), accepting candidate")
+                        cp.copyto(lhs_x, ref_lhs_x)
+                        cp.copyto(lhs_y, ref_lhs_y)
+                        cp.copyto(lhs_z, ref_lhs_z)
+                    else:
+                        if VERBOSE_IR:
+                            print(f"  IR: no improvement ({improvement_rate:.2f}x), rejecting candidate")
+                    break
+                # Accept candidate
+                cp.copyto(lhs_x, ref_lhs_x)
+                cp.copyto(lhs_y, ref_lhs_y)
+                cp.copyto(lhs_z, ref_lhs_z)
+
+            # Solve for correction: K * ref_lhs = ref_err
+            self._kkt_solver.solve(data,
+                                   ref_err_x, ref_err_y, ref_err_z,
+                                   ref_lhs_x, ref_lhs_y, ref_lhs_z)
+
+            # Build candidate in ref_lhs: ref_lhs = lhs + correction
+            ref_lhs_x += lhs_x
+            ref_lhs_y += lhs_y
+            ref_lhs_z += lhs_z
+
+        return True
+
+    @nvtx.annotate("KKTSystem::mul_condensed_kkt")
+    def mul_condensed_kkt(self, data: Data,
+                          lhs_x: cp.ndarray, lhs_y: cp.ndarray, lhs_z: cp.ndarray,
+                          rhs_x: cp.ndarray, rhs_y: cp.ndarray, rhs_z: cp.ndarray) -> None:
+        """
+        Compute the matrix-vector product with the condensed (reduced) KKT matrix:
+
+            [ P + x_reg*I   A^T       G^T    ] [ lhs_x ]   [ rhs_x ]
+            [ A            -delta*I    0     ] [ lhs_y ] = [ rhs_y ]
+            [ G              0       -z_reg  ] [ lhs_z ]   [ rhs_z ]
+
+        where x_reg and z_reg incorporate the eliminated slack/bound contributions.
+        Requires update_scalings_and_factor() to have been called first (sets _x_reg, _z_reg, _delta).
+
+        All output arrays (rhs_x, rhs_y, rhs_z) are overwritten.
+        """
+        # rhs_x = P*lhs_x
+        self.eval_P_x(data, 1., lhs_x, rhs_x)
+        rhs_x += self._x_reg * lhs_x
+
+        # A block: rhs_y = A*lhs_x, rhs_x += A^T*lhs_y
+        if data.p > 0:
+            self.eval_A_xn(data, 1., lhs_x, rhs_y)
+            self.eval_AT_xt(data, 1., lhs_y, self._work_x)
+            rhs_x += self._work_x
+            rhs_y -= self._delta[0] * lhs_y
+
+        # G block: rhs_z = G*lhs_x, rhs_x += G^T*lhs_z
+        if data.m > 0:
+            self.eval_G_xn(data, 1., lhs_x, rhs_z)
+            self.eval_GT_xt(data, 1., lhs_z, self._work_x)
+            rhs_x += self._work_x
+            rhs_z -= self._z_reg * lhs_z
+
+    @nvtx.annotate("KKTSystem::get_refinement_error")
+    def get_refinement_error(self, data: Data,
+                         lhs_x: cp.ndarray, lhs_y: cp.ndarray, lhs_z: cp.ndarray,
+                         rhs_x: cp.ndarray, rhs_y: cp.ndarray, rhs_z: cp.ndarray,
+                         err_x: cp.ndarray, err_y: cp.ndarray, err_z: cp.ndarray) -> float:
+        """
+        Compute the residual error of the condensed KKT solve:
+            err = rhs - KKT * lhs
+        and return ||err||_inf = max(||err_x||_inf, ||err_y||_inf, ||err_z||_inf).
+
+        Args:
+            lhs_x, lhs_y, lhs_z: current solution (primal, eq dual, ineq dual)
+            rhs_x, rhs_y, rhs_z: right-hand side of condensed KKT system
+            err_x, err_y, err_z: output arrays overwritten with residual
+        Returns:
+            Infinity norm of the residual.
+        """
+        # err = rhs - KKT * lhs
+        self.mul_condensed_kkt(data, lhs_x, lhs_y, lhs_z, err_x, err_y, err_z)
+        cp.subtract(rhs_x, err_x, out=err_x)
+        cp.subtract(rhs_y, err_y, out=err_y)
+        cp.subtract(rhs_z, err_z, out=err_z)
+
+        # return max(||err_x||_inf, ||err_y||_inf, ||err_z||_inf)
+        norm = float(cp.max(cp.abs(err_x)))
+        if err_y.size > 0:
+            norm = max(norm, float(cp.max(cp.abs(err_y))))
+        if err_z.size > 0:
+            norm = max(norm, float(cp.max(cp.abs(err_z))))
+        return norm
 
     @nvtx.annotate("KKTSystem::eval_P_x")
     def eval_P_x(self, data: Data, alpha: float, x: cp.ndarray, z: cp.ndarray):
@@ -414,100 +641,6 @@ class KKTSystem:
         zt = alpha_t * G^T * xt
         """
         self._kkt_solver.eval_GT_xt(data, alpha_t, xt, zt)
-    
-    def kkt_matrix(self, rho: float, delta: float, vars: Variables) -> cp.ndarray:
-        """
-        NOTICE: this method is only for testing purpose. It returns the full KKT matrix with given rho and delta
-        """
-        n, p, m = data.n, data.p, data.m
-        data = data
-        kkt_mat = cp.zeros((data.n + data.p + 4*data.m + 2*(data.num_xl + data.num_xu),
-                            data.n + data.p + 4*data.m + 2*(data.num_xl + data.num_xu)))
-        
-        # fill in P, A related parts
-        kkt_mat[:n, :n] = data.P + rho * cp.eye(n)
-        kkt_mat[n:n+p, :n] = data.A
-        kkt_mat[:n, n:n+p] = data.A.T
-        kkt_mat[n:n+p, n:n+p] = -delta * cp.eye(p)
-
-        # fill in G related parts
-        rows_start = n + p
-        rows_end = rows_start + 2*m
-        kkt_mat[rows_start:rows_end, :n] = cp.vstack((data.G, -data.G))
-        kkt_mat[:n, rows_start:rows_end] = cp.hstack((data.G.T, -data.G.T))
-        kkt_mat[rows_start:rows_start+m, rows_start:rows_start+m] = -delta * cp.eye(data.m)
-        kkt_mat[rows_start+m:rows_end, rows_start+m:rows_end] = -delta * cp.eye(data.m)
-
-        # fill in box constraint related parts
-        rows_start += 2*m
-        rows_end = rows_start + data.num_xu + data.num_xl
-        kkt_mat[rows_start:rows_end, :n] = cp.vstack((cp.eye(n)[data.idx_xu, :], -cp.eye(n)[data.idx_xl, :]))
-        kkt_mat[:n, rows_start:rows_end] = cp.hstack((cp.eye(n)[:, data.idx_xu], -cp.eye(n)[:, data.idx_xl]))
-        kkt_mat[rows_start:rows_start+data.num_xu, rows_start:rows_start+data.num_xu] = -delta * cp.eye(data.num_xu)
-        kkt_mat[rows_start+data.num_xu:rows_end, rows_start+data.num_xu:rows_end] = -delta * cp.eye(data.num_xl)
-
-        # fill in slack rows for h_u
-        rows_start += data.num_xu + data.num_xl
-        rows_end = rows_start + data.m
-        kkt_mat[rows_start:rows_end, n+p:n+p+m] = cp.diag(vars.s_u)
-        kkt_mat[rows_start:rows_end, rows_start:rows_end] = cp.diag(vars.z_u)
-        kkt_mat[n+p:n+p+m, rows_start:rows_end] = cp.eye(data.m)
-
-        rows_start += data.m
-        rows_end = rows_start + data.m
-        kkt_mat[rows_start:rows_end, n+p+m:n+p+2*m] = cp.diag(vars.s_l)
-        kkt_mat[rows_start:rows_end, rows_start:rows_end] = cp.diag(vars.z_l)
-        kkt_mat[n+p+m:n+p+2*m, rows_start:rows_end] = cp.eye(data.m)
-
-        rows_start += data.m
-        rows_end = rows_start + data.num_xu
-        kkt_mat[rows_start:rows_end, n+p+2*m:n+p+2*m+data.num_xu] = cp.diag(vars.s_bu)
-        kkt_mat[rows_start:rows_end, rows_start:rows_end] = cp.diag(vars.z_bu)
-        kkt_mat[n+p+2*m:n+p+2*m+data.num_xu, rows_start:rows_end] = cp.eye(data.num_xu)
-
-        rows_start += data.num_xu
-        rows_end = rows_start + data.num_xl
-        kkt_mat[rows_start:rows_end, n+p+2*m+data.num_xu:n+p+2*m+data.num_xu+data.num_xl] = cp.diag(vars.s_bl)
-        kkt_mat[rows_start:rows_end, rows_start:rows_end] = cp.diag(vars.z_bl)
-        kkt_mat[n+p+2*m+data.num_xu:n+p+2*m+data.num_xu+data.num_xl, rows_start:rows_end] = cp.eye(data.num_xl)
-
-        return kkt_mat
-    
-    def kkt_solution(self, rho: float, delta: float, vars: Variables, rhs: Variables) -> Variables:
-        """
-        Only for testing purpose: return the KKT solution for given rhs
-        """
-        n, p, m = data.n, data.p, data.m
-        kkt_mat = self.kkt_matrix(rho, delta, vars)
-        rhs_vector = cp.hstack((rhs.x, rhs.y, rhs.z_u, rhs.z_l, rhs.z_bu, rhs.z_bl, rhs.s_u, rhs.s_l, rhs.s_bu, rhs.s_bl))
-        sol =  cp.linalg.solve(kkt_mat, rhs_vector)
-        assert cp.abs(cp.max(kkt_mat @ sol - rhs_vector)) < 1e-8, "KKT solution verification failed!"
-        lhs = Variables(n, p, m, data.num_xu, data.num_xl)
-        lhs.x = sol[:n]
-        lhs.y = sol[n:n + p]
-        lhs.z_u = sol[n + p:n + p + m]
-        lhs.z_l = sol[n + p + m:n + p + 2*m]
-
-        idx = n + p + 2*m
-        lhs.z_bu = sol[idx : idx + data.num_xu]
-
-        idx += data.num_xu
-        lhs.z_bl = sol[idx : idx + data.num_xl]
-
-        idx += data.num_xl
-        lhs.s_u = sol[idx : idx + m]
-
-        idx += m
-        lhs.s_l = sol[idx : idx + m]
-
-        idx += m
-        lhs.s_bu = sol[idx : idx + data.num_xu]
-
-        idx += data.num_xu
-        lhs.s_bl = sol[idx : idx + data.num_xl]
-
-        return lhs
-    
 
 def create_build_inverse_index_kernel():
     """Create a kernel that builds an inverse index map: inv_idx[idx[t]] = t."""

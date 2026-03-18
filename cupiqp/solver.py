@@ -1,12 +1,18 @@
 import cupy as cp
 import warp as wp
-from typing import Tuple
+from typing import Optional, Any
 import nvtx
 
 from .settings import Settings
 from .data import Data
 from .results import Result, Status, Variables
 from .kkt_systems import KKTSystem
+
+
+wp.config.quiet = True  # disable warp module initialization messages.
+wp.config.enable_backward = False  # disable backward mode, cut down kernel compile time
+wp.init()
+
 
 class SolverBase:
     def __init__(self):
@@ -70,6 +76,60 @@ class SolverBase:
 
         self._mu_prev = cp.empty(1)
         self._mu_rate = cp.empty(1)
+
+        self._enable_iterative_refinement = self.settings.iterative_refinement_always_enabled
+
+        self._setup_done = True
+
+    def update(self,
+               P: Optional[Any] = None,
+               c: Optional[Any] = None,
+               A: Optional[Any] = None,
+               b: Optional[Any] = None,
+               G: Optional[Any] = None,
+               h_u: Optional[Any] = None,
+               h_l: Optional[Any] = None,
+               x_u: Optional[Any] = None,
+               x_l: Optional[Any] = None,
+               check_validity: bool = False,
+               ):
+        """Update problem data between solves without a full setup().
+
+        Only numerical values are updated; dimensions and sparsity patterns
+        must remain unchanged.  Call ``solve()`` again after ``update()``.
+
+        Args:
+            check_validity: If True, validate dimensions/sparsity of the new data.
+                   Defaults to False for maximum performance (skips D2H syncs
+                   from sparsity pattern validation in the sparse backend).
+                   The caller must ensure that the finite/infinite bound
+                   structure is unchanged (same indices have finite bounds
+                   as in ``setup()``).
+        """
+        if not self._setup_done:
+            raise RuntimeError("Solver not setup yet. Call setup() first.")
+
+        if P is not None:
+            self._data.set_P(P, check=check_validity)
+        if c is not None:
+            self._data.set_c(c, check=check_validity)
+        if A is not None:
+            self._data.set_A(A, check=check_validity)
+        if b is not None:
+            self._data.set_b(b, check=check_validity)
+        if G is not None:
+            self._data.set_G(G, check=check_validity)
+        if h_u is not None:
+            self._data.set_h_u(h_u, check=check_validity)
+        if h_l is not None:
+            self._data.set_h_l(h_l, check=check_validity)
+        if x_u is not None:
+            self._data.set_x_u(x_u, check=check_validity)
+        if x_l is not None:
+            self._data.set_x_l(x_l, check=check_validity)
+
+        self._data._compute_constraints_rhs_inf_norm()
+        self._kkt_system.update_data(self._data, P is not None, A is not None, G is not None)
 
     def solve(self) -> Status:
         if self.settings.verbose:
@@ -149,7 +209,37 @@ class SolverBase:
                     self._result.info.status = Status.PIQP_DUAL_INFEASIBLE
                     return self._result.info.status
                 
-
+                # avoid getting too close to boundary which can result in a division by zero
+                epsilon = float(cp.finfo(cp.float64).eps)
+                boundary_shifted = False
+                if self._data.num_hl > 0 and bool(cp.any(self._result.z_l < epsilon)):
+                    self._result.z_l += (self._result.z_l < epsilon) * epsilon
+                    boundary_shifted = True
+                if self._data.num_hu > 0 and bool(cp.any(self._result.z_u < epsilon)):
+                    self._result.z_u += (self._result.z_u < epsilon) * epsilon
+                    boundary_shifted = True
+                if self._data.num_xl > 0 and bool(cp.min(self._result.z_bl) < epsilon):
+                    self._result.z_bl += epsilon
+                    boundary_shifted = True
+                if self._data.num_xu > 0 and bool(cp.min(self._result.z_bu) < epsilon):
+                    self._result.z_bu += epsilon
+                    boundary_shifted = True
+                if boundary_shifted:
+                    print("Boundary shifted to avoid division by zero")
+                    self._calculate_mu()
+                
+                # avoid possibility of converging to a local minimum -> decrease the minimum regularization value
+                if ((self._result.info.no_primal_update > self.settings.reg_finetune_primal_update_threshold and
+                    self._result.info.rho[0] == self._result.info.reg_limit[0] and
+                    self._result.info.reg_limit[0] != self.settings.reg_finetune_lower_limit) or
+                    (self._result.info.no_dual_update > self.settings.reg_finetune_dual_update_threshold and
+                    self._result.info.delta[0] == self._result.info.reg_limit[0] and
+                    self._result.info.reg_limit[0] != self.settings.reg_finetune_lower_limit)):
+                    if (self._result.info.dual_prox_inf < self.settings.infeasibility_threshold and self._result.info.primal_prox_inf < self.settings.infeasibility_threshold):
+                        self._result.info.reg_limit[0] = self.settings.reg_finetune_lower_limit
+                        self._result.info.no_primal_update = 0
+                        self._result.info.no_dual_update = 0
+                
                 if self.settings.verbose:
                     self._print_iteration_info()
 
@@ -187,6 +277,8 @@ class SolverBase:
 
         self._kkt_system.update_scalings_and_factor(
             self._data,
+            self.settings,
+            self._enable_iterative_refinement,
             self._result.info.rho,
             self._result.info.delta,
             self._result
@@ -295,10 +387,14 @@ class SolverBase:
     def _update_and_factorize_kkt(self) -> None:
         """Update the KKT matrix and refactorize."""
         while self._result.info.factor_retires < self.settings.max_factor_retires:
-            factor_succeeded = self._kkt_system.update_scalings_and_factor(self._data, self._result.info.rho, self._result.info.delta, self._result)
+            factor_succeeded = self._kkt_system.update_scalings_and_factor(
+                self._data, self.settings, self._enable_iterative_refinement,
+                self._result.info.rho, self._result.info.delta, self._result)
             if factor_succeeded:
                 break
             else:
+                if not self._enable_iterative_refinement:
+                    self._enable_iterative_refinement = True
                 self._result.info.factor_retires += 1
                 self._result.info.rho *= 100.
                 self._result.info.delta *= 100.
@@ -430,7 +526,7 @@ class SolverBase:
         
         if key not in self._calculate_step_cuda_graphs:
             self._calculate_step_cuda_graphs_capture_count += 1
-            print(f"Solver::_calculate_step capturing CUDA graph (occurrence {self._calculate_step_cuda_graphs_capture_count})...")
+            # print(f"Solver::_calculate_step capturing CUDA graph (occurrence {self._calculate_step_cuda_graphs_capture_count})...")
             stream = cp.cuda.Stream(non_blocking=True)
             stream.begin_capture()
             with stream:
@@ -483,7 +579,7 @@ class SolverBase:
         key = (self._result.buffer_ptr, self._result.info.mu.data.ptr)
         if key not in self._calculate_mu_cuda_graphs:
             self._calculate_mu_cuda_graphs_capture_count += 1
-            print(f"Solver::_calculate_mu capturing CUDA graph (occurrence {self._calculate_mu_cuda_graphs_capture_count})...")
+            # print(f"Solver::_calculate_mu capturing CUDA graph (occurrence {self._calculate_mu_cuda_graphs_capture_count})...")
             stream = cp.cuda.Stream(non_blocking=True)
             stream.begin_capture()
             with stream:
@@ -512,7 +608,7 @@ class SolverBase:
         
         if key not in self._calculate_sigma_cuda_graphs:
             self._calculate_sigma_cuda_graphs_capture_count += 1
-            print(f"Solver::_calculate_sigma capturing CUDA graph (occurrence {self._calculate_sigma_cuda_graphs_capture_count})...")
+            # print(f"Solver::_calculate_sigma capturing CUDA graph (occurrence {self._calculate_sigma_cuda_graphs_capture_count})...")
             stream = cp.cuda.Stream(non_blocking=True)
             stream.begin_capture()
             with stream:
@@ -589,7 +685,7 @@ class SolverBase:
 
         if key not in self._update_residuals_nr_cuda_graphs:
             self._update_residuals_nr_cuda_graphs_capture_count += 1
-            print(f"Solver::_update_residuals_nr capturing CUDA graph (occurrence {self._update_residuals_nr_cuda_graphs_capture_count})...")
+            # print(f"Solver::_update_residuals_nr capturing CUDA graph (occurrence {self._update_residuals_nr_cuda_graphs_capture_count})...")
             stream = cp.cuda.Stream(non_blocking=True)
             stream.begin_capture()
             with stream:
@@ -759,7 +855,7 @@ class SolverBase:
         
         if key not in self._update_residuals_r_cuda_graphs:
             self._update_residuals_r_cuda_graphs_capture_count += 1
-            print(f"Solver::_update_residuals_r capturing CUDA graph (occurrence {self._update_residuals_r_cuda_graphs_capture_count})...")
+            # print(f"Solver::_update_residuals_r capturing CUDA graph (occurrence {self._update_residuals_r_cuda_graphs_capture_count})...")
             # !IMPORTANT! Use the same stream for warp and cupy to make sure the captured graph contains both the warp kernel and the cupy operations, and they can be executed together without unnecessary stream synchronization
             stream = cp.cuda.ExternalStream(wp.get_stream().cuda_stream)
             stream.begin_capture()

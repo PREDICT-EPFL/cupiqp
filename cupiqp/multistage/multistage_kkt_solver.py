@@ -25,10 +25,10 @@ class MultistageKKTSolver(KKTSolverBase):
     """
     Multi-stage KKT solver with block-wise Cholesky factorization. All operations use native block structures.
     """
-    def __init__(self, data: MultistageData, block_size: int):
+    def __init__(self, data: MultistageData):
         super().__init__()
         N = data.num_blocks
-        d = block_size
+        d = data.block_size
 
         self._block_size = d
         self.num_stages = N
@@ -90,6 +90,19 @@ class MultistageKKTSolver(KKTSolverBase):
         if data.m > 0:
             self._eval_G_xn_kernel = create_block_bidiag_gemv_n_kernel(N, data._G.rows_of_blocks, d, wp.float64)
             self._eval_GT_xt_kernel = create_block_bidiag_gemv_t_kernel(N, data._G.rows_of_blocks, d, wp.float64)
+
+    def update_data(self, data: MultistageData, update_P: bool, update_A: bool, update_G: bool):
+        if update_A and data.p > 0:
+            stream = wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr)
+            wp.launch(
+                kernel=self._eval_AT_A_kernel,
+                dim=(self.num_stages, self._block_size, self._block_size),
+                inputs=[
+                    wp.float64(1.0), data._A.D, data._A.E,
+                    wp.float64(0.0), self._AtA_diag, self._AtA_offdiag,
+                ],
+                stream=stream,
+            )
 
     @nvtx.annotate("MultistageKKTSolver::update_kkt")
     def update_kkt(self, data: MultistageData, delta: float, x_reg: cp.ndarray, z_reg: cp.ndarray) -> None:
@@ -253,6 +266,7 @@ class MultistageKKTSolver(KKTSolverBase):
 
     @nvtx.annotate("MultistageKKTSolver::eval_P_x")
     def eval_P_x(self, data: MultistageData, alpha: float, x: cp.ndarray, z: cp.ndarray):
+        stream_wp = wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr)
         N = self.num_stages
         d = self._block_size
         wp.launch(
@@ -265,10 +279,12 @@ class MultistageKKTSolver(KKTSolverBase):
                 wp.float64(0.0),
                 z,
             ],
+            stream=stream_wp,
         )
 
     @nvtx.annotate("MultistageKKTSolver::eval_A_xn")
     def eval_A_xn(self, data: MultistageData, alpha_n: float, xn: cp.ndarray, zn: cp.ndarray):
+        stream_wp = wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr)
         N = self.num_stages
         d = self._block_size
         # zn = alpha_n * A * xn
@@ -282,10 +298,12 @@ class MultistageKKTSolver(KKTSolverBase):
                 wp.float64(0.0),
                 zn,
             ],
+            stream=stream_wp,
         )
 
     @nvtx.annotate("MultistageKKTSolver::eval_AT_xt")
     def eval_AT_xt(self, data: MultistageData, alpha_t: float, xt: cp.ndarray, zt: cp.ndarray):
+        stream_wp = wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr)
         N = self.num_stages
         d = self._block_size
         # zt = alpha_t * A^T * xt
@@ -299,10 +317,12 @@ class MultistageKKTSolver(KKTSolverBase):
                 wp.float64(0.0),
                 zt,
             ],
+            stream=stream_wp,
         )
 
     @nvtx.annotate("MultistageKKTSolver::eval_G_xn")
     def eval_G_xn(self, data: MultistageData, alpha_n: float, xn: cp.ndarray, zn: cp.ndarray):
+        stream_wp = wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr)
         N = self.num_stages
         r_G = data._G.rows_of_blocks
         # zn = alpha_n * G * xn
@@ -316,12 +336,14 @@ class MultistageKKTSolver(KKTSolverBase):
                 wp.float64(0.0),
                 zn,
             ],
+            stream=stream_wp,
         )
 
     @nvtx.annotate("MultistageKKTSolver::eval_GT_xt")
     def eval_GT_xt(self, data: MultistageData, alpha_t: float, xt: cp.ndarray, zt: cp.ndarray):
         N = self.num_stages
         d = self._block_size
+        stream_wp = wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr)
         # zt = alpha_t * G^T * xt
         wp.launch(
             self._eval_GT_xt_kernel,
@@ -334,4 +356,5 @@ class MultistageKKTSolver(KKTSolverBase):
                 wp.float64(0.0),
                 zt,
             ],
+            stream=stream_wp,
         )
