@@ -1,13 +1,15 @@
+import math
+
 import cupy as cp
 import warp as wp
 import nvtx
 
+from .results import Variables
 from .data import Data
 from .settings import Settings
 from .sparse.sparse_kkt_solver import SparseKKTSolver
 from .dense.dense_kkt_solver import DenseKKTSolver
 from .multistage.multistage_kkt_solver import MultistageKKTSolver
-from .results import Variables
 
 
 class KKTSystem:
@@ -42,6 +44,7 @@ class KKTSystem:
     
     def init(self, data: Data, settings: Settings):
         self._settings = settings
+        self._use_iterative_refinement = False
 
         self._x_reg = cp.nan * cp.ones(data.n)
         self._z_reg = cp.nan * cp.ones(data.m)
@@ -91,6 +94,10 @@ class KKTSystem:
         self._updated_rhs_z_bu = cp.zeros(data.num_xu)
         self._updated_rhs_z_bl = cp.zeros(data.num_xl)
 
+        # pre-allocate memory for condensed KKT iterative refinement (operates on x, y, z blocks only)
+        self._iter_refine_error_xyz = cp.zeros(data.n + data.p + data.m)
+        self._iter_refine_delta_xyz = cp.zeros(data.n+data.p+data.m)
+
         # create kernels
         self._update_regulerization_step_1_kernel = create_update_regularizations_step_1_kernel(data.num_hu, data.num_hl, data.num_xu, data.num_xl)
         self._update_regulerization_step_2_kernel = create_update_regularizations_step_2_kernel(data.n, data.m)
@@ -124,9 +131,11 @@ class KKTSystem:
         self._kkt_solver.update_data(data, update_P, update_A, update_G)
 
     @nvtx.annotate("KKTSystem::update_scalings_and_factor")
-    def update_scalings_and_factor(self, data: Data, rho: cp.ndarray, delta: cp.ndarray, vars: Variables) -> bool:
+    def update_scalings_and_factor(self, data: Data, settings: Settings, iterative_refinement: bool, rho: cp.ndarray, delta: cp.ndarray, vars: Variables) -> bool:
         """
         Update the scaling factors and refactor the KKT matrix.
+
+        TODO: When iterative_refinement (IR) is True, adds static regularization to improve factorization stability. The solve() method will then run IR.
 
         The variable vars is the current primal/dual variable values at this iteration, i.e., values of x, y, z_u, z_l, s_u, s_l, z_bu, z_bl, s_bu, s_bl at the current iteration.
         """
@@ -140,6 +149,7 @@ class KKTSystem:
                 self._m_z_u_inv.data.ptr, self._m_z_l_inv.data.ptr, self._m_z_bu_inv.data.ptr, self._m_z_bl_inv.data.ptr,
                 self._w_u_delta_inv.data.ptr, self._w_l_delta_inv.data.ptr, self._w_bu_delta_inv.data.ptr, self._w_bl_delta_inv.data.ptr,
                 self._x_reg.data.ptr, self._z_reg.data.ptr,
+                iterative_refinement,
                 )
 
             if key not in self._update_scaling_and_factor_cuda_graphs:
@@ -223,12 +233,16 @@ class KKTSystem:
                         self._z_reg[data.idx_hl] += self._w_l_delta_inv
                         cp.reciprocal(self._z_reg, out=self._z_reg)
 
+                    # TODO: in PIQP, if iterative_refinement is enabled, they add a small perturbation to the diagonal for improved stability. We can consider adding this as well.
                     self._kkt_solver.update_kkt(data, delta, self._x_reg, self._z_reg)
 
                 self._update_scaling_and_factor_cuda_graphs[key] = stream.end_capture()
 
             self._update_scaling_and_factor_cuda_graphs[key].launch()
 
+        self._rho = rho
+        self._delta = delta
+        self._use_iterative_refinement = iterative_refinement
         factor_success = self._kkt_solver.factor() # ! this is implicitly assuming idx_hu and idx_hl cover all indices of inequalities 0:m
         return factor_success
     
@@ -328,6 +342,12 @@ class KKTSystem:
 
         self._kkt_solver.solve(data, self._rhs_x_bar, rhs.y, self._rhs_z_bar, lhs.x, lhs.y, self._work_z)  # ! the second _work_z is used to hold delta_z, but useless anyway. Can be further optimized.
 
+        if self._use_iterative_refinement and settings.iterative_refinement_max_iter > 0:
+            self.iterative_refinement(
+                data, settings,
+                self._rhs_x_bar, rhs.y, self._rhs_z_bar,
+                lhs.x, lhs.y, self._work_z)
+
         with nvtx.annotate("KKTSystem::solve::recover_lhs"):
             if not hasattr(self, '_recover_lhs_cuda_graphs'):
                 self._recover_lhs_cuda_graphs = {}
@@ -423,6 +443,101 @@ class KKTSystem:
 
             self._recover_lhs_cuda_graphs[key].launch()
 
+    @nvtx.annotate("KKTSystem::iterative_refinement")
+    def iterative_refinement(self, data: Data, settings: Settings,
+                             rhs_x: cp.ndarray, rhs_y: cp.ndarray, rhs_z: cp.ndarray,
+                             lhs_x: cp.ndarray, lhs_y: cp.ndarray, lhs_z: cp.ndarray) -> bool:
+        """Iterative refinement on the condensed 3-block KKT system.
+
+        Refines (lhs_x, lhs_y, lhs_z) in-place so that
+            K_condensed * [lhs_x; lhs_y; lhs_z] ≈ [rhs_x; rhs_y; rhs_z].
+
+        Matches PIQP's solve() IR loop (kkt_system.tpp lines 294-339).
+        Returns False if a non-finite residual is encountered.
+        """
+        ref_err_x = self._iter_refine_error_xyz[:data.n]
+        ref_err_y = self._iter_refine_error_xyz[data.n:data.n+data.p]
+        ref_err_z = self._iter_refine_error_xyz[data.n+data.p:]
+        ref_lhs_x = self._iter_refine_delta_xyz[:data.n]
+        ref_lhs_y = self._iter_refine_delta_xyz[data.n:data.n+data.p]
+        ref_lhs_z = self._iter_refine_delta_xyz[data.n+data.p:]
+
+        rhs_norm = float(cp.max(cp.abs(rhs_x)))
+        if data.p > 0:
+            rhs_norm = max(rhs_norm, float(cp.max(cp.abs(rhs_y))))
+        if data.m > 0:
+            rhs_norm = max(rhs_norm, float(cp.max(cp.abs(rhs_z))))
+
+        # Initial error computed on first iteration; subsequent iterations
+        # reuse ref_err from candidate evaluation at end of previous iteration.
+        refine_error = math.inf
+        VERBOSE_IR = True
+        tol = settings.iterative_refinement_eps_abs + settings.iterative_refinement_eps_rel * rhs_norm
+
+        for i in range(settings.iterative_refinement_max_iter):
+            # Compute error: initial solve (i==0) or candidate (i>0)
+            if i == 0:
+                self.get_refinement_error(
+                    data, lhs_x, lhs_y, lhs_z, rhs_x, rhs_y, rhs_z,
+                    ref_err_x, ref_err_y, ref_err_z)
+            else:
+                self.get_refinement_error(
+                    data, ref_lhs_x, ref_lhs_y, ref_lhs_z, rhs_x, rhs_y, rhs_z,
+                    ref_err_x, ref_err_y, ref_err_z)
+
+            prev_refine_error = refine_error
+            refine_error = float(cp.linalg.norm(self._iter_refine_error_xyz[:data.n + data.p + data.m], ord=cp.inf))
+
+            if VERBOSE_IR:
+                if i == 0:
+                    print(f"  IR iter {i}: error={refine_error:.2e}, tol={tol:.2e}")
+                else:
+                    print(f"  IR iter {i}: error={refine_error:.2e}, improvement={prev_refine_error/refine_error:.2f}x")
+
+            if not math.isfinite(refine_error):
+                if VERBOSE_IR:
+                    print(f"  IR: non-finite error, aborting")
+                return False
+
+            if refine_error <= tol:
+                if VERBOSE_IR:
+                    print(f"  IR: converged at iter {i}")
+                if i > 0:
+                    cp.copyto(lhs_x, ref_lhs_x)
+                    cp.copyto(lhs_y, ref_lhs_y)
+                    cp.copyto(lhs_z, ref_lhs_z)
+                break
+
+            if i > 0:
+                improvement_rate = prev_refine_error / refine_error
+                if improvement_rate < settings.iterative_refinement_min_improvement_rate:
+                    if improvement_rate > 1.0:
+                        if VERBOSE_IR:
+                            print(f"  IR: slow improvement ({improvement_rate:.2f}x < {settings.iterative_refinement_min_improvement_rate:.1f}x), accepting candidate")
+                        cp.copyto(lhs_x, ref_lhs_x)
+                        cp.copyto(lhs_y, ref_lhs_y)
+                        cp.copyto(lhs_z, ref_lhs_z)
+                    else:
+                        if VERBOSE_IR:
+                            print(f"  IR: no improvement ({improvement_rate:.2f}x), rejecting candidate")
+                    break
+                # Accept candidate
+                cp.copyto(lhs_x, ref_lhs_x)
+                cp.copyto(lhs_y, ref_lhs_y)
+                cp.copyto(lhs_z, ref_lhs_z)
+
+            # Solve for correction: K * ref_lhs = ref_err
+            self._kkt_solver.solve(data,
+                                   ref_err_x, ref_err_y, ref_err_z,
+                                   ref_lhs_x, ref_lhs_y, ref_lhs_z)
+
+            # Build candidate in ref_lhs: ref_lhs = lhs + correction
+            ref_lhs_x += lhs_x
+            ref_lhs_y += lhs_y
+            ref_lhs_z += lhs_z
+
+        return True
+
     @nvtx.annotate("KKTSystem::mul_condensed_kkt")
     def mul_condensed_kkt(self, data: Data,
                           lhs_x: cp.ndarray, lhs_y: cp.ndarray, lhs_z: cp.ndarray,
@@ -441,7 +556,6 @@ class KKTSystem:
         """
         # rhs_x = P*lhs_x
         self.eval_P_x(data, 1., lhs_x, rhs_x)
-        # rhs_x += x_reg .* lhs_x
         rhs_x += self._x_reg * lhs_x
 
         # A block: rhs_y = A*lhs_x, rhs_x += A^T*lhs_y
@@ -475,10 +589,8 @@ class KKTSystem:
         Returns:
             Infinity norm of the residual.
         """
-        # err = KKT * lhs
+        # err = rhs - KKT * lhs
         self.mul_condensed_kkt(data, lhs_x, lhs_y, lhs_z, err_x, err_y, err_z)
-
-        # err = rhs - err
         cp.subtract(rhs_x, err_x, out=err_x)
         cp.subtract(rhs_y, err_y, out=err_y)
         cp.subtract(rhs_z, err_z, out=err_z)
