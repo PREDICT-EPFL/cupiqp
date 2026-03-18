@@ -140,7 +140,7 @@ class CudssSparseDirectSolver(SparseDirectSolver):
         return True
 
     def solve(self, 
-              iterative_refinement: bool = True, 
+              iterative_refinement: bool = False, 
               ir_abs_tol: float = 1e-12, 
               ir_rel_tol: float = 1e-12,
               ir_max_iter: int = 10, 
@@ -157,6 +157,7 @@ class CudssSparseDirectSolver(SparseDirectSolver):
     def iterative_refinement(self, abs_tol: float, rel_tol: float, max_iter: int, min_improvement_rate: float) -> None:
         VERBOSE = False
         USE_RHS_NORM = False  # True: tol = atol + rtol * ||b||,  False: tol = atol + rtol * ||r_0||
+        # TODO: the iterative refinement here and the one in KKTSystem are actually the same thing. Should find a cleaner way to organize the code to avoid this confusion.
 
         self._rhs_saved[:] = self._rhs
 
