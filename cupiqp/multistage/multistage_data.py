@@ -185,6 +185,9 @@ class MultistageData(Data):
         self._h_l[inf_mask] = -1.0
         self._h_u[inf_mask] = 1.0
 
+    def extract_P_diag(self, diag_P: cp.ndarray):
+        raise NotImplementedError
+
     def set_P(self, value: BlockTridiagMat, check: bool = True):
         if check:
             if value.num_diag_blocks != self._P.num_diag_blocks:

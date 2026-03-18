@@ -22,6 +22,9 @@ class DenseData(Data):
 
     def _as_float64_mat(self, M: Union[cp.ndarray, None]) -> cp.ndarray:
         return M.astype(cp.float64) if M is not None else cp.zeros((0, self.n), dtype=cp.float64)
+    
+    def extract_P_diag(self, diag_P: cp.ndarray):
+        diag_P[:] = cp.diag(self._P)
 
     def set_P(self, value: cp.ndarray, check: bool = True):
         if check and value.shape != self._P.shape:

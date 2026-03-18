@@ -25,10 +25,10 @@ class MultistageKKTSolver(KKTSolverBase):
     """
     Multi-stage KKT solver with block-wise Cholesky factorization. All operations use native block structures.
     """
-    def __init__(self, data: MultistageData, block_size: int):
+    def __init__(self, data: MultistageData):
         super().__init__()
         N = data.num_blocks
-        d = block_size
+        d = data.block_size
 
         self._block_size = d
         self.num_stages = N

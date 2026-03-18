@@ -98,16 +98,16 @@ class Variables:
     def set_random(self):
         """Testing purpose only: set all variables to random values."""
         cp.random.seed(0)
-        self.x = cp.random.randn(*self.x.shape)
-        self.y = cp.random.randn(*self.y.shape)
-        self.z_u = cp.random.rand(*self.z_u.shape) + 1.0  # ensure positivity
-        self.z_l = cp.random.rand(*self.z_l.shape) + 1.0
-        self.z_bu = cp.random.rand(*self.z_bu.shape) + 1.0
-        self.z_bl = cp.random.rand(*self.z_bl.shape) + 1.0
-        self.s_u = cp.random.rand(*self.s_u.shape) + 1.0
-        self.s_l = cp.random.rand(*self.s_l.shape) + 1.0
-        self.s_bu = cp.random.rand(*self.s_bu.shape) + 1.0
-        self.s_bl = cp.random.rand(*self.s_bl.shape) + 1.0
+        self.x[:] = cp.random.randn(*self.x.shape)
+        self.y[:] = cp.random.randn(*self.y.shape)
+        self.z_u[:] = cp.random.rand(*self.z_u.shape) + 1.0  # ensure positivity
+        self.z_l[:] = cp.random.rand(*self.z_l.shape) + 1.0
+        self.z_bu[:] = cp.random.rand(*self.z_bu.shape) + 1.0
+        self.z_bl[:] = cp.random.rand(*self.z_bl.shape) + 1.0
+        self.s_u[:] = cp.random.rand(*self.s_u.shape) + 1.0
+        self.s_l[:] = cp.random.rand(*self.s_l.shape) + 1.0
+        self.s_bu[:] = cp.random.rand(*self.s_bu.shape) + 1.0
+        self.s_bl[:] = cp.random.rand(*self.s_bl.shape) + 1.0
     
 @dataclass
 class Info:

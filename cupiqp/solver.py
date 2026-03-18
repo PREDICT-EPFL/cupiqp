@@ -77,6 +77,8 @@ class SolverBase:
         self._mu_prev = cp.empty(1)
         self._mu_rate = cp.empty(1)
 
+        self._enable_iterative_refinement = self.settings.iterative_refinement_always_enabled
+
         self._setup_done = True
 
     def update(self,
@@ -275,6 +277,8 @@ class SolverBase:
 
         self._kkt_system.update_scalings_and_factor(
             self._data,
+            self.settings,
+            self._enable_iterative_refinement,
             self._result.info.rho,
             self._result.info.delta,
             self._result
@@ -383,10 +387,14 @@ class SolverBase:
     def _update_and_factorize_kkt(self) -> None:
         """Update the KKT matrix and refactorize."""
         while self._result.info.factor_retires < self.settings.max_factor_retires:
-            factor_succeeded = self._kkt_system.update_scalings_and_factor(self._data, self._result.info.rho, self._result.info.delta, self._result)
+            factor_succeeded = self._kkt_system.update_scalings_and_factor(
+                self._data, self.settings, self._enable_iterative_refinement,
+                self._result.info.rho, self._result.info.delta, self._result)
             if factor_succeeded:
                 break
             else:
+                if not self._enable_iterative_refinement:
+                    self._enable_iterative_refinement = True
                 self._result.info.factor_retires += 1
                 self._result.info.rho *= 100.
                 self._result.info.delta *= 100.

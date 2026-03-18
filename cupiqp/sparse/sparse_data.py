@@ -50,6 +50,9 @@ class SparseData(Data):
             raise ValueError(
                 f"Dimension changed: expected {old.shape}, got {new.shape}"
             )
+        
+    def extract_P_diag(self, diag_P: cp.ndarray):
+        diag_P[:] = self._P.diagonal()
 
     def set_P(self, value: csr_matrix, check: bool = True):
         if check:
