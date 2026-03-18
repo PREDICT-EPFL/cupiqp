@@ -45,6 +45,14 @@ class KKTSystem:
 
         self._x_reg = cp.nan * cp.ones(data.n)
         self._z_reg = cp.nan * cp.ones(data.m)
+        self._P_diag = cp.empty(data.n)
+
+        # used to store the rhs of the condensed KKT system
+        # K_condensed * [dx; dy; dz] = [rhs_x_bar; rhs_y_bar; rhs_z_bar], 
+        # where K_condensed is the condensed KKT matrix after eliminating duals of inequalities and box constraints and all slacks.
+        # Since eliminating slacks and duals does not change rhs_y, we only need to store rhs_x_bar and rhs_z_bar.
+        self._rhs_x_bar = cp.empty(data.n)
+        self._rhs_z_bar = cp.empty(data.m)
 
         self._work_x = cp.nan * cp.zeros(data.n)
         self._work_z = cp.nan * cp.zeros(data.m)
@@ -261,11 +269,11 @@ class KKTSystem:
                             rhs.x,
                             self._w_bu_delta_inv, self._w_bl_delta_inv,
                             self._updated_rhs_z_bu, self._updated_rhs_z_bl,
-                            self._work_x,
+                            self._rhs_x_bar,
                             self._w_u_delta_inv, self._w_l_delta_inv,
                             self._updated_rhs_z_u, self._updated_rhs_z_l,
                             self._z_reg,
-                            self._work_z,
+                            self._rhs_z_bar,
                         ],
                         device="cuda",
                         stream=stream_wp_capture,
@@ -318,7 +326,7 @@ class KKTSystem:
 
             self._prepare_rhs_cuda_graphs[key].launch()
 
-        self._kkt_solver.solve(data, self._work_x, rhs.y, self._work_z, lhs.x, lhs.y, self._work_z)  # ! the second _work_z is used to hold delta_z, but useless anyway. Can be further optimized.
+        self._kkt_solver.solve(data, self._rhs_x_bar, rhs.y, self._rhs_z_bar, lhs.x, lhs.y, self._work_z)  # ! the second _work_z is used to hold delta_z, but useless anyway. Can be further optimized.
 
         with nvtx.annotate("KKTSystem::solve::recover_lhs"):
             if not hasattr(self, '_recover_lhs_cuda_graphs'):
