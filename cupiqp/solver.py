@@ -7,6 +7,7 @@ from .settings import Settings
 from .data import Data
 from .results import Result, Status, Variables
 from .kkt_systems import KKTSystem
+from .utils import cuda_graph_capture
 
 
 wp.config.quiet = True  # disable warp module initialization messages.
@@ -78,6 +79,24 @@ class SolverBase:
         self._mu_rate = cp.empty(1)
 
         self._enable_iterative_refinement = self.settings.iterative_refinement_always_enabled
+
+        # Keys for cuda graph capture
+        self._key__calculate_step = (
+            self._result.buffer_ptr,
+            self._step.buffer_ptr
+        )
+        self._key__calculate_mu = (
+            self._result.buffer_ptr,
+            self._result.info.mu.data.ptr,
+            self._work_reduce.data.ptr
+        )
+        self._key__calculate_sigma = (
+            self._alpha_sz.data.ptr,
+            self._result.buffer_ptr,
+            self._step.buffer_ptr,
+            self._result.info.sigma.data.ptr,
+            self._result.info.mu.data.ptr
+            )        
 
         self._setup_done = True
 
@@ -511,122 +530,73 @@ class SolverBase:
         cp.maximum(self._mu_rate, 0., out=self._mu_rate)
 
     @nvtx.annotate("Solver::_calculate_step")
+    @cuda_graph_capture(contains_warp_kernels=False)
     def _calculate_step(self) -> None:
         """
         Compute the step length of the slack variables and dual variables. Make sure they remain non-negative.
         Vectorized implementation to minimize GPU kernel launches and synchronization.
         """
         num_hl, num_hu, num_xl, num_xu = self._data.num_hl, self._data.num_hu, self._data.num_xl, self._data.num_xu
-
-        if not hasattr(self, '_calculate_step_cuda_graphs'):
-            self._calculate_step_cuda_graphs = {}
-            self._calculate_step_cuda_graphs_capture_count = 0
-
-        key = (self._step.buffer_ptr, self._result.buffer_ptr)
         
-        if key not in self._calculate_step_cuda_graphs:
-            self._calculate_step_cuda_graphs_capture_count += 1
-            # print(f"Solver::_calculate_step capturing CUDA graph (occurrence {self._calculate_step_cuda_graphs_capture_count})...")
-            stream = cp.cuda.Stream(non_blocking=True)
-            stream.begin_capture()
-            with stream:
-                # first compute alpha_s, use self._work_s to concatenate step, use self._work_z to concatenate result
-                offset = 0
-                self._work_s[offset : offset+num_hl] = self._step.s_l
-                self._work_z[offset : offset+num_hl] = self._result.s_l
-                offset += num_hl
-                self._work_s[offset:offset + num_hu] = self._step.s_u
-                self._work_z[offset:offset + num_hu] = self._result.s_u
-                offset += num_hu
-                self._work_s[offset:offset + num_xl] = self._step.s_bl
-                self._work_z[offset:offset + num_xl] = self._result.s_bl
-                offset += num_xl
-                self._work_s[offset:offset + num_xu] = self._step.s_bu
-                self._work_z[offset:offset + num_xu] = self._result.s_bu
-                offset += num_xu
+        # first compute alpha_s, use self._work_s to concatenate step, use self._work_z to concatenate result
+        offset = 0
+        self._work_s[offset : offset+num_hl] = self._step.s_l
+        self._work_z[offset : offset+num_hl] = self._result.s_l
+        offset += num_hl
+        self._work_s[offset:offset + num_hu] = self._step.s_u
+        self._work_z[offset:offset + num_hu] = self._result.s_u
+        offset += num_hu
+        self._work_s[offset:offset + num_xl] = self._step.s_bl
+        self._work_z[offset:offset + num_xl] = self._result.s_bl
+        offset += num_xl
+        self._work_s[offset:offset + num_xu] = self._step.s_bu
+        self._work_z[offset:offset + num_xu] = self._result.s_bu
+        offset += num_xu
 
-                # if step < 0, must limit alpha <= -s / step, otherwise take full step 1.0
-                self._work_s[:offset] = cp.where(self._work_s[:offset] < 0, -self._work_z[:offset] / self._work_s[:offset], 1.)
-                self._alpha_sz[0] = cp.min(self._work_s[:offset]) # alpha_s
+        # if step < 0, must limit alpha <= -s / step, otherwise take full step 1.0
+        self._work_s[:offset] = cp.where(self._work_s[:offset] < 0, -self._work_z[:offset] / self._work_s[:offset], 1.)
+        self._alpha_sz[0] = cp.min(self._work_s[:offset]) # alpha_s
 
-                # then compute alpha_z, use self._work_s to concatenate step, use self._work_z to concatenate result
-                offset = 0
-                self._work_z[offset : offset+num_hl] = self._step.z_l
-                self._work_s[offset : offset+num_hl] = self._result.z_l
-                offset += num_hl
-                self._work_z[offset : offset+num_hu] = self._step.z_u
-                self._work_s[offset : offset+num_hu] = self._result.z_u
-                offset += num_hu
-                self._work_z[offset : offset+num_xl] = self._step.z_bl
-                self._work_s[offset : offset+num_xl] = self._result.z_bl
-                offset += num_xl
-                self._work_z[offset : offset+num_xu] = self._step.z_bu
-                self._work_s[offset : offset+num_xu] = self._result.z_bu
-                offset += num_xu
+        # then compute alpha_z, use self._work_s to concatenate step, use self._work_z to concatenate result
+        offset = 0
+        self._work_z[offset : offset+num_hl] = self._step.z_l
+        self._work_s[offset : offset+num_hl] = self._result.z_l
+        offset += num_hl
+        self._work_z[offset : offset+num_hu] = self._step.z_u
+        self._work_s[offset : offset+num_hu] = self._result.z_u
+        offset += num_hu
+        self._work_z[offset : offset+num_xl] = self._step.z_bl
+        self._work_s[offset : offset+num_xl] = self._result.z_bl
+        offset += num_xl
+        self._work_z[offset : offset+num_xu] = self._step.z_bu
+        self._work_s[offset : offset+num_xu] = self._result.z_bu
+        offset += num_xu
 
-                self._work_z[:offset] = cp.where(self._work_z[:offset] < 0, -self._work_s[:offset] / self._work_z[:offset], 1.)
-                self._alpha_sz[1] = cp.min(self._work_z[:offset]) # alpha_z
-
-            self._calculate_step_cuda_graphs[key] = stream.end_capture()
-
-        self._calculate_step_cuda_graphs[key].launch()
+        self._work_z[:offset] = cp.where(self._work_z[:offset] < 0, -self._work_s[:offset] / self._work_z[:offset], 1.)
+        self._alpha_sz[1] = cp.min(self._work_z[:offset]) # alpha_z
 
     @nvtx.annotate("Solver::_calculate_mu")
+    @cuda_graph_capture(contains_warp_kernels=False)
     def _calculate_mu(self) -> None:
-        if not hasattr(self, '_calculate_mu_cuda_graphs'):
-            self._calculate_mu_cuda_graphs = {}
-            self._calculate_mu_cuda_graphs_capture_count = 0
-        key = (self._result.buffer_ptr, self._result.info.mu.data.ptr)
-        if key not in self._calculate_mu_cuda_graphs:
-            self._calculate_mu_cuda_graphs_capture_count += 1
-            # print(f"Solver::_calculate_mu capturing CUDA graph (occurrence {self._calculate_mu_cuda_graphs_capture_count})...")
-            stream = cp.cuda.Stream(non_blocking=True)
-            stream.begin_capture()
-            with stream:
-                cp.dot(self._result.s_l, self._result.z_l, out=self._work_reduce[0:1])
-                cp.dot(self._result.s_u, self._result.z_u, out=self._work_reduce[1:2])
-                cp.dot(self._result.s_bl, self._result.z_bl, out=self._work_reduce[2:3])
-                cp.dot(self._result.s_bu, self._result.z_bu, out=self._work_reduce[3:4])
-                cp.sum(self._work_reduce[0:4], out=self._result.info.mu[:], keepdims=True)
-                self._result.info.mu /= (self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)
-            self._calculate_mu_cuda_graphs[key] = stream.end_capture()
-
-        self._calculate_mu_cuda_graphs[key].launch()
+        cp.dot(self._result.s_l, self._result.z_l, out=self._work_reduce[0:1])
+        cp.dot(self._result.s_u, self._result.z_u, out=self._work_reduce[1:2])
+        cp.dot(self._result.s_bl, self._result.z_bl, out=self._work_reduce[2:3])
+        cp.dot(self._result.s_bu, self._result.z_bu, out=self._work_reduce[3:4])
+        cp.sum(self._work_reduce[0:4], out=self._result.info.mu[:], keepdims=True)
+        self._result.info.mu /= (self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)
 
     @nvtx.annotate("Solver::_calculate_sigma")
-    def _calculate_sigma(self) -> None:
-        if not hasattr(self, '_calculate_sigma_cuda_graphs'):
-            self._calculate_sigma_cuda_graphs = {}
-            self._calculate_sigma_cuda_graphs_capture_count = 0
-
-        key = (self._alpha_sz.data.ptr,
-                self._result.buffer_ptr,
-                self._step.buffer_ptr,
-                self._result.info.sigma.data.ptr,
-                self._result.info.mu.data.ptr
-            )
-        
-        if key not in self._calculate_sigma_cuda_graphs:
-            self._calculate_sigma_cuda_graphs_capture_count += 1
-            # print(f"Solver::_calculate_sigma capturing CUDA graph (occurrence {self._calculate_sigma_cuda_graphs_capture_count})...")
-            stream = cp.cuda.Stream(non_blocking=True)
-            stream.begin_capture()
-            with stream:
-                self._result.info.sigma[:] = 0.
-                self._result.info.sigma += cp.dot(self._result.s_l + self._alpha_sz[0] * self._step.s_l, self._result.z_l + self._alpha_sz[1] * self._step.z_l)
-                self._result.info.sigma += cp.dot(self._result.s_u + self._alpha_sz[0] * self._step.s_u, self._result.z_u + self._alpha_sz[1] * self._step.z_u)
-                self._result.info.sigma += cp.dot(self._result.s_bl + self._alpha_sz[0] * self._step.s_bl, self._result.z_bl + self._alpha_sz[1] * self._step.z_bl)
-                self._result.info.sigma += cp.dot(self._result.s_bu + self._alpha_sz[0] * self._step.s_bu, self._result.z_bu + self._alpha_sz[1] * self._step.z_bu)
-                
-                cp.divide(self._result.info.sigma, self._result.info.mu, out=self._result.info.sigma)
-                self._result.info.sigma /= self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu
-                cp.clip(self._result.info.sigma, 0., 1., out=self._result.info.sigma)
-                cp.power(self._result.info.sigma, 3., out=self._result.info.sigma)
-
-            self._calculate_sigma_cuda_graphs[key] = stream.end_capture()
-
-        self._calculate_sigma_cuda_graphs[key].launch()
-
+    @cuda_graph_capture(contains_warp_kernels=False)
+    def _calculate_sigma(self) -> None:        
+        self._result.info.sigma[:] = 0.
+        self._result.info.sigma += cp.dot(self._result.s_l + self._alpha_sz[0] * self._step.s_l, self._result.z_l + self._alpha_sz[1] * self._step.z_l)
+        self._result.info.sigma += cp.dot(self._result.s_u + self._alpha_sz[0] * self._step.s_u, self._result.z_u + self._alpha_sz[1] * self._step.z_u)
+        self._result.info.sigma += cp.dot(self._result.s_bl + self._alpha_sz[0] * self._step.s_bl, self._result.z_bl + self._alpha_sz[1] * self._step.z_bl)
+        self._result.info.sigma += cp.dot(self._result.s_bu + self._alpha_sz[0] * self._step.s_bu, self._result.z_bu + self._alpha_sz[1] * self._step.z_bu)        
+        cp.divide(self._result.info.sigma, self._result.info.mu, out=self._result.info.sigma)
+        self._result.info.sigma /= self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu
+        cp.clip(self._result.info.sigma, 0., 1., out=self._result.info.sigma)
+        cp.power(self._result.info.sigma, 3., out=self._result.info.sigma)
 
     @nvtx.annotate("Solver::_update_residuals_nr")
     def _update_residuals_nr(self):
