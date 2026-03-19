@@ -46,8 +46,10 @@ class KKTSystem:
         self._settings = settings
         self._use_iterative_refinement = False
 
-        self._x_reg = cp.nan * cp.ones(data.n)
-        self._z_reg = cp.nan * cp.ones(data.m)
+        self._rho = cp.empty(1)
+        self._delta = cp.empty(1)
+        self._x_reg = cp.empty(data.n)
+        self._z_reg = cp.empty(data.m)
         self._P_diag = cp.empty(data.n)
 
         # used to store the rhs of the condensed KKT system
@@ -136,112 +138,92 @@ class KKTSystem:
 
         The variable vars is the current primal/dual variable values at this iteration, i.e., values of x, y, z_u, z_l, s_u, s_l, z_bu, z_bl, s_bu, s_bl at the current iteration.
         """
-        with nvtx.annotate("KKTSystem::update_scalings_and_factor::update_regularizations"):
-            if not hasattr(self, '_update_scaling_and_factor_cuda_graphs'):
-                self._update_scaling_and_factor_cuda_graphs = {}
-                self._update_scaling_and_factor_cuda_graphs_capture_count = 0
-
-            key = (vars.buffer_ptr, 
-                self._m_s_u.data.ptr, self._m_s_l.data.ptr, self._m_s_bu.data.ptr, self._m_s_bl.data.ptr,
-                self._m_z_u_inv.data.ptr, self._m_z_l_inv.data.ptr, self._m_z_bu_inv.data.ptr, self._m_z_bl_inv.data.ptr,
-                self._w_u_delta_inv.data.ptr, self._w_l_delta_inv.data.ptr, self._w_bu_delta_inv.data.ptr, self._w_bl_delta_inv.data.ptr,
-                self._x_reg.data.ptr, self._z_reg.data.ptr,
-                iterative_refinement,
-                )
-
-            if key not in self._update_scaling_and_factor_cuda_graphs:
-                self._update_scaling_and_factor_cuda_graphs_capture_count += 1
-                # print(f"KKTSystems::_update_scaling_and_factor capturing CUDA graph (occurrence {self._update_scaling_and_factor_cuda_graphs_capture_count})...")
-                stream = cp.cuda.Stream(non_blocking=True)
-                wp_stream = wp.Stream(cuda_stream=stream.ptr)
-
-                stream.begin_capture()
-                with stream:
-
-                    USE_WARP_IMPLEMENTATION = True  # set to False to use pure cupy implementation for updating regularization, which is easier to debug but slower.
-                    if USE_WARP_IMPLEMENTATION:
-                        wp.launch(
-                            kernel=self._update_regulerization_step_1_kernel,
-                            dim=data.num_hu + data.num_hl + data.num_xu + data.num_xl,
-                            inputs=[vars.s_u, vars.s_l, vars.s_bu, vars.s_bl,
-                                    vars.z_u, vars.z_l, vars.z_bu, vars.z_bl,
-                                    self._m_s_u, self._m_s_l, self._m_s_bu, self._m_s_bl,
-                                    self._m_z_u_inv, self._m_z_l_inv, self._m_z_bu_inv, self._m_z_bl_inv,
-                                    self._w_u_delta_inv, self._w_l_delta_inv, self._w_bu_delta_inv, self._w_bl_delta_inv,
-                                    delta],
-                            device="cuda",
-                            stream=wp_stream,
-                        )
-
-                        wp.launch(
-                            kernel=self._update_regulerization_step_2_kernel,
-                            dim=data.n + data.m,
-                            inputs=[
-                                self._inv_idx_xu,
-                                self._inv_idx_xl,
-                                self._inv_idx_hu,
-                                self._inv_idx_hl,
-                                self._w_bu_delta_inv,
-                                self._w_bl_delta_inv,
-                                rho,
-                                self._x_reg,
-                                self._w_u_delta_inv,
-                                self._w_l_delta_inv,
-                                self._z_reg,
-                            ],
-                            device="cuda",
-                            stream=wp_stream,
-                        )
-
-                    else:
-                        # store the current slack and dual variable values at this iteration
-                        self._m_s_u[:] = vars.s_u
-                        self._m_s_l[:] = vars.s_l
-                        self._m_s_bu[:] = vars.s_bu
-                        self._m_s_bl[:] = vars.s_bl
-                        cp.reciprocal(vars.z_u, out=self._m_z_u_inv)  # better than self._m_z_u_inv[:] = 1. / vars.z_u since it avoids temporary allocation
-                        cp.reciprocal(vars.z_l, out=self._m_z_l_inv)
-                        cp.reciprocal(vars.z_bu, out=self._m_z_bu_inv)
-                        cp.reciprocal(vars.z_bl, out=self._m_z_bl_inv)
-
-                        # eliminate the box constraints by adding their contribution to x_reg and z_reg
-                        # self._w_bu_delta_inv[:] = 1. / (self._m_s_bu * self._m_z_bu_inv + delta)
-                        cp.multiply(self._m_s_bu, self._m_z_bu_inv, out=self._w_bu_delta_inv)
-                        cp.add(self._w_bu_delta_inv, delta, out=self._w_bu_delta_inv)
-                        cp.reciprocal(self._w_bu_delta_inv, out=self._w_bu_delta_inv)
-                        # self._w_bl_delta_inv[:] = 1. / (self._m_s_bl * self._m_z_bl_inv + delta)
-                        cp.multiply(self._m_s_bl, self._m_z_bl_inv, out=self._w_bl_delta_inv)
-                        cp.add(self._w_bl_delta_inv, delta, out=self._w_bl_delta_inv)
-                        cp.reciprocal(self._w_bl_delta_inv, out=self._w_bl_delta_inv)
-                        # self._w_u_delta_inv[:] = 1. / (vars.s_u / vars.z_u + delta)
-                        cp.multiply(self._m_s_u, self._m_z_u_inv, out=self._w_u_delta_inv)
-                        cp.add(self._w_u_delta_inv, delta, out=self._w_u_delta_inv)
-                        cp.reciprocal(self._w_u_delta_inv, out=self._w_u_delta_inv)
-                        # self._w_l_delta_inv[:] = 1. / (vars.s_l / vars.z_l + delta)
-                        cp.multiply(self._m_s_l, self._m_z_l_inv, out=self._w_l_delta_inv)
-                        cp.add(self._w_l_delta_inv, delta, out=self._w_l_delta_inv)
-                        cp.reciprocal(self._w_l_delta_inv, out=self._w_l_delta_inv)
-
-                        self._x_reg[:] = rho[0]
-                        self._x_reg[data.idx_xu] += self._w_bu_delta_inv
-                        self._x_reg[data.idx_xl] += self._w_bl_delta_inv
-                        self._z_reg.fill(0.)
-                        self._z_reg[data.idx_hu] += self._w_u_delta_inv
-                        self._z_reg[data.idx_hl] += self._w_l_delta_inv
-                        cp.reciprocal(self._z_reg, out=self._z_reg)
-
-                    # TODO: in PIQP, if iterative_refinement is enabled, they add a small perturbation to the diagonal for improved stability. We can consider adding this as well.
-                    self._kkt_solver.update_kkt(data, delta, self._x_reg, self._z_reg)
-
-                self._update_scaling_and_factor_cuda_graphs[key] = stream.end_capture()
-
-            self._update_scaling_and_factor_cuda_graphs[key].launch()
-
-        self._rho = rho
-        self._delta = delta
+        self._update_reg_and_kkt(data, delta, rho, vars)
+        
         self._use_iterative_refinement = iterative_refinement
         factor_success = self._kkt_solver.factor() # ! this is implicitly assuming idx_hu and idx_hl cover all indices of inequalities 0:m
         return factor_success
+    
+    @nvtx.annotate("KKTSystem::update_reg_and_kkt")
+    @cuda_graph_capture(key=lambda self, data, delta, rho, vars: (vars.buffer_ptr, delta.data.ptr, rho.data.ptr))
+    def _update_reg_and_kkt(self, data: Data, delta: cp.ndarray, rho: cp.ndarray, vars: Variables):
+        """Update the regularization terms x_reg and z_reg for the condensed KKT system after eliminating slacks and duals of inequalities and box constraints. 
+        Also update the condensed KKT matrix with the new regularization terms."""
+        self._rho[:] = rho
+        self._delta[:] = delta
+
+        USE_WARP_IMPLEMENTATION = True  # set to False to use pure cupy implementation for updating regularization, which is easier to debug but slower.
+        if USE_WARP_IMPLEMENTATION:
+            wp.launch(
+                kernel=self._update_regulerization_step_1_kernel,
+                dim=data.num_hu + data.num_hl + data.num_xu + data.num_xl,
+                inputs=[vars.s_u, vars.s_l, vars.s_bu, vars.s_bl,
+                        vars.z_u, vars.z_l, vars.z_bu, vars.z_bl,
+                        self._m_s_u, self._m_s_l, self._m_s_bu, self._m_s_bl,
+                        self._m_z_u_inv, self._m_z_l_inv, self._m_z_bu_inv, self._m_z_bl_inv,
+                        self._w_u_delta_inv, self._w_l_delta_inv, self._w_bu_delta_inv, self._w_bl_delta_inv,
+                        delta],
+                device="cuda",
+                stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+            )
+            wp.launch(
+                kernel=self._update_regulerization_step_2_kernel,
+                dim=data.n + data.m,
+                inputs=[
+                    self._inv_idx_xu,
+                    self._inv_idx_xl,
+                    self._inv_idx_hu,
+                    self._inv_idx_hl,
+                    self._w_bu_delta_inv,
+                    self._w_bl_delta_inv,
+                    rho,
+                    self._x_reg,
+                    self._w_u_delta_inv,
+                    self._w_l_delta_inv,
+                    self._z_reg,
+                ],
+                device="cuda",
+                stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+            )
+
+        else:
+            # store the current slack and dual variable values at this iteration
+            self._m_s_u[:] = vars.s_u
+            self._m_s_l[:] = vars.s_l
+            self._m_s_bu[:] = vars.s_bu
+            self._m_s_bl[:] = vars.s_bl
+            cp.reciprocal(vars.z_u, out=self._m_z_u_inv)  # better than self._m_z_u_inv[:] = 1. / vars.z_u since it avoids temporary allocation
+            cp.reciprocal(vars.z_l, out=self._m_z_l_inv)
+            cp.reciprocal(vars.z_bu, out=self._m_z_bu_inv)
+            cp.reciprocal(vars.z_bl, out=self._m_z_bl_inv)
+
+            # eliminate the box constraints by adding their contribution to x_reg and z_reg
+            # self._w_bu_delta_inv[:] = 1. / (self._m_s_bu * self._m_z_bu_inv + delta)
+            cp.multiply(self._m_s_bu, self._m_z_bu_inv, out=self._w_bu_delta_inv)
+            cp.add(self._w_bu_delta_inv, delta, out=self._w_bu_delta_inv)
+            cp.reciprocal(self._w_bu_delta_inv, out=self._w_bu_delta_inv)
+            # self._w_bl_delta_inv[:] = 1. / (self._m_s_bl * self._m_z_bl_inv + delta)
+            cp.multiply(self._m_s_bl, self._m_z_bl_inv, out=self._w_bl_delta_inv)
+            cp.add(self._w_bl_delta_inv, delta, out=self._w_bl_delta_inv)
+            cp.reciprocal(self._w_bl_delta_inv, out=self._w_bl_delta_inv)
+            # self._w_u_delta_inv[:] = 1. / (vars.s_u / vars.z_u + delta)
+            cp.multiply(self._m_s_u, self._m_z_u_inv, out=self._w_u_delta_inv)
+            cp.add(self._w_u_delta_inv, delta, out=self._w_u_delta_inv)
+            cp.reciprocal(self._w_u_delta_inv, out=self._w_u_delta_inv)
+            # self._w_l_delta_inv[:] = 1. / (vars.s_l / vars.z_l + delta)
+            cp.multiply(self._m_s_l, self._m_z_l_inv, out=self._w_l_delta_inv)
+            cp.add(self._w_l_delta_inv, delta, out=self._w_l_delta_inv)
+            cp.reciprocal(self._w_l_delta_inv, out=self._w_l_delta_inv)
+
+            self._x_reg[:] = rho[0]
+            self._x_reg[data.idx_xu] += self._w_bu_delta_inv
+            self._x_reg[data.idx_xl] += self._w_bl_delta_inv
+            self._z_reg.fill(0.)
+            self._z_reg[data.idx_hu] += self._w_u_delta_inv
+            self._z_reg[data.idx_hl] += self._w_l_delta_inv
+            cp.reciprocal(self._z_reg, out=self._z_reg)
+
+        self._kkt_solver.update_kkt(data, delta, self._x_reg, self._z_reg)
     
     @nvtx.annotate("KKTSystem::solve")
     def solve(self, data: Data, settings: Settings, rhs: Variables, lhs: Variables) -> None:
