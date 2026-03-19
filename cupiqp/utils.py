@@ -3,7 +3,7 @@ import cupy as cp
 import warp as wp
 
 
-def cuda_graph_capture(contains_warp_kernels=False):
+def cuda_graph_capture():
     """Decorator that caches a method's GPU operations as a CUDA graph.
 
     On first call (per unique key), captures all GPU operations inside the
@@ -17,16 +17,10 @@ def cuda_graph_capture(contains_warp_kernels=False):
         graphs, allowing the same method to handle varying buffer layouts or
         control-flow branches.
 
-    Args:
-        contains_warp_kernels: if True, creates a warp Stream wrapping the
-            capture stream and passes it to the method as the
-            ``stream_wp_capture`` keyword argument, so that ``wp.launch()``
-            calls inside the method are recorded into the same CUDA graph.
-
     Example::
 
         # In the class body:
-        @cuda_graph_capture(contains_warp_kernels=False)
+        @cuda_graph_capture()
         def _calculate_sigma(self):
             self._result.info.sigma[:] = 0.
             self._result.info.sigma += cp.dot(...)
@@ -52,8 +46,6 @@ def cuda_graph_capture(contains_warp_kernels=False):
             if key not in cache:
                 setattr(self, count_attr, getattr(self, count_attr) + 1)
                 stream_cp_capture = cp.cuda.Stream(non_blocking=True)
-                if contains_warp_kernels:
-                    kwargs['stream_wp_capture'] = wp.Stream(cuda_stream=stream_cp_capture.ptr)
                 stream_cp_capture.begin_capture()
                 with stream_cp_capture:
                     fn(self, *args, **kwargs)
