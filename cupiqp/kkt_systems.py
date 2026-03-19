@@ -70,13 +70,10 @@ class KKTSystem:
             raise ValueError(f"Unsupported kkt_solver: {settings.kkt_solver}")
 
         # store the value of slack and dual variables value at this iteration, will be used in recovering the slack step: S*delta_z + Z*delta_s = r_s
-        # allocate for max possible size, but we will only use part of them according to idx_hu and idx_hl. 
         self._m_s_u = cp.zeros(data.num_hu)
         self._m_s_l = cp.zeros(data.num_hl)
         self._m_z_u_inv = cp.zeros(data.num_hu)
         self._m_z_l_inv = cp.zeros(data.num_hl)
-        # allocate for max possible size, but we will only use part of them according to idx_xu and idx_xl. 
-        # TODO: can be optimized later to reduce memory usage
         self._m_s_bu = cp.zeros(data.num_xu)
         self._m_s_bl = cp.zeros(data.num_xl)
         self._m_z_bu_inv = cp.zeros(data.num_xu)
@@ -248,11 +245,6 @@ class KKTSystem:
     
     @nvtx.annotate("KKTSystem::solve")
     def solve(self, data: Data, settings: Settings, rhs: Variables, lhs: Variables) -> None:
-        self._key__prepare_rhs = (
-            rhs.buffer_ptr,
-            self._updated_rhs_z_u.data.ptr, self._updated_rhs_z_l.data.ptr,
-            self._updated_rhs_z_bu.data.ptr, self._updated_rhs_z_bl.data.ptr,
-        )
         self._prepare_rhs(data, rhs)
         self._kkt_solver.solve(data, self._rhs_x_bar, rhs.y, self._rhs_z_bar, lhs.x, lhs.y, self._work_z)  # ! the second _work_z is used to hold delta_z, but useless anyway. Can be further optimized.
         if self._use_iterative_refinement and settings.iterative_refinement_max_iter > 0:
@@ -260,15 +252,10 @@ class KKTSystem:
                 data, settings,
                 self._rhs_x_bar, rhs.y, self._rhs_z_bar,
                 lhs.x, lhs.y, self._work_z)
-        self._key__recover_lhs = (
-            rhs.buffer_ptr, lhs.buffer_ptr, self._work_z.data.ptr,
-            self._w_u_delta_inv.data.ptr, self._w_l_delta_inv.data.ptr,
-            self._w_bu_delta_inv.data.ptr, self._w_bl_delta_inv.data.ptr,
-        )
         self._recover_lhs(data, rhs, lhs)
 
     @nvtx.annotate("KKTSystem::solve::_prepare_rhs")
-    @cuda_graph_capture()
+    @cuda_graph_capture(key=lambda self, data, rhs: (rhs.buffer_ptr,))
     def _prepare_rhs(self, data: Data, rhs: Variables):
         """Prepare the rhs for the condensed KKT system after eliminating slacks and duals of inequalities and box constraints."""
         wp.launch(
@@ -344,7 +331,7 @@ class KKTSystem:
         # self._work_z[:] *= self._z_reg
 
     @nvtx.annotate("KKTSystem::_recover_lhs")
-    @cuda_graph_capture()
+    @cuda_graph_capture(key=lambda self, data, rhs, lhs: (rhs.buffer_ptr, lhs.buffer_ptr))
     def _recover_lhs(self, data: Data, rhs: Variables, lhs: Variables):
         """Recover the full KKT solution from the condense KKT solution."""
         # TODO: find a cleaner and more flexible to pass stream to eval_G_xn() and so on

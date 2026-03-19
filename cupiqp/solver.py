@@ -80,30 +80,6 @@ class SolverBase:
 
         self._enable_iterative_refinement = self.settings.iterative_refinement_always_enabled
 
-        # Keys for cuda graph capture
-        self._key__calculate_step = (
-            self._result.buffer_ptr,
-            self._step.buffer_ptr
-        )
-        self._key__calculate_mu = (
-            self._result.buffer_ptr,
-            self._result.info.mu.data.ptr,
-            self._work_reduce.data.ptr
-        )
-        self._key__calculate_sigma = (
-            self._alpha_sz.data.ptr,
-            self._result.buffer_ptr,
-            self._step.buffer_ptr,
-            self._result.info.sigma.data.ptr,
-            self._result.info.mu.data.ptr
-            )
-        self._key__update_residuals_r = (
-            self._res.buffer_ptr, 
-            self._result.buffer_ptr,
-            self._prox_vars.buffer_ptr,
-            self._res_nr.buffer_ptr
-        )
-
         self._setup_done = True
 
     def update(self,
