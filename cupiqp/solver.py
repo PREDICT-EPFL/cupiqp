@@ -7,6 +7,7 @@ from .settings import Settings
 from .data import Data
 from .results import Result, Status, Variables
 from .kkt_systems import KKTSystem
+from .utils import cuda_graph_capture
 
 
 wp.config.quiet = True  # disable warp module initialization messages.
@@ -511,122 +512,73 @@ class SolverBase:
         cp.maximum(self._mu_rate, 0., out=self._mu_rate)
 
     @nvtx.annotate("Solver::_calculate_step")
+    @cuda_graph_capture()
     def _calculate_step(self) -> None:
         """
         Compute the step length of the slack variables and dual variables. Make sure they remain non-negative.
         Vectorized implementation to minimize GPU kernel launches and synchronization.
         """
         num_hl, num_hu, num_xl, num_xu = self._data.num_hl, self._data.num_hu, self._data.num_xl, self._data.num_xu
-
-        if not hasattr(self, '_calculate_step_cuda_graphs'):
-            self._calculate_step_cuda_graphs = {}
-            self._calculate_step_cuda_graphs_capture_count = 0
-
-        key = (self._step.buffer_ptr, self._result.buffer_ptr)
         
-        if key not in self._calculate_step_cuda_graphs:
-            self._calculate_step_cuda_graphs_capture_count += 1
-            # print(f"Solver::_calculate_step capturing CUDA graph (occurrence {self._calculate_step_cuda_graphs_capture_count})...")
-            stream = cp.cuda.Stream(non_blocking=True)
-            stream.begin_capture()
-            with stream:
-                # first compute alpha_s, use self._work_s to concatenate step, use self._work_z to concatenate result
-                offset = 0
-                self._work_s[offset : offset+num_hl] = self._step.s_l
-                self._work_z[offset : offset+num_hl] = self._result.s_l
-                offset += num_hl
-                self._work_s[offset:offset + num_hu] = self._step.s_u
-                self._work_z[offset:offset + num_hu] = self._result.s_u
-                offset += num_hu
-                self._work_s[offset:offset + num_xl] = self._step.s_bl
-                self._work_z[offset:offset + num_xl] = self._result.s_bl
-                offset += num_xl
-                self._work_s[offset:offset + num_xu] = self._step.s_bu
-                self._work_z[offset:offset + num_xu] = self._result.s_bu
-                offset += num_xu
+        # first compute alpha_s, use self._work_s to concatenate step, use self._work_z to concatenate result
+        offset = 0
+        self._work_s[offset : offset+num_hl] = self._step.s_l
+        self._work_z[offset : offset+num_hl] = self._result.s_l
+        offset += num_hl
+        self._work_s[offset:offset + num_hu] = self._step.s_u
+        self._work_z[offset:offset + num_hu] = self._result.s_u
+        offset += num_hu
+        self._work_s[offset:offset + num_xl] = self._step.s_bl
+        self._work_z[offset:offset + num_xl] = self._result.s_bl
+        offset += num_xl
+        self._work_s[offset:offset + num_xu] = self._step.s_bu
+        self._work_z[offset:offset + num_xu] = self._result.s_bu
+        offset += num_xu
 
-                # if step < 0, must limit alpha <= -s / step, otherwise take full step 1.0
-                self._work_s[:offset] = cp.where(self._work_s[:offset] < 0, -self._work_z[:offset] / self._work_s[:offset], 1.)
-                self._alpha_sz[0] = cp.min(self._work_s[:offset]) # alpha_s
+        # if step < 0, must limit alpha <= -s / step, otherwise take full step 1.0
+        self._work_s[:offset] = cp.where(self._work_s[:offset] < 0, -self._work_z[:offset] / self._work_s[:offset], 1.)
+        self._alpha_sz[0] = cp.min(self._work_s[:offset]) # alpha_s
 
-                # then compute alpha_z, use self._work_s to concatenate step, use self._work_z to concatenate result
-                offset = 0
-                self._work_z[offset : offset+num_hl] = self._step.z_l
-                self._work_s[offset : offset+num_hl] = self._result.z_l
-                offset += num_hl
-                self._work_z[offset : offset+num_hu] = self._step.z_u
-                self._work_s[offset : offset+num_hu] = self._result.z_u
-                offset += num_hu
-                self._work_z[offset : offset+num_xl] = self._step.z_bl
-                self._work_s[offset : offset+num_xl] = self._result.z_bl
-                offset += num_xl
-                self._work_z[offset : offset+num_xu] = self._step.z_bu
-                self._work_s[offset : offset+num_xu] = self._result.z_bu
-                offset += num_xu
+        # then compute alpha_z, use self._work_s to concatenate step, use self._work_z to concatenate result
+        offset = 0
+        self._work_z[offset : offset+num_hl] = self._step.z_l
+        self._work_s[offset : offset+num_hl] = self._result.z_l
+        offset += num_hl
+        self._work_z[offset : offset+num_hu] = self._step.z_u
+        self._work_s[offset : offset+num_hu] = self._result.z_u
+        offset += num_hu
+        self._work_z[offset : offset+num_xl] = self._step.z_bl
+        self._work_s[offset : offset+num_xl] = self._result.z_bl
+        offset += num_xl
+        self._work_z[offset : offset+num_xu] = self._step.z_bu
+        self._work_s[offset : offset+num_xu] = self._result.z_bu
+        offset += num_xu
 
-                self._work_z[:offset] = cp.where(self._work_z[:offset] < 0, -self._work_s[:offset] / self._work_z[:offset], 1.)
-                self._alpha_sz[1] = cp.min(self._work_z[:offset]) # alpha_z
-
-            self._calculate_step_cuda_graphs[key] = stream.end_capture()
-
-        self._calculate_step_cuda_graphs[key].launch()
+        self._work_z[:offset] = cp.where(self._work_z[:offset] < 0, -self._work_s[:offset] / self._work_z[:offset], 1.)
+        self._alpha_sz[1] = cp.min(self._work_z[:offset]) # alpha_z
 
     @nvtx.annotate("Solver::_calculate_mu")
+    @cuda_graph_capture()
     def _calculate_mu(self) -> None:
-        if not hasattr(self, '_calculate_mu_cuda_graphs'):
-            self._calculate_mu_cuda_graphs = {}
-            self._calculate_mu_cuda_graphs_capture_count = 0
-        key = (self._result.buffer_ptr, self._result.info.mu.data.ptr)
-        if key not in self._calculate_mu_cuda_graphs:
-            self._calculate_mu_cuda_graphs_capture_count += 1
-            # print(f"Solver::_calculate_mu capturing CUDA graph (occurrence {self._calculate_mu_cuda_graphs_capture_count})...")
-            stream = cp.cuda.Stream(non_blocking=True)
-            stream.begin_capture()
-            with stream:
-                cp.dot(self._result.s_l, self._result.z_l, out=self._work_reduce[0:1])
-                cp.dot(self._result.s_u, self._result.z_u, out=self._work_reduce[1:2])
-                cp.dot(self._result.s_bl, self._result.z_bl, out=self._work_reduce[2:3])
-                cp.dot(self._result.s_bu, self._result.z_bu, out=self._work_reduce[3:4])
-                cp.sum(self._work_reduce[0:4], out=self._result.info.mu[:], keepdims=True)
-                self._result.info.mu /= (self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)
-            self._calculate_mu_cuda_graphs[key] = stream.end_capture()
-
-        self._calculate_mu_cuda_graphs[key].launch()
+        cp.dot(self._result.s_l, self._result.z_l, out=self._work_reduce[0:1])
+        cp.dot(self._result.s_u, self._result.z_u, out=self._work_reduce[1:2])
+        cp.dot(self._result.s_bl, self._result.z_bl, out=self._work_reduce[2:3])
+        cp.dot(self._result.s_bu, self._result.z_bu, out=self._work_reduce[3:4])
+        cp.sum(self._work_reduce[0:4], out=self._result.info.mu[:], keepdims=True)
+        self._result.info.mu /= (self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)
 
     @nvtx.annotate("Solver::_calculate_sigma")
-    def _calculate_sigma(self) -> None:
-        if not hasattr(self, '_calculate_sigma_cuda_graphs'):
-            self._calculate_sigma_cuda_graphs = {}
-            self._calculate_sigma_cuda_graphs_capture_count = 0
-
-        key = (self._alpha_sz.data.ptr,
-                self._result.buffer_ptr,
-                self._step.buffer_ptr,
-                self._result.info.sigma.data.ptr,
-                self._result.info.mu.data.ptr
-            )
-        
-        if key not in self._calculate_sigma_cuda_graphs:
-            self._calculate_sigma_cuda_graphs_capture_count += 1
-            # print(f"Solver::_calculate_sigma capturing CUDA graph (occurrence {self._calculate_sigma_cuda_graphs_capture_count})...")
-            stream = cp.cuda.Stream(non_blocking=True)
-            stream.begin_capture()
-            with stream:
-                self._result.info.sigma[:] = 0.
-                self._result.info.sigma += cp.dot(self._result.s_l + self._alpha_sz[0] * self._step.s_l, self._result.z_l + self._alpha_sz[1] * self._step.z_l)
-                self._result.info.sigma += cp.dot(self._result.s_u + self._alpha_sz[0] * self._step.s_u, self._result.z_u + self._alpha_sz[1] * self._step.z_u)
-                self._result.info.sigma += cp.dot(self._result.s_bl + self._alpha_sz[0] * self._step.s_bl, self._result.z_bl + self._alpha_sz[1] * self._step.z_bl)
-                self._result.info.sigma += cp.dot(self._result.s_bu + self._alpha_sz[0] * self._step.s_bu, self._result.z_bu + self._alpha_sz[1] * self._step.z_bu)
-                
-                cp.divide(self._result.info.sigma, self._result.info.mu, out=self._result.info.sigma)
-                self._result.info.sigma /= self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu
-                cp.clip(self._result.info.sigma, 0., 1., out=self._result.info.sigma)
-                cp.power(self._result.info.sigma, 3., out=self._result.info.sigma)
-
-            self._calculate_sigma_cuda_graphs[key] = stream.end_capture()
-
-        self._calculate_sigma_cuda_graphs[key].launch()
-
+    @cuda_graph_capture()
+    def _calculate_sigma(self) -> None:        
+        self._result.info.sigma[:] = 0.
+        self._result.info.sigma += cp.dot(self._result.s_l + self._alpha_sz[0] * self._step.s_l, self._result.z_l + self._alpha_sz[1] * self._step.z_l)
+        self._result.info.sigma += cp.dot(self._result.s_u + self._alpha_sz[0] * self._step.s_u, self._result.z_u + self._alpha_sz[1] * self._step.z_u)
+        self._result.info.sigma += cp.dot(self._result.s_bl + self._alpha_sz[0] * self._step.s_bl, self._result.z_bl + self._alpha_sz[1] * self._step.z_bl)
+        self._result.info.sigma += cp.dot(self._result.s_bu + self._alpha_sz[0] * self._step.s_bu, self._result.z_bu + self._alpha_sz[1] * self._step.z_bu)        
+        cp.divide(self._result.info.sigma, self._result.info.mu, out=self._result.info.sigma)
+        self._result.info.sigma /= self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu
+        cp.clip(self._result.info.sigma, 0., 1., out=self._result.info.sigma)
+        cp.power(self._result.info.sigma, 3., out=self._result.info.sigma)
 
     @nvtx.annotate("Solver::_update_residuals_nr")
     def _update_residuals_nr(self):
@@ -838,94 +790,75 @@ class SolverBase:
 
 
     @nvtx.annotate("Solver::_update_residuals_r")
+    @cuda_graph_capture()
     def _update_residuals_r(self):
         """
         Compute the regularized primal and dual residuals. The computation is based on the non-regularized residuals computed in _update_residuals_nr.
         It adds the regularization terms to the non-regularized residuals to obtain the regularized residuals.
         """
+        # update the rhs of the KKT system
+        # self._res.x[:] = self._res_nr.x - self._result.info.rho * (self._result.x - self._prox_vars.x)
+        # self._res.y[:] = self._res_nr.y - self._result.info.delta * (self._prox_vars.y - self._result.y)
+        # self._res.z_l[:] = self._res_nr.z_l - self._result.info.delta * (self._prox_vars.z_l - self._result.z_l)
+        # self._res.z_u[:] = self._res_nr.z_u - self._result.info.delta * (self._prox_vars.z_u - self._result.z_u)
+        # self._res.z_bl[:] = self._res_nr.z_bl - self._result.info.delta * (self._prox_vars.z_bl - self._result.z_bl)
+        # self._res.z_bu[:] = self._res_nr.z_bu - self._result.info.delta * (self._prox_vars.z_bu - self._result.z_bu)
+        USE_WARP_IMPLEMENTATION = True
+        if USE_WARP_IMPLEMENTATION:
+            wp.launch(
+                kernel=self._update_residuals_r_kernel,
+                dim=self._data.n + self._data.p + self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu,
+                inputs=[
+                    self._result.info.rho, self._result.info.delta,
+                    self._res_nr.x, self._res_nr.y, self._res_nr.z_l, self._res_nr.z_u, self._res_nr.z_bl, self._res_nr.z_bu,
+                    self._result.x, self._result.y, self._result.z_l, self._result.z_u, self._result.z_bl, self._result.z_bu,
+                    self._prox_vars.x, self._prox_vars.y, self._prox_vars.z_l, self._prox_vars.z_u, self._prox_vars.z_bl, self._prox_vars.z_bu,
+                    self._res.x, self._res.y, self._res.z_l, self._res.z_u, self._res.z_bl, self._res.z_bu
+                ],
+                device="cuda",
+                stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr)
+            )
+        else:
+            cp.subtract(self._result.x, self._prox_vars.x, out=self._res.x)
+            self._res.x *= self._result.info.rho
+            cp.subtract(self._res_nr.x, self._res.x, out=self._res.x)
+            cp.subtract(self._prox_vars.y, self._result.y, out=self._res.y)
+            self._res.y *= self._result.info.delta
+            cp.subtract(self._res_nr.y, self._res.y, out=self._res.y)
+            cp.subtract(self._prox_vars.z_l, self._result.z_l, out=self._res.z_l)
+            self._res.z_l *= self._result.info.delta
+            cp.subtract(self._res_nr.z_l, self._res.z_l, out=self._res.z_l)
+            cp.subtract(self._prox_vars.z_u, self._result.z_u, out=self._res.z_u)
+            self._res.z_u *= self._result.info.delta
+            cp.subtract(self._res_nr.z_u, self._res.z_u, out=self._res.z_u)
+            cp.subtract(self._prox_vars.z_bl, self._result.z_bl, out=self._res.z_bl)
+            self._res.z_bl *= self._result.info.delta
+            cp.subtract(self._res_nr.z_bl, self._res.z_bl, out=self._res.z_bl)
+            cp.subtract(self._prox_vars.z_bu, self._result.z_bu, out=self._res.z_bu)
+            self._res.z_bu *= self._result.info.delta
+            cp.subtract(self._res_nr.z_bu, self._res.z_bu, out=self._res.z_bu)
 
-        if not hasattr(self, '_update_residuals_r_cuda_graphs'):
-            self._update_residuals_r_cuda_graphs = {}
-            self._update_residuals_r_cuda_graphs_capture_count = 0
+        self._result.info.primal_res_reg[:] = self._primal_res_r()
+        # primal_rel_scaling = self._result.info.primal_res / self._result.info.primal_res_rel if self._result.info.primal_res_rel > 0 else 1.
+        # self._result.info.primal_res_reg_rel[:] = self._result.info.primal_res_reg / primal_rel_scaling
+        cp.divide(self._result.info.primal_res, self._result.info.primal_res_rel, out=self._result.info.primal_res_reg_rel)
+        self._result.info.primal_res_reg_rel[:] = cp.where(self._result.info.primal_res_rel > 0,
+                self._result.info.primal_res_reg_rel, cp.asarray(1.0, dtype=self._result.info.primal_res_reg_rel.dtype))
+        cp.divide(self._result.info.primal_res_reg, self._result.info.primal_res_reg_rel, out=self._result.info.primal_res_reg_rel)
 
-        key = (self._res.buffer_ptr, 
-               self._result.buffer_ptr,
-               self._prox_vars.buffer_ptr,
-               self._res_nr.buffer_ptr)
+        self._result.info.dual_res_reg[:] = self._dual_res_r()
+        # dual_rel_scaling = self._result.info.dual_res / self._result.info.dual_res_rel if self._result.info.dual_res_rel > 0 else 1.
+        # self._result.info.dual_res_reg_rel[:] = self._result.info.dual_res_reg / dual_rel_scaling
+        cp.divide(self._result.info.dual_res, self._result.info.dual_res_rel, out=self._result.info.dual_res_reg_rel)
+        self._result.info.dual_res_reg_rel[:] = cp.where(self._result.info.dual_res_rel > 0,
+                self._result.info.dual_res_reg_rel, cp.asarray(1.0, dtype=self._result.info.dual_res_reg_rel.dtype))
+        cp.divide(self._result.info.dual_res_reg, self._result.info.dual_res_reg_rel, out=self._result.info.dual_res_reg_rel)
+
+        self._result.info.primal_prox_inf[:] = self._primal_prox_inf()
+        self._result.info.primal_prox_inf *= self._result.info.delta
+        self._result.info.dual_prox_inf[:] = self._dual_prox_inf()
+        self._result.info.dual_prox_inf *= self._result.info.rho
         
-        if key not in self._update_residuals_r_cuda_graphs:
-            self._update_residuals_r_cuda_graphs_capture_count += 1
-            # print(f"Solver::_update_residuals_r capturing CUDA graph (occurrence {self._update_residuals_r_cuda_graphs_capture_count})...")
-            # !IMPORTANT! Use the same stream for warp and cupy to make sure the captured graph contains both the warp kernel and the cupy operations, and they can be executed together without unnecessary stream synchronization
-            stream = cp.cuda.ExternalStream(wp.get_stream().cuda_stream)
-            stream.begin_capture()
-            with stream:
-
-                # update the rhs of the KKT system
-                # self._res.x[:] = self._res_nr.x - self._result.info.rho * (self._result.x - self._prox_vars.x)
-                # self._res.y[:] = self._res_nr.y - self._result.info.delta * (self._prox_vars.y - self._result.y)
-                # self._res.z_l[:] = self._res_nr.z_l - self._result.info.delta * (self._prox_vars.z_l - self._result.z_l)
-                # self._res.z_u[:] = self._res_nr.z_u - self._result.info.delta * (self._prox_vars.z_u - self._result.z_u)
-                # self._res.z_bl[:] = self._res_nr.z_bl - self._result.info.delta * (self._prox_vars.z_bl - self._result.z_bl)
-                # self._res.z_bu[:] = self._res_nr.z_bu - self._result.info.delta * (self._prox_vars.z_bu - self._result.z_bu)
-                USE_WARP_IMPLEMENTATION = True
-                if USE_WARP_IMPLEMENTATION:
-                    wp.launch(
-                        kernel=self._update_residuals_r_kernel,
-                        dim=self._data.n + self._data.p + self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu,
-                        inputs=[
-                            self._result.info.rho, self._result.info.delta,
-                            self._res_nr.x, self._res_nr.y, self._res_nr.z_l, self._res_nr.z_u, self._res_nr.z_bl, self._res_nr.z_bu,
-                            self._result.x, self._result.y, self._result.z_l, self._result.z_u, self._result.z_bl, self._result.z_bu,
-                            self._prox_vars.x, self._prox_vars.y, self._prox_vars.z_l, self._prox_vars.z_u, self._prox_vars.z_bl, self._prox_vars.z_bu,
-                            self._res.x, self._res.y, self._res.z_l, self._res.z_u, self._res.z_bl, self._res.z_bu
-                        ],
-                        device="cuda",
-                    )
-                else:
-                    cp.subtract(self._result.x, self._prox_vars.x, out=self._res.x)
-                    self._res.x *= self._result.info.rho
-                    cp.subtract(self._res_nr.x, self._res.x, out=self._res.x)
-                    cp.subtract(self._prox_vars.y, self._result.y, out=self._res.y)
-                    self._res.y *= self._result.info.delta
-                    cp.subtract(self._res_nr.y, self._res.y, out=self._res.y)
-                    cp.subtract(self._prox_vars.z_l, self._result.z_l, out=self._res.z_l)
-                    self._res.z_l *= self._result.info.delta
-                    cp.subtract(self._res_nr.z_l, self._res.z_l, out=self._res.z_l)
-                    cp.subtract(self._prox_vars.z_u, self._result.z_u, out=self._res.z_u)
-                    self._res.z_u *= self._result.info.delta
-                    cp.subtract(self._res_nr.z_u, self._res.z_u, out=self._res.z_u)
-                    cp.subtract(self._prox_vars.z_bl, self._result.z_bl, out=self._res.z_bl)
-                    self._res.z_bl *= self._result.info.delta
-                    cp.subtract(self._res_nr.z_bl, self._res.z_bl, out=self._res.z_bl)
-                    cp.subtract(self._prox_vars.z_bu, self._result.z_bu, out=self._res.z_bu)
-                    self._res.z_bu *= self._result.info.delta
-                    cp.subtract(self._res_nr.z_bu, self._res.z_bu, out=self._res.z_bu)
-
-                self._result.info.primal_res_reg[:] = self._primal_res_r()
-                # primal_rel_scaling = self._result.info.primal_res / self._result.info.primal_res_rel if self._result.info.primal_res_rel > 0 else 1.
-                # self._result.info.primal_res_reg_rel[:] = self._result.info.primal_res_reg / primal_rel_scaling
-                cp.divide(self._result.info.primal_res, self._result.info.primal_res_rel, out=self._result.info.primal_res_reg_rel)
-                self._result.info.primal_res_reg_rel[:] = cp.where(self._result.info.primal_res_rel > 0,
-                        self._result.info.primal_res_reg_rel, cp.asarray(1.0, dtype=self._result.info.primal_res_reg_rel.dtype))
-                cp.divide(self._result.info.primal_res_reg, self._result.info.primal_res_reg_rel, out=self._result.info.primal_res_reg_rel)
-
-                self._result.info.dual_res_reg[:] = self._dual_res_r()
-                # dual_rel_scaling = self._result.info.dual_res / self._result.info.dual_res_rel if self._result.info.dual_res_rel > 0 else 1.
-                # self._result.info.dual_res_reg_rel[:] = self._result.info.dual_res_reg / dual_rel_scaling
-                cp.divide(self._result.info.dual_res, self._result.info.dual_res_rel, out=self._result.info.dual_res_reg_rel)
-                self._result.info.dual_res_reg_rel[:] = cp.where(self._result.info.dual_res_rel > 0,
-                        self._result.info.dual_res_reg_rel, cp.asarray(1.0, dtype=self._result.info.dual_res_reg_rel.dtype))
-                cp.divide(self._result.info.dual_res_reg, self._result.info.dual_res_reg_rel, out=self._result.info.dual_res_reg_rel)
-
-                self._result.info.primal_prox_inf[:] = self._primal_prox_inf()
-                self._result.info.primal_prox_inf *= self._result.info.delta
-                self._result.info.dual_prox_inf[:] = self._dual_prox_inf()
-                self._result.info.dual_prox_inf *= self._result.info.rho
-        
-            self._update_residuals_r_cuda_graphs[key] = stream.end_capture()
-
-        self._update_residuals_r_cuda_graphs[key].launch()
         
 
     @nvtx.annotate("Solver::_primal_res_nr")

@@ -10,7 +10,7 @@ from .settings import Settings
 from .sparse.sparse_kkt_solver import SparseKKTSolver
 from .dense.dense_kkt_solver import DenseKKTSolver
 from .multistage.multistage_kkt_solver import MultistageKKTSolver
-
+from .utils import cuda_graph_capture
 
 class KKTSystem:
     """
@@ -46,8 +46,10 @@ class KKTSystem:
         self._settings = settings
         self._use_iterative_refinement = False
 
-        self._x_reg = cp.nan * cp.ones(data.n)
-        self._z_reg = cp.nan * cp.ones(data.m)
+        self._rho = cp.empty(1)
+        self._delta = cp.empty(1)
+        self._x_reg = cp.empty(data.n)
+        self._z_reg = cp.empty(data.m)
         self._P_diag = cp.empty(data.n)
 
         # used to store the rhs of the condensed KKT system
@@ -70,13 +72,10 @@ class KKTSystem:
             raise ValueError(f"Unsupported kkt_solver: {settings.kkt_solver}")
 
         # store the value of slack and dual variables value at this iteration, will be used in recovering the slack step: S*delta_z + Z*delta_s = r_s
-        # allocate for max possible size, but we will only use part of them according to idx_hu and idx_hl. 
         self._m_s_u = cp.zeros(data.num_hu)
         self._m_s_l = cp.zeros(data.num_hl)
         self._m_z_u_inv = cp.zeros(data.num_hu)
         self._m_z_l_inv = cp.zeros(data.num_hl)
-        # allocate for max possible size, but we will only use part of them according to idx_xu and idx_xl. 
-        # TODO: can be optimized later to reduce memory usage
         self._m_s_bu = cp.zeros(data.num_xu)
         self._m_s_bl = cp.zeros(data.num_xl)
         self._m_z_bu_inv = cp.zeros(data.num_xu)
@@ -125,7 +124,7 @@ class KKTSystem:
         if data.num_hl > 0:
             wp.launch(_build_inv_idx_kernel, dim=data.num_hl,
                       inputs=[data.idx_hl, self._inv_idx_hl], device="cuda")
-            
+ 
     @nvtx.annotate("KKTSystem::update_data")
     def update_data(self, data: Data, update_P: bool = False, update_A: bool = False, update_G: bool = False):
         self._kkt_solver.update_data(data, update_P, update_A, update_G)
@@ -139,309 +138,259 @@ class KKTSystem:
 
         The variable vars is the current primal/dual variable values at this iteration, i.e., values of x, y, z_u, z_l, s_u, s_l, z_bu, z_bl, s_bu, s_bl at the current iteration.
         """
-        with nvtx.annotate("KKTSystem::update_scalings_and_factor::update_regularizations"):
-            if not hasattr(self, '_update_scaling_and_factor_cuda_graphs'):
-                self._update_scaling_and_factor_cuda_graphs = {}
-                self._update_scaling_and_factor_cuda_graphs_capture_count = 0
-
-            key = (vars.buffer_ptr, 
-                self._m_s_u.data.ptr, self._m_s_l.data.ptr, self._m_s_bu.data.ptr, self._m_s_bl.data.ptr,
-                self._m_z_u_inv.data.ptr, self._m_z_l_inv.data.ptr, self._m_z_bu_inv.data.ptr, self._m_z_bl_inv.data.ptr,
-                self._w_u_delta_inv.data.ptr, self._w_l_delta_inv.data.ptr, self._w_bu_delta_inv.data.ptr, self._w_bl_delta_inv.data.ptr,
-                self._x_reg.data.ptr, self._z_reg.data.ptr,
-                iterative_refinement,
-                )
-
-            if key not in self._update_scaling_and_factor_cuda_graphs:
-                self._update_scaling_and_factor_cuda_graphs_capture_count += 1
-                # print(f"KKTSystems::_update_scaling_and_factor capturing CUDA graph (occurrence {self._update_scaling_and_factor_cuda_graphs_capture_count})...")
-                stream = cp.cuda.Stream(non_blocking=True)
-                wp_stream = wp.Stream(cuda_stream=stream.ptr)
-
-                stream.begin_capture()
-                with stream:
-
-                    USE_WARP_IMPLEMENTATION = True  # set to False to use pure cupy implementation for updating regularization, which is easier to debug but slower.
-                    if USE_WARP_IMPLEMENTATION:
-                        wp.launch(
-                            kernel=self._update_regulerization_step_1_kernel,
-                            dim=data.num_hu + data.num_hl + data.num_xu + data.num_xl,
-                            inputs=[vars.s_u, vars.s_l, vars.s_bu, vars.s_bl,
-                                    vars.z_u, vars.z_l, vars.z_bu, vars.z_bl,
-                                    self._m_s_u, self._m_s_l, self._m_s_bu, self._m_s_bl,
-                                    self._m_z_u_inv, self._m_z_l_inv, self._m_z_bu_inv, self._m_z_bl_inv,
-                                    self._w_u_delta_inv, self._w_l_delta_inv, self._w_bu_delta_inv, self._w_bl_delta_inv,
-                                    delta],
-                            device="cuda",
-                            stream=wp_stream,
-                        )
-
-                        wp.launch(
-                            kernel=self._update_regulerization_step_2_kernel,
-                            dim=data.n + data.m,
-                            inputs=[
-                                self._inv_idx_xu,
-                                self._inv_idx_xl,
-                                self._inv_idx_hu,
-                                self._inv_idx_hl,
-                                self._w_bu_delta_inv,
-                                self._w_bl_delta_inv,
-                                rho,
-                                self._x_reg,
-                                self._w_u_delta_inv,
-                                self._w_l_delta_inv,
-                                self._z_reg,
-                            ],
-                            device="cuda",
-                            stream=wp_stream,
-                        )
-
-                    else:
-                        # store the current slack and dual variable values at this iteration
-                        self._m_s_u[:] = vars.s_u
-                        self._m_s_l[:] = vars.s_l
-                        self._m_s_bu[:] = vars.s_bu
-                        self._m_s_bl[:] = vars.s_bl
-                        cp.reciprocal(vars.z_u, out=self._m_z_u_inv)  # better than self._m_z_u_inv[:] = 1. / vars.z_u since it avoids temporary allocation
-                        cp.reciprocal(vars.z_l, out=self._m_z_l_inv)
-                        cp.reciprocal(vars.z_bu, out=self._m_z_bu_inv)
-                        cp.reciprocal(vars.z_bl, out=self._m_z_bl_inv)
-
-                        # eliminate the box constraints by adding their contribution to x_reg and z_reg
-                        # self._w_bu_delta_inv[:] = 1. / (self._m_s_bu * self._m_z_bu_inv + delta)
-                        cp.multiply(self._m_s_bu, self._m_z_bu_inv, out=self._w_bu_delta_inv)
-                        cp.add(self._w_bu_delta_inv, delta, out=self._w_bu_delta_inv)
-                        cp.reciprocal(self._w_bu_delta_inv, out=self._w_bu_delta_inv)
-                        # self._w_bl_delta_inv[:] = 1. / (self._m_s_bl * self._m_z_bl_inv + delta)
-                        cp.multiply(self._m_s_bl, self._m_z_bl_inv, out=self._w_bl_delta_inv)
-                        cp.add(self._w_bl_delta_inv, delta, out=self._w_bl_delta_inv)
-                        cp.reciprocal(self._w_bl_delta_inv, out=self._w_bl_delta_inv)
-                        # self._w_u_delta_inv[:] = 1. / (vars.s_u / vars.z_u + delta)
-                        cp.multiply(self._m_s_u, self._m_z_u_inv, out=self._w_u_delta_inv)
-                        cp.add(self._w_u_delta_inv, delta, out=self._w_u_delta_inv)
-                        cp.reciprocal(self._w_u_delta_inv, out=self._w_u_delta_inv)
-                        # self._w_l_delta_inv[:] = 1. / (vars.s_l / vars.z_l + delta)
-                        cp.multiply(self._m_s_l, self._m_z_l_inv, out=self._w_l_delta_inv)
-                        cp.add(self._w_l_delta_inv, delta, out=self._w_l_delta_inv)
-                        cp.reciprocal(self._w_l_delta_inv, out=self._w_l_delta_inv)
-
-                        self._x_reg[:] = rho[0]
-                        self._x_reg[data.idx_xu] += self._w_bu_delta_inv
-                        self._x_reg[data.idx_xl] += self._w_bl_delta_inv
-                        self._z_reg.fill(0.)
-                        self._z_reg[data.idx_hu] += self._w_u_delta_inv
-                        self._z_reg[data.idx_hl] += self._w_l_delta_inv
-                        cp.reciprocal(self._z_reg, out=self._z_reg)
-
-                    # TODO: in PIQP, if iterative_refinement is enabled, they add a small perturbation to the diagonal for improved stability. We can consider adding this as well.
-                    self._kkt_solver.update_kkt(data, delta, self._x_reg, self._z_reg)
-
-                self._update_scaling_and_factor_cuda_graphs[key] = stream.end_capture()
-
-            self._update_scaling_and_factor_cuda_graphs[key].launch()
-
-        self._rho = rho
-        self._delta = delta
+        self._update_reg_and_kkt(data, delta, rho, vars)
+        
         self._use_iterative_refinement = iterative_refinement
         factor_success = self._kkt_solver.factor() # ! this is implicitly assuming idx_hu and idx_hl cover all indices of inequalities 0:m
         return factor_success
     
+    @nvtx.annotate("KKTSystem::update_reg_and_kkt")
+    @cuda_graph_capture(key=lambda self, data, delta, rho, vars: (vars.buffer_ptr, delta.data.ptr, rho.data.ptr))
+    def _update_reg_and_kkt(self, data: Data, delta: cp.ndarray, rho: cp.ndarray, vars: Variables):
+        """Update the regularization terms x_reg and z_reg for the condensed KKT system after eliminating slacks and duals of inequalities and box constraints. 
+        Also update the condensed KKT matrix with the new regularization terms."""
+        self._rho[:] = rho
+        self._delta[:] = delta
+
+        USE_WARP_IMPLEMENTATION = True  # set to False to use pure cupy implementation for updating regularization, which is easier to debug but slower.
+        if USE_WARP_IMPLEMENTATION:
+            wp.launch(
+                kernel=self._update_regulerization_step_1_kernel,
+                dim=data.num_hu + data.num_hl + data.num_xu + data.num_xl,
+                inputs=[vars.s_u, vars.s_l, vars.s_bu, vars.s_bl,
+                        vars.z_u, vars.z_l, vars.z_bu, vars.z_bl,
+                        self._m_s_u, self._m_s_l, self._m_s_bu, self._m_s_bl,
+                        self._m_z_u_inv, self._m_z_l_inv, self._m_z_bu_inv, self._m_z_bl_inv,
+                        self._w_u_delta_inv, self._w_l_delta_inv, self._w_bu_delta_inv, self._w_bl_delta_inv,
+                        delta],
+                device="cuda",
+                stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+            )
+            wp.launch(
+                kernel=self._update_regulerization_step_2_kernel,
+                dim=data.n + data.m,
+                inputs=[
+                    self._inv_idx_xu,
+                    self._inv_idx_xl,
+                    self._inv_idx_hu,
+                    self._inv_idx_hl,
+                    self._w_bu_delta_inv,
+                    self._w_bl_delta_inv,
+                    rho,
+                    self._x_reg,
+                    self._w_u_delta_inv,
+                    self._w_l_delta_inv,
+                    self._z_reg,
+                ],
+                device="cuda",
+                stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+            )
+
+        else:
+            # store the current slack and dual variable values at this iteration
+            self._m_s_u[:] = vars.s_u
+            self._m_s_l[:] = vars.s_l
+            self._m_s_bu[:] = vars.s_bu
+            self._m_s_bl[:] = vars.s_bl
+            cp.reciprocal(vars.z_u, out=self._m_z_u_inv)  # better than self._m_z_u_inv[:] = 1. / vars.z_u since it avoids temporary allocation
+            cp.reciprocal(vars.z_l, out=self._m_z_l_inv)
+            cp.reciprocal(vars.z_bu, out=self._m_z_bu_inv)
+            cp.reciprocal(vars.z_bl, out=self._m_z_bl_inv)
+
+            # eliminate the box constraints by adding their contribution to x_reg and z_reg
+            # self._w_bu_delta_inv[:] = 1. / (self._m_s_bu * self._m_z_bu_inv + delta)
+            cp.multiply(self._m_s_bu, self._m_z_bu_inv, out=self._w_bu_delta_inv)
+            cp.add(self._w_bu_delta_inv, delta, out=self._w_bu_delta_inv)
+            cp.reciprocal(self._w_bu_delta_inv, out=self._w_bu_delta_inv)
+            # self._w_bl_delta_inv[:] = 1. / (self._m_s_bl * self._m_z_bl_inv + delta)
+            cp.multiply(self._m_s_bl, self._m_z_bl_inv, out=self._w_bl_delta_inv)
+            cp.add(self._w_bl_delta_inv, delta, out=self._w_bl_delta_inv)
+            cp.reciprocal(self._w_bl_delta_inv, out=self._w_bl_delta_inv)
+            # self._w_u_delta_inv[:] = 1. / (vars.s_u / vars.z_u + delta)
+            cp.multiply(self._m_s_u, self._m_z_u_inv, out=self._w_u_delta_inv)
+            cp.add(self._w_u_delta_inv, delta, out=self._w_u_delta_inv)
+            cp.reciprocal(self._w_u_delta_inv, out=self._w_u_delta_inv)
+            # self._w_l_delta_inv[:] = 1. / (vars.s_l / vars.z_l + delta)
+            cp.multiply(self._m_s_l, self._m_z_l_inv, out=self._w_l_delta_inv)
+            cp.add(self._w_l_delta_inv, delta, out=self._w_l_delta_inv)
+            cp.reciprocal(self._w_l_delta_inv, out=self._w_l_delta_inv)
+
+            self._x_reg[:] = rho[0]
+            self._x_reg[data.idx_xu] += self._w_bu_delta_inv
+            self._x_reg[data.idx_xl] += self._w_bl_delta_inv
+            self._z_reg.fill(0.)
+            self._z_reg[data.idx_hu] += self._w_u_delta_inv
+            self._z_reg[data.idx_hl] += self._w_l_delta_inv
+            cp.reciprocal(self._z_reg, out=self._z_reg)
+
+        self._kkt_solver.update_kkt(data, delta, self._x_reg, self._z_reg)
+    
     @nvtx.annotate("KKTSystem::solve")
     def solve(self, data: Data, settings: Settings, rhs: Variables, lhs: Variables) -> None:
-        stream_cp = cp.cuda.get_current_stream()
-        stream_wp = wp.Stream(cuda_stream=stream_cp.ptr)
-        
-        with nvtx.annotate("KKTSystem::solve::prepare_rhs"):
-            if not hasattr(self, '_prepare_rhs_cuda_graphs'):
-                self._prepare_rhs_cuda_graphs = {}
-
-            key = (rhs.buffer_ptr,)
-
-            if key not in self._prepare_rhs_cuda_graphs:
-                # stream_cp_capture and stream_wp_capture are used to launch kernels to capture cuda graph, but the actual computation is captured in stream_cp and stream_wp
-                stream_cp_capture = cp.cuda.Stream(non_blocking=True)
-                stream_wp_capture = wp.Stream(cuda_stream=stream_cp_capture.ptr)
-
-                stream_cp_capture.begin_capture()
-                with stream_cp_capture:
-                    wp.launch(
-                        kernel=self._eliminate_slacks_kernel,
-                        dim=data.num_hu+data.num_hl+data.num_xu+data.num_xl,
-                        inputs=[rhs.z_u, rhs.s_u, self._m_z_u_inv, self._updated_rhs_z_u,
-                                rhs.z_l, rhs.s_l, self._m_z_l_inv, self._updated_rhs_z_l,
-                                rhs.z_bu, rhs.s_bu, self._m_z_bu_inv, self._updated_rhs_z_bu,
-                                rhs.z_bl, rhs.s_bl, self._m_z_bl_inv, self._updated_rhs_z_bl],
-                        device="cuda",
-                        stream=stream_wp_capture,
-                    )
-                    wp.launch(
-                        kernel=self._eliminate_duals_kernel,
-                        dim=data.n + data.m,
-                        inputs=[
-                            self._inv_idx_xu, self._inv_idx_xl,
-                            self._inv_idx_hu, self._inv_idx_hl,
-                            rhs.x,
-                            self._w_bu_delta_inv, self._w_bl_delta_inv,
-                            self._updated_rhs_z_bu, self._updated_rhs_z_bl,
-                            self._rhs_x_bar,
-                            self._w_u_delta_inv, self._w_l_delta_inv,
-                            self._updated_rhs_z_u, self._updated_rhs_z_l,
-                            self._z_reg,
-                            self._rhs_z_bar,
-                        ],
-                        device="cuda",
-                        stream=stream_wp_capture,
-                    )
-
-                    # # ! ALTERNATIVE IMPLEMENTATION (pure cupy operations)
-                    # ------ elliminate slack variables from rhs
-                    # # rhs_z_u - inv(Z_u) * r_s_u
-                    # cp.multiply(self._m_z_u_inv, rhs.s_u, out=self._updated_rhs_z_u)
-                    # cp.subtract(rhs.z_u, self._updated_rhs_z_u, out=self._updated_rhs_z_u)
-                    # # rhs_z_l - inv(Z_l) * r_s_l
-                    # cp.multiply(self._m_z_l_inv, rhs.s_l, out=self._updated_rhs_z_l)
-                    # cp.subtract(rhs.z_l, self._updated_rhs_z_l, out=self._updated_rhs_z_l)
-                    # # rhs_z_bu - inv(Z_bu) * r_s_bu
-                    # cp.multiply(self._m_z_bu_inv, rhs.s_bu, out=self._updated_rhs_z_bu)
-                    # cp.subtract(rhs.z_bu, self._updated_rhs_z_bu, out=self._updated_rhs_z_bu)
-                    # # rhs_z_bl - inv(Z_bl) * r_s_bl
-                    # cp.multiply(self._m_z_bl_inv, rhs.s_bl, out=self._updated_rhs_z_bl)
-                    # cp.subtract(rhs.z_bl, self._updated_rhs_z_bl, out=self._updated_rhs_z_bl)
-
-                    # ------ elliminate dual variables from rhs to yield one single rhs_z passing to kkt solver
-                    # To avoid avoid extra allocation, we use:
-                    # self._work_x to hold modified rhs_x (to be passed to KKTSolver), self._work_z to hold modified rhs_z (to be passed to KKTSolver)
-                    # use lhs.z_* to hold temporary value self._w_u_delta_inv * self._updated_rhs_z_u, and so on
-
-                    # The below code is equivalent to:
-                    # self._work_x[:] = rhs.x
-                    # self._work_x[data.idx_xu] += self._w_bu_delta_inv * self._updated_rhs_z_bu
-                    # self._work_x[data.idx_xl] -= self._w_bl_delta_inv * self._updated_rhs_z_bl
-                    # self._work_z[:] = 0.
-                    # self._work_z[data.idx_hu] += self._w_u_delta_inv * self._updated_rhs_z_u
-                    # self._work_z[data.idx_hl] -= self._w_l_delta_inv * self._updated_rhs_z_l
-                    # self._work_z[:] *= self._z_reg
-                    
-                    # self._work_x[:] = rhs.x
-                    # cp.multiply(self._w_bu_delta_inv, self._updated_rhs_z_bu, out=lhs.z_bu)
-                    # cp.add.at(self._work_x, data.idx_xu, lhs.z_bu)
-                    # cp.multiply(self._w_bl_delta_inv, self._updated_rhs_z_bl, out=lhs.z_bl)
-                    # cp.negative(lhs.z_bl, out=lhs.z_bl)
-                    # cp.add.at(self._work_x, data.idx_xl, lhs.z_bl)
-                    # self._work_z.fill(0)  # faster than cp.zeros assignment
-                    # cp.multiply(self._w_u_delta_inv, self._updated_rhs_z_u, out=lhs.z_u) # use lhs.z_u as temporary storage
-                    # cp.add.at(self._work_z, data.idx_hu, lhs.z_u)
-                    # cp.multiply(self._w_l_delta_inv, self._updated_rhs_z_l, out=lhs.z_l)
-                    # cp.negative(lhs.z_l, out=lhs.z_l)
-                    # cp.add.at(self._work_z, data.idx_hl, lhs.z_l)
-                    # self._work_z[:] *= self._z_reg
-
-                self._prepare_rhs_cuda_graphs[key] = stream_cp_capture.end_capture()
-
-            self._prepare_rhs_cuda_graphs[key].launch()
-
+        self._prepare_rhs(data, rhs)
         self._kkt_solver.solve(data, self._rhs_x_bar, rhs.y, self._rhs_z_bar, lhs.x, lhs.y, self._work_z)  # ! the second _work_z is used to hold delta_z, but useless anyway. Can be further optimized.
-
         if self._use_iterative_refinement and settings.iterative_refinement_max_iter > 0:
             self.iterative_refinement(
                 data, settings,
                 self._rhs_x_bar, rhs.y, self._rhs_z_bar,
                 lhs.x, lhs.y, self._work_z)
+        self._recover_lhs(data, rhs, lhs)
 
-        with nvtx.annotate("KKTSystem::solve::recover_lhs"):
-            if not hasattr(self, '_recover_lhs_cuda_graphs'):
-                self._recover_lhs_cuda_graphs = {}
+    @nvtx.annotate("KKTSystem::solve::_prepare_rhs")
+    @cuda_graph_capture(key=lambda self, data, rhs: (rhs.buffer_ptr,))
+    def _prepare_rhs(self, data: Data, rhs: Variables):
+        """Prepare the rhs for the condensed KKT system after eliminating slacks and duals of inequalities and box constraints."""
+        wp.launch(
+            kernel=self._eliminate_slacks_kernel,
+            dim=data.num_hu+data.num_hl+data.num_xu+data.num_xl,
+            inputs=[rhs.z_u, rhs.s_u, self._m_z_u_inv, self._updated_rhs_z_u,
+                    rhs.z_l, rhs.s_l, self._m_z_l_inv, self._updated_rhs_z_l,
+                    rhs.z_bu, rhs.s_bu, self._m_z_bu_inv, self._updated_rhs_z_bu,
+                    rhs.z_bl, rhs.s_bl, self._m_z_bl_inv, self._updated_rhs_z_bl],
+            device="cuda",
+            stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+        )
+        wp.launch(
+            kernel=self._eliminate_duals_kernel,
+            dim=data.n + data.m,
+            inputs=[
+                self._inv_idx_xu, self._inv_idx_xl,
+                self._inv_idx_hu, self._inv_idx_hl,
+                rhs.x,
+                self._w_bu_delta_inv, self._w_bl_delta_inv,
+                self._updated_rhs_z_bu, self._updated_rhs_z_bl,
+                self._rhs_x_bar,
+                self._w_u_delta_inv, self._w_l_delta_inv,
+                self._updated_rhs_z_u, self._updated_rhs_z_l,
+                self._z_reg,
+                self._rhs_z_bar,
+            ],
+            device="cuda",
+            stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+        )
 
-            key = (
-                rhs.buffer_ptr, lhs.buffer_ptr, self._work_z.data.ptr, 
-                self._w_u_delta_inv.data.ptr, self._w_l_delta_inv.data.ptr, 
-                self._w_bu_delta_inv.data.ptr, self._w_bl_delta_inv.data.ptr,
-                )
+        # # ! ALTERNATIVE IMPLEMENTATION (pure cupy operations)
+        # ------ elliminate slack variables from rhs
+        # # rhs_z_u - inv(Z_u) * r_s_u
+        # cp.multiply(self._m_z_u_inv, rhs.s_u, out=self._updated_rhs_z_u)
+        # cp.subtract(rhs.z_u, self._updated_rhs_z_u, out=self._updated_rhs_z_u)
+        # # rhs_z_l - inv(Z_l) * r_s_l
+        # cp.multiply(self._m_z_l_inv, rhs.s_l, out=self._updated_rhs_z_l)
+        # cp.subtract(rhs.z_l, self._updated_rhs_z_l, out=self._updated_rhs_z_l)
+        # # rhs_z_bu - inv(Z_bu) * r_s_bu
+        # cp.multiply(self._m_z_bu_inv, rhs.s_bu, out=self._updated_rhs_z_bu)
+        # cp.subtract(rhs.z_bu, self._updated_rhs_z_bu, out=self._updated_rhs_z_bu)
+        # # rhs_z_bl - inv(Z_bl) * r_s_bl
+        # cp.multiply(self._m_z_bl_inv, rhs.s_bl, out=self._updated_rhs_z_bl)
+        # cp.subtract(rhs.z_bl, self._updated_rhs_z_bl, out=self._updated_rhs_z_bl)
 
-            if key not in self._recover_lhs_cuda_graphs:
-                stream_cp_capture = cp.cuda.Stream(non_blocking=True)
-                stream_wp_capture = wp.Stream(cuda_stream=stream_cp_capture.ptr)
+        # ------ elliminate dual variables from rhs to yield one single rhs_z passing to kkt solver
+        # To avoid avoid extra allocation, we use:
+        # self._work_x to hold modified rhs_x (to be passed to KKTSolver), self._work_z to hold modified rhs_z (to be passed to KKTSolver)
+        # use lhs.z_* to hold temporary value self._w_u_delta_inv * self._updated_rhs_z_u, and so on
 
-                stream_cp_capture.begin_capture()
-                with stream_cp_capture:
-                    self.eval_G_xn(data, 1., lhs.x, self._work_z)  # G * delta_x, where delta_x is stored in lhs.x
-                    wp.launch(
-                        kernel=self._recover_duals_kernel,
-                        dim=data.num_hu+data.num_hl+data.num_xu+data.num_xl,
-                        inputs=[
-                            self._work_z, lhs.x,
-                            data.idx_hu, self._w_u_delta_inv, self._updated_rhs_z_u, lhs.z_u,
-                            data.idx_hl, self._w_l_delta_inv, self._updated_rhs_z_l, lhs.z_l,
-                            data.idx_xu, self._w_bu_delta_inv, self._m_z_bu_inv, rhs.z_bu, rhs.s_bu, lhs.z_bu,
-                            data.idx_xl, self._w_bl_delta_inv, self._m_z_bl_inv, rhs.z_bl, rhs.s_bl, lhs.z_bl],
-                        device="cuda",
-                        stream=stream_wp_capture,
-                    )
-                    wp.launch(
-                        kernel=self._recover_slacks_kernel,
-                        dim=data.num_hu+data.num_hl+data.num_xu+data.num_xl,
-                        inputs=[rhs.s_u, lhs.z_u, self._m_s_u, self._m_z_u_inv, lhs.s_u,
-                                rhs.s_l, lhs.z_l, self._m_s_l, self._m_z_l_inv, lhs.s_l,
-                                rhs.s_bu, lhs.z_bu, self._m_s_bu, self._m_z_bu_inv, lhs.s_bu,
-                                rhs.s_bl, lhs.z_bl, self._m_s_bl, self._m_z_bl_inv, lhs.s_bl],
-                        device="cuda",
-                        stream=stream_wp_capture,
-                    )
+        # The below code is equivalent to:
+        # self._work_x[:] = rhs.x
+        # self._work_x[data.idx_xu] += self._w_bu_delta_inv * self._updated_rhs_z_bu
+        # self._work_x[data.idx_xl] -= self._w_bl_delta_inv * self._updated_rhs_z_bl
+        # self._work_z[:] = 0.
+        # self._work_z[data.idx_hu] += self._w_u_delta_inv * self._updated_rhs_z_u
+        # self._work_z[data.idx_hl] -= self._w_l_delta_inv * self._updated_rhs_z_l
+        # self._work_z[:] *= self._z_reg
+        
+        # self._work_x[:] = rhs.x
+        # cp.multiply(self._w_bu_delta_inv, self._updated_rhs_z_bu, out=lhs.z_bu)
+        # cp.add.at(self._work_x, data.idx_xu, lhs.z_bu)
+        # cp.multiply(self._w_bl_delta_inv, self._updated_rhs_z_bl, out=lhs.z_bl)
+        # cp.negative(lhs.z_bl, out=lhs.z_bl)
+        # cp.add.at(self._work_x, data.idx_xl, lhs.z_bl)
+        # self._work_z.fill(0)  # faster than cp.zeros assignment
+        # cp.multiply(self._w_u_delta_inv, self._updated_rhs_z_u, out=lhs.z_u) # use lhs.z_u as temporary storage
+        # cp.add.at(self._work_z, data.idx_hu, lhs.z_u)
+        # cp.multiply(self._w_l_delta_inv, self._updated_rhs_z_l, out=lhs.z_l)
+        # cp.negative(lhs.z_l, out=lhs.z_l)
+        # cp.add.at(self._work_z, data.idx_hl, lhs.z_l)
+        # self._work_z[:] *= self._z_reg
 
-                    # # ! ALTERNATIVE IMPLEMENTATION (pure cupy operations)
+    @nvtx.annotate("KKTSystem::_recover_lhs")
+    @cuda_graph_capture(key=lambda self, data, rhs, lhs: (rhs.buffer_ptr, lhs.buffer_ptr))
+    def _recover_lhs(self, data: Data, rhs: Variables, lhs: Variables):
+        """Recover the full KKT solution from the condense KKT solution."""
+        # TODO: find a cleaner and more flexible to pass stream to eval_G_xn() and so on
+        self.eval_G_xn(data, 1., lhs.x, self._work_z)  # G * delta_x, where delta_x is stored in lhs.x
+        wp.launch(
+            kernel=self._recover_duals_kernel,
+            dim=data.num_hu+data.num_hl+data.num_xu+data.num_xl,
+            inputs=[
+                self._work_z, lhs.x,
+                data.idx_hu, self._w_u_delta_inv, self._updated_rhs_z_u, lhs.z_u,
+                data.idx_hl, self._w_l_delta_inv, self._updated_rhs_z_l, lhs.z_l,
+                data.idx_xu, self._w_bu_delta_inv, self._m_z_bu_inv, rhs.z_bu, rhs.s_bu, lhs.z_bu,
+                data.idx_xl, self._w_bl_delta_inv, self._m_z_bl_inv, rhs.z_bl, rhs.s_bl, lhs.z_bl],
+            device="cuda",
+            stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+        )
+        wp.launch(
+            kernel=self._recover_slacks_kernel,
+            dim=data.num_hu+data.num_hl+data.num_xu+data.num_xl,
+            inputs=[rhs.s_u, lhs.z_u, self._m_s_u, self._m_z_u_inv, lhs.s_u,
+                    rhs.s_l, lhs.z_l, self._m_s_l, self._m_z_l_inv, lhs.s_l,
+                    rhs.s_bu, lhs.z_bu, self._m_s_bu, self._m_z_bu_inv, lhs.s_bu,
+                    rhs.s_bl, lhs.z_bl, self._m_s_bl, self._m_z_bl_inv, lhs.s_bl],
+            device="cuda",
+            stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+        )
 
-                    # ----- recover dual variables on lhs
-                    # The below code is equivalent to:
-                    # lhs.z_u[:] = self._w_u_delta_inv * (G_dx[data.idx_hu] - self._updated_rhs_z_u)   # delta_z_u
-                    # lhs.z_l[:] = self._w_l_delta_inv * (-G_dx[data.idx_hl] - self._updated_rhs_z_l)  # delta_z_l
-                    # lhs.z_bu[:] = self._w_bu_delta_inv * (lhs.x[data.idx_xu] - rhs.z_bu + self._m_z_bu_inv * rhs.s_bu)  # delta_z_bu
-                    # lhs.z_bl[:] = -self._w_bl_delta_inv * (lhs.x[data.idx_xl] + rhs.z_bl - self._m_z_bl_inv * rhs.s_bl)  # delta_z_bl
-                    
-                    # lhs.z_u[:] = self._work_z[data.idx_hu]
-                    # lhs.z_u -= self._updated_rhs_z_u
-                    # lhs.z_u *= self._w_u_delta_inv
+        # # ! ALTERNATIVE IMPLEMENTATION (pure cupy operations)
 
-                    # lhs.z_l[:] = self._work_z[data.idx_hl]
-                    # lhs.z_l *= -1.
-                    # lhs.z_l -= self._updated_rhs_z_l
-                    # lhs.z_l *= self._w_l_delta_inv
+        # ----- recover dual variables on lhs
+        # The below code is equivalent to:
+        # lhs.z_u[:] = self._w_u_delta_inv * (G_dx[data.idx_hu] - self._updated_rhs_z_u)   # delta_z_u
+        # lhs.z_l[:] = self._w_l_delta_inv * (-G_dx[data.idx_hl] - self._updated_rhs_z_l)  # delta_z_l
+        # lhs.z_bu[:] = self._w_bu_delta_inv * (lhs.x[data.idx_xu] - rhs.z_bu + self._m_z_bu_inv * rhs.s_bu)  # delta_z_bu
+        # lhs.z_bl[:] = -self._w_bl_delta_inv * (lhs.x[data.idx_xl] + rhs.z_bl - self._m_z_bl_inv * rhs.s_bl)  # delta_z_bl
+        
+        # lhs.z_u[:] = self._work_z[data.idx_hu]
+        # lhs.z_u -= self._updated_rhs_z_u
+        # lhs.z_u *= self._w_u_delta_inv
 
-                    # cp.multiply(self._m_z_bu_inv, rhs.s_bu, out=lhs.z_bu)
-                    # lhs.z_bu += lhs.x[data.idx_xu]
-                    # lhs.z_bu -= rhs.z_bu
-                    # lhs.z_bu *= self._w_bu_delta_inv
+        # lhs.z_l[:] = self._work_z[data.idx_hl]
+        # lhs.z_l *= -1.
+        # lhs.z_l -= self._updated_rhs_z_l
+        # lhs.z_l *= self._w_l_delta_inv
 
-                    # cp.multiply(self._m_z_bl_inv, rhs.s_bl, out=lhs.z_bl)
-                    # lhs.z_bl -= lhs.x[data.idx_xl]
-                    # lhs.z_bl -= rhs.z_bl
-                    # lhs.z_bl *= self._w_bl_delta_inv
-                    
-                    # ----- recover slack variable on lhs
-                    # The below code is equivalent to:
-                    # lhs.s_u[:] = self._m_z_u_inv * (rhs.s_u - self._m_s_u * lhs.z_u)  # delta_s_u = inv(Z_u) (r_s_u - S_u delta_z_u)
-                    # lhs.s_l[:] = self._m_z_l_inv * (rhs.s_l - self._m_s_l * lhs.z_l)  # delta_s_l = inv(Z_l) (r_s_l - S_l delta_z_l)
-                    # lhs.s_bu[:] = self._m_z_bu_inv * (rhs.s_bu - self._m_s_bu * lhs.z_bu)  # delta_s_bu = inv(Z_bu) (r_s_bu - S_bu delta_z_bu)
-                    # lhs.s_bl[:] = self._m_z_bl_inv * (rhs.s_bl - self._m_s_bl * lhs.z_bl)  # delta_s_bl = inv(Z_bl) (r_s_bl - S_bl delta_z_bl)
+        # cp.multiply(self._m_z_bu_inv, rhs.s_bu, out=lhs.z_bu)
+        # lhs.z_bu += lhs.x[data.idx_xu]
+        # lhs.z_bu -= rhs.z_bu
+        # lhs.z_bu *= self._w_bu_delta_inv
 
-                    # cp.multiply(self._m_s_u, lhs.z_u, out=lhs.s_u)
-                    # cp.subtract(rhs.s_u, lhs.s_u, out=lhs.s_u)
-                    # cp.multiply(self._m_z_u_inv, lhs.s_u, out=lhs.s_u)
+        # cp.multiply(self._m_z_bl_inv, rhs.s_bl, out=lhs.z_bl)
+        # lhs.z_bl -= lhs.x[data.idx_xl]
+        # lhs.z_bl -= rhs.z_bl
+        # lhs.z_bl *= self._w_bl_delta_inv
+        
+        # ----- recover slack variable on lhs
+        # The below code is equivalent to:
+        # lhs.s_u[:] = self._m_z_u_inv * (rhs.s_u - self._m_s_u * lhs.z_u)  # delta_s_u = inv(Z_u) (r_s_u - S_u delta_z_u)
+        # lhs.s_l[:] = self._m_z_l_inv * (rhs.s_l - self._m_s_l * lhs.z_l)  # delta_s_l = inv(Z_l) (r_s_l - S_l delta_z_l)
+        # lhs.s_bu[:] = self._m_z_bu_inv * (rhs.s_bu - self._m_s_bu * lhs.z_bu)  # delta_s_bu = inv(Z_bu) (r_s_bu - S_bu delta_z_bu)
+        # lhs.s_bl[:] = self._m_z_bl_inv * (rhs.s_bl - self._m_s_bl * lhs.z_bl)  # delta_s_bl = inv(Z_bl) (r_s_bl - S_bl delta_z_bl)
 
-                    # cp.multiply(self._m_s_l, lhs.z_l, out=lhs.s_l)
-                    # cp.subtract(rhs.s_l, lhs.s_l, out=lhs.s_l)
-                    # cp.multiply(self._m_z_l_inv, lhs.s_l, out=lhs.s_l)
+        # cp.multiply(self._m_s_u, lhs.z_u, out=lhs.s_u)
+        # cp.subtract(rhs.s_u, lhs.s_u, out=lhs.s_u)
+        # cp.multiply(self._m_z_u_inv, lhs.s_u, out=lhs.s_u)
 
-                    # cp.multiply(self._m_s_bu, lhs.z_bu, out=lhs.s_bu)
-                    # cp.subtract(rhs.s_bu, lhs.s_bu, out=lhs.s_bu)
-                    # cp.multiply(self._m_z_bu_inv, lhs.s_bu, out=lhs.s_bu)
+        # cp.multiply(self._m_s_l, lhs.z_l, out=lhs.s_l)
+        # cp.subtract(rhs.s_l, lhs.s_l, out=lhs.s_l)
+        # cp.multiply(self._m_z_l_inv, lhs.s_l, out=lhs.s_l)
 
-                    # cp.multiply(self._m_s_bl, lhs.z_bl, out=lhs.s_bl)
-                    # cp.subtract(rhs.s_bl, lhs.s_bl, out=lhs.s_bl)
-                    # cp.multiply(self._m_z_bl_inv, lhs.s_bl, out=lhs.s_bl)
+        # cp.multiply(self._m_s_bu, lhs.z_bu, out=lhs.s_bu)
+        # cp.subtract(rhs.s_bu, lhs.s_bu, out=lhs.s_bu)
+        # cp.multiply(self._m_z_bu_inv, lhs.s_bu, out=lhs.s_bu)
 
-                self._recover_lhs_cuda_graphs[key] = stream_cp_capture.end_capture()
-
-            self._recover_lhs_cuda_graphs[key].launch()
+        # cp.multiply(self._m_s_bl, lhs.z_bl, out=lhs.s_bl)
+        # cp.subtract(rhs.s_bl, lhs.s_bl, out=lhs.s_bl)
+        # cp.multiply(self._m_z_bl_inv, lhs.s_bl, out=lhs.s_bl)
 
     @nvtx.annotate("KKTSystem::iterative_refinement")
     def iterative_refinement(self, data: Data, settings: Settings,
