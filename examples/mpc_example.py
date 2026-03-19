@@ -106,7 +106,12 @@ res = prob.solve()
 
 print("Run time: ", res.info.run_time)
 
-
+import piqp
+solver_cpu = piqp.SparseSolver()
+solver_cpu.settings.verbose = True
+solver_cpu.settings.iterative_refinement_always_enabled = True
+solver_cpu.setup(P, q, Aeq, leq, Aineq, lineq, uineq, x_l, x_u)
+solver_cpu.solve()
 
 
 import cupy as cp
@@ -117,6 +122,8 @@ solver.settings.kkt_solver = 'sparse_ldlt'
 # solver.settings.debug = True
 solver.settings.verbose = True
 solver.settings.max_iter = 30
+solver.settings.iterative_refinement_always_enabled = False
+
 with cp.cuda.Device(0):
 	solver.setup(
 		P=csr_matrix(P),  # Convert scipy sparse to cupy sparse directly
@@ -134,16 +141,15 @@ with cp.cuda.Device(0):
 
 print("status: ", solver._result.info.status)
 
-	
 
-import cupy as cp
-from cupyx.scipy.sparse import csr_matrix
 
 solver = SolverBase()
 solver.settings.kkt_solver = 'dense_cholesky'
 # solver.settings.debug = True
 solver.settings.verbose = True
 solver.settings.max_iter = 30
+solver.settings.iterative_refinement_always_enabled = False
+
 with cp.cuda.Device(0):
 	solver.setup(
 		P=cp.array(P.toarray()),  # Convert scipy sparse to cupy dense directly
