@@ -47,6 +47,10 @@ class SparseDirectSolver(ABC):
         """Solve the linear system for the given right-hand side."""
         pass
 
+    def __del__(self):
+        """Ensure resources are freed when the solver is garbage collected."""
+        pass
+
     @property
     def mat(self):
         """Expose the matrix for in-place updates before calling factor()."""
@@ -85,6 +89,9 @@ class CudssSparseDirectSolver(SparseDirectSolver):
         self._cudss_solver.plan_config.reordering_algorithm = DirectSolverAlgType.ALG_DEFAULT
         self._cudss_solver.solution_config.ir_num_steps = 0  # NOTE: iterative refinement steps, to be tuned
         # cudss has IR_TOL, but not implemented yet according to https://docs.nvidia.com/cuda/cudss/types.html#c.cudssConfigParam_t.CUDSS_CONFIG_IR_TOL
+        # self._cudss_solver.plan_config.pivot_type = cudss_bindings.PivotType.PIVOT_COL
+        # self._cudss_solver.plan_config.pivot_threshold = 1.0
+        # self._cudss_solver.factorization_config.pivot_eps = 1e-12
 
         # Enable deterministic mode for bit-wise reproducible results across runs.
         # Uses slower kernels but guarantees identical factorization every time.
@@ -130,8 +137,18 @@ class CudssSparseDirectSolver(SparseDirectSolver):
 
             # NOTE: this causes a D2H synchronization, which can be inefficient. More importantly, this prevents us from capturing cuda graphs.
             if fac_info.info != 0:
-                print(f"Factorization failed with info={fac_info.info}")
+                # print(f"Factorization failed with info={fac_info.info}")
                 return False
+
+            # For ExecuteCUDA, check the diagonal entries of the factorization to detect potential numerical issues. 
+            # If any diagonal entry is very small, it may indicate the matrix is close to singular or indefinite, 
+            # which can lead to very inaccurate results in subsequent computations. 
+            # For ExecuteHybrid we cannot do this because fac_info.diag are always all zeros.
+            if isinstance(self._cudss_solver.execution_options, ExecutionCUDA):
+                if np.any(np.abs(fac_info.diag) < 1e-12):  # NOTE: the threshold here may need to be tuned based on the problem
+                    # print(f"\033[94mFactorization warning: small diagonal entries detected (min diag={fac_info.diag.min():.2e}). Matrix may be close to singular.\033[0m")
+                    # print(f"\033[94mFactorization info: {fac_info.info}, inertia: {fac_info.inertia}, "f"min/max diag: {np.abs(fac_info.diag).min():.2e}/{np.abs(fac_info.diag).max():.2e}\033[0m")
+                    return False
 
         except Exception as e:
             print(f"Factorization failed: {e}")
@@ -219,7 +236,7 @@ class CudssSparseDirectSolver(SparseDirectSolver):
         # Restore original RHS
         self._rhs[:] = self._rhs_saved
 
-    @staticmethod    
+    @staticmethod
     def _find_cudss_mt_lib():
         """Auto-discover the cuDSS multithreading layer library.
 
