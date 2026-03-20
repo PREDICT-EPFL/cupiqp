@@ -141,10 +141,9 @@ class SparseKKTSolver(KKTSolverBase):
         m = 0 if G is None else int(G.shape[0])
 
         # Sparse diagonal placeholders (avoid cp.diag / cp.eye which create dense matrices)
-        # Keep a diagonal entry present in each block so setdiag() won't change sparsity.
-        P_diag_abs_max = cp.max(cp.abs(P.diagonal()))  # ensure diagonal exists
-
-        In = diags(2 * P_diag_abs_max * cp.ones(n, dtype=cp.float64), 0, shape=(n, n), format="csr")  # make sure the diagonal entries of P+In are non-zero
+        # Do P+In make sure the diagonal entries are non-zero 
+        # P is p.s.d so P's diagonal are all non-negative, adding I will not change non-zeros entries to zero
+        In = diags(cp.ones(n, dtype=cp.float64), 0, shape=(n, n), format="csr")
         Ip = diags(cp.ones(p, dtype=cp.float64), 0, shape=(p, p), format="csr") if p else None
         Im = diags(cp.ones(m, dtype=cp.float64), 0, shape=(m, m), format="csr") if m else None
         kkt = bmat([
