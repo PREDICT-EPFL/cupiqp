@@ -78,6 +78,7 @@ class Data(ABC):
         _G, _h_l, _h_u, _x_l, _x_u have been populated.
         """
         self._preprocess()
+        self._x_b_scaling = cp.ones(self.n, dtype=cp.float64)  # diagonal scaling for box constraints
         self._constraints_rhs_inf_norm = cp.empty(1, dtype=cp.float64)
         self._compute_constraints_rhs_inf_norm()
 
@@ -145,6 +146,11 @@ class Data(ABC):
     @property
     def x_u(self):
         return self._x_u
+
+    @property
+    def x_b_scaling(self):
+        """Scaling for box constraints."""
+        return self._x_b_scaling
 
     @property
     def x_l(self):

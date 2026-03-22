@@ -1,0 +1,118 @@
+import cupy as cp
+
+from ..data import Data
+from ..preconditioner import RuizEquilibration
+
+
+class SparseRuizEquilibration(RuizEquilibration):
+    """Ruiz equilibration for sparse (CSR) matrix backends."""
+
+    def _compute_kkt_norms(self, data: Data, d: cp.ndarray, d_b: cp.ndarray):
+        n, p, m = self.n, self.p, self.m
+
+        d[:n] = self._csr_utri_symmetric_col_inf_norms(data._P)
+
+        if p > 0:
+            cp.maximum(d[:n], self._csr_col_inf_norms(data._A), out=d[:n])
+            d[n:n + p] = self._csr_row_inf_norms(data._A)
+        else:
+            d[n:n + p] = 1.0
+
+        if m > 0:
+            cp.maximum(d[:n], self._csr_col_inf_norms(data._G), out=d[:n])
+            d[n + p:] = self._csr_row_inf_norms(data._G)
+        else:
+            d[n + p:] = 1.0
+
+    def _scale_matrices(self, data: Data,
+                        d_x: cp.ndarray, d_y: cp.ndarray, d_z: cp.ndarray):
+        self._csr_row_scale(data._P, d_x)
+        self._csr_col_scale(data._P, d_x)
+        data._c *= d_x
+
+        if self.p > 0:
+            self._csr_row_scale(data._A, d_y)
+            self._csr_col_scale(data._A, d_x)
+        if self.m > 0:
+            self._csr_row_scale(data._G, d_z)
+            self._csr_col_scale(data._G, d_x)
+
+    def _apply_cost_scaling(self, data: Data):
+        P_norms = self._csr_utri_symmetric_col_inf_norms(data._P)
+        gamma = float(cp.mean(P_norms))
+        gamma = self._limit_scaling_scalar(gamma)
+        gamma = max(gamma, float(cp.max(cp.abs(data._c))))
+        gamma = self._limit_scaling_scalar(gamma)
+        gamma = 1.0 / gamma
+        data._P.data *= gamma
+        data._c *= gamma
+        self.c_scaling *= gamma
+
+    def _unscale_matrices(self, data: Data,
+                          d_x_inv: cp.ndarray, d_y_inv: cp.ndarray, d_z_inv: cp.ndarray):
+        c_inv = float(self._c_scaling_inv)
+
+        data._P.data *= c_inv
+        self._csr_row_scale(data._P, d_x_inv)
+        self._csr_col_scale(data._P, d_x_inv)
+        data._c *= c_inv * d_x_inv
+
+        if self.p > 0:
+            self._csr_row_scale(data._A, d_y_inv)
+            self._csr_col_scale(data._A, d_x_inv)
+        if self.m > 0:
+            self._csr_row_scale(data._G, d_z_inv)
+            self._csr_col_scale(data._G, d_x_inv)
+
+    def _apply_stored_scaling(self, data: Data,
+                              d_x: cp.ndarray, d_y: cp.ndarray, d_z: cp.ndarray):
+        c = float(self.c_scaling)
+
+        data._P.data *= c
+        self._csr_row_scale(data._P, d_x)
+        self._csr_col_scale(data._P, d_x)
+        data._c *= c * d_x
+
+        if self.p > 0:
+            self._csr_row_scale(data._A, d_y)
+            self._csr_col_scale(data._A, d_x)
+        if self.m > 0:
+            self._csr_row_scale(data._G, d_z)
+            self._csr_col_scale(data._G, d_x)
+
+
+    # ------------------------------------------------------------------
+    # CSR helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _csr_row_scale(M, d):
+        if M.shape[0] == 0 or M.nnz == 0:
+            return
+        nz_indices = cp.arange(M.nnz, dtype=cp.int32)
+        row_indices = cp.searchsorted(M.indptr[1:], nz_indices, side='right')
+        M.data *= d[row_indices]
+
+    @staticmethod
+    def _csr_col_scale(M, d):
+        if M.nnz == 0:
+            return
+        M.data *= d[M.indices]
+
+    @staticmethod
+    def _csr_row_inf_norms(M):
+        if M.shape[0] == 0 or M.nnz == 0:
+            return cp.zeros(M.shape[0], dtype=cp.float64)
+        return cp.asarray(abs(M).max(axis=1).toarray()).ravel()
+
+    @staticmethod
+    def _csr_col_inf_norms(M):
+        if M.shape[1] == 0 or M.nnz == 0:
+            return cp.zeros(M.shape[1], dtype=cp.float64)
+        return cp.asarray(abs(M).max(axis=0).toarray()).ravel()
+
+    @classmethod
+    def _csr_utri_symmetric_col_inf_norms(cls, P):
+        if P.nnz == 0:
+            return cp.zeros(P.shape[0], dtype=cp.float64)
+        return cp.maximum(cls._csr_row_inf_norms(P), cls._csr_col_inf_norms(P))
