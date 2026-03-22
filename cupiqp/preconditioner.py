@@ -84,6 +84,30 @@ class RuizEquilibration(ABC):
         self._delta_iter = cp.empty(n + p + m, dtype=cp.float64)  # used to store current Ruiz iteration scaling factors
         self._delta_b_iter = cp.empty(n, dtype=cp.float64) # used to store current Ruiz iteration box scaling factors
 
+    @property
+    def c_scaling_inv(self) -> cp.ndarray:
+        return self._c_scaling_inv
+
+    @property
+    def delta(self) -> cp.ndarray:
+        return self._delta
+
+    @property
+    def delta_inv(self) -> cp.ndarray:
+        return self._delta_inv
+
+    @property
+    def delta_b(self) -> cp.ndarray:
+        return self._delta_b
+
+    @property
+    def delta_b_inv(self) -> cp.ndarray:
+        return self._delta_b_inv
+
+    @property
+    def x_b_scaling(self) -> cp.ndarray:
+        return self._x_b_scaling
+
     def reset(self):
         self._delta.fill(1.0)
         self._delta_inv.fill(1.0)
@@ -170,38 +194,89 @@ class RuizEquilibration(ABC):
         self._scale_bounds(data)
 
     def unscale_solution(self, result: Variables, data: Data):
-        """Transform scaled IPM solution back to original coordinates."""
-        n, p = self.n, self.p
-        c_inv = self._c_scaling_inv
+        """Transform scaled IPM solution back to original coordinates.
+        Matches C++ PIQP SolverBase::unscale_results()."""
+        result.x[:] = self.unscale_primal(result.x)
 
-        # Primal variables: x_unscaled = delta_x * x_scaled
-        result.x *= self._delta[:n]
+        if self.p > 0:
+            result.y[:] = self.unscale_dual_eq(result.y)
 
-        # Equality duals: y_unscaled = c_inv * delta_y * y_scaled
-        if p > 0:
-            result.y *= c_inv * self._delta[n:n + p]
-
-        # Inequality duals: z_unscaled = c_inv * delta_z * z_scaled
         if data.num_hu > 0:
-            result.z_u *= c_inv * self._delta[n + p + data.idx_hu]
+            result.z_u[:] = self.unscale_dual_ineq(result.z_u, data.idx_hu)
+            result.s_u[:] = self.unscale_slack_ineq(result.s_u, data.idx_hu)
         if data.num_hl > 0:
-            result.z_l *= c_inv * self._delta[n + p + data.idx_hl]
-
-        # Box duals: z_b_unscaled = c_inv * delta_b * z_b_scaled
+            result.z_l[:] = self.unscale_dual_ineq(result.z_l, data.idx_hl)
+            result.s_l[:] = self.unscale_slack_ineq(result.s_l, data.idx_hl)
         if data.num_xu > 0:
-            result.z_bu *= c_inv * self._delta_b[data.idx_xu]
+            result.z_bu[:] = self.unscale_dual_b(result.z_bu, data.idx_xu)
+            result.s_bu[:] = self.unscale_slack_b(result.s_bu, data.idx_xu)
         if data.num_xl > 0:
-            result.z_bl *= c_inv * self._delta_b[data.idx_xl]
+            result.z_bl[:] = self.unscale_dual_b(result.z_bl, data.idx_xl)
+            result.s_bl[:] = self.unscale_slack_b(result.s_bl, data.idx_xl)
 
-        # Slacks (scale inversely)
-        if data.num_hu > 0:
-            result.s_u *= self._delta_inv[n + p + data.idx_hu]
-        if data.num_hl > 0:
-            result.s_l *= self._delta_inv[n + p + data.idx_hl]
-        if data.num_xu > 0:
-            result.s_bu *= self._delta_b_inv[data.idx_xu]
-        if data.num_xl > 0:
-            result.s_bl *= self._delta_b_inv[data.idx_xl]
+    # ------------------------------------------------------------------
+    # Primal / dual / slack scaling and unscaling
+    # ------------------------------------------------------------------
+
+    def unscale_primal(self, x: cp.ndarray) -> cp.ndarray:
+        """x_orig = delta_x * x_scaled"""
+        return x * self._delta[:self.n]
+
+    def scale_primal(self, x: cp.ndarray) -> cp.ndarray:
+        """x_scaled = delta_inv_x * x_orig"""
+        return x * self._delta_inv[:self.n]
+
+    def unscale_dual_eq(self, y: cp.ndarray) -> cp.ndarray:
+        """y_orig = c_inv * delta_y * y_scaled"""
+        return y * self._c_scaling_inv * self._delta[self.n:self.n + self.p]
+
+    def scale_dual_eq(self, y: cp.ndarray) -> cp.ndarray:
+        """y_scaled = c * delta_inv_y * y_orig"""
+        return y * self._c_scaling * self._delta_inv[self.n:self.n + self.p]
+
+    def unscale_dual_ineq(self, z: cp.ndarray, idx: cp.ndarray) -> cp.ndarray:
+        """z_orig = c_inv * delta_z[idx] * z_scaled"""
+        return z * self._c_scaling_inv * self._delta[self.n + self.p + idx]
+
+    def unscale_dual_b(self, z_b: cp.ndarray, idx: cp.ndarray) -> cp.ndarray:
+        """z_b_orig = c_inv * delta_b[idx] * z_b_scaled"""
+        return z_b * self._c_scaling_inv * self._delta_b[idx]
+
+    def unscale_slack_ineq(self, s: cp.ndarray, idx: cp.ndarray) -> cp.ndarray:
+        """s_orig = delta_inv_z[idx] * s_scaled"""
+        return s * self._delta_inv[self.n + self.p + idx]
+
+    def unscale_slack_b(self, s_b: cp.ndarray, idx: cp.ndarray) -> cp.ndarray:
+        """s_b_orig = delta_b_inv[idx] * s_b_scaled"""
+        return s_b * self._delta_b_inv[idx]
+
+    # ------------------------------------------------------------------
+    # Residual unscaling (used every iteration for convergence checks)
+    # ------------------------------------------------------------------
+
+    def unscale_dual_res(self, v: cp.ndarray) -> cp.ndarray:
+        """v_orig = c_inv * delta_inv_x * v_scaled"""
+        return v * self._c_scaling_inv * self._delta_inv[:self.n]
+
+    def unscale_primal_res_eq(self, v: cp.ndarray) -> cp.ndarray:
+        """v_orig = delta_inv_y * v_scaled"""
+        return v * self._delta_inv[self.n:self.n + self.p]
+
+    def unscale_primal_res_ineq(self, v: cp.ndarray, idx: cp.ndarray) -> cp.ndarray:
+        """v_orig = delta_inv_z[idx] * v_scaled"""
+        return v * self._delta_inv[self.n + self.p + idx]
+
+    def unscale_primal_res_b(self, v: cp.ndarray, idx: cp.ndarray) -> cp.ndarray:
+        """v_orig = delta_b_inv[idx] * v_scaled"""
+        return v * self._delta_b_inv[idx]
+
+    # ------------------------------------------------------------------
+    # Cost unscaling
+    # ------------------------------------------------------------------
+
+    def unscale_cost(self, cost: float) -> float:
+        """cost_orig = c_inv * cost_scaled"""
+        return float(cost * self._c_scaling_inv)
 
     @abstractmethod
     def _compute_kkt_norms(self, data: Data, d: cp.ndarray, d_b: cp.ndarray):

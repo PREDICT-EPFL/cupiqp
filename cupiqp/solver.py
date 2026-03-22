@@ -110,42 +110,40 @@ class SolverBase:
         self._enable_iterative_refinement = self.settings.iterative_refinement_always_enabled
 
         # Pre-compute residual unscaling factors for preconditioner.
-        # These are used in _update_residuals_nr to compute relative norms in the
-        # original (unscaled) coordinate system.
+        # These are cached arrays used every iteration in _update_residuals_nr
+        # to compute norms in the original (unscaled) coordinate system.
         # When no preconditioner is active, all factors are 1.0 (identity).
         n, p, m = self._data.n, self._data.p, self._data.m
-        if self._preconditioner is not None:
-            pc = self._preconditioner
-            c_inv = pc._c_scaling_inv
-            self._c_scaling_inv = pc._c_scaling_inv  # for unscaling objectives during solve
-            self._unscale_dual_res_factor = c_inv * pc._delta_inv[:n]
-            self._unscale_primal_res_eq_factor = pc._delta_inv[n:n + p] if p > 0 else cp.empty(0)
-            self._unscale_primal_res_ineq_hu = pc._delta_inv[n + p + self._data.idx_hu] if self._data.num_hu > 0 else cp.empty(0)
-            self._unscale_primal_res_ineq_hl = pc._delta_inv[n + p + self._data.idx_hl] if self._data.num_hl > 0 else cp.empty(0)
-            self._unscale_primal_res_b_xu = pc._delta_b_inv[self._data.idx_xu] if self._data.num_xu > 0 else cp.empty(0)
-            self._unscale_primal_res_b_xl = pc._delta_b_inv[self._data.idx_xl] if self._data.num_xl > 0 else cp.empty(0)
+        pc = self._preconditioner
+        if pc is not None:
+            self._c_scaling_inv = pc.c_scaling_inv
+            self._unscale_dual_res_factor = pc.c_scaling_inv * pc.delta_inv[:n]
+            self._unscale_primal_res_eq_factor = pc.delta_inv[n:n + p] if p > 0 else cp.empty(0)
+            self._unscale_primal_res_ineq_hu = pc.delta_inv[n + p + self._data.idx_hu] if self._data.num_hu > 0 else cp.empty(0)
+            self._unscale_primal_res_ineq_hl = pc.delta_inv[n + p + self._data.idx_hl] if self._data.num_hl > 0 else cp.empty(0)
+            self._unscale_primal_res_b_xu = pc.delta_b_inv[self._data.idx_xu] if self._data.num_xu > 0 else cp.empty(0)
+            self._unscale_primal_res_b_xl = pc.delta_b_inv[self._data.idx_xl] if self._data.num_xl > 0 else cp.empty(0)
             # Compute unscaled constraints RHS norm from original (pre-scaling) bounds
             self._constraints_rhs_inf_norm_unscaled = cp.zeros(1, dtype=cp.float64)
             if p > 0:
-                # b_unscaled = b_scaled * delta_inv_y
                 cp.maximum(self._constraints_rhs_inf_norm_unscaled,
-                           cp.max(cp.abs(self._data.b * pc._delta_inv[n:n + p])),
+                           cp.max(cp.abs(pc.unscale_primal_res_eq(self._data.b))),
                            out=self._constraints_rhs_inf_norm_unscaled)
             if self._data.num_hu > 0:
                 cp.maximum(self._constraints_rhs_inf_norm_unscaled,
-                           cp.max(cp.abs(self._data.h_u[self._data.idx_hu] * pc._delta_inv[n + p + self._data.idx_hu])),
+                           cp.max(cp.abs(pc.unscale_primal_res_ineq(self._data.h_u[self._data.idx_hu], self._data.idx_hu))),
                            out=self._constraints_rhs_inf_norm_unscaled)
             if self._data.num_hl > 0:
                 cp.maximum(self._constraints_rhs_inf_norm_unscaled,
-                           cp.max(cp.abs(self._data.h_l[self._data.idx_hl] * pc._delta_inv[n + p + self._data.idx_hl])),
+                           cp.max(cp.abs(pc.unscale_primal_res_ineq(self._data.h_l[self._data.idx_hl], self._data.idx_hl))),
                            out=self._constraints_rhs_inf_norm_unscaled)
             if self._data.num_xu > 0:
                 cp.maximum(self._constraints_rhs_inf_norm_unscaled,
-                           cp.max(cp.abs(self._data.x_u[self._data.idx_xu] * pc._delta_b_inv[self._data.idx_xu])),
+                           cp.max(cp.abs(pc.unscale_primal_res_b(self._data.x_u[self._data.idx_xu], self._data.idx_xu))),
                            out=self._constraints_rhs_inf_norm_unscaled)
             if self._data.num_xl > 0:
                 cp.maximum(self._constraints_rhs_inf_norm_unscaled,
-                           cp.max(cp.abs(self._data.x_l[self._data.idx_xl] * pc._delta_b_inv[self._data.idx_xl])),
+                           cp.max(cp.abs(pc.unscale_primal_res_b(self._data.x_l[self._data.idx_xl], self._data.idx_xl))),
                            out=self._constraints_rhs_inf_norm_unscaled)
         else:
             self._c_scaling_inv = cp.ones(1, dtype=cp.float64)
