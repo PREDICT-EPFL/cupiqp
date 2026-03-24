@@ -84,6 +84,8 @@ class RuizEquilibration(ABC):
         self._delta_iter = cp.empty(n + p + m, dtype=cp.float64)  # used to store current Ruiz iteration scaling factors
         self._delta_b_iter = cp.empty(n, dtype=cp.float64) # used to store current Ruiz iteration box scaling factors
 
+        self._work_n = cp.empty(n, dtype=cp.float64)  # temp workspace of size n
+
     @property
     def c_scaling_inv(self) -> cp.ndarray:
         return self._c_scaling_inv
@@ -278,7 +280,6 @@ class RuizEquilibration(ABC):
         """cost_orig = c_inv * cost_scaled"""
         return float(cost * self._c_scaling_inv)
 
-    @abstractmethod
     def _compute_kkt_norms(self, data: Data, d: cp.ndarray, d_b: cp.ndarray):
         """Compute inf-norms of each KKT row/column into d[0:n+p+m].
 
@@ -287,6 +288,40 @@ class RuizEquilibration(ABC):
         d[n+p:]   = G row norms
         d_b is NOT set here (handled by the base class).
         """
+        n, p, m = self.n, self.p, self.m
+        self.eval_P_row_inf_norms(data.P, d[:n])
+        if p > 0:
+            self.eval_A_col_inf_norms(data.A, self._work_n)
+            d[:n] = cp.maximum(d[:n], self._work_n)
+            self.eval_A_row_inf_norms(data.A, d[n:n+p])
+        if m > 0:
+            self.eval_G_col_inf_norms(data.G, self._work_n)
+            d[:n] = cp.maximum(d[:n], self._work_n)
+            self.eval_G_row_inf_norms(data.G, d[n+p:n+p+m])
+
+    @abstractmethod
+    def eval_P_row_inf_norms(self, P, out: cp.ndarray):
+        """Compute infinity norms of rows of P. The shape of P is (n, n). Return shape is (n,)."""
+        pass
+
+    @abstractmethod
+    def eval_A_row_inf_norms(self, A, out: cp.ndarray):
+        """Compute infinity norms of rows of A. The shape of A is (p, n). Return shape is (p,)."""
+        pass
+
+    @abstractmethod
+    def eval_A_col_inf_norms(self, A, out: cp.ndarray):
+        """Compute infinity norms of columns of A. The shape of A is (p, n). Return shape is (n,)."""
+        pass
+
+    @abstractmethod
+    def eval_G_row_inf_norms(self, G, out: cp.ndarray):
+        """Compute infinity norms of rows of G. The shape of G is (m, n). Return shape is (m,)."""
+        pass
+
+    @abstractmethod
+    def eval_G_col_inf_norms(self, G, out: cp.ndarray):
+        """Compute infinity norms of columns of G. The shape of G is (m, n). Return shape is (n,)."""
         pass
 
     @abstractmethod

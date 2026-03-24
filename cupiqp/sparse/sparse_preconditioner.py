@@ -1,4 +1,5 @@
 import cupy as cp
+from cupyx.scipy.sparse import csr_matrix, linalg as sparse_la
 
 from ..data import Data
 from ..preconditioner import RuizEquilibration
@@ -7,22 +8,20 @@ from ..preconditioner import RuizEquilibration
 class SparseRuizEquilibration(RuizEquilibration):
     """Ruiz equilibration for sparse (CSR) matrix backends."""
 
-    def _compute_kkt_norms(self, data: Data, d: cp.ndarray, d_b: cp.ndarray):
-        n, p, m = self.n, self.p, self.m
+    def eval_P_row_inf_norms(self, P: csr_matrix, out: cp.ndarray):
+        out[:] = sparse_la.norm(P, ord=cp.inf, axis=1)
 
-        d[:n] = self._csr_utri_symmetric_col_inf_norms(data._P)
+    def eval_A_row_inf_norms(self, A: csr_matrix, out: cp.ndarray):
+        out[:] = sparse_la.norm(A, ord=cp.inf, axis=1)
 
-        if p > 0:
-            cp.maximum(d[:n], self._csr_col_inf_norms(data._A), out=d[:n])
-            d[n:n + p] = self._csr_row_inf_norms(data._A)
-        else:
-            d[n:n + p] = 1.0
+    def eval_A_col_inf_norms(self, A: csr_matrix, out: cp.ndarray):
+        out[:] = sparse_la.norm(A, ord=cp.inf, axis=0)
 
-        if m > 0:
-            cp.maximum(d[:n], self._csr_col_inf_norms(data._G), out=d[:n])
-            d[n + p:] = self._csr_row_inf_norms(data._G)
-        else:
-            d[n + p:] = 1.0
+    def eval_G_row_inf_norms(self, G: csr_matrix, out: cp.ndarray):
+        out[:] = sparse_la.norm(G, ord=cp.inf, axis=1)
+
+    def eval_G_col_inf_norms(self, G: csr_matrix, out: cp.ndarray):
+        out[:] = sparse_la.norm(G, ord=cp.inf, axis=0)
 
     def _scale_matrices(self, data: Data,
                         d_x: cp.ndarray, d_y: cp.ndarray, d_z: cp.ndarray):

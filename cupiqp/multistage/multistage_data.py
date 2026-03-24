@@ -113,6 +113,7 @@ class MultistageData(Data):
 
         # preprocessing (reuses inherited _init_h_l / _init_h_u / _init_x_l / _init_x_u)
         self._preprocess()
+        self._x_b_scaling = cp.ones(_n, dtype=cp.float64)
         self._constraints_rhs_inf_norm = cp.empty(1, dtype=cp.float64)
         self._compute_constraints_rhs_inf_norm()
 

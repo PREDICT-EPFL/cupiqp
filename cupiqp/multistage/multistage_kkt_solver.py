@@ -201,7 +201,7 @@ class MultistageKKTSolver(KKTSolverBase):
                 kernel=self._eval_AT_xt_kernel,
                 dim=(N, d),
                 inputs=[
-                    self._delta_inv,
+                    wp.float64(self._delta_inv[0]),
                     data._A.D, data._A.E,
                     rhs_y,
                     wp.float64(1.0),

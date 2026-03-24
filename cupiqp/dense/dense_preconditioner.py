@@ -7,26 +7,20 @@ from ..preconditioner import RuizEquilibration
 class DenseRuizEquilibration(RuizEquilibration):
     """Ruiz equilibration for dense matrix backends."""
 
-    def _compute_kkt_norms(self, data: Data, d: cp.ndarray, d_b: cp.ndarray):
-        n, p, m = self.n, self.p, self.m
-
-        P_abs = cp.abs(data._P)
-        P_utri = cp.triu(P_abs)
-        d[:n] = cp.maximum(cp.max(P_utri, axis=0), cp.max(P_utri, axis=1))
-
-        if p > 0:
-            A_abs = cp.abs(data._A)
-            cp.maximum(d[:n], cp.max(A_abs, axis=0), out=d[:n])
-            d[n:n + p] = cp.max(A_abs, axis=1)
-        else:
-            d[n:n + p] = 1.0
-
-        if m > 0:
-            G_abs = cp.abs(data._G)
-            cp.maximum(d[:n], cp.max(G_abs, axis=0), out=d[:n])
-            d[n + p:] = cp.max(G_abs, axis=1)
-        else:
-            d[n + p:] = 1.0
+    def eval_P_row_inf_norms(self, P: cp.ndarray, out: cp.ndarray):
+        out[:] = cp.linalg.norm(P, ord=cp.inf, axis=1)
+    
+    def eval_A_row_inf_norms(self, A: cp.ndarray, out: cp.ndarray):
+        out[:] = cp.linalg.norm(A, ord=cp.inf, axis=1)
+    
+    def eval_A_col_inf_norms(self, A: cp.ndarray, out: cp.ndarray):
+        out[:] = cp.linalg.norm(A, ord=cp.inf, axis=0)
+    
+    def eval_G_row_inf_norms(self, G: cp.ndarray, out: cp.ndarray):
+        out[:] = cp.linalg.norm(G, ord=cp.inf, axis=1)
+    
+    def eval_G_col_inf_norms(self, G: cp.ndarray, out: cp.ndarray):
+        out[:] = cp.linalg.norm(G, ord=cp.inf, axis=0)
 
     def _scale_matrices(self, data: Data,
                         d_x: cp.ndarray, d_y: cp.ndarray, d_z: cp.ndarray):
