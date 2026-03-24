@@ -7,6 +7,7 @@ from .settings import Settings
 from .data import Data
 from .results import Result, Status, Variables
 from .kkt_systems import KKTSystem
+from .preconditioner import RuizEquilibration
 from .utils import cuda_graph_capture
 
 
@@ -26,6 +27,7 @@ class SolverBase:
         self._res = Variables()  # used to store the regularized residuals
         self._prox_vars = Variables()  # used to store the proximal variables
         self._kkt_system = KKTSystem()
+        self._preconditioner = None
 
     @property
     def result(self):
@@ -44,11 +46,38 @@ class SolverBase:
             self._data = MultistageData(P, c, A, b, G, h_u, h_l, x_u, x_l)
         else:
             raise ValueError(f"Unknown kkt_solver type: {self.settings.kkt_solver}")
+
+        # Apply Ruiz equilibration preconditioner
+        if self.settings.preconditioner_iter > 0:
+            if self.settings.kkt_solver == "dense_cholesky":
+                from .dense.dense_preconditioner import DenseRuizEquilibration
+                PreconditionerClass = DenseRuizEquilibration
+            elif self.settings.kkt_solver == "sparse_ldlt":
+                from .sparse.sparse_preconditioner import SparseRuizEquilibration
+                PreconditionerClass = SparseRuizEquilibration
+            elif self.settings.kkt_solver == "multistage_block_cholesky":
+                from .multistage.multistage_preconditioner import MultistageRuizEquilibration
+                PreconditionerClass = MultistageRuizEquilibration
+            else:
+                raise ValueError(f"No preconditioner for kkt_solver type: {self.settings.kkt_solver}")
+            self._preconditioner = PreconditionerClass(
+                self._data.n, self._data.p, self._data.m,
+                self._data.idx_xl, self._data.idx_xu,
+            )
+            self._preconditioner.scale_data(
+                self._data,
+                self.settings.preconditioner_scale_cost,
+                self.settings.preconditioner_iter,
+            )
+            self._data._compute_constraints_rhs_inf_norm()
+        else:
+            self._preconditioner = None
+
         self._result.init(self._data)
         self._result.info.rho[0] = self.settings.rho_init
         self._result.info.delta[0] = self.settings.delta_init
         self._result.init(self._data)
-        
+
         self._step.init(self._data)
         self._res_nr.init(self._data)
         self._res.init(self._data)
@@ -79,6 +108,56 @@ class SolverBase:
         self._mu_rate = cp.empty(1)
 
         self._enable_iterative_refinement = self.settings.iterative_refinement_always_enabled
+
+        # Pre-compute residual unscaling factors for preconditioner.
+        # These are cached arrays used every iteration in _update_residuals_nr
+        # to compute norms in the original (unscaled) coordinate system.
+        # When no preconditioner is active, all factors are 1.0 (identity).
+        n, p, m = self._data.n, self._data.p, self._data.m
+        pc = self._preconditioner
+        if pc is not None:
+            self._c_scaling_inv = pc.c_scaling_inv
+            self._unscale_dual_res_factor = pc.c_scaling_inv * pc.delta_inv[:n]
+            self._unscale_primal_res_eq_factor = pc.delta_inv[n:n + p] if p > 0 else cp.empty(0)
+            self._unscale_primal_res_ineq_hu = pc.delta_inv[n + p + self._data.idx_hu] if self._data.num_hu > 0 else cp.empty(0)
+            self._unscale_primal_res_ineq_hl = pc.delta_inv[n + p + self._data.idx_hl] if self._data.num_hl > 0 else cp.empty(0)
+            self._unscale_primal_res_b_xu = pc.delta_b_inv[self._data.idx_xu] if self._data.num_xu > 0 else cp.empty(0)
+            self._unscale_primal_res_b_xl = pc.delta_b_inv[self._data.idx_xl] if self._data.num_xl > 0 else cp.empty(0)
+            # Compute unscaled constraints RHS norm from original (pre-scaling) bounds
+            self._constraints_rhs_inf_norm_unscaled = cp.zeros(1, dtype=cp.float64)
+            if p > 0:
+                cp.maximum(self._constraints_rhs_inf_norm_unscaled,
+                           cp.max(cp.abs(pc.unscale_primal_res_eq(self._data.b))),
+                           out=self._constraints_rhs_inf_norm_unscaled)
+            if self._data.num_hu > 0:
+                cp.maximum(self._constraints_rhs_inf_norm_unscaled,
+                           cp.max(cp.abs(pc.unscale_primal_res_ineq(self._data.h_u[self._data.idx_hu], self._data.idx_hu))),
+                           out=self._constraints_rhs_inf_norm_unscaled)
+            if self._data.num_hl > 0:
+                cp.maximum(self._constraints_rhs_inf_norm_unscaled,
+                           cp.max(cp.abs(pc.unscale_primal_res_ineq(self._data.h_l[self._data.idx_hl], self._data.idx_hl))),
+                           out=self._constraints_rhs_inf_norm_unscaled)
+            if self._data.num_xu > 0:
+                cp.maximum(self._constraints_rhs_inf_norm_unscaled,
+                           cp.max(cp.abs(pc.unscale_primal_res_b(self._data.x_u[self._data.idx_xu], self._data.idx_xu))),
+                           out=self._constraints_rhs_inf_norm_unscaled)
+            if self._data.num_xl > 0:
+                cp.maximum(self._constraints_rhs_inf_norm_unscaled,
+                           cp.max(cp.abs(pc.unscale_primal_res_b(self._data.x_l[self._data.idx_xl], self._data.idx_xl))),
+                           out=self._constraints_rhs_inf_norm_unscaled)
+        else:
+            self._c_scaling_inv = cp.ones(1, dtype=cp.float64)
+            self._unscale_dual_res_factor = cp.ones(n, dtype=cp.float64)
+            self._unscale_primal_res_eq_factor = cp.ones(p, dtype=cp.float64) if p > 0 else cp.empty(0)
+            self._unscale_primal_res_ineq_hu = cp.ones(self._data.num_hu, dtype=cp.float64) if self._data.num_hu > 0 else cp.empty(0)
+            self._unscale_primal_res_ineq_hl = cp.ones(self._data.num_hl, dtype=cp.float64) if self._data.num_hl > 0 else cp.empty(0)
+            self._unscale_primal_res_b_xu = cp.ones(self._data.num_xu, dtype=cp.float64) if self._data.num_xu > 0 else cp.empty(0)
+            self._unscale_primal_res_b_xl = cp.ones(self._data.num_xl, dtype=cp.float64) if self._data.num_xl > 0 else cp.empty(0)
+            self._constraints_rhs_inf_norm_unscaled = self._data._constraints_rhs_inf_norm
+
+        # Clear CUDA graph cache (invalidated by new setup)
+        self._update_residuals_nr_cuda_graphs = {}
+        self._update_residuals_nr_cuda_graphs_capture_count = 0
 
         self._setup_done = True
 
@@ -129,6 +208,18 @@ class SolverBase:
         if x_l is not None:
             self._data.set_x_l(x_l, check=check_validity)
 
+        # Apply preconditioner scaling to updated data
+        if self._preconditioner is not None:
+            if self.settings.preconditioner_reuse_on_update:
+                self._preconditioner.apply_scaling(self._data)
+            else:
+                self._preconditioner.reset()
+                self._preconditioner.scale_data(
+                    self._data,
+                    self.settings.preconditioner_scale_cost,
+                    self.settings.preconditioner_iter,
+                )
+
         self._data._compute_constraints_rhs_inf_norm()
         self._kkt_system.update_data(self._data, P is not None, A is not None, G is not None)
 
@@ -173,7 +264,7 @@ class SolverBase:
         self._result.info.delta[0] = self.settings.delta_init
 
         if self.settings.verbose:
-            print("iter  prim_obj       dual_obj       duality_gap   prim_res      dual_res      rho         delta       mu          p_step   d_step")  
+            print("iter  prim_obj       dual_obj       duality_gap   prim_res      dual_res      rho         delta       mu          p_step   d_step")
 
         ## ----------- initial iteration --------------
         self._initial_guess()
@@ -194,6 +285,7 @@ class SolverBase:
                     (self._result.info.dual_res < self.settings.eps_abs or self._result.info.dual_res_rel < self.settings.eps_rel) and
                     (not self.settings.check_duality_gap or self._result.info.duality_gap < self.settings.eps_duality_gap_abs or self._result.info.duality_gap_rel < self.settings.eps_duality_gap_rel)):
                     self._result.info.status = Status.PIQP_SOLVED
+                    self._preconditioner.unscale_solution(self._result, self._data)
                     return self._result.info.status
                 
                 self._update_residuals_r()
@@ -202,12 +294,14 @@ class SolverBase:
                     self._result.info.primal_prox_inf > self.settings.infeasibility_threshold and
                     (self._result.info.primal_res_reg < self.settings.eps_abs or self._result.info.primal_res_reg_rel < self.settings.eps_rel)):
                     self._result.info.status = Status.PIQP_PRIMAL_INFEASIBLE
+                    self._preconditioner.unscale_solution(self._result, self._data)
                     return self._result.info.status
                 
                 if (self._result.info.no_primal_update > cp.minimum(5., self.settings.reg_finetune_primal_update_threshold) and
                     self._result.info.dual_prox_inf > self.settings.infeasibility_threshold and
                     (self._result.info.dual_res_reg < self.settings.eps_abs or self._result.info.dual_res_reg_rel < self.settings.eps_rel)):
                     self._result.info.status = Status.PIQP_DUAL_INFEASIBLE
+                    self._preconditioner.unscale_solution(self._result, self._data)
                     return self._result.info.status
                 
                 # avoid getting too close to boundary which can result in a division by zero
@@ -240,12 +334,13 @@ class SolverBase:
                         self._result.info.reg_limit[0] = self.settings.reg_finetune_lower_limit
                         self._result.info.no_primal_update = 0
                         self._result.info.no_dual_update = 0
-                
+
                 if self.settings.verbose:
                     self._print_iteration_info()
 
                 self._update_and_factorize_kkt()
                 if self._result.info.status == Status.PIQP_NUMERICAL_ISSUES:
+                    self._preconditioner.unscale_solution(self._result, self._data)
                     return self._result.info.status
 
                 if self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu == 0:
@@ -257,10 +352,10 @@ class SolverBase:
                     self._run_predictor_corrector()
                     self._update_residuals_nr()
                     self._update_rho_delta_with_ineq()
-                
+
         self._result.info.status = Status.PIQP_MAX_ITER_REACHED
-        return self._result.info.status        
-        
+        self._preconditioner.unscale_solution(self._result, self._data)
+        return self._result.info.status
 
     @nvtx.annotate("Solver::_initial_guess")
     def _initial_guess(self):
@@ -606,22 +701,24 @@ class SolverBase:
         if not hasattr(self, '_update_residuals_nr_cuda_graphs'):
             self._update_residuals_nr_cuda_graphs = {}
             self._update_residuals_nr_cuda_graphs_capture_count = 0
-
-        key = (self._res.buffer_ptr, 
+            
+        key = (self._res.buffer_ptr,
                self._result.buffer_ptr,
                self._prox_vars.buffer_ptr,
                self._res_nr.buffer_ptr)
         # cuSPARSE/cuBLAS operations (outside graph capture for now)
         self._kkt_system.eval_P_x(self._data, -1., self._result.x, self._res_nr.x)
-        # ||P*x||_inf -> _work_dual_res_norm (will be updated further inside graph)
+        # ||unscale_dual_res(P*x)||_inf -> _work_dual_res_norm (will be updated further inside graph)
         cp.absolute(self._res_nr.x, out=self._work_primals)
+        self._work_primals *= self._unscale_dual_res_factor
         cp.max(self._work_primals, out=self._work_dual_res_norm, keepdims=True)
 
         self._kkt_system.eval_A_xn(self._data, -1., self._result.x, self._res_nr.y)  # store -A*x in res_nr.y
         self._kkt_system.eval_AT_xt(self._data, 1., self._result.y, self._res.x)  # add -A^T*y to res_nr.y
-        # ||A*x||_inf -> _work_primal_rel_norm (will be updated further inside graph)
+        # ||unscale_primal_res_eq(A*x)||_inf -> _work_primal_rel_norm (will be updated further inside graph)
         if self._data.p > 0:
             cp.absolute(self._res_nr.y, out=self._work_duals[:self._data.p])
+            self._work_duals[:self._data.p] *= self._unscale_primal_res_eq_factor
             cp.max(self._work_duals[:self._data.p], out=self._work_primal_rel_norm, keepdims=True)
         else:
             self._work_primal_rel_norm.fill(0.)
@@ -673,11 +770,17 @@ class SolverBase:
                 cp.sum(self._work_reduce[2:8], out=self._result.info.dual_obj, keepdims=True)
                 self._result.info.dual_obj *= -1.  # dual_obj = -b^T y - h_u^T z_u + h_l^T z_l - x_u^T z_bu + x_l^T z_bl
 
-                # duality_gap = abs(primal_obj - dual_obj)
+                # duality_gap = abs(primal_obj - dual_obj) (in scaled space, then unscale all three)
                 cp.subtract(self._result.info.primal_obj, self._result.info.dual_obj, out=self._result.info.duality_gap)
-                
-                # duality_gap_rel_norm = max(abs(0.5 x'Px, b'y, h_u'z_u, h_l'z_l, x_u'z_bu, x_l'z_bl))
-                # duality_gap_relative = duality_gap / maximum(1., duality_gap_rel_norm)
+
+                # Unscale objectives and duality gap from scaled to original space
+                self._result.info.primal_obj *= self._c_scaling_inv
+                self._result.info.dual_obj *= self._c_scaling_inv
+                self._result.info.duality_gap *= self._c_scaling_inv
+
+                # duality_gap_rel_norm = max(abs(unscaled terms))
+                # Unscale the work_reduce terms before computing duality_gap_rel
+                self._work_reduce *= self._c_scaling_inv
                 cp.abs(self._work_reduce, out=self._work_reduce)
                 cp.max(self._work_reduce[0:8], out=self._result.info.duality_gap_rel, keepdims=True)
                 cp.abs(self._result.info.duality_gap, out=self._result.info.duality_gap)
@@ -690,8 +793,8 @@ class SolverBase:
                 self._res_nr.x -= self._data.c
                 self._res_nr.x -= self._res.x  # self._res.x holds A^T*y
                 self._res_nr.x -= GT_zu_minus_zl
-                self._res_nr.x[self._data.idx_xl] += self._result.z_bl
-                self._res_nr.x[self._data.idx_xu] -= self._result.z_bu
+                self._res_nr.x[self._data.idx_xl] += self._data.x_b_scaling[self._data.idx_xl] * self._result.z_bl
+                self._res_nr.x[self._data.idx_xu] -= self._data.x_b_scaling[self._data.idx_xu] * self._result.z_bu
                 
                 # res_nr.y = -(A*x - b)
                 self._res_nr.y += self._data.b
@@ -707,15 +810,17 @@ class SolverBase:
                 cp.subtract(self._res_nr.z_u, self._result.s_u, out=self._res_nr.z_u)
                 cp.add(self._res_nr.z_u, self._data.h_u[self._data.idx_hu], out=self._res_nr.z_u)  # TODO: this creates a tmp array, optimize?
 
-                # res_nr.z_bl = x - s_bl - xl  =>  self._res_nr.z_bl[:] = (self._result.x[self._data.idx_xl] - self._result.s_bl - self._data.x_l[self._data.idx_xl])
+                # res_nr.z_bl = x_b_scaling*x - s_bl - xl
                 cp.take(self._result.x, self._data.idx_xl, out=self._res_nr.z_bl)
+                self._res_nr.z_bl *= self._data.x_b_scaling[self._data.idx_xl]
                 cp.subtract(self._res_nr.z_bl, self._result.s_bl, out=self._res_nr.z_bl)
-                cp.subtract(self._res_nr.z_bl, self._data.x_l[self._data.idx_xl], out=self._res_nr.z_bl)  # TODO: this creates a tmp array, optimize?
+                cp.subtract(self._res_nr.z_bl, self._data.x_l[self._data.idx_xl], out=self._res_nr.z_bl)
 
-                # res_nr.z_bu = -(x + s_bu - xu)  =>  self._res_nr.z_bu[:] = - (self._result.x[self._data.idx_xu] + self._result.s_bu - self._data.x_u[self._data.idx_xu])
+                # res_nr.z_bu = -(x_b_scaling*x + s_bu - xu)
                 cp.take(self._result.x, self._data.idx_xu, out=self._res_nr.z_bu)
+                self._res_nr.z_bu *= self._data.x_b_scaling[self._data.idx_xu]
                 cp.add(self._res_nr.z_bu, self._result.s_bu, out=self._res_nr.z_bu)
-                cp.subtract(self._res_nr.z_bu, self._data.x_u[self._data.idx_xu], out=self._res_nr.z_bu)  # TODO: this creates a tmp array, optimize?
+                cp.subtract(self._res_nr.z_bu, self._data.x_u[self._data.idx_xu], out=self._res_nr.z_bu)
                 cp.negative(self._res_nr.z_bu, out=self._res_nr.z_bu)
 
 
@@ -725,58 +830,67 @@ class SolverBase:
 
                 self._result.info.primal_res[:] = self._primal_res_nr()
 
-                # primal_rel_norm: update running max (initialized outside graph with ||A*x||_inf)
+                # primal_rel_norm: update running max (initialized outside graph with ||unscale(A*x)||_inf)
+                # All terms are unscaled before taking norms to match PIQP C++ convergence check.
                 # _work_z_1 is free at this point (only used before graph for cuSPARSE input)
                 if self._data.num_hu > 0:
                     cp.take(G_x, self._data.idx_hu, out=self._work_z_1[:self._data.num_hu])
                     cp.absolute(self._work_z_1[:self._data.num_hu], out=self._work_z_1[:self._data.num_hu])
+                    self._work_z_1[:self._data.num_hu] *= self._unscale_primal_res_ineq_hu
                     cp.max(self._work_z_1[:self._data.num_hu], out=self._work_norm_temp, keepdims=True)
                     cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
 
                 if self._data.num_hl > 0:
                     cp.take(G_x, self._data.idx_hl, out=self._work_z_1[:self._data.num_hl])
                     cp.absolute(self._work_z_1[:self._data.num_hl], out=self._work_z_1[:self._data.num_hl])
+                    self._work_z_1[:self._data.num_hl] *= self._unscale_primal_res_ineq_hl
                     cp.max(self._work_z_1[:self._data.num_hl], out=self._work_norm_temp, keepdims=True)
                     cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
 
                 if self._data.num_hu > 0:
                     cp.absolute(self._result.s_u, out=self._work_z_1[:self._data.num_hu])
+                    self._work_z_1[:self._data.num_hu] *= self._unscale_primal_res_ineq_hu
                     cp.max(self._work_z_1[:self._data.num_hu], out=self._work_norm_temp, keepdims=True)
                     cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
 
                 if self._data.num_hl > 0:
                     cp.absolute(self._result.s_l, out=self._work_z_1[:self._data.num_hl])
+                    self._work_z_1[:self._data.num_hl] *= self._unscale_primal_res_ineq_hl
                     cp.max(self._work_z_1[:self._data.num_hl], out=self._work_norm_temp, keepdims=True)
                     cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
 
                 if self._data.num_xu > 0:
                     cp.absolute(self._result.s_bu, out=self._work_z[:self._data.num_xu])
+                    self._work_z[:self._data.num_xu] *= self._unscale_primal_res_b_xu
                     cp.max(self._work_z[:self._data.num_xu], out=self._work_norm_temp, keepdims=True)
                     cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
 
                 if self._data.num_xl > 0:
                     cp.absolute(self._result.s_bl, out=self._work_z[:self._data.num_xl])
+                    self._work_z[:self._data.num_xl] *= self._unscale_primal_res_b_xl
                     cp.max(self._work_z[:self._data.num_xl], out=self._work_norm_temp, keepdims=True)
                     cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
 
-                cp.maximum(self._work_primal_rel_norm, self._data._constraints_rhs_inf_norm, out=self._work_primal_rel_norm)
+                cp.maximum(self._work_primal_rel_norm, self._constraints_rhs_inf_norm_unscaled, out=self._work_primal_rel_norm)
                 # Store max(1, primal_rel_norm) for use by _update_residuals_r
                 cp.maximum(self._work_primal_rel_norm, 1., out=self._work_primal_rel_norm)
                 cp.divide(self._result.info.primal_res, self._work_primal_rel_norm, out=self._result.info.primal_res_rel)
 
-                # dual_res_norm: update running max (initialized outside graph with ||P*x||_inf)
+                # dual_res_norm: update running max (initialized outside graph with ||unscale(P*x)||_inf)
                 self._result.info.dual_res[:] = self._dual_res_nr()
 
-                # ||c||_inf
+                # ||unscale_dual_res(c)||_inf
                 cp.absolute(self._data.c, out=self._work_primals)
+                self._work_primals *= self._unscale_dual_res_factor
                 cp.max(self._work_primals, out=self._work_norm_temp, keepdims=True)
                 cp.maximum(self._work_dual_res_norm, self._work_norm_temp, out=self._work_dual_res_norm)
 
-                # ||A^T*y + G^T*(z_u - z_l) + z_bu - z_bl||_inf
+                # ||unscale_dual_res(A^T*y + G^T*(z_u - z_l) + x_b_scaling*(z_bu - z_bl))||_inf
                 self._res.x += GT_zu_minus_zl
-                self._res.x[self._data.idx_xl] -= self._result.z_bl
-                self._res.x[self._data.idx_xu] += self._result.z_bu
+                self._res.x[self._data.idx_xl] -= self._data.x_b_scaling[self._data.idx_xl] * self._result.z_bl
+                self._res.x[self._data.idx_xu] += self._data.x_b_scaling[self._data.idx_xu] * self._result.z_bu
                 cp.absolute(self._res.x, out=self._work_primals)
+                self._work_primals *= self._unscale_dual_res_factor
                 cp.max(self._work_primals, out=self._work_norm_temp, keepdims=True)
                 cp.maximum(self._work_dual_res_norm, self._work_norm_temp, out=self._work_dual_res_norm)
 
@@ -865,16 +979,20 @@ class SolverBase:
     def _primal_res_nr(self) -> float:
         offset = 0
         self._work_duals[:self._data.p] = self._res_nr.y
+        self._work_duals[:self._data.p] *= self._unscale_primal_res_eq_factor
         offset += self._data.p
         self._work_duals[offset : offset+self._data.num_hu] = self._res_nr.z_u
+        self._work_duals[offset : offset+self._data.num_hu] *= self._unscale_primal_res_ineq_hu
         offset += self._data.num_hu
         self._work_duals[offset : offset+self._data.num_hl] = self._res_nr.z_l
+        self._work_duals[offset : offset+self._data.num_hl] *= self._unscale_primal_res_ineq_hl
         offset += self._data.num_hl
         self._work_duals[offset : offset+self._data.num_xu] = self._res_nr.z_bu
+        self._work_duals[offset : offset+self._data.num_xu] *= self._unscale_primal_res_b_xu
         offset += self._data.num_xu
         self._work_duals[offset : offset+self._data.num_xl] = self._res_nr.z_bl
+        self._work_duals[offset : offset+self._data.num_xl] *= self._unscale_primal_res_b_xl
         offset += self._data.num_xl
-        # inf-norm without allocating a scalar output
         cp.absolute(self._work_duals[:offset], out=self._work_duals[:offset])
         cp.max(self._work_duals[:offset], out=self._work_residual)
         return self._work_residual
@@ -883,14 +1001,19 @@ class SolverBase:
     def _primal_res_r(self) -> float:
         offset = 0
         self._work_duals[:self._data.p] = self._res.y
+        self._work_duals[:self._data.p] *= self._unscale_primal_res_eq_factor
         offset = self._data.p
         self._work_duals[offset : offset+self._data.num_hu] = self._res.z_u
+        self._work_duals[offset : offset+self._data.num_hu] *= self._unscale_primal_res_ineq_hu
         offset += self._data.num_hu
         self._work_duals[offset : offset+self._data.num_hl] = self._res.z_l
+        self._work_duals[offset : offset+self._data.num_hl] *= self._unscale_primal_res_ineq_hl
         offset += self._data.num_hl
         self._work_duals[offset : offset+self._data.num_xu] = self._res.z_bu
+        self._work_duals[offset : offset+self._data.num_xu] *= self._unscale_primal_res_b_xu
         offset += self._data.num_xu
         self._work_duals[offset : offset+self._data.num_xl] = self._res.z_bl
+        self._work_duals[offset : offset+self._data.num_xl] *= self._unscale_primal_res_b_xl
         offset += self._data.num_xl
         cp.absolute(self._work_duals[:offset], out=self._work_duals[:offset])
         cp.max(self._work_duals[:offset], out=self._work_residual)
@@ -898,13 +1021,16 @@ class SolverBase:
     
     @nvtx.annotate("Solver::_dual_res_nr")
     def _dual_res_nr(self) -> float:
+        # Unscale dual residual before computing inf-norm (matching PIQP C++ dual_res_nr)
         cp.absolute(self._res_nr.x, out=self._work_primals)
+        self._work_primals *= self._unscale_dual_res_factor
         cp.max(self._work_primals, out=self._work_residual)
         return self._work_residual
     
     @nvtx.annotate("Solver::_dual_res_r")
     def _dual_res_r(self) -> float:
         cp.absolute(self._res.x, out=self._work_primals)
+        self._work_primals *= self._unscale_dual_res_factor
         cp.max(self._work_primals, out=self._work_residual)
         return self._work_residual
     

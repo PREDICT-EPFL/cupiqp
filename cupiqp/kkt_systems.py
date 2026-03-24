@@ -176,6 +176,7 @@ class KKTSystem:
                     self._inv_idx_hl,
                     self._w_bu_delta_inv,
                     self._w_bl_delta_inv,
+                    data.x_b_scaling,
                     rho,
                     self._x_reg,
                     self._w_u_delta_inv,
@@ -216,8 +217,10 @@ class KKTSystem:
             cp.reciprocal(self._w_l_delta_inv, out=self._w_l_delta_inv)
 
             self._x_reg[:] = rho[0]
-            self._x_reg[data.idx_xu] += self._w_bu_delta_inv
-            self._x_reg[data.idx_xl] += self._w_bl_delta_inv
+            xbs_xu = data.x_b_scaling[data.idx_xu]
+            xbs_xl = data.x_b_scaling[data.idx_xl]
+            self._x_reg[data.idx_xu] += xbs_xu * xbs_xu * self._w_bu_delta_inv
+            self._x_reg[data.idx_xl] += xbs_xl * xbs_xl * self._w_bl_delta_inv
             self._z_reg.fill(0.)
             self._z_reg[data.idx_hu] += self._w_u_delta_inv
             self._z_reg[data.idx_hl] += self._w_l_delta_inv
@@ -258,6 +261,7 @@ class KKTSystem:
                 self._inv_idx_hu, self._inv_idx_hl,
                 rhs.x,
                 self._w_bu_delta_inv, self._w_bl_delta_inv,
+                data._x_b_scaling,
                 self._updated_rhs_z_bu, self._updated_rhs_z_bl,
                 self._rhs_x_bar,
                 self._w_u_delta_inv, self._w_l_delta_inv,
@@ -326,7 +330,8 @@ class KKTSystem:
                 data.idx_hu, self._w_u_delta_inv, self._updated_rhs_z_u, lhs.z_u,
                 data.idx_hl, self._w_l_delta_inv, self._updated_rhs_z_l, lhs.z_l,
                 data.idx_xu, self._w_bu_delta_inv, self._m_z_bu_inv, rhs.z_bu, rhs.s_bu, lhs.z_bu,
-                data.idx_xl, self._w_bl_delta_inv, self._m_z_bl_inv, rhs.z_bl, rhs.s_bl, lhs.z_bl],
+                data.idx_xl, self._w_bl_delta_inv, self._m_z_bl_inv, rhs.z_bl, rhs.s_bl, lhs.z_bl,
+                data.x_b_scaling],
             device="cuda",
             stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
         )
@@ -700,6 +705,7 @@ def create_update_regularizations_step_2_kernel(nx: int, nz: int):
         inv_idx_hl: wp.array(dtype=wp.int32),  # pyright: ignore[reportInvalidTypeForm]
         w_bu_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
         w_bl_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        x_b_scaling: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
         rho: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
         x_reg: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
         w_u_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
@@ -712,12 +718,14 @@ def create_update_regularizations_step_2_kernel(nx: int, nz: int):
 
         if t < nx_static:
             val = rho[0]
+            xb_scaling = x_b_scaling[t]
+            xb_scaling_squared = xb_scaling * xb_scaling
             ixu = inv_idx_xu[t]
             ixl = inv_idx_xl[t]
             if ixu >= 0:
-                val = val + w_bu_delta_inv[ixu]
+                val = val + xb_scaling_squared * w_bu_delta_inv[ixu]
             if ixl >= 0:
-                val = val + w_bl_delta_inv[ixl]
+                val = val + xb_scaling_squared * w_bl_delta_inv[ixl]
             x_reg[t] = val
         elif t < nx_static + nz_static:
             tz = t - nx_static
@@ -760,6 +768,7 @@ def create_eliminate_duals_kernel(nx: int, nz: int):
         rhs_x: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
         w_bu_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
         w_bl_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        x_b_scaling: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
         rhs_z_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
         rhs_z_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
         rhs_x_updated: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
@@ -777,12 +786,13 @@ def create_eliminate_duals_kernel(nx: int, nz: int):
 
         if t < nx_static:
             val = rhs_x[t]
+            xb_scaling = x_b_scaling[t]
             ixu = inv_idx_xu[t]
             ixl = inv_idx_xl[t]
             if ixu >= 0:
-                val = val + w_bu_delta_inv[ixu] * rhs_z_bu[ixu]
+                val = val + xb_scaling * w_bu_delta_inv[ixu] * rhs_z_bu[ixu]
             if ixl >= 0:
-                val = val - w_bl_delta_inv[ixl] * rhs_z_bl[ixl]
+                val = val - xb_scaling * w_bl_delta_inv[ixl] * rhs_z_bl[ixl]
             rhs_x_updated[t] = val
 
         elif t < nx_static + nz_static:
@@ -889,6 +899,8 @@ def create_recover_duals_kernel(num_hu: int, num_hl: int, num_xu: int, num_xl: i
         rhs_z_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
         rhs_s_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
         lhs_z_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        # x_b_scaling
+        x_b_scaling: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
     ):
         t = wp.tid()
         num_hu_static = wp.static(num_hu)
@@ -905,15 +917,17 @@ def create_recover_duals_kernel(num_hu: int, num_hl: int, num_xu: int, num_xl: i
             offset = num_hu_static
             lhs_z_l[t - offset] = -G_dx[idx_hl[t - offset]] - rhs_z_l[t - offset]
             lhs_z_l[t - offset] *= w_l_delta_inv[t - offset]
-        # lhs.z_bu[:] = self._w_bu_delta_inv * (lhs.x[data.idx_xu] - rhs.z_bu + self._m_z_bu_inv * rhs.s_bu)
+        # lhs.z_bu[:] = w_bu_delta_inv * (x_b_scaling[idx] * lhs.x[idx] - rhs.z_bu + z_bu_inv * rhs.s_bu)
         elif t < num_hu_static + num_hl_static + num_xu_static:
             offset = num_hu_static + num_hl_static
-            lhs_z_bu[t - offset] = lhs_x[idx_xu[t - offset]] - rhs_z_bu[t - offset] + m_z_bu_inv[t - offset] * rhs_s_bu[t - offset]
+            idx = idx_xu[t - offset]
+            lhs_z_bu[t - offset] = x_b_scaling[idx] * lhs_x[idx] - rhs_z_bu[t - offset] + m_z_bu_inv[t - offset] * rhs_s_bu[t - offset]
             lhs_z_bu[t - offset] *= w_bu_delta_inv[t - offset]
-        # lhs.z_bl[:] = -self._w_bl_delta_inv * (lhs.x[data.idx_xl] + rhs.z_bl - self._m_z_bl_inv * rhs.s_bl)
+        # lhs.z_bl[:] = -w_bl_delta_inv * (x_b_scaling[idx] * lhs.x[idx] + rhs.z_bl - z_bl_inv * rhs.s_bl)
         elif t < num_hu_static + num_hl_static + num_xu_static + num_xl_static:
             offset = num_hu_static + num_hl_static + num_xu_static
-            lhs_z_bl[t - offset] = lhs_x[idx_xl[t - offset]] + rhs_z_bl[t - offset] - m_z_bl_inv[t - offset] * rhs_s_bl[t - offset]
+            idx = idx_xl[t - offset]
+            lhs_z_bl[t - offset] = x_b_scaling[idx] * lhs_x[idx] + rhs_z_bl[t - offset] - m_z_bl_inv[t - offset] * rhs_s_bl[t - offset]
             lhs_z_bl[t - offset] *= -w_bl_delta_inv[t - offset]
         else:
             return
