@@ -5,12 +5,12 @@ import cupyx.scipy.sparse as cpsp
 def create_csr_add_btd_kernel(num_blocks: int, block_size: int, dtype=wp.float64):
     @wp.kernel
     def _csr_add_btd_kernel(
-        alpha: dtype,
-        row_ptr: wp.array(dtype=wp.int32),
-        col_idx: wp.array(dtype=wp.int32),
-        vals: wp.array(dtype=dtype),
-        diag_data: wp.array3d(dtype=dtype),
-        off_lower_data: wp.array3d(dtype=dtype),
+        alpha: dtype,                               # type: ignore
+        row_ptr: wp.array(dtype=wp.int32),          # type: ignore
+        col_idx: wp.array(dtype=wp.int32),          # type: ignore
+        vals: wp.array(dtype=dtype),                # type: ignore
+        diag_data: wp.array3d(dtype=dtype),         # type: ignore
+        off_lower_data: wp.array3d(dtype=dtype),    # type: ignore
     ):
         """
         Perform Y = alpha*X + Y, where X is in CSR format and Y is in block-tridiagonal (BTD) format.
@@ -52,8 +52,8 @@ def create_block_tridiag_diaad_kernel(block_size: int, dtype=wp.float64):
     """diag(A) += alpha*x, where A is block-tridiagonal and x is a vector."""
     @wp.kernel
     def _block_tridiag_diaad_kernel(
-        x: wp.array(dtype=dtype),
-        diag_blocks: wp.array3d(dtype=dtype),
+        x: wp.array(dtype=dtype),              # type: ignore
+        diag_blocks: wp.array3d(dtype=dtype),  # type: ignore
     ):
         block_size_static = wp.static(block_size)
         row = wp.tid()
@@ -68,11 +68,11 @@ def create_block_tridiag_gead_kernel(num_blocks: int, block_size: int, dtype=wp.
     """B += alpha*A, where A and B are block-tridiagonal matrices."""
     @wp.kernel
     def _block_tridiag_gead_kernel(
-        alpha: wp.array(dtype=dtype),  # used to hold a scalar
-        A_diag: wp.array3d(dtype=dtype),
-        A_offdiag: wp.array3d(dtype=dtype),
-        B_diag: wp.array3d(dtype=dtype),
-        B_offdiag: wp.array3d(dtype=dtype),
+        alpha: wp.array(dtype=dtype),  # type: ignore
+        A_diag: wp.array3d(dtype=dtype),  # type: ignore
+        A_offdiag: wp.array3d(dtype=dtype),  # type: ignore
+        B_diag: wp.array3d(dtype=dtype),  # type: ignore
+        B_offdiag: wp.array3d(dtype=dtype),  # type: ignore
     ):
         k, i, j = wp.tid()
         N = wp.static(num_blocks)
@@ -90,12 +90,12 @@ def create_block_bidiag_gemv_n_kernel(num_blocks: int, rows_of_blocks: int, cols
     """
     @wp.kernel
     def _block_bidiag_gemv_n_kernel(
-        alpha: dtype,
-        A_D: wp.array3d(dtype=dtype),  # (N, r, c)
-        A_E: wp.array3d(dtype=dtype),  # (N, r, c)
-        x: wp.array(dtype=dtype),      # (N*c,)
-        beta: dtype,
-        y: wp.array(dtype=dtype),      # ((N+1)*r,)
+        alpha: dtype,  # type: ignore
+        A_D: wp.array3d(dtype=dtype),  # type: ignore   Shape (N, r, c)
+        A_E: wp.array3d(dtype=dtype),  # type: ignore   Shape (N, r, c)
+        x: wp.array(dtype=dtype),      # type: ignore   Shape (N*c,)
+        beta: dtype,  # type: ignore
+        y: wp.array(dtype=dtype),      # type: ignore   Shape ((N+1)*r,)
     ):
         block_row, local_row = wp.tid()
         N = wp.static(num_blocks)
@@ -132,12 +132,12 @@ def create_block_bidiag_gemv_t_kernel(num_blocks: int, rows_of_blocks: int, cols
     """
     @wp.kernel
     def _block_bidiag_gemv_t_kernel(
-        alpha: dtype,
-        A_D: wp.array3d(dtype=dtype),  # (N, r, c)
-        A_E: wp.array3d(dtype=dtype),  # (N, r, c)
-        y: wp.array(dtype=dtype),      # ((N+1)*r,)
-        beta: dtype,
-        z: wp.array(dtype=dtype),      # (N*c,)
+        alpha: dtype,                  # type: ignore
+        A_D: wp.array3d(dtype=dtype),  # type: ignore   Shape (N, r, c)
+        A_E: wp.array3d(dtype=dtype),  # type: ignore   Shape (N, r, c)
+        y: wp.array(dtype=dtype),      # type: ignore   Shape ((N+1)*r,)
+        beta: dtype,                   # type: ignore
+        z: wp.array(dtype=dtype),      # type: ignore   Shape (N*c,)
     ):
         k, local_col = wp.tid()
         N = wp.static(num_blocks)
@@ -171,12 +171,12 @@ def create_block_tridiag_gemv_kernel(num_blocks: int, block_size: int, dtype=wp.
     """
     @wp.kernel
     def _block_tridiag_gemv_kernel(
-        alpha: dtype,
-        P_D: wp.array3d(dtype=dtype),  # (N, d, d)
-        P_E: wp.array3d(dtype=dtype),  # (N-1, d, d)
-        x: wp.array(dtype=dtype),      # (N*d,)
-        beta: dtype,
-        z: wp.array(dtype=dtype),      # (N*d,)
+        alpha: dtype,                  # type: ignore
+        P_D: wp.array3d(dtype=dtype),  # type: ignore   Shape (N, d, d)
+        P_E: wp.array3d(dtype=dtype),  # type: ignore   Shape (N-1, d, d)
+        x: wp.array(dtype=dtype),      # type: ignore   Shape (N*d,)
+        beta: dtype,                   # type: ignore
+        z: wp.array(dtype=dtype),      # type: ignore   Shape (N*d,)
     ):
         k, local_row = wp.tid()
         N = wp.static(num_blocks)
@@ -284,11 +284,11 @@ def create_block_syrk_kernel(
     @wp.kernel
     def block_syrk_kernel(
         alpha: wp.float64,
-        A_D: wp.array3d(dtype=wp.float64),  # (num_blocks, rows_of_blocks, cols_of_blocks)
-        A_E: wp.array3d(dtype=wp.float64),  # (num_blocks, rows_of_blocks, cols_of_blocks)
+        A_D: wp.array3d(dtype=wp.float64),  # type: ignore   Shape (num_blocks, rows_of_blocks, cols_of_blocks)
+        A_E: wp.array3d(dtype=wp.float64),  # type: ignore   Shape (num_blocks, rows_of_blocks, cols_of_blocks)
         beta: wp.float64,
-        C_D: wp.array3d(dtype=wp.float64),  # (num_blocks, cols_of_blocks, cols_of_blocks)
-        C_E: wp.array3d(dtype=wp.float64),  # (num_blocks - 1, cols_of_blocks, cols_of_blocks)
+        C_D: wp.array3d(dtype=wp.float64),  # type: ignore   Shape (num_blocks, cols_of_blocks, cols_of_blocks)
+        C_E: wp.array3d(dtype=wp.float64),  # type: ignore   Shape (num_blocks - 1, cols_of_blocks, cols_of_blocks)
     ):
         k, i, j = wp.tid()
 
@@ -340,12 +340,12 @@ def create_weighted_block_syrk_kernel(
     @wp.kernel
     def weighted_block_syrk_kernel(
         alpha: wp.float64,
-        A_D: wp.array3d(dtype=wp.float64),  # (num_blocks, rows_of_blocks, cols_of_blocks)
-        A_E: wp.array3d(dtype=wp.float64),  # (num_blocks, rows_of_blocks, cols_of_blocks)
-        w: wp.array(dtype=wp.float64),
+        A_D: wp.array3d(dtype=wp.float64),  # type: ignore   Shape (num_blocks, rows_of_blocks, cols_of_blocks)
+        A_E: wp.array3d(dtype=wp.float64),  # type: ignore   Shape (num_blocks, rows_of_blocks, cols_of_blocks)
+        w: wp.array(dtype=wp.float64),      # type: ignore   Shape ((num_blocks + 1) * rows_of_blocks,)
         beta: wp.float64,
-        C_D: wp.array3d(dtype=wp.float64),  # (num_blocks, cols_of_blocks, cols_of_blocks)
-        C_E: wp.array3d(dtype=wp.float64),  # (num_blocks - 1, cols_of_blocks, cols_of_blocks)
+        C_D: wp.array3d(dtype=wp.float64),  # type: ignore   Shape (num_blocks, cols_of_blocks, cols_of_blocks)
+        C_E: wp.array3d(dtype=wp.float64),  # type: ignore   Shape (num_blocks - 1, cols_of_blocks, cols_of_blocks)
     ):
         k, i, j = wp.tid()
 
