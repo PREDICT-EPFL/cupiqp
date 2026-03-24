@@ -181,9 +181,11 @@ def main(problem_name="", n_runs=10):
     settings_quiet = SolverSettings()
     settings_quiet.set_optimality_tolerance(1e-8)
     settings_quiet.set_parameter("log_to_console", "0")
+    settings_quiet.set_parameter("time_limit", "30")
 
     settings_verbose = SolverSettings()
     settings_verbose.set_optimality_tolerance(1e-8)
+    settings_verbose.set_parameter("time_limit", "30")
 
     # Warmup solve (verbose)
     prob.solve(settings_verbose)
