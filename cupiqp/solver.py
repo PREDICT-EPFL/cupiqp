@@ -676,6 +676,7 @@ class SolverBase:
         cp.power(self._result.info.sigma, 3., out=self._result.info.sigma)
 
     @nvtx.annotate("Solver::_update_residuals_nr")
+    @cuda_graph_capture()
     def _update_residuals_nr(self):
         """
         Compute the non-regularized residuals, which reflects the residuals of the KKT conditions excluding the regularization terms in Schwan 2023 paper eq(6)
@@ -698,211 +699,191 @@ class SolverBase:
             - primal_obj = 0.5 x^T P x + c^T x
             - dual_obj = -0.5 x^T P x - b^T y - h_u^T z_u + h_l^T z_l - x_u^T z_bu + x_l^T z_bl
         """
-        if not hasattr(self, '_update_residuals_nr_cuda_graphs'):
-            self._update_residuals_nr_cuda_graphs = {}
-            self._update_residuals_nr_cuda_graphs_capture_count = 0
-            
-        key = (self._res.buffer_ptr,
-               self._result.buffer_ptr,
-               self._prox_vars.buffer_ptr,
-               self._res_nr.buffer_ptr)
+        # cuSPARSE/cuBLAS operations (outside graph capture for now)
+        self._kkt_system.eval_P_x(self._data, -1., self._result.x, self._res_nr.x)
+        # ||unscale_dual_res(P*x)||_inf -> _work_dual_res_norm (will be updated further inside graph)
+        cp.absolute(self._res_nr.x, out=self._work_primals)
+        self._work_primals *= self._unscale_dual_res_factor
+        cp.max(self._work_primals, out=self._work_dual_res_norm, keepdims=True)
 
-        if key not in self._update_residuals_nr_cuda_graphs:
-            self._update_residuals_nr_cuda_graphs_capture_count += 1
-            stream = cp.cuda.Stream(non_blocking=True)
-            stream.begin_capture()
-            with stream:
+        self._kkt_system.eval_A_xn(self._data, -1., self._result.x, self._res_nr.y)  # store -A*x in res_nr.y
+        self._kkt_system.eval_AT_xt(self._data, 1., self._result.y, self._res.x)  # add -A^T*y to res_nr.y
+        # ||unscale_primal_res_eq(A*x)||_inf -> _work_primal_rel_norm (will be updated further inside graph)
+        if self._data.p > 0:
+            cp.absolute(self._res_nr.y, out=self._work_duals[:self._data.p])
+            self._work_duals[:self._data.p] *= self._unscale_primal_res_eq_factor
+            cp.max(self._work_duals[:self._data.p], out=self._work_primal_rel_norm, keepdims=True)
+        else:
+            self._work_primal_rel_norm.fill(0.)
 
-                # cuSPARSE/cuBLAS operations (outside graph capture for now)
-                self._kkt_system.eval_P_x(self._data, -1., self._result.x, self._res_nr.x)
-                # ||unscale_dual_res(P*x)||_inf -> _work_dual_res_norm (will be updated further inside graph)
-                cp.absolute(self._res_nr.x, out=self._work_primals)
-                self._work_primals *= self._unscale_dual_res_factor
-                cp.max(self._work_primals, out=self._work_dual_res_norm, keepdims=True)
+        self._work_z_1.fill(0.)
+        self._work_z_1[self._data.idx_hu] += self._result.z_u
+        self._work_z_1[self._data.idx_hl] -= self._result.z_l
 
-                self._kkt_system.eval_A_xn(self._data, -1., self._result.x, self._res_nr.y)  # store -A*x in res_nr.y
-                self._kkt_system.eval_AT_xt(self._data, 1., self._result.y, self._res.x)  # add -A^T*y to res_nr.y
-                # ||unscale_primal_res_eq(A*x)||_inf -> _work_primal_rel_norm (will be updated further inside graph)
-                if self._data.p > 0:
-                    cp.absolute(self._res_nr.y, out=self._work_duals[:self._data.p])
-                    self._work_duals[:self._data.p] *= self._unscale_primal_res_eq_factor
-                    cp.max(self._work_duals[:self._data.p], out=self._work_primal_rel_norm, keepdims=True)
-                else:
-                    self._work_primal_rel_norm.fill(0.)
+        G_x = self._work_z_2 # reuse self._work_z_2 to store G*x
+        GT_zu_minus_zl = self._step.x  # reuse self._step.x as temporary storage
+        self._kkt_system.eval_G_xn(self._data, 1., self._result.x, G_x)
+        self._kkt_system.eval_GT_xt(self._data, 1., self._work_z_1, GT_zu_minus_zl)
 
-                self._work_z_1.fill(0.)
-                self._work_z_1[self._data.idx_hu] += self._result.z_u
-                self._work_z_1[self._data.idx_hl] -= self._result.z_l
+        # ------------ update primal / dual objectives and duality gap ------------
+        # primal objective: 0.5 x^T P x + c^T x
+        # dual objective is: -0.5 x^T P x - b^T y - h_u^T z_u + h_l^T z_l - x_u^T z_bu + x_l^T z_bl
 
-                G_x = self._work_z_2 # reuse self._work_z_2 to store G*x
-                GT_zu_minus_zl = self._step.x  # reuse self._step.x as temporary storage
-                self._kkt_system.eval_G_xn(self._data, 1., self._result.x, G_x)
-                self._kkt_system.eval_GT_xt(self._data, 1., self._work_z_1, GT_zu_minus_zl)
+        # use self._work_reduce to hold intermediate terms for primal and dual objectives:
+        # index |  content
+        #  0    |   0.5 * x^T P x
+        #  1    |   c^T x
+        #  2    |   0.5 * x^T P x (copy of idx 0 for easier reduction)
+        #  3    |   b^T y
+        #  4    |   -h_l^T z_l
+        #  5    |   h_u^T z_u
+        #  6    |   -x_l^T z_bl
+        #  7    |   x_u^T z_bu
 
-                # ------------ update primal / dual objectives and duality gap ------------
-                # primal objective: 0.5 x^T P x + c^T x
-                # dual objective is: -0.5 x^T P x - b^T y - h_u^T z_u + h_l^T z_l - x_u^T z_bu + x_l^T z_bl
+        cp.dot(self._res_nr.x, self._result.x, out=self._work_reduce[0:1])
+        self._work_reduce[0:1] *= -0.5  # hold 0.5 * x^T P x
+        cp.dot(self._data.c, self._result.x, out=self._work_reduce[1:2]) # hold c^T x
 
-                # use self._work_reduce to hold intermediate terms for primal and dual objectives:
-                # index |  content
-                #  0    |   0.5 * x^T P x
-                #  1    |   c^T x
-                #  2    |   0.5 * x^T P x (copy of idx 0 for easier reduction)
-                #  3    |   b^T y
-                #  4    |   -h_l^T z_l
-                #  5    |   h_u^T z_u
-                #  6    |   -x_l^T z_bl
-                #  7    |   x_u^T z_bu
+        cp.multiply(self._work_reduce[0:1], 1., out=self._work_reduce[2:3])  # hold 0.5 * x^T P x
+        cp.dot(self._data.b, self._result.y, out=self._work_reduce[3:4]) # hold b^T y
+        cp.dot(self._data.h_l[self._data.idx_hl], self._result.z_l, out=self._work_reduce[4:5])  # hold h_l^T z_l
+        self._work_reduce[4:5] *= -1.  # hold - h_l^T z_l
+        cp.dot(self._data.h_u[self._data.idx_hu], self._result.z_u, out=self._work_reduce[5:6])  # hold h_u^T z_u
+        cp.dot(self._data.x_l[self._data.idx_xl], self._result.z_bl, out=self._work_reduce[6:7])
+        self._work_reduce[6:7] *= -1.  # hold - x_l^T z_bl
+        cp.dot(self._data.x_u[self._data.idx_xu], self._result.z_bu, out=self._work_reduce[7:8])  # hold x_u^T z_bu
 
-                cp.dot(self._res_nr.x, self._result.x, out=self._work_reduce[0:1])
-                self._work_reduce[0:1] *= -0.5  # hold 0.5 * x^T P x
-                cp.dot(self._data.c, self._result.x, out=self._work_reduce[1:2]) # hold c^T x
+        cp.sum(self._work_reduce[0:2], out=self._result.info.primal_obj, keepdims=True)  # primal_obj = 0.5 x^T P x + c^T x
+        cp.sum(self._work_reduce[2:8], out=self._result.info.dual_obj, keepdims=True)
+        self._result.info.dual_obj *= -1.  # dual_obj = -b^T y - h_u^T z_u + h_l^T z_l - x_u^T z_bu + x_l^T z_bl
 
-                cp.multiply(self._work_reduce[0:1], 1., out=self._work_reduce[2:3])  # hold 0.5 * x^T P x
-                cp.dot(self._data.b, self._result.y, out=self._work_reduce[3:4]) # hold b^T y
-                cp.dot(self._data.h_l[self._data.idx_hl], self._result.z_l, out=self._work_reduce[4:5])  # hold h_l^T z_l
-                self._work_reduce[4:5] *= -1.  # hold - h_l^T z_l
-                cp.dot(self._data.h_u[self._data.idx_hu], self._result.z_u, out=self._work_reduce[5:6])  # hold h_u^T z_u
-                cp.dot(self._data.x_l[self._data.idx_xl], self._result.z_bl, out=self._work_reduce[6:7])
-                self._work_reduce[6:7] *= -1.  # hold - x_l^T z_bl
-                cp.dot(self._data.x_u[self._data.idx_xu], self._result.z_bu, out=self._work_reduce[7:8])  # hold x_u^T z_bu
+        # duality_gap = abs(primal_obj - dual_obj) (in scaled space, then unscale all three)
+        cp.subtract(self._result.info.primal_obj, self._result.info.dual_obj, out=self._result.info.duality_gap)
 
-                cp.sum(self._work_reduce[0:2], out=self._result.info.primal_obj, keepdims=True)  # primal_obj = 0.5 x^T P x + c^T x
-                cp.sum(self._work_reduce[2:8], out=self._result.info.dual_obj, keepdims=True)
-                self._result.info.dual_obj *= -1.  # dual_obj = -b^T y - h_u^T z_u + h_l^T z_l - x_u^T z_bu + x_l^T z_bl
+        # Unscale objectives and duality gap from scaled to original space
+        self._result.info.primal_obj *= self._c_scaling_inv
+        self._result.info.dual_obj *= self._c_scaling_inv
+        self._result.info.duality_gap *= self._c_scaling_inv
 
-                # duality_gap = abs(primal_obj - dual_obj) (in scaled space, then unscale all three)
-                cp.subtract(self._result.info.primal_obj, self._result.info.dual_obj, out=self._result.info.duality_gap)
+        # duality_gap_rel_norm = max(abs(unscaled terms))
+        # Unscale the work_reduce terms before computing duality_gap_rel
+        self._work_reduce *= self._c_scaling_inv
+        cp.abs(self._work_reduce, out=self._work_reduce)
+        cp.max(self._work_reduce[0:8], out=self._result.info.duality_gap_rel, keepdims=True)
+        cp.abs(self._result.info.duality_gap, out=self._result.info.duality_gap)
+        cp.maximum(self._result.info.duality_gap_rel, 1., out=self._result.info.duality_gap_rel)
+        cp.divide(self._result.info.duality_gap, self._result.info.duality_gap_rel, out=self._result.info.duality_gap_rel)
 
-                # Unscale objectives and duality gap from scaled to original space
-                self._result.info.primal_obj *= self._c_scaling_inv
-                self._result.info.dual_obj *= self._c_scaling_inv
-                self._result.info.duality_gap *= self._c_scaling_inv
+        # ------------ update non-regulerized residuals ------------
+        # res_nr.x = -(P*x + c + A^T*y + G^T*(z_u - z_l) + z_bu - z_bl)
+        # self._res_nr.x is computed as -P*x above
+        self._res_nr.x -= self._data.c
+        self._res_nr.x -= self._res.x  # self._res.x holds A^T*y
+        self._res_nr.x -= GT_zu_minus_zl
+        self._res_nr.x[self._data.idx_xl] += self._data.x_b_scaling[self._data.idx_xl] * self._result.z_bl
+        self._res_nr.x[self._data.idx_xu] -= self._data.x_b_scaling[self._data.idx_xu] * self._result.z_bu
+        
+        # res_nr.y = -(A*x - b)
+        self._res_nr.y += self._data.b
 
-                # duality_gap_rel_norm = max(abs(unscaled terms))
-                # Unscale the work_reduce terms before computing duality_gap_rel
-                self._work_reduce *= self._c_scaling_inv
-                cp.abs(self._work_reduce, out=self._work_reduce)
-                cp.max(self._work_reduce[0:8], out=self._result.info.duality_gap_rel, keepdims=True)
-                cp.abs(self._result.info.duality_gap, out=self._result.info.duality_gap)
-                cp.maximum(self._result.info.duality_gap_rel, 1., out=self._result.info.duality_gap_rel)
-                cp.divide(self._result.info.duality_gap, self._result.info.duality_gap_rel, out=self._result.info.duality_gap_rel)
+        # res_nr.z_l = G*x - s_l - hl  =>  self._res_nr.z_l[:] = (G_x[self._data.idx_hl] - self._result.s_l - self._data.h_l[self._data.idx_hl])
+        cp.take(G_x, self._data.idx_hl, out=self._res_nr.z_l)
+        cp.subtract(self._res_nr.z_l, self._result.s_l, out=self._res_nr.z_l)
+        cp.subtract(self._res_nr.z_l, self._data.h_l[self._data.idx_hl], out=self._res_nr.z_l)  # TODO: this creates a tmp array, optimize?
+        
+        # res_nr.z_u = -G*x - s_u + hu  =>  self._res_nr.z_u[:] = (-G_x[self._data.idx_hu] - self._result.s_u + self._data.h_u[self._data.idx_hu])
+        cp.take(G_x, self._data.idx_hu, out=self._res_nr.z_u)
+        cp.negative(self._res_nr.z_u, out=self._res_nr.z_u)
+        cp.subtract(self._res_nr.z_u, self._result.s_u, out=self._res_nr.z_u)
+        cp.add(self._res_nr.z_u, self._data.h_u[self._data.idx_hu], out=self._res_nr.z_u)  # TODO: this creates a tmp array, optimize?
 
-                # ------------ update non-regulerized residuals ------------
-                # res_nr.x = -(P*x + c + A^T*y + G^T*(z_u - z_l) + z_bu - z_bl)
-                # self._res_nr.x is computed as -P*x above
-                self._res_nr.x -= self._data.c
-                self._res_nr.x -= self._res.x  # self._res.x holds A^T*y
-                self._res_nr.x -= GT_zu_minus_zl
-                self._res_nr.x[self._data.idx_xl] += self._data.x_b_scaling[self._data.idx_xl] * self._result.z_bl
-                self._res_nr.x[self._data.idx_xu] -= self._data.x_b_scaling[self._data.idx_xu] * self._result.z_bu
-                
-                # res_nr.y = -(A*x - b)
-                self._res_nr.y += self._data.b
+        # res_nr.z_bl = x_b_scaling*x - s_bl - xl
+        cp.take(self._result.x, self._data.idx_xl, out=self._res_nr.z_bl)
+        self._res_nr.z_bl *= self._data.x_b_scaling[self._data.idx_xl]
+        cp.subtract(self._res_nr.z_bl, self._result.s_bl, out=self._res_nr.z_bl)
+        cp.subtract(self._res_nr.z_bl, self._data.x_l[self._data.idx_xl], out=self._res_nr.z_bl)
 
-                # res_nr.z_l = G*x - s_l - hl  =>  self._res_nr.z_l[:] = (G_x[self._data.idx_hl] - self._result.s_l - self._data.h_l[self._data.idx_hl])
-                cp.take(G_x, self._data.idx_hl, out=self._res_nr.z_l)
-                cp.subtract(self._res_nr.z_l, self._result.s_l, out=self._res_nr.z_l)
-                cp.subtract(self._res_nr.z_l, self._data.h_l[self._data.idx_hl], out=self._res_nr.z_l)  # TODO: this creates a tmp array, optimize?
-                
-                # res_nr.z_u = -G*x - s_u + hu  =>  self._res_nr.z_u[:] = (-G_x[self._data.idx_hu] - self._result.s_u + self._data.h_u[self._data.idx_hu])
-                cp.take(G_x, self._data.idx_hu, out=self._res_nr.z_u)
-                cp.negative(self._res_nr.z_u, out=self._res_nr.z_u)
-                cp.subtract(self._res_nr.z_u, self._result.s_u, out=self._res_nr.z_u)
-                cp.add(self._res_nr.z_u, self._data.h_u[self._data.idx_hu], out=self._res_nr.z_u)  # TODO: this creates a tmp array, optimize?
-
-                # res_nr.z_bl = x_b_scaling*x - s_bl - xl
-                cp.take(self._result.x, self._data.idx_xl, out=self._res_nr.z_bl)
-                self._res_nr.z_bl *= self._data.x_b_scaling[self._data.idx_xl]
-                cp.subtract(self._res_nr.z_bl, self._result.s_bl, out=self._res_nr.z_bl)
-                cp.subtract(self._res_nr.z_bl, self._data.x_l[self._data.idx_xl], out=self._res_nr.z_bl)
-
-                # res_nr.z_bu = -(x_b_scaling*x + s_bu - xu)
-                cp.take(self._result.x, self._data.idx_xu, out=self._res_nr.z_bu)
-                self._res_nr.z_bu *= self._data.x_b_scaling[self._data.idx_xu]
-                cp.add(self._res_nr.z_bu, self._result.s_bu, out=self._res_nr.z_bu)
-                cp.subtract(self._res_nr.z_bu, self._data.x_u[self._data.idx_xu], out=self._res_nr.z_bu)
-                cp.negative(self._res_nr.z_bu, out=self._res_nr.z_bu)
+        # res_nr.z_bu = -(x_b_scaling*x + s_bu - xu)
+        cp.take(self._result.x, self._data.idx_xu, out=self._res_nr.z_bu)
+        self._res_nr.z_bu *= self._data.x_b_scaling[self._data.idx_xu]
+        cp.add(self._res_nr.z_bu, self._result.s_bu, out=self._res_nr.z_bu)
+        cp.subtract(self._res_nr.z_bu, self._data.x_u[self._data.idx_xu], out=self._res_nr.z_bu)
+        cp.negative(self._res_nr.z_bu, out=self._res_nr.z_bu)
 
 
-                # ------------ update primal and dual residuals ------------
-                self._result.info.prev_primal_res[:] = self._result.info.primal_res
-                self._result.info.prev_dual_res[:] = self._result.info.dual_res
+        # ------------ update primal and dual residuals ------------
+        self._result.info.prev_primal_res[:] = self._result.info.primal_res
+        self._result.info.prev_dual_res[:] = self._result.info.dual_res
 
-                self._result.info.primal_res[:] = self._primal_res_nr()
+        self._result.info.primal_res[:] = self._primal_res_nr()
 
-                # primal_rel_norm: update running max (initialized outside graph with ||unscale(A*x)||_inf)
-                # All terms are unscaled before taking norms to match PIQP C++ convergence check.
-                # _work_z_1 is free at this point (only used before graph for cuSPARSE input)
-                if self._data.num_hu > 0:
-                    cp.take(G_x, self._data.idx_hu, out=self._work_z_1[:self._data.num_hu])
-                    cp.absolute(self._work_z_1[:self._data.num_hu], out=self._work_z_1[:self._data.num_hu])
-                    self._work_z_1[:self._data.num_hu] *= self._unscale_primal_res_ineq_hu
-                    cp.max(self._work_z_1[:self._data.num_hu], out=self._work_norm_temp, keepdims=True)
-                    cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
+        # primal_rel_norm: update running max (initialized outside graph with ||unscale(A*x)||_inf)
+        # All terms are unscaled before taking norms to match PIQP C++ convergence check.
+        # _work_z_1 is free at this point (only used before graph for cuSPARSE input)
+        if self._data.num_hu > 0:
+            cp.take(G_x, self._data.idx_hu, out=self._work_z_1[:self._data.num_hu])
+            cp.absolute(self._work_z_1[:self._data.num_hu], out=self._work_z_1[:self._data.num_hu])
+            self._work_z_1[:self._data.num_hu] *= self._unscale_primal_res_ineq_hu
+            cp.max(self._work_z_1[:self._data.num_hu], out=self._work_norm_temp, keepdims=True)
+            cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
 
-                if self._data.num_hl > 0:
-                    cp.take(G_x, self._data.idx_hl, out=self._work_z_1[:self._data.num_hl])
-                    cp.absolute(self._work_z_1[:self._data.num_hl], out=self._work_z_1[:self._data.num_hl])
-                    self._work_z_1[:self._data.num_hl] *= self._unscale_primal_res_ineq_hl
-                    cp.max(self._work_z_1[:self._data.num_hl], out=self._work_norm_temp, keepdims=True)
-                    cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
+        if self._data.num_hl > 0:
+            cp.take(G_x, self._data.idx_hl, out=self._work_z_1[:self._data.num_hl])
+            cp.absolute(self._work_z_1[:self._data.num_hl], out=self._work_z_1[:self._data.num_hl])
+            self._work_z_1[:self._data.num_hl] *= self._unscale_primal_res_ineq_hl
+            cp.max(self._work_z_1[:self._data.num_hl], out=self._work_norm_temp, keepdims=True)
+            cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
 
-                if self._data.num_hu > 0:
-                    cp.absolute(self._result.s_u, out=self._work_z_1[:self._data.num_hu])
-                    self._work_z_1[:self._data.num_hu] *= self._unscale_primal_res_ineq_hu
-                    cp.max(self._work_z_1[:self._data.num_hu], out=self._work_norm_temp, keepdims=True)
-                    cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
+        if self._data.num_hu > 0:
+            cp.absolute(self._result.s_u, out=self._work_z_1[:self._data.num_hu])
+            self._work_z_1[:self._data.num_hu] *= self._unscale_primal_res_ineq_hu
+            cp.max(self._work_z_1[:self._data.num_hu], out=self._work_norm_temp, keepdims=True)
+            cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
 
-                if self._data.num_hl > 0:
-                    cp.absolute(self._result.s_l, out=self._work_z_1[:self._data.num_hl])
-                    self._work_z_1[:self._data.num_hl] *= self._unscale_primal_res_ineq_hl
-                    cp.max(self._work_z_1[:self._data.num_hl], out=self._work_norm_temp, keepdims=True)
-                    cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
+        if self._data.num_hl > 0:
+            cp.absolute(self._result.s_l, out=self._work_z_1[:self._data.num_hl])
+            self._work_z_1[:self._data.num_hl] *= self._unscale_primal_res_ineq_hl
+            cp.max(self._work_z_1[:self._data.num_hl], out=self._work_norm_temp, keepdims=True)
+            cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
 
-                if self._data.num_xu > 0:
-                    cp.absolute(self._result.s_bu, out=self._work_z[:self._data.num_xu])
-                    self._work_z[:self._data.num_xu] *= self._unscale_primal_res_b_xu
-                    cp.max(self._work_z[:self._data.num_xu], out=self._work_norm_temp, keepdims=True)
-                    cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
+        if self._data.num_xu > 0:
+            cp.absolute(self._result.s_bu, out=self._work_z[:self._data.num_xu])
+            self._work_z[:self._data.num_xu] *= self._unscale_primal_res_b_xu
+            cp.max(self._work_z[:self._data.num_xu], out=self._work_norm_temp, keepdims=True)
+            cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
 
-                if self._data.num_xl > 0:
-                    cp.absolute(self._result.s_bl, out=self._work_z[:self._data.num_xl])
-                    self._work_z[:self._data.num_xl] *= self._unscale_primal_res_b_xl
-                    cp.max(self._work_z[:self._data.num_xl], out=self._work_norm_temp, keepdims=True)
-                    cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
+        if self._data.num_xl > 0:
+            cp.absolute(self._result.s_bl, out=self._work_z[:self._data.num_xl])
+            self._work_z[:self._data.num_xl] *= self._unscale_primal_res_b_xl
+            cp.max(self._work_z[:self._data.num_xl], out=self._work_norm_temp, keepdims=True)
+            cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
 
-                cp.maximum(self._work_primal_rel_norm, self._constraints_rhs_inf_norm_unscaled, out=self._work_primal_rel_norm)
-                # Store max(1, primal_rel_norm) for use by _update_residuals_r
-                cp.maximum(self._work_primal_rel_norm, 1., out=self._work_primal_rel_norm)
-                cp.divide(self._result.info.primal_res, self._work_primal_rel_norm, out=self._result.info.primal_res_rel)
+        cp.maximum(self._work_primal_rel_norm, self._constraints_rhs_inf_norm_unscaled, out=self._work_primal_rel_norm)
+        # Store max(1, primal_rel_norm) for use by _update_residuals_r
+        cp.maximum(self._work_primal_rel_norm, 1., out=self._work_primal_rel_norm)
+        cp.divide(self._result.info.primal_res, self._work_primal_rel_norm, out=self._result.info.primal_res_rel)
 
-                # dual_res_norm: update running max (initialized outside graph with ||unscale(P*x)||_inf)
-                self._result.info.dual_res[:] = self._dual_res_nr()
+        # dual_res_norm: update running max (initialized outside graph with ||unscale(P*x)||_inf)
+        self._result.info.dual_res[:] = self._dual_res_nr()
 
-                # ||unscale_dual_res(c)||_inf
-                cp.absolute(self._data.c, out=self._work_primals)
-                self._work_primals *= self._unscale_dual_res_factor
-                cp.max(self._work_primals, out=self._work_norm_temp, keepdims=True)
-                cp.maximum(self._work_dual_res_norm, self._work_norm_temp, out=self._work_dual_res_norm)
+        # ||unscale_dual_res(c)||_inf
+        cp.absolute(self._data.c, out=self._work_primals)
+        self._work_primals *= self._unscale_dual_res_factor
+        cp.max(self._work_primals, out=self._work_norm_temp, keepdims=True)
+        cp.maximum(self._work_dual_res_norm, self._work_norm_temp, out=self._work_dual_res_norm)
 
-                # ||unscale_dual_res(A^T*y + G^T*(z_u - z_l) + x_b_scaling*(z_bu - z_bl))||_inf
-                self._res.x += GT_zu_minus_zl
-                self._res.x[self._data.idx_xl] -= self._data.x_b_scaling[self._data.idx_xl] * self._result.z_bl
-                self._res.x[self._data.idx_xu] += self._data.x_b_scaling[self._data.idx_xu] * self._result.z_bu
-                cp.absolute(self._res.x, out=self._work_primals)
-                self._work_primals *= self._unscale_dual_res_factor
-                cp.max(self._work_primals, out=self._work_norm_temp, keepdims=True)
-                cp.maximum(self._work_dual_res_norm, self._work_norm_temp, out=self._work_dual_res_norm)
+        # ||unscale_dual_res(A^T*y + G^T*(z_u - z_l) + x_b_scaling*(z_bu - z_bl))||_inf
+        self._res.x += GT_zu_minus_zl
+        self._res.x[self._data.idx_xl] -= self._data.x_b_scaling[self._data.idx_xl] * self._result.z_bl
+        self._res.x[self._data.idx_xu] += self._data.x_b_scaling[self._data.idx_xu] * self._result.z_bu
+        cp.absolute(self._res.x, out=self._work_primals)
+        self._work_primals *= self._unscale_dual_res_factor
+        cp.max(self._work_primals, out=self._work_norm_temp, keepdims=True)
+        cp.maximum(self._work_dual_res_norm, self._work_norm_temp, out=self._work_dual_res_norm)
 
-                # store max(1, dual_res_norm) for use by _update_residuals_r
-                cp.maximum(self._work_dual_res_norm, 1., out=self._work_dual_res_norm)
-                cp.divide(self._result.info.dual_res, self._work_dual_res_norm, out=self._result.info.dual_res_rel)
-
-            self._update_residuals_nr_cuda_graphs[key] = stream.end_capture()
-
-        self._update_residuals_nr_cuda_graphs[key].launch()
-
+        # store max(1, dual_res_norm) for use by _update_residuals_r
+        cp.maximum(self._work_dual_res_norm, 1., out=self._work_dual_res_norm)
+        cp.divide(self._result.info.dual_res, self._work_dual_res_norm, out=self._result.info.dual_res_rel)
 
     @nvtx.annotate("Solver::_update_residuals_r")
     @cuda_graph_capture()
