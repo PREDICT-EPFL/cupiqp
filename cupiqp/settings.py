@@ -40,6 +40,7 @@ class Settings:
     iterative_refinement_static_regularization_rel: float = 2.220446049250313e-32  # Approximation of epsilon squared
 
     use_deterministic_mode_for_cudss: bool = False  # Enable cuDSS deterministic mode for bit-wise reproducible results (slower)
+    enable_cuda_graph: bool = True
 
     verbose: bool = False
     debug: bool = False

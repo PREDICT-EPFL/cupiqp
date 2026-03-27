@@ -3,7 +3,7 @@ import functools
 import cupy as cp
 
 
-def cuda_graph_capture(key: Optional[Callable] = None):
+def cuda_graph_capture(key: Optional[Callable] = None, enable: Optional[Callable] = None):
     """Decorator that caches a method's GPU operations as a CUDA graph.
 
     On first call (per unique key), captures all GPU operations inside the
@@ -14,6 +14,10 @@ def cuda_graph_capture(key: Optional[Callable] = None):
         key: A callable ``(self, *args, **kwargs) -> hashable`` that computes
              the cache key from the method's arguments. Different key values
              produce separate cached graphs.
+        enable: A callable ``(self) -> bool`` that determines whether CUDA
+             graph capture is enabled at runtime. When it returns False, the
+             decorated method is called directly without graph capture/replay.
+             Defaults to None (always enabled).
 
     Example::
 
@@ -28,6 +32,9 @@ def cuda_graph_capture(key: Optional[Callable] = None):
 
         @functools.wraps(fn)
         def wrapper(self, *args, **kwargs):
+            if enable is not None and not enable(self):
+                return fn(self, *args, **kwargs)
+
             if not hasattr(self, cache_attr):
                 setattr(self, cache_attr, {})
 

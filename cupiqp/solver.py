@@ -607,7 +607,7 @@ class SolverBase:
         cp.maximum(self._mu_rate, 0., out=self._mu_rate)
 
     @nvtx.annotate("Solver::_calculate_step")
-    @cuda_graph_capture()
+    @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
     def _calculate_step(self) -> None:
         """
         Compute the step length of the slack variables and dual variables. Make sure they remain non-negative.
@@ -653,7 +653,7 @@ class SolverBase:
         self._alpha_sz[1] = cp.min(self._work_z[:offset]) # alpha_z
 
     @nvtx.annotate("Solver::_calculate_mu")
-    @cuda_graph_capture()
+    @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
     def _calculate_mu(self) -> None:
         cp.dot(self._result.s_l, self._result.z_l, out=self._work_reduce[0:1])
         cp.dot(self._result.s_u, self._result.z_u, out=self._work_reduce[1:2])
@@ -663,7 +663,7 @@ class SolverBase:
         self._result.info.mu /= (self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)
 
     @nvtx.annotate("Solver::_calculate_sigma")
-    @cuda_graph_capture()
+    @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
     def _calculate_sigma(self) -> None:        
         self._result.info.sigma[:] = 0.
         self._result.info.sigma += cp.dot(self._result.s_l + self._alpha_sz[0] * self._step.s_l, self._result.z_l + self._alpha_sz[1] * self._step.z_l)
@@ -676,7 +676,7 @@ class SolverBase:
         cp.power(self._result.info.sigma, 3., out=self._result.info.sigma)
 
     @nvtx.annotate("Solver::_update_residuals_nr")
-    @cuda_graph_capture()
+    @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
     def _update_residuals_nr(self):
         """
         Compute the non-regularized residuals, which reflects the residuals of the KKT conditions excluding the regularization terms in Schwan 2023 paper eq(6)
@@ -886,7 +886,7 @@ class SolverBase:
         cp.divide(self._result.info.dual_res, self._work_dual_res_norm, out=self._result.info.dual_res_rel)
 
     @nvtx.annotate("Solver::_update_residuals_r")
-    @cuda_graph_capture()
+    @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
     def _update_residuals_r(self):
         """
         Compute the regularized primal and dual residuals. The computation is based on the non-regularized residuals computed in _update_residuals_nr.

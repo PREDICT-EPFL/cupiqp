@@ -145,7 +145,7 @@ class KKTSystem:
         return factor_success
     
     @nvtx.annotate("KKTSystem::update_reg_and_kkt")
-    @cuda_graph_capture(key=lambda self, data, delta, rho, vars: (vars.buffer_ptr, delta.data.ptr, rho.data.ptr))
+    @cuda_graph_capture(key=lambda self, data, delta, rho, vars: (vars.buffer_ptr, delta.data.ptr, rho.data.ptr), enable=lambda self: self._settings.enable_cuda_graph)
     def _update_reg_and_kkt(self, data: Data, delta: cp.ndarray, rho: cp.ndarray, vars: Variables):
         """Update the regularization terms x_reg and z_reg for the condensed KKT system after eliminating slacks and duals of inequalities and box constraints. 
         Also update the condensed KKT matrix with the new regularization terms."""
@@ -240,7 +240,7 @@ class KKTSystem:
         self._recover_lhs(data, rhs, lhs)
 
     @nvtx.annotate("KKTSystem::solve::_prepare_rhs")
-    @cuda_graph_capture(key=lambda self, data, rhs: (rhs.buffer_ptr,))
+    @cuda_graph_capture(key=lambda self, data, rhs: (rhs.buffer_ptr,), enable=lambda self: self._settings.enable_cuda_graph)
     def _prepare_rhs(self, data: Data, rhs: Variables):
         """Prepare the rhs for the condensed KKT system after eliminating slacks and duals of inequalities and box constraints."""
         wp.launch(
@@ -317,7 +317,7 @@ class KKTSystem:
         # self._work_z[:] *= self._z_reg
 
     @nvtx.annotate("KKTSystem::_recover_lhs")
-    @cuda_graph_capture(key=lambda self, data, rhs, lhs: (rhs.buffer_ptr, lhs.buffer_ptr))
+    @cuda_graph_capture(key=lambda self, data, rhs, lhs: (rhs.buffer_ptr, lhs.buffer_ptr), enable=lambda self: self._settings.enable_cuda_graph)
     def _recover_lhs(self, data: Data, rhs: Variables, lhs: Variables):
         """Recover the full KKT solution from the condense KKT solution."""
         # TODO: find a cleaner and more flexible to pass stream to eval_G_xn() and so on
