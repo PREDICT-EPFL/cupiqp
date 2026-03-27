@@ -706,38 +706,39 @@ class SolverBase:
                self._result.buffer_ptr,
                self._prox_vars.buffer_ptr,
                self._res_nr.buffer_ptr)
-        # cuSPARSE/cuBLAS operations (outside graph capture for now)
-        self._kkt_system.eval_P_x(self._data, -1., self._result.x, self._res_nr.x)
-        # ||unscale_dual_res(P*x)||_inf -> _work_dual_res_norm (will be updated further inside graph)
-        cp.absolute(self._res_nr.x, out=self._work_primals)
-        self._work_primals *= self._unscale_dual_res_factor
-        cp.max(self._work_primals, out=self._work_dual_res_norm, keepdims=True)
-
-        self._kkt_system.eval_A_xn(self._data, -1., self._result.x, self._res_nr.y)  # store -A*x in res_nr.y
-        self._kkt_system.eval_AT_xt(self._data, 1., self._result.y, self._res.x)  # add -A^T*y to res_nr.y
-        # ||unscale_primal_res_eq(A*x)||_inf -> _work_primal_rel_norm (will be updated further inside graph)
-        if self._data.p > 0:
-            cp.absolute(self._res_nr.y, out=self._work_duals[:self._data.p])
-            self._work_duals[:self._data.p] *= self._unscale_primal_res_eq_factor
-            cp.max(self._work_duals[:self._data.p], out=self._work_primal_rel_norm, keepdims=True)
-        else:
-            self._work_primal_rel_norm.fill(0.)
-
-        self._work_z_1.fill(0.)
-        self._work_z_1[self._data.idx_hu] += self._result.z_u
-        self._work_z_1[self._data.idx_hl] -= self._result.z_l
-
-        G_x = self._work_z_2 # reuse self._work_z_2 to store G*x
-        GT_zu_minus_zl = self._step.x  # reuse self._step.x as temporary storage
-        self._kkt_system.eval_G_xn(self._data, 1., self._result.x, G_x)
-        self._kkt_system.eval_GT_xt(self._data, 1., self._work_z_1, GT_zu_minus_zl)
 
         if key not in self._update_residuals_nr_cuda_graphs:
             self._update_residuals_nr_cuda_graphs_capture_count += 1
-            # print(f"Solver::_update_residuals_nr capturing CUDA graph (occurrence {self._update_residuals_nr_cuda_graphs_capture_count})...")
             stream = cp.cuda.Stream(non_blocking=True)
             stream.begin_capture()
             with stream:
+
+                # cuSPARSE/cuBLAS operations (outside graph capture for now)
+                self._kkt_system.eval_P_x(self._data, -1., self._result.x, self._res_nr.x)
+                # ||unscale_dual_res(P*x)||_inf -> _work_dual_res_norm (will be updated further inside graph)
+                cp.absolute(self._res_nr.x, out=self._work_primals)
+                self._work_primals *= self._unscale_dual_res_factor
+                cp.max(self._work_primals, out=self._work_dual_res_norm, keepdims=True)
+
+                self._kkt_system.eval_A_xn(self._data, -1., self._result.x, self._res_nr.y)  # store -A*x in res_nr.y
+                self._kkt_system.eval_AT_xt(self._data, 1., self._result.y, self._res.x)  # add -A^T*y to res_nr.y
+                # ||unscale_primal_res_eq(A*x)||_inf -> _work_primal_rel_norm (will be updated further inside graph)
+                if self._data.p > 0:
+                    cp.absolute(self._res_nr.y, out=self._work_duals[:self._data.p])
+                    self._work_duals[:self._data.p] *= self._unscale_primal_res_eq_factor
+                    cp.max(self._work_duals[:self._data.p], out=self._work_primal_rel_norm, keepdims=True)
+                else:
+                    self._work_primal_rel_norm.fill(0.)
+
+                self._work_z_1.fill(0.)
+                self._work_z_1[self._data.idx_hu] += self._result.z_u
+                self._work_z_1[self._data.idx_hl] -= self._result.z_l
+
+                G_x = self._work_z_2 # reuse self._work_z_2 to store G*x
+                GT_zu_minus_zl = self._step.x  # reuse self._step.x as temporary storage
+                self._kkt_system.eval_G_xn(self._data, 1., self._result.x, G_x)
+                self._kkt_system.eval_GT_xt(self._data, 1., self._work_z_1, GT_zu_minus_zl)
+
                 # ------------ update primal / dual objectives and duality gap ------------
                 # primal objective: 0.5 x^T P x + c^T x
                 # dual objective is: -0.5 x^T P x - b^T y - h_u^T z_u + h_l^T z_l - x_u^T z_bu + x_l^T z_bl
