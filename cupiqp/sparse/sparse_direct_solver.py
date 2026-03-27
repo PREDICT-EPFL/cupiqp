@@ -131,9 +131,8 @@ class CudssSparseDirectSolver(SparseDirectSolver):
 
     def factor(self) -> bool:
         try:
-            cp.cuda.Device().synchronize()
             fac_info = self._cudss_solver.factorize(stream=cp.cuda.get_current_stream().ptr)
-            cp.cuda.Device().synchronize()
+            cp.cuda.get_current_stream().synchronize()
 
             # NOTE: this causes a D2H synchronization, which can be inefficient. More importantly, this prevents us from capturing cuda graphs.
             if fac_info.info != 0:
@@ -165,7 +164,7 @@ class CudssSparseDirectSolver(SparseDirectSolver):
               ) -> None:
         # initial solve
         self._sol[:] = self._cudss_solver.solve(stream=cp.cuda.get_current_stream().ptr)
-        cp.cuda.Device().synchronize()
+        cp.cuda.get_current_stream().synchronize()
 
         if iterative_refinement:
             self.iterative_refinement(ir_abs_tol, ir_rel_tol, ir_max_iter, ir_min_improvement_rate)
@@ -224,7 +223,7 @@ class CudssSparseDirectSolver(SparseDirectSolver):
             # Solve for correction: A*dx = res
             self._rhs[:] = self._res
             self._sol_ir[:] = self._cudss_solver.solve(stream=cp.cuda.get_current_stream().ptr)
-            cp.cuda.Device().synchronize()
+            cp.cuda.get_current_stream().synchronize()
 
             self._sol += self._sol_ir
 
