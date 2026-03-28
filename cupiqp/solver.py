@@ -155,10 +155,6 @@ class SolverBase:
             self._unscale_primal_res_b_xl = cp.ones(self._data.num_xl, dtype=cp.float64) if self._data.num_xl > 0 else cp.empty(0)
             self._constraints_rhs_inf_norm_unscaled = self._data._constraints_rhs_inf_norm
 
-        # Clear CUDA graph cache (invalidated by new setup)
-        self._update_residuals_nr_cuda_graphs = {}
-        self._update_residuals_nr_cuda_graphs_capture_count = 0
-
         self._setup_done = True
 
     def update(self,
