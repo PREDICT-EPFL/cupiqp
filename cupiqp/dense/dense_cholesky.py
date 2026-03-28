@@ -1,6 +1,69 @@
+import ctypes
+import ctypes.util
 import cupy as cp
 from cupy_backends.cuda.libs import cublas, cusolver
-from cupy.cuda import device
+
+
+# ---------------------------------------------------------------------------
+# Load cuSOLVER shared library for handle management
+# ---------------------------------------------------------------------------
+def _load_cusolver_lib() -> ctypes.CDLL:
+    try:
+        import cupy.cuda.runtime as rt
+        major = rt.runtimeGetVersion() // 1000
+        try:
+            return ctypes.CDLL(f"libcusolver.so.{major}")
+        except OSError:
+            pass
+    except Exception:
+        pass
+    for name in ("libcusolver.so", "cusolver"):
+        try:
+            return ctypes.CDLL(name)
+        except OSError:
+            continue
+    lib_path = ctypes.util.find_library("cusolver")
+    if lib_path:
+        return ctypes.CDLL(lib_path)
+    raise RuntimeError("Could not find cuSOLVER shared library")
+
+
+_cusolver_lib = _load_cusolver_lib()
+
+_cusolver_dn_create = _cusolver_lib.cusolverDnCreate
+_cusolver_dn_create.restype = ctypes.c_int
+_cusolver_dn_create.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+
+_cusolver_dn_destroy = _cusolver_lib.cusolverDnDestroy
+_cusolver_dn_destroy.restype = ctypes.c_int
+_cusolver_dn_destroy.argtypes = [ctypes.c_void_p]
+
+_cusolver_dn_set_stream = _cusolver_lib.cusolverDnSetStream
+_cusolver_dn_set_stream.restype = ctypes.c_int
+_cusolver_dn_set_stream.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+
+
+def cusolver_create_handle():
+    """Create a new cuSOLVER dense handle."""
+    handle = ctypes.c_void_p()
+    status = _cusolver_dn_create(ctypes.byref(handle))
+    if status != 0:
+        raise RuntimeError(f"cusolverDnCreate failed with status {status}")
+    return handle.value
+
+
+def cusolver_destroy_handle(handle):
+    """Destroy a cuSOLVER dense handle."""
+    status = _cusolver_dn_destroy(handle)
+    if status != 0:
+        raise RuntimeError(f"cusolverDnDestroy failed with status {status}")
+
+
+def cusolver_set_stream(handle, stream_ptr):
+    """Associate a CUDA stream with the cuSOLVER handle."""
+    status = _cusolver_dn_set_stream(handle, stream_ptr)
+    if status != 0:
+        raise RuntimeError(f"cusolverDnSetStream failed with status {status}")
 
 
 class CholeskyInplaceSolver:
@@ -12,7 +75,7 @@ class CholeskyInplaceSolver:
     def __init__(self, n: int, dtype = cp.float64):
         self.n = n
         self._dtype = cp.dtype(dtype).char
-        self._handle = device.get_cusolver_handle()
+        self._cusolver_handle = cusolver_create_handle()
         
         if self._dtype == 'f':
             self._potrf = cusolver.spotrf
@@ -34,14 +97,24 @@ class CholeskyInplaceSolver:
             raise ValueError(f"Unsupported dtype: {dtype}")
 
         self._dev_info = cp.empty(1, dtype=cp.int32)
-        self._buffersize = buffer_func(self._handle, cublas.CUBLAS_FILL_MODE_UPPER, n, 0, n)
+        self._buffersize = buffer_func(self._cusolver_handle, cublas.CUBLAS_FILL_MODE_UPPER, n, 0, n)
         self._workspace = cp.empty(self._buffersize, dtype=self._dtype)
         
         self._factor_ptr = None
         self._uplo = None
         self._ctx_A = None # holds reference to A
 
+    def __del__(self):
+        handle = getattr(self, "_cusolver_handle", None)
+        if handle is not None:
+            try:
+                cusolver_destroy_handle(handle)
+            except Exception:
+                pass
+
     def factorize(self, A: cp.ndarray) -> bool:
+        # point the cusolver handle at CuPy's current stream
+        cusolver_set_stream(self._cusolver_handle, cp.cuda.get_current_stream().ptr)
         if not cp.dtype(A.dtype).char == self._dtype:
             raise TypeError(f"Input matrix dtype {A.dtype} does not match solver dtype {self._dtype}.")
         if A.shape[0] != self.n or A.shape[1] != self.n:
@@ -60,7 +133,7 @@ class CholeskyInplaceSolver:
         self._factor_ptr = A.data.ptr
         
         self._potrf(
-            self._handle,
+            self._cusolver_handle,
             self._uplo,
             self.n,
             self._factor_ptr,
@@ -75,6 +148,7 @@ class CholeskyInplaceSolver:
 
     def solve(self, B: cp.ndarray):
         """Combined forward and backward substitution to solve Ax = B."""
+        cusolver_set_stream(self._cusolver_handle, cp.cuda.get_current_stream().ptr)
         if self._factor_ptr is None:
             raise RuntimeError("You must call factorize() before solve().")
 
@@ -92,7 +166,7 @@ class CholeskyInplaceSolver:
              raise ValueError("RHS B must be contiguous.")
 
         self._potrs(
-            self._handle,
+            self._cusolver_handle,
             self._uplo,
             self.n,
             nrhs,

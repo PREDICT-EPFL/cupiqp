@@ -5,7 +5,8 @@ from ..kkt_solver import KKTSolverBase
 from .dense_data import DenseData
 from .dense_cholesky import CholeskyInplaceSolver
 from .cublas_wrappers import (
-    dgemv, dcopy, daxpy, dsyrk, ddgmm, set_stream,
+    dgemv, dcopy, daxpy, dsyrk, ddgmm, cublas_set_stream,
+    cublas_create_handle, cublas_destroy_handle,
     OP_N, FILL_UPPER, SIDE_RIGHT,
 )
 
@@ -34,19 +35,18 @@ class DenseKKTSolver(KKTSolverBase):
         self._G_scaled = cp.zeros_like(data.G) if m > 0 else cp.zeros((0, 0), dtype=cp.float64)
 
         self._cholesky_solver = CholeskyInplaceSolver(n, dtype=cp.float64)
-
-        self._cublas_handle = cp.cuda.Device().cublas_handle
+        self._cublas_handle = cublas_create_handle()
 
         if p > 0:
             self._compute_AtA(data)
 
-    def _sync_cublas_stream(self):
-        """Point the cuBLAS handle at cupy's current stream.
-
-        This ensures cuBLAS operations follow the ``with stream:`` context
-        (critical for CUDA graph capture on a non-default stream).
-        """
-        set_stream(self._cublas_handle, cp.cuda.get_current_stream().ptr)
+    def __del__(self):
+        handle = getattr(self, "_cublas_handle", None)
+        if handle is not None:
+            try:
+                cublas_destroy_handle(handle)
+            except Exception:
+                pass
 
     def _compute_AtA(self, data: DenseData):
         """Compute AtA = A^T * A via cuBLAS dsyrk to reduce overhead.
@@ -55,7 +55,7 @@ class DenseKKTSolver(KKTSolverBase):
         - cuBLAS sees column-major layout as an nxp matrix (call it A_cm)
         - dsyrk with OP_N computes C = A_cm * A_cm^T = A^T * A  (nxn)
         """
-        self._sync_cublas_stream()
+        cublas_set_stream(self._cublas_handle, cp.cuda.get_current_stream().ptr)
         n, p = data.n, data.p
         dsyrk(self._cublas_handle, FILL_UPPER, OP_N, n, p,
               1.0, data.A.data.ptr, n,
@@ -71,7 +71,7 @@ class DenseKKTSolver(KKTSolverBase):
         
         Set cuBLAS handle to current cupy stream to ensure these operations are recorded into the graph when called within a cupy's ``with stream:`` context.
         """
-        self._sync_cublas_stream()
+        cublas_set_stream(self._cublas_handle, cp.cuda.get_current_stream().ptr)
         n = data.n
         handle = self._cublas_handle
 
@@ -114,9 +114,9 @@ class DenseKKTSolver(KKTSolverBase):
               delta_x: cp.ndarray, delta_y: cp.ndarray, delta_z: cp.ndarray):
         """Solve the reduced KKT system and recover delta_y, delta_z.
         
-        Set cublas handle to current cupy stream to ensure these operations are recorded into the graph when called within a cupy's ``with stream:`` context.
+        Set cublas handle to current cupy stream to ensure these operations are recorded into the graph.
         """
-        self._sync_cublas_stream()
+        cublas_set_stream(self._cublas_handle, cp.cuda.get_current_stream().ptr)
         handle = self._cublas_handle
         n = data.n
 
@@ -150,25 +150,25 @@ class DenseKKTSolver(KKTSolverBase):
 
     @nvtx.annotate("DenseKKTSolver::eval_P_x")
     def eval_P_x(self, data: DenseData, alpha: float, x: cp.ndarray, z: cp.ndarray):
-        self._sync_cublas_stream()
+        cublas_set_stream(self._cublas_handle, cp.cuda.get_current_stream().ptr)
         dgemv(self._cublas_handle, data.P, x, z, alpha=alpha, beta=0.0)
 
     @nvtx.annotate("DenseKKTSolver::eval_A_xn")
     def eval_A_xn(self, data: DenseData, alpha_n: float, xn: cp.ndarray, zn: cp.ndarray):
-        self._sync_cublas_stream()
+        cublas_set_stream(self._cublas_handle, cp.cuda.get_current_stream().ptr)
         dgemv(self._cublas_handle, data.A, xn, zn, alpha=alpha_n, beta=0.0)
 
     @nvtx.annotate("DenseKKTSolver::eval_AT_xt")
     def eval_AT_xt(self, data: DenseData, alpha_t: float, xt: cp.ndarray, zt: cp.ndarray):
-        self._sync_cublas_stream()
+        cublas_set_stream(self._cublas_handle, cp.cuda.get_current_stream().ptr)
         dgemv(self._cublas_handle, data.A, xt, zt, transa=True, alpha=alpha_t, beta=0.0)
 
     @nvtx.annotate("DenseKKTSolver::eval_G_xn")
     def eval_G_xn(self, data: DenseData, alpha_n: float, xn: cp.ndarray, zn: cp.ndarray):
-        self._sync_cublas_stream()
+        cublas_set_stream(self._cublas_handle, cp.cuda.get_current_stream().ptr)
         dgemv(self._cublas_handle, data.G, xn, zn, alpha=alpha_n, beta=0.0)
 
     @nvtx.annotate("DenseKKTSolver::eval_GT_xt")
     def eval_GT_xt(self, data: DenseData, alpha_t: float, xt: cp.ndarray, zt: cp.ndarray):
-        self._sync_cublas_stream()
+        cublas_set_stream(self._cublas_handle, cp.cuda.get_current_stream().ptr)
         dgemv(self._cublas_handle, data.G, xt, zt, transa=True, alpha=alpha_t, beta=0.0)

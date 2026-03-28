@@ -157,10 +157,43 @@ _set_stream.argtypes = [
     ctypes.c_void_p,  # stream (cudaStream_t)
 ]
 
+_create = _lib.cublasCreate_v2
+_create.restype = ctypes.c_int
+_create.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+
+_destroy = _lib.cublasDestroy_v2
+_destroy.restype = ctypes.c_int
+_destroy.argtypes = [ctypes.c_void_p]
+
 
 # ---------------------------------------------------------------------------
 # Wrapper functions
 # ---------------------------------------------------------------------------
+def cublas_create_handle():
+    """Create a new cuBLAS handle (thread-safe, independent of CuPy's shared handle)."""
+    handle = ctypes.c_void_p()
+    status = _create(ctypes.byref(handle))
+    if status != 0:
+        raise RuntimeError(f"cublasCreate failed with status {status}")
+    return handle.value
+
+def cublas_destroy_handle(handle):
+    """Destroy a cuBLAS handle created by :func:`cublas_create_handle`."""
+    status = _destroy(handle)
+    if status != 0:
+        raise RuntimeError(f"cublasDestroy failed with status {status}")
+    
+def cublas_set_stream(handle, cuda_stream):
+    """Associate a CUDA stream with the cuBLAS handle.
+
+    All subsequent cuBLAS calls on *handle* will be submitted to *stream_ptr*.
+    This is a host-side state change (no graph node is created), so it is safe
+    to call before/after ``stream.begin_capture()``.
+    """
+    status = _set_stream(handle, cuda_stream)
+    if status != 0:
+        raise RuntimeError(f"cublasSetStream failed with status {status}")
+    
 def dgemv(handle, mat, x, y, transa=False, alpha=1.0, beta=0.0):
     """``y = alpha * op(mat) * x + beta * y``  (CUDA graph safe).
 
@@ -244,12 +277,3 @@ def set_pointer_mode(handle, mode):
     """Set cuBLAS pointer mode (``POINTER_HOST`` or ``POINTER_DEVICE``)."""
     _set_pointer_mode(handle, mode)
 
-
-def set_stream(handle, stream_ptr):
-    """Associate a CUDA stream with the cuBLAS handle.
-
-    All subsequent cuBLAS calls on *handle* will be submitted to *stream_ptr*.
-    This is a host-side state change (no graph node is created), so it is safe
-    to call before/after ``stream.begin_capture()``.
-    """
-    _set_stream(handle, stream_ptr)
