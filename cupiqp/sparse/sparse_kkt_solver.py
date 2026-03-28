@@ -47,8 +47,6 @@ class SparseKKTSolver(KKTSolverBase):
         if not plan_success:
             raise RuntimeError("Sparse direct solver planning failed.")
 
-        self._stream_cp = cp.cuda.get_current_stream()
-
     def __del__(self):
         self._lin_sys_solver.__del__()
 
@@ -191,18 +189,20 @@ class SparseKKTSolver(KKTSolverBase):
         """
         Solve the KKT system using the factorized KKT matrix.
         """
+        stream_ptr = cp.cuda.get_current_stream().ptr
+
         # ! cp.cuda.runtime.memcpyAsync has lower launch overhead than multiple small cp.copyto() calls
         # self._rhs <= [rhs_x, rhs_y, rhs_z]
-        cp.cuda.runtime.memcpyAsync(self._lin_sys_solver.rhs.data.ptr, rhs_x.data.ptr, data.n * 8, 1, self._stream_cp.ptr)
-        cp.cuda.runtime.memcpyAsync(self._lin_sys_solver.rhs.data.ptr + data.n * 8, rhs_y.data.ptr, data.p * 8, 1, self._stream_cp.ptr)
-        cp.cuda.runtime.memcpyAsync(self._lin_sys_solver.rhs.data.ptr + (data.n+data.p) * 8, rhs_z.data.ptr, data.m * 8, 1, self._stream_cp.ptr)
+        cp.cuda.runtime.memcpyAsync(self._lin_sys_solver.rhs.data.ptr, rhs_x.data.ptr, data.n * 8, 1, stream_ptr)
+        cp.cuda.runtime.memcpyAsync(self._lin_sys_solver.rhs.data.ptr + data.n * 8, rhs_y.data.ptr, data.p * 8, 1, stream_ptr)
+        cp.cuda.runtime.memcpyAsync(self._lin_sys_solver.rhs.data.ptr + (data.n+data.p) * 8, rhs_z.data.ptr, data.m * 8, 1, stream_ptr)
 
-        self._lin_sys_solver.solve(cuda_stream=cp.cuda.get_current_stream().ptr)
+        self._lin_sys_solver.solve(cuda_stream=stream_ptr)
 
         # [delta_x, delta_y, delta_z] <= self._sol
-        cp.cuda.runtime.memcpyAsync(delta_x.data.ptr, self._lin_sys_solver.sol.data.ptr, data.n * 8, 1, self._stream_cp.ptr)
-        cp.cuda.runtime.memcpyAsync(delta_y.data.ptr, self._lin_sys_solver.sol.data.ptr + data.n * 8, data.p * 8, 1, self._stream_cp.ptr)
-        cp.cuda.runtime.memcpyAsync(delta_z.data.ptr, self._lin_sys_solver.sol.data.ptr + (data.n+data.p) * 8, data.m * 8, 1, self._stream_cp.ptr)
+        cp.cuda.runtime.memcpyAsync(delta_x.data.ptr, self._lin_sys_solver.sol.data.ptr, data.n * 8, 1, stream_ptr)
+        cp.cuda.runtime.memcpyAsync(delta_y.data.ptr, self._lin_sys_solver.sol.data.ptr + data.n * 8, data.p * 8, 1, stream_ptr)
+        cp.cuda.runtime.memcpyAsync(delta_z.data.ptr, self._lin_sys_solver.sol.data.ptr + (data.n+data.p) * 8, data.m * 8, 1, stream_ptr)
 
     @nvtx.annotate("SparseKKTSolver::eval_P_x")
     def eval_P_x(self, data: SparseData, alpha: float, x: cp.ndarray, z: cp.ndarray):
@@ -223,4 +223,3 @@ class SparseKKTSolver(KKTSolverBase):
     @nvtx.annotate("SparseKKTSolver::eval_GT_xt")
     def eval_GT_xt(self, data: SparseData, alpha_t: float, xt: cp.ndarray, zt: cp.ndarray):
         self._spmv_GT(xt, zt, alpha=alpha_t, beta=0.0, stream_ptr=cp.cuda.get_current_stream().ptr)
-
