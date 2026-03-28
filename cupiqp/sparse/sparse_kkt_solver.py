@@ -43,7 +43,7 @@ class SparseKKTSolver(KKTSolverBase):
 
         # setup direct solver for KKT factorization and solves
         self._lin_sys_solver = CudssSparseDirectSolver(self._kkt_mat, use_deterministic_mode=use_deterministic_mode)
-        plan_success = self._lin_sys_solver.plan()  # symbolic factorization and reordering
+        plan_success = self._lin_sys_solver.plan(cuda_stream=cp.cuda.get_current_stream().ptr)  # symbolic factorization and reordering
         if not plan_success:
             raise RuntimeError("Sparse direct solver planning failed.")
 
@@ -184,7 +184,7 @@ class SparseKKTSolver(KKTSolverBase):
     
     @nvtx.annotate("SparseKKTSolver::factor")
     def factor(self) -> bool:
-        return self._lin_sys_solver.factor()
+        return self._lin_sys_solver.factor(cuda_stream=cp.cuda.get_current_stream().ptr)
 
     @nvtx.annotate("SparseKKTSolver::solve")
     def solve(self, data: SparseData, rhs_x: cp.ndarray, rhs_y: cp.ndarray, rhs_z: cp.ndarray, delta_x: cp.ndarray, delta_y: cp.ndarray, delta_z: cp.ndarray):
@@ -197,7 +197,7 @@ class SparseKKTSolver(KKTSolverBase):
         cp.cuda.runtime.memcpyAsync(self._lin_sys_solver.rhs.data.ptr + data.n * 8, rhs_y.data.ptr, data.p * 8, 1, self._stream_cp.ptr)
         cp.cuda.runtime.memcpyAsync(self._lin_sys_solver.rhs.data.ptr + (data.n+data.p) * 8, rhs_z.data.ptr, data.m * 8, 1, self._stream_cp.ptr)
 
-        self._lin_sys_solver.solve()
+        self._lin_sys_solver.solve(cuda_stream=cp.cuda.get_current_stream().ptr)
 
         # [delta_x, delta_y, delta_z] <= self._sol
         cp.cuda.runtime.memcpyAsync(delta_x.data.ptr, self._lin_sys_solver.sol.data.ptr, data.n * 8, 1, self._stream_cp.ptr)

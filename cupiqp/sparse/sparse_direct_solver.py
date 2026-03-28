@@ -31,19 +31,19 @@ class SparseDirectSolver(ABC):
     
     @nvtx.annotate("SparseDirectSolver::plan")
     @abstractmethod
-    def plan(self) -> bool:
+    def plan(self, cuda_stream: int) -> bool:
         """Precompute reordering and symbolic factorization"""
         pass
 
     @nvtx.annotate("SparseDirectSolver::factor")
     @abstractmethod
-    def factor(self) -> bool:
+    def factor(self, cuda_stream: int) -> bool:
         """Numerical factorization of the matrix. Should be called after plan() and before solve()."""
         pass
 
     @nvtx.annotate("SparseDirectSolver::solve")
     @abstractmethod
-    def solve(self):
+    def solve(self, cuda_stream: int):
         """Solve the linear system for the given right-hand side."""
         pass
 
@@ -52,17 +52,17 @@ class SparseDirectSolver(ABC):
         pass
 
     @property
-    def mat(self):
+    def mat(self) -> csr_matrix:
         """Expose the matrix for in-place updates before calling factor()."""
         return self._mat
     
     @property
-    def rhs(self):
+    def rhs(self) -> cp.ndarray:
         """Expose the right-hand side vector for in-place updates before calling solve()."""
         return self._rhs
     
     @property
-    def sol(self):
+    def sol(self) -> cp.ndarray:
         """Expose the solution vector after calling solve()."""
         return self._sol
 
@@ -119,20 +119,20 @@ class CudssSparseDirectSolver(SparseDirectSolver):
                 pass
             self._cudss_solver = None
 
-    def plan(self) -> bool:
+    def plan(self, cuda_stream: int) -> bool:
         try:
-            plan_info = self._cudss_solver.plan(stream=cp.cuda.get_current_stream().ptr)
-            cp.cuda.get_current_stream().synchronize()
+            plan_info = self._cudss_solver.plan(stream=cuda_stream)
+            # cp.cuda.get_current_stream().synchronize()
         except Exception as e:
             print(f"Planning failed: {e}")
             return False
         
         return True
 
-    def factor(self) -> bool:
+    def factor(self, cuda_stream: int) -> bool:
         try:
-            fac_info = self._cudss_solver.factorize(stream=cp.cuda.get_current_stream().ptr)
-            cp.cuda.get_current_stream().synchronize()
+            fac_info = self._cudss_solver.factorize(stream=cuda_stream)
+            # cp.cuda.get_current_stream().synchronize()
 
             # NOTE: this causes a D2H synchronization, which can be inefficient. More importantly, this prevents us from capturing cuda graphs.
             if fac_info.info != 0:
@@ -156,6 +156,7 @@ class CudssSparseDirectSolver(SparseDirectSolver):
         return True
 
     def solve(self, 
+              cuda_stream: int,
               iterative_refinement: bool = False, 
               ir_abs_tol: float = 1e-12, 
               ir_rel_tol: float = 1e-12,
@@ -163,14 +164,14 @@ class CudssSparseDirectSolver(SparseDirectSolver):
               ir_min_improvement_rate: float = 5.0
               ) -> None:
         # initial solve
-        self._sol[:] = self._cudss_solver.solve(stream=cp.cuda.get_current_stream().ptr)
-        cp.cuda.get_current_stream().synchronize()
+        self._sol[:] = self._cudss_solver.solve(stream=cuda_stream)
+        # cp.cuda.get_current_stream().synchronize()
 
         if iterative_refinement:
-            self.iterative_refinement(ir_abs_tol, ir_rel_tol, ir_max_iter, ir_min_improvement_rate)
+            self.iterative_refinement(cuda_stream, ir_abs_tol, ir_rel_tol, ir_max_iter, ir_min_improvement_rate)
 
     @nvtx.annotate("SparseDirectSolver::iterative_refinement")
-    def iterative_refinement(self, abs_tol: float, rel_tol: float, max_iter: int, min_improvement_rate: float) -> None:
+    def iterative_refinement(self, cuda_stream: int, abs_tol: float, rel_tol: float, max_iter: int, min_improvement_rate: float) -> None:
         VERBOSE = False
         USE_RHS_NORM = False  # True: tol = atol + rtol * ||b||,  False: tol = atol + rtol * ||r_0||
         # TODO: the iterative refinement here and the one in KKTSystem are actually the same thing. Should find a cleaner way to organize the code to avoid this confusion.
@@ -222,8 +223,8 @@ class CudssSparseDirectSolver(SparseDirectSolver):
 
             # Solve for correction: A*dx = res
             self._rhs[:] = self._res
-            self._sol_ir[:] = self._cudss_solver.solve(stream=cp.cuda.get_current_stream().ptr)
-            cp.cuda.get_current_stream().synchronize()
+            self._sol_ir[:] = self._cudss_solver.solve(stream=cuda_stream)
+            # cp.cuda.get_current_stream().synchronize()
 
             self._sol += self._sol_ir
 
