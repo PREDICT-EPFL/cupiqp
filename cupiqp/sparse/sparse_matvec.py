@@ -16,7 +16,7 @@ import ctypes
 import ctypes.util
 import cupy as cp
 import cupyx.scipy.sparse as cpsp
-from cupy.cuda import cusparse, device
+from cupy.cuda import cusparse
 import cupy.cuda.runtime as rt
 
 # ---------------------------------------------------------------------------
@@ -63,6 +63,28 @@ _cusparse_lib.cusparseDnVecSetValues.argtypes = [
 # cusparseStatus_t cusparseSetStream(cusparseHandle_t handle, cudaStream_t streamId)
 _cusparse_lib.cusparseSetStream.restype = ctypes.c_int
 _cusparse_lib.cusparseSetStream.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+
+# cusparseStatus_t cusparseCreate(cusparseHandle_t *handle)
+_cusparse_lib.cusparseCreate.restype = ctypes.c_int
+_cusparse_lib.cusparseCreate.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+
+# cusparseStatus_t cusparseDestroy(cusparseHandle_t handle)
+_cusparse_lib.cusparseDestroy.restype = ctypes.c_int
+_cusparse_lib.cusparseDestroy.argtypes = [ctypes.c_void_p]
+
+
+def _create_cusparse_handle():
+    handle = ctypes.c_void_p()
+    status = _cusparse_lib.cusparseCreate(ctypes.byref(handle))
+    if status != 0:
+        raise RuntimeError(f"cusparseCreate failed with status {status}")
+    return handle.value
+
+
+def _destroy_cusparse_handle(handle):
+    status = _cusparse_lib.cusparseDestroy(handle)
+    if status != 0:
+        raise RuntimeError(f"cusparseDestroy failed with status {status}")
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +172,7 @@ class SparseMatVecProduct:
         mat: cpsp.spmatrix,
         transa: bool = False,
     ):
-        self._handle = device.get_cusparse_handle()
+        self._cusparse_handle = _create_cusparse_handle()
 
         # ---- operation ----
         self._op = (
@@ -181,7 +203,7 @@ class SparseMatVecProduct:
         _alpha_placeholder = ctypes.c_double(1.0)
         _beta_placeholder = ctypes.c_double(0.0)
         buf_size = cusparse.spMV_bufferSize(
-            self._handle,
+            self._cusparse_handle,
             self._op,
             ctypes.addressof(_alpha_placeholder),
             self._mat_desc,
@@ -196,13 +218,13 @@ class SparseMatVecProduct:
         # Keep mat alive so its device buffers aren't freed.
         self._mat_ref = mat
 
-    # ------------------------------------------------------------------
     def __call__(
         self,
         x: cp.ndarray,
         y: cp.ndarray,
         alpha: float = 1.0,
         beta: float = 0.0,
+        stream_ptr: int = None,
     ) -> None:
         """Execute ``y = alpha * op(A) * x + beta * y``.
 
@@ -222,8 +244,14 @@ class SparseMatVecProduct:
             Scalar multiplier for ``op(A) * x``.  Defaults to ``1.0``.
         beta : float
             Scalar multiplier for the initial value of ``y``.  Defaults to ``0.0``.
+        stream_ptr : int, optional
+            If not None, a raw CUDA stream pointer to set for this operation.
+            If None (default), uses CuPy's current stream.
         """
-        _cusparse_lib.cusparseSetStream(self._handle, cp.cuda.get_current_stream().ptr)
+        # if not set, use the current CuPy stream
+        if stream_ptr is None:
+            stream_ptr = cp.cuda.get_current_stream().ptr
+        _cusparse_lib.cusparseSetStream(self._cusparse_handle, stream_ptr)
 
         _alpha = ctypes.c_double(alpha)
         _beta = ctypes.c_double(beta)
@@ -232,7 +260,7 @@ class SparseMatVecProduct:
         _cusparse_lib.cusparseDnVecSetValues(self._y_desc, y.data.ptr)
 
         status = _cusparse_lib.cusparseSpMV(
-            self._handle,
+            self._cusparse_handle,
             self._op,
             ctypes.addressof(_alpha),
             self._mat_desc,
@@ -246,7 +274,6 @@ class SparseMatVecProduct:
         if status != 0:
             raise RuntimeError(f"cusparseSpMV failed with status {status}")
 
-    # ------------------------------------------------------------------
     def __del__(self):
         try:
             cusparse.destroyDnVec(self._x_desc)
@@ -261,4 +288,9 @@ class SparseMatVecProduct:
         except Exception:
             pass
 
-
+        handle = getattr(self, "_cusparse_handle", None)
+        if handle is not None:
+            try:
+                _destroy_cusparse_handle(handle)
+            except Exception:
+                pass
