@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-
+import nvtx
 import cupy as cp
 
 from .data import Data
@@ -119,6 +119,7 @@ class RuizEquilibration(ABC):
         self._c_scaling_inv.fill(1.0)
         cp.copyto(self._x_b_scaling, self._x_b_scaling_init)
 
+    @nvtx.annotate("RuizEquilibration::scale_data")
     def scale_data(self, data: Data, scale_cost: bool, max_iter: int):
         """Run Ruiz equilibration iterations to scale the problem data."""
         n, p = self.n, self.p
@@ -170,6 +171,7 @@ class RuizEquilibration(ABC):
         # Scale bounds
         self._scale_bounds(data)
 
+    @nvtx.annotate("RuizEquilibration::unscale_data")
     def unscale_data(self, data: Data):
         """Reverse all scaling transformations on the problem data."""
         n, p = self.n, self.p
@@ -183,6 +185,7 @@ class RuizEquilibration(ABC):
         self._x_b_scaling *= self._delta_b_inv * d_x_inv
         self.reset()
 
+    @nvtx.annotate("RuizEquilibration::apply_scaling")
     def apply_scaling(self, data: Data):
         """Re-apply stored scaling to fresh (unscaled) data."""
         n, p = self.n, self.p
@@ -195,6 +198,7 @@ class RuizEquilibration(ABC):
         cp.copyto(data._x_b_scaling, self._x_b_scaling)
         self._scale_bounds(data)
 
+    @nvtx.annotate("RuizEquilibration::unscale_solution")
     def unscale_solution(self, result: Variables, data: Data):
         """Transform scaled IPM solution back to original coordinates.
         Matches C++ PIQP SolverBase::unscale_results()."""
