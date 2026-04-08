@@ -97,7 +97,7 @@ class SolverBase:
         self._work_reduce = cp.empty(8)  # used to hold the intermediate results of the reductions related to s_l, s_u, s_bl, s_bu and z_l, z_u, z_bl, z_bu
         
         self._update_residuals_r_kernel = create_update_residual_r_kernel(
-            self._data.n, self._data.p, self._data.num_hl, self._data.num_hu, self._data.num_xl, self._data.num_xu
+            self._data.n, self._data.p, self._data.num_hl+self._data.num_hu+self._data.num_xl+self._data.num_xu  # only n is used by the kernel; others kept for API compatibility
         )
         # Pre-allocated scalar buffers for CUDA-graph-safe norm computations in _update_residuals_nr / _update_residuals_r
         self._work_primal_rel_norm = cp.empty(1, dtype=cp.float64)  # running max of primal relative norm terms
@@ -358,14 +358,8 @@ class SolverBase:
         # eq(12) in Roland Schwan 2023 paper
         self._result.x.fill(0.0)
         self._result.y.fill(0.0)
-        self._result.s_l.fill(1.0)
-        self._result.z_l.fill(1.0)
-        self._result.s_u.fill(1.0)
-        self._result.z_u.fill(1.0)
-        self._result.s_bl.fill(1.0)
-        self._result.z_bl.fill(1.0)
-        self._result.s_bu.fill(1.0)
-        self._result.z_bu.fill(1.0)
+        self._result.s_all.fill(1.0)
+        self._result.z_all.fill(1.0)
 
         self._kkt_system.update_scalings_and_factor(
             self._data,
@@ -385,10 +379,7 @@ class SolverBase:
         cp.take(self._data.x_l, self._data.idx_xl, out=self._res.z_bl)
         self._res.z_bl *= -1.0
         cp.take(self._data.x_u, self._data.idx_xu, out=self._res.z_bu)
-        self._res.s_l[:] = 0.
-        self._res.s_u[:] = 0.
-        self._res.s_bl[:] = 0.
-        self._res.s_bu[:] = 0.
+        self._res.s_all[:] = 0.
 
         self._kkt_system.solve(self._data, self.settings, self._res, self._result)  # getting an initial point of _result
 
@@ -398,31 +389,10 @@ class SolverBase:
         if self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu > 0:
             ## ----------- keep z and s non-negative --------------
             # this is according to the IV.A part of Roland Schwan 2023 paper
-            offset = 0
-            self._work_s[offset:offset+self._data.num_hl] = self._result.s_l
-            self._work_z[offset:offset+self._data.num_hl] = self._result.z_l
-            offset += self._data.num_hl
-            self._work_s[offset:offset+self._data.num_hu] = self._result.s_u
-            self._work_z[offset:offset+self._data.num_hu] = self._result.z_u
-            offset += self._data.num_hu
-            self._work_s[offset:offset+self._data.num_xl] = self._result.s_bl
-            self._work_z[offset:offset+self._data.num_xl] = self._result.z_bl
-            offset += self._data.num_xl
-            self._work_s[offset:offset+self._data.num_xu] = self._result.s_bu
-            self._work_z[offset:offset+self._data.num_xu] = self._result.z_bu
-            offset += self._data.num_xu
-            delta_s = -cp.min(self._work_s[:offset]) # single D2H transfer
-            delta_z = -cp.min(self._work_z[:offset]) # single D2H transfer
-
-            self._result.s_l += delta_s
-            self._result.z_l += delta_z
-            self._result.s_u += delta_s
-            self._result.z_u += delta_z
-
-            self._result.s_bl += delta_s
-            self._result.z_bl += delta_z
-            self._result.s_bu += delta_s
-            self._result.z_bu += delta_z
+            delta_s = -cp.min(self._result.s_all)
+            delta_z = -cp.min(self._result.z_all)
+            self._result.s_all += delta_s
+            self._result.z_all += delta_z
 
             # need to make sure mu is positive here, otherwise in the next step (put s and z on central path) sqrt(mu) the computed z_* will be zeros
             self._calculate_mu()
@@ -432,30 +402,22 @@ class SolverBase:
                 print("Initial mu:", self._result.info.mu)
 
             # put s and z on the central path
-            # Do the following: c = z* - delta-z; z = (c + sqrt(c^2 + 4*mu)) / 2; s = z - c
-            for s, z in zip(
-                [self._result.s_l, self._result.s_u, self._result.s_bl, self._result.s_bu], 
-                [self._result.z_l, self._result.z_u, self._result.z_bl, self._result.z_bu]
-                ):
-                cp.subtract(z, delta_z, out=s)
-                cp.power(s, 2, out=z)
-                z += 4. * self._result.info.mu[0]
-                cp.sqrt(z, out=z)
-                z += s
-                z /= 2.
-                cp.subtract(z, s, out=s)
+            # c = z - delta_z; z = (c + sqrt(c^2 + 4*mu)) / 2; s = z - c
+            cp.subtract(self._result.z_all, delta_z, out=self._result.s_all)
+            cp.power(self._result.s_all, 2, out=self._result.z_all)
+            self._result.z_all += 4. * self._result.info.mu[0]
+            cp.sqrt(self._result.z_all, out=self._result.z_all)
+            self._result.z_all += self._result.s_all
+            self._result.z_all /= 2.
+            cp.subtract(self._result.z_all, self._result.s_all, out=self._result.s_all)
 
             if self.settings.debug:
                 print("self._result:", self._result)
 
             self._calculate_mu()
 
-        self._prox_vars.x[:] = self._result.x
-        self._prox_vars.y[:] = self._result.y
-        self._prox_vars.z_l[:] = self._result.z_l
-        self._prox_vars.z_u[:] = self._result.z_u
-        self._prox_vars.z_bl[:] = self._result.z_bl
-        self._prox_vars.z_bu[:] = self._result.z_bu
+        self._prox_vars.primals_all[:] = self._result.primals_all
+        self._prox_vars.duals_all[:] = self._result.duals_all
 
     @nvtx.annotate("Solver::_print_iteration_info")
     def _print_iteration_info(self):
@@ -522,14 +484,8 @@ class SolverBase:
         # Thus the predictor RHS for the slack/dual complementarity equations is - s ∘ z (elementwise product), which is exactly what the four lines set for the different constraint groups.
         # In words: those lines build the complementarity residual r_s = - s .* z so the KKT solve computes Δs, Δz satisfying S Δz + Z Δs = r_s (the linearized complementarity equation) for the predictor (affine) direction. The .array() calls implement the elementwise product s .* z.
         with nvtx.annotate("Solver::prepare_predictor_step"):
-            cp.multiply(self._result.s_l, self._result.z_l, out=self._res.s_l)
-            self._res.s_l *= -1.
-            cp.multiply(self._result.s_u, self._result.z_u, out=self._res.s_u)
-            self._res.s_u *= -1.
-            cp.multiply(self._result.s_bl, self._result.z_bl, out=self._res.s_bl)
-            self._res.s_bl *= -1.
-            cp.multiply(self._result.s_bu, self._result.z_bu, out=self._res.s_bu)
-            self._res.s_bu *= -1.
+            cp.multiply(self._result.s_all, self._result.z_all, out=self._res.s_all)
+            self._res.s_all *= -1.
             
 
         if self.settings.debug:
@@ -556,18 +512,9 @@ class SolverBase:
             # self._res.s_bl += -self._step.s_bl * self._step.z_bl + self._result.info.sigma * self._result.info.mu
             # self._res.s_bu += -self._step.s_bu * self._step.z_bu + self._result.info.sigma * self._result.info.mu
             tmp_sigma_mu = self._result.info.sigma * self._result.info.mu
-            cp.multiply(self._step.s_l, self._step.z_l, out=self._work_duals[:self._data.num_hl])
-            self._res.s_l -= self._work_duals[:self._data.num_hl]
-            self._res.s_l += tmp_sigma_mu
-            cp.multiply(self._step.s_u, self._step.z_u, out=self._work_duals[:self._data.num_hu])
-            self._res.s_u -= self._work_duals[:self._data.num_hu]
-            self._res.s_u += tmp_sigma_mu
-            cp.multiply(self._step.s_bl, self._step.z_bl, out=self._work_duals[:self._data.num_xl])
-            self._res.s_bl -= self._work_duals[:self._data.num_xl]
-            self._res.s_bl += tmp_sigma_mu
-            cp.multiply(self._step.s_bu, self._step.z_bu, out=self._work_duals[:self._data.num_xu])
-            self._res.s_bu -= self._work_duals[:self._data.num_xu]
-            self._res.s_bu += tmp_sigma_mu
+            cp.multiply(self._step.s_all, self._step.z_all, out=self._work_s)
+            self._res.s_all -= self._work_s
+            self._res.s_all += tmp_sigma_mu
 
         if self.settings.debug:
             print("corrector step rhs is: res= ", self._res)
@@ -584,16 +531,8 @@ class SolverBase:
         self._result.info.dual_step[:] = self._alpha_sz[1]
 
         # ------------------ update variables ------------------
-        self._result.x += self._result.info.primal_step * self._step.x
-        self._result.y += self._result.info.dual_step * self._step.y
-        self._result.z_l += self._result.info.dual_step * self._step.z_l
-        self._result.z_u += self._result.info.dual_step * self._step.z_u
-        self._result.z_bl += self._result.info.dual_step * self._step.z_bl
-        self._result.z_bu += self._result.info.dual_step * self._step.z_bu
-        self._result.s_l += self._result.info.primal_step * self._step.s_l
-        self._result.s_u += self._result.info.primal_step * self._step.s_u
-        self._result.s_bl += self._result.info.primal_step * self._step.s_bl
-        self._result.s_bu += self._result.info.primal_step * self._step.s_bu
+        self._result.primals_all += self._result.info.primal_step * self._step.primals_all
+        self._result.duals_all += self._result.info.dual_step * self._step.duals_all
 
         # ------------------ update mu and mu_rate for adaptive regularization ------------------
         self._mu_prev[:] = self._result.info.mu
@@ -609,63 +548,26 @@ class SolverBase:
         Compute the step length of the slack variables and dual variables. Make sure they remain non-negative.
         Vectorized implementation to minimize GPU kernel launches and synchronization.
         """
-        num_hl, num_hu, num_xl, num_xu = self._data.num_hl, self._data.num_hu, self._data.num_xl, self._data.num_xu
-        
-        # first compute alpha_s, use self._work_s to concatenate step, use self._work_z to concatenate result
-        offset = 0
-        self._work_s[offset : offset+num_hl] = self._step.s_l
-        self._work_z[offset : offset+num_hl] = self._result.s_l
-        offset += num_hl
-        self._work_s[offset:offset + num_hu] = self._step.s_u
-        self._work_z[offset:offset + num_hu] = self._result.s_u
-        offset += num_hu
-        self._work_s[offset:offset + num_xl] = self._step.s_bl
-        self._work_z[offset:offset + num_xl] = self._result.s_bl
-        offset += num_xl
-        self._work_s[offset:offset + num_xu] = self._step.s_bu
-        self._work_z[offset:offset + num_xu] = self._result.s_bu
-        offset += num_xu
+        # alpha_s: step length for slacks
+        self._work_s[:] = cp.where(self._step.s_all < 0, -self._result.s_all / self._step.s_all, 1.)
+        self._alpha_sz[0] = cp.min(self._work_s)  # alpha_s
 
-        # if step < 0, must limit alpha <= -s / step, otherwise take full step 1.0
-        self._work_s[:offset] = cp.where(self._work_s[:offset] < 0, -self._work_z[:offset] / self._work_s[:offset], 1.)
-        self._alpha_sz[0] = cp.min(self._work_s[:offset]) # alpha_s
-
-        # then compute alpha_z, use self._work_s to concatenate step, use self._work_z to concatenate result
-        offset = 0
-        self._work_z[offset : offset+num_hl] = self._step.z_l
-        self._work_s[offset : offset+num_hl] = self._result.z_l
-        offset += num_hl
-        self._work_z[offset : offset+num_hu] = self._step.z_u
-        self._work_s[offset : offset+num_hu] = self._result.z_u
-        offset += num_hu
-        self._work_z[offset : offset+num_xl] = self._step.z_bl
-        self._work_s[offset : offset+num_xl] = self._result.z_bl
-        offset += num_xl
-        self._work_z[offset : offset+num_xu] = self._step.z_bu
-        self._work_s[offset : offset+num_xu] = self._result.z_bu
-        offset += num_xu
-
-        self._work_z[:offset] = cp.where(self._work_z[:offset] < 0, -self._work_s[:offset] / self._work_z[:offset], 1.)
-        self._alpha_sz[1] = cp.min(self._work_z[:offset]) # alpha_z
+        # alpha_z: step length for duals
+        self._work_z[:] = cp.where(self._step.z_all < 0, -self._result.z_all / self._step.z_all, 1.)
+        self._alpha_sz[1] = cp.min(self._work_z)  # alpha_z
 
     @nvtx.annotate("Solver::_calculate_mu")
     @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
     def _calculate_mu(self) -> None:
-        cp.dot(self._result.s_l, self._result.z_l, out=self._work_reduce[0:1])
-        cp.dot(self._result.s_u, self._result.z_u, out=self._work_reduce[1:2])
-        cp.dot(self._result.s_bl, self._result.z_bl, out=self._work_reduce[2:3])
-        cp.dot(self._result.s_bu, self._result.z_bu, out=self._work_reduce[3:4])
-        cp.sum(self._work_reduce[0:4], out=self._result.info.mu[:], keepdims=True)
+        cp.dot(self._result.s_all, self._result.z_all, out=self._result.info.mu[:])
         self._result.info.mu /= (self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)
 
     @nvtx.annotate("Solver::_calculate_sigma")
     @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
     def _calculate_sigma(self) -> None:        
-        self._result.info.sigma[:] = 0.
-        self._result.info.sigma += cp.dot(self._result.s_l + self._alpha_sz[0] * self._step.s_l, self._result.z_l + self._alpha_sz[1] * self._step.z_l)
-        self._result.info.sigma += cp.dot(self._result.s_u + self._alpha_sz[0] * self._step.s_u, self._result.z_u + self._alpha_sz[1] * self._step.z_u)
-        self._result.info.sigma += cp.dot(self._result.s_bl + self._alpha_sz[0] * self._step.s_bl, self._result.z_bl + self._alpha_sz[1] * self._step.z_bl)
-        self._result.info.sigma += cp.dot(self._result.s_bu + self._alpha_sz[0] * self._step.s_bu, self._result.z_bu + self._alpha_sz[1] * self._step.z_bu)        
+        cp.dot(self._result.s_all + self._alpha_sz[0] * self._step.s_all,
+               self._result.z_all + self._alpha_sz[1] * self._step.z_all,
+               out=self._result.info.sigma)
         cp.divide(self._result.info.sigma, self._result.info.mu, out=self._result.info.sigma)
         self._result.info.sigma /= self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu
         cp.clip(self._result.info.sigma, 0., 1., out=self._result.info.sigma)
@@ -902,10 +804,10 @@ class SolverBase:
                 dim=self._data.n + self._data.p + self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu,
                 inputs=[
                     self._result.info.rho, self._result.info.delta,
-                    self._res_nr.x, self._res_nr.y, self._res_nr.z_l, self._res_nr.z_u, self._res_nr.z_bl, self._res_nr.z_bu,
-                    self._result.x, self._result.y, self._result.z_l, self._result.z_u, self._result.z_bl, self._result.z_bu,
-                    self._prox_vars.x, self._prox_vars.y, self._prox_vars.z_l, self._prox_vars.z_u, self._prox_vars.z_bl, self._prox_vars.z_bu,
-                    self._res.x, self._res.y, self._res.z_l, self._res.z_u, self._res.z_bl, self._res.z_bu
+                    self._res_nr.x, self._res_nr.duals_all,
+                    self._result.x, self._result.duals_all,
+                    self._prox_vars.x, self._prox_vars.duals_all,
+                    self._res.x, self._res.duals_all
                 ],
                 device="cuda",
                 stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr)
@@ -914,21 +816,9 @@ class SolverBase:
             cp.subtract(self._result.x, self._prox_vars.x, out=self._res.x)
             self._res.x *= self._result.info.rho
             cp.subtract(self._res_nr.x, self._res.x, out=self._res.x)
-            cp.subtract(self._prox_vars.y, self._result.y, out=self._res.y)
-            self._res.y *= self._result.info.delta
-            cp.subtract(self._res_nr.y, self._res.y, out=self._res.y)
-            cp.subtract(self._prox_vars.z_l, self._result.z_l, out=self._res.z_l)
-            self._res.z_l *= self._result.info.delta
-            cp.subtract(self._res_nr.z_l, self._res.z_l, out=self._res.z_l)
-            cp.subtract(self._prox_vars.z_u, self._result.z_u, out=self._res.z_u)
-            self._res.z_u *= self._result.info.delta
-            cp.subtract(self._res_nr.z_u, self._res.z_u, out=self._res.z_u)
-            cp.subtract(self._prox_vars.z_bl, self._result.z_bl, out=self._res.z_bl)
-            self._res.z_bl *= self._result.info.delta
-            cp.subtract(self._res_nr.z_bl, self._res.z_bl, out=self._res.z_bl)
-            cp.subtract(self._prox_vars.z_bu, self._result.z_bu, out=self._res.z_bu)
-            self._res.z_bu *= self._result.info.delta
-            cp.subtract(self._res_nr.z_bu, self._res.z_bu, out=self._res.z_bu)
+            cp.subtract(self._prox_vars.duals_all, self._result.duals_all, out=self._res.duals_all)
+            self._res.duals_all *= self._result.info.delta
+            cp.subtract(self._res_nr.duals_all, self._res.duals_all, out=self._res.duals_all)
 
         self._result.info.primal_res_reg[:] = self._primal_res_r()
         # primal_rel_scaling = self._result.info.primal_res / self._result.info.primal_res_rel if self._result.info.primal_res_rel > 0 else 1.
@@ -1014,18 +904,9 @@ class SolverBase:
     
     @nvtx.annotate("Solver::_primal_prox_inf")
     def _primal_prox_inf(self) -> float:
-        cp.subtract(self._result.y, self._prox_vars.y, out=self._work_duals[:self._data.p])
-        offset = self._data.p
-        cp.subtract(self._result.z_l, self._prox_vars.z_l, out=self._work_duals[offset : offset+self._data.num_hl])
-        offset += self._data.num_hl
-        cp.subtract(self._result.z_u, self._prox_vars.z_u, out=self._work_duals[offset : offset+self._data.num_hu])
-        offset += self._data.num_hu
-        cp.subtract(self._result.z_bl, self._prox_vars.z_bl, out=self._work_duals[offset : offset+self._data.num_xl])
-        offset += self._data.num_xl
-        cp.subtract(self._result.z_bu, self._prox_vars.z_bu, out=self._work_duals[offset : offset+self._data.num_xu])
-        offset += self._data.num_xu
-        cp.absolute(self._work_duals[:offset], out=self._work_duals[:offset])
-        cp.max(self._work_duals[:offset], out=self._work_residual)
+        cp.subtract(self._result.duals_all, self._prox_vars.duals_all, out=self._work_duals)
+        cp.absolute(self._work_duals, out=self._work_duals)
+        cp.max(self._work_duals, out=self._work_residual)
         return self._work_residual
 
     @nvtx.annotate("Solver::_dual_prox_inf")
@@ -1051,11 +932,7 @@ class SolverBase:
         if self._result.info.primal_res < 0.95 * self._result.info.prev_primal_res or \
             (self._result.info.primal_res < self.settings.eps_abs or self._result.info.primal_res_rel < self.settings.eps_rel) or \
             (self._result.info.delta == self.settings.reg_finetune_lower_limit and self._result.info.primal_prox_inf < self.settings.infeasibility_threshold):
-            self._prox_vars.y[:] = self._result.y
-            self._prox_vars.z_l[:] = self._result.z_l
-            self._prox_vars.z_u[:] = self._result.z_u
-            self._prox_vars.z_bu[:] = self._result.z_bu
-            self._prox_vars.z_bl[:] = self._result.z_bl
+            self._prox_vars.duals_all[:] = self._result.duals_all
             self._result.info.delta[:] = cp.maximum(self._result.info.reg_limit, (1. - self._mu_rate) * self._result.info.delta)
         else:
             self._result.info.no_dual_update += 1
@@ -1087,70 +964,34 @@ class SolverBase:
 
 
 
-def create_update_residual_r_kernel(n: int, p: int, num_hl: int, num_hu: int, num_xl: int, num_xu: int):
+def create_update_residual_r_kernel(n: int, p: int, num_ineq: int):
     """
-    Perform the following operations:
-        self._res.x[:] = self._res_nr.x - self._result.info.rho * (self._result.x - self._prox_vars.x)
-        self._res.y[:] = self._res_nr.y - self._result.info.delta * (self._prox_vars.y - self._result.y)
-        self._res.z_l[:] = self._res_nr.z_l - self._result.info.delta * (self._prox_vars.z_l - self._result.z_l)
-        self._res.z_u[:] = self._res_nr.z_u - self._result.info.delta * (self._prox_vars.z_u - self._result.z_u)
-        self._res.z_bl[:] = self._res_nr.z_bl - self._result.info.delta * (self._prox_vars.z_bl - self._result.z_bl)
-        self._res.z_bu[:] = self._res_nr.z_bu - self._result.info.delta * (self._prox_vars.z_bu - self._result.z_bu)
+    Perform the following operations using contiguous duals_all = [y | z_l | z_u | z_bl | z_bu]:
+        res.x         = res_nr.x         - rho   * (result.x         - prox.x)
+        res.duals_all = res_nr.duals_all + delta * (result.duals_all - prox.duals_all)
     """
     @wp.kernel
     def update_residual_r_kernel(
         rho: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
         delta: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
         res_nr_x: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        res_nr_y: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        res_nr_z_l: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        res_nr_z_u: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        res_nr_z_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        res_nr_z_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        res_nr_dual: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
         result_x: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        result_y: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        result_z_l: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        result_z_u: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        result_z_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        result_z_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        prox_var_x: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        prox_var_y: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        prox_var_z_l: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        prox_var_z_u: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        prox_var_z_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        prox_var_z_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        result_dual: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        prox_x: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        prox_dual: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
         res_r_x: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        res_r_y: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        res_r_z_l: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        res_r_z_u: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        res_r_z_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        res_r_z_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
+        res_r_dual: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
     ):
         t = wp.tid()
         n_static = wp.static(n)
-        p_static = wp.static(p)
-        num_hl_static = wp.static(num_hl)
-        num_hu_static = wp.static(num_hu)
-        num_xl_static = wp.static(num_xl)
-        num_xu_static = wp.static(num_xu)
+        num_duals_static = wp.static(p + num_ineq)
 
         if t < n_static:
-            res_r_x[t] = -rho[0] * (result_x[t] - prox_var_x[t]) + res_nr_x[t]
-        elif t < n_static + p_static:
+            res_r_x[t] = -rho[0] * (result_x[t] - prox_x[t]) + res_nr_x[t]
+        elif t < n_static + num_duals_static:
             idx = t - n_static
-            res_r_y[idx] = delta[0] * (result_y[idx] - prox_var_y[idx]) + res_nr_y[idx]
-        elif t < n_static + p_static + num_hl_static:
-            idx = t - n_static - p_static
-            res_r_z_l[idx] = delta[0] * (result_z_l[idx] - prox_var_z_l[idx]) + res_nr_z_l[idx]
-        elif t < n_static + p_static + num_hl_static + num_hu_static:
-            idx = t - n_static - p_static - num_hl_static
-            res_r_z_u[idx] = delta[0] * (result_z_u[idx] - prox_var_z_u[idx]) + res_nr_z_u[idx]
-        elif t < n_static + p_static + num_hl_static + num_hu_static + num_xl_static:
-            idx = t - n_static - p_static - num_hl_static - num_hu_static
-            res_r_z_bl[idx] = delta[0] * (result_z_bl[idx] - prox_var_z_bl[idx]) + res_nr_z_bl[idx]
-        elif t < n_static + p_static + num_hl_static + num_hu_static + num_xl_static + num_xu_static:
-            idx = t - n_static - p_static - num_hl_static - num_hu_static - num_xl_static
-            res_r_z_bu[idx] = delta[0] * (result_z_bu[idx] - prox_var_z_bu[idx]) + res_nr_z_bu[idx]
+            res_r_dual[idx] = delta[0] * (result_dual[idx] - prox_dual[idx]) + res_nr_dual[idx]
         else:
             return
 
