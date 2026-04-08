@@ -90,7 +90,6 @@ class SolverBase:
 
         self._work_z = cp.empty(self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)  # used in _calculate_step to hold all concatenated slack or dual steps / results
         self._work_s = cp.empty(self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)  # used in _calculate_step to hold all concatenated slack or dual steps / results
-        self._alpha_sz = cp.empty(2) # step lengths of slack and dual variables [alpha_s, alpha_z]
         self._work_primals = cp.empty(self._data.n)
         self._work_duals = cp.empty(self._data.p + self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)  # used to hold the concatenated dual variables for computing the residuals in _update_residuals_nr
         self._work_residual = cp.empty(())
@@ -499,9 +498,6 @@ class SolverBase:
         # step in the non-negative orthant
         self._calculate_step()
 
-        # avoid getting too close to the boundary
-        self._alpha_sz *= self.settings.tau
-
         # ------------------ compute centering parameter sigma ------------------
         self._calculate_sigma()
 
@@ -525,21 +521,19 @@ class SolverBase:
 
         # step in the non-negative orthant
         self._calculate_step()
-        # avoid getting too close to the boundary
-        self._alpha_sz *= self.settings.tau
-        self._result.info.primal_step[:] = self._alpha_sz[0]
-        self._result.info.dual_step[:] = self._alpha_sz[1]
-
-        # ------------------ update variables ------------------
-        self._result.primals_all += self._result.info.primal_step * self._step.primals_all
-        self._result.duals_all += self._result.info.dual_step * self._step.duals_all
-
-        # ------------------ update mu and mu_rate for adaptive regularization ------------------
-        self._mu_prev[:] = self._result.info.mu
+        self._update_vars_after_corrector_step()
         self._calculate_mu()
         cp.subtract(self._mu_prev, self._result.info.mu, out=self._mu_rate)
         cp.divide(self._mu_rate, self._mu_prev, out=self._mu_rate)
         cp.maximum(self._mu_rate, 0., out=self._mu_rate)
+
+    @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
+    def _update_vars_after_corrector_step(self):
+        # ------------------ update variables ------------------
+        self._result.primals_all += self._result.info.primal_step * self._step.primals_all
+        self._result.duals_all += self._result.info.dual_step * self._step.duals_all
+        # ------------------ update mu and mu_rate for adaptive regularization ------------------
+        self._mu_prev[:] = self._result.info.mu
 
     @nvtx.annotate("Solver::_calculate_step")
     @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
@@ -550,11 +544,13 @@ class SolverBase:
         """
         # alpha_s: step length for slacks
         self._work_s[:] = cp.where(self._step.s_all < 0, -self._result.s_all / self._step.s_all, 1.)
-        self._alpha_sz[0] = cp.min(self._work_s)  # alpha_s
+        self._result.info.primal_step[:] = cp.min(self._work_s)  # alpha_s
+        self._result.info.primal_step *= self.settings.tau  # avoid getting too close to the boundary
 
         # alpha_z: step length for duals
         self._work_z[:] = cp.where(self._step.z_all < 0, -self._result.z_all / self._step.z_all, 1.)
-        self._alpha_sz[1] = cp.min(self._work_z)  # alpha_z
+        self._result.info.dual_step[:] = cp.min(self._work_z)  # alpha_z
+        self._result.info.dual_step *= self.settings.tau  # avoid getting too close to the boundary
 
     @nvtx.annotate("Solver::_calculate_mu")
     @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
@@ -565,8 +561,8 @@ class SolverBase:
     @nvtx.annotate("Solver::_calculate_sigma")
     @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
     def _calculate_sigma(self) -> None:        
-        cp.dot(self._result.s_all + self._alpha_sz[0] * self._step.s_all,
-               self._result.z_all + self._alpha_sz[1] * self._step.z_all,
+        cp.dot(self._result.s_all + self._result.info.primal_step * self._step.s_all,
+               self._result.z_all + self._result.info.dual_step * self._step.z_all,
                out=self._result.info.sigma)
         cp.divide(self._result.info.sigma, self._result.info.mu, out=self._result.info.sigma)
         self._result.info.sigma /= self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu
