@@ -1,6 +1,8 @@
 import cupy as cp
-from enum import Enum
+import numpy as np
+from enum import Enum, IntEnum, auto
 from dataclasses import dataclass
+import nvtx
 
 from .data import Data
 
@@ -181,50 +183,85 @@ class Variables:
         self._s_bu[:] = cp.random.rand(*self._s_bu.shape) + 1.0
         self._s_bl[:] = cp.random.rand(*self._s_bl.shape) + 1.0
     
-@dataclass
-class Info:
-    status: Status = Status.PIQP_UNSOLVED
+class InfoIdx(IntEnum):
+    """Index mapping for the contiguous Info scalar buffer."""
+    def _generate_next_value_(name, start, count, last_values):
+        return count   # 0, 1, 2, ...
 
-    iter: int = 0
-    rho: cp.ndarray = None # using array to allow in-place updates without CUDA graph cache misses
-    delta: cp.ndarray = None
-    mu: cp.ndarray = None
-    sigma: cp.ndarray = None
-    primal_step: cp.ndarray = None
-    dual_step: cp.ndarray = None
-    
-    primal_res: cp.ndarray = None
-    primal_res_rel: cp.ndarray = None
-    dual_res: cp.ndarray = None
-    dual_res_rel: cp.ndarray = None
-    
-    primal_res_reg: cp.ndarray = None
-    primal_res_reg_rel: cp.ndarray = None  # relative primal residual with regularization
-    dual_res_reg: cp.ndarray = None
-    dual_res_reg_rel: cp.ndarray = None
-    
-    primal_prox_inf: cp.ndarray = None
-    dual_prox_inf: cp.ndarray = None
-    
-    prev_primal_res: cp.ndarray = None  # primal residual from previous iteration
-    prev_dual_res: cp.ndarray = None  # dual residual from previous iteration
-    
-    primal_obj: cp.ndarray = None
-    dual_obj: cp.ndarray = None
-    duality_gap: cp.ndarray = None      # duality gap
-    duality_gap_rel: cp.ndarray = None  # relative duality gap
-    
-    factor_retires: int = 0
-    reg_limit: cp.ndarray = None
-    no_primal_update: int = 0  # dual infeasibility detection counter
-    no_dual_update: int = 0    # primal infeasibility detection counter
-    
-    setup_time: cp.ndarray = None
-    update_time: cp.ndarray = None
-    solve_time: cp.ndarray = None
-    kkt_factor_time: cp.ndarray = None
-    kkt_solve_time: cp.ndarray = None
-    run_time: cp.ndarray = None
+    rho = auto()
+    delta = auto()
+    mu = auto()
+    sigma = auto()
+    primal_step = auto()
+    dual_step = auto()
+    primal_res = auto()
+    primal_res_rel = auto()
+    dual_res = auto()
+    dual_res_rel = auto()
+    primal_res_reg = auto()
+    primal_res_reg_rel = auto()
+    dual_res_reg = auto()
+    dual_res_reg_rel = auto()
+    primal_prox_inf = auto()
+    dual_prox_inf = auto()
+    prev_primal_res = auto()
+    prev_dual_res = auto()
+    primal_obj = auto()
+    dual_obj = auto()
+    duality_gap = auto()
+    duality_gap_rel = auto()
+    reg_limit = auto()
+    setup_time = auto()
+    update_time = auto()
+    solve_time = auto()
+    kkt_factor_time = auto()
+    kkt_solve_time = auto()
+    run_time = auto()
+
+class Info:
+    """
+    Solver info scalars stored in single contiguous GPU buffer.
+    """
+    # auto-generate properties from InfoIdx: getter returns array view, setter copies in-place
+    for idx in InfoIdx:
+        def _make(i=idx):
+            def getter(self):
+                return self._views[i]
+            def setter(self, value): 
+                self._views[i][:] = value
+            return property(getter, setter)
+        locals()[idx.name] = _make()
+    del idx, _make
+
+    def __init__(self):
+        self.status: Status = Status.PIQP_UNSOLVED
+        self.iter: int = 0
+        self.factor_retires: int = 0
+        self.no_primal_update: int = 0  # dual infeasibility detection counter
+        self.no_dual_update: int = 0    # primal infeasibility detection counter
+
+    def init(self):
+        self._buffer = cp.zeros(len(InfoIdx), dtype=cp.float64)  # one contiguous GPU buffer for all scalar fields
+        self._views = tuple(self._buffer[i:i+1] for i in range(len(InfoIdx)))
+
+    @nvtx.annotate("Info:to_host")
+    def to_host(self, info_host: 'InfoHost'):
+        cp.asnumpy(self._buffer, out=info_host._buffer)
+
+
+class InfoHost:
+    """
+    A mirror of Info on the host side (CPU). The purpose is to fetch all device-side info to host all at once, instead of multiple time to reduce overhead.
+    """
+    __slots__ = ('_buffer',)
+
+    # auto-generate read-only properties from InfoIdx
+    for _idx in InfoIdx:
+        locals()[_idx.name] = property(lambda self, i=_idx: self._buffer[i])
+    del _idx
+
+    def __init__(self):
+        self._buffer = np.empty(len(InfoIdx))
 
 
 class Result(Variables):
@@ -234,32 +271,4 @@ class Result(Variables):
 
     def init(self, data: Data):
         super().init(data)
-        self.info.rho = cp.zeros(1, dtype=cp.float64)
-        self.info.delta = cp.zeros(1, dtype=cp.float64)
-        self.info.mu = cp.zeros(1, dtype=cp.float64)
-        self.info.sigma = cp.zeros(1, dtype=cp.float64)
-        self.info.primal_step = cp.zeros(1, dtype=cp.float64)
-        self.info.dual_step = cp.zeros(1, dtype=cp.float64)
-        self.info.primal_res = cp.zeros(1, dtype=cp.float64)
-        self.info.primal_res_rel = cp.zeros(1, dtype=cp.float64)
-        self.info.dual_res = cp.zeros(1, dtype=cp.float64)
-        self.info.dual_res_rel = cp.zeros(1, dtype=cp.float64)
-        self.info.primal_res_reg = cp.zeros(1, dtype=cp.float64)
-        self.info.primal_res_reg_rel = cp.zeros(1, dtype=cp.float64)
-        self.info.dual_res_reg = cp.zeros(1, dtype=cp.float64)
-        self.info.dual_res_reg_rel = cp.zeros(1, dtype=cp.float64)
-        self.info.primal_prox_inf = cp.zeros(1, dtype=cp.float64)
-        self.info.dual_prox_inf = cp.zeros(1, dtype=cp.float64)
-        self.info.prev_primal_res = cp.zeros(1, dtype=cp.float64)
-        self.info.prev_dual_res = cp.zeros(1, dtype=cp.float64)
-        self.info.primal_obj = cp.zeros(1, dtype=cp.float64)
-        self.info.dual_obj = cp.zeros(1, dtype=cp.float64)
-        self.info.duality_gap = cp.zeros(1, dtype=cp.float64)
-        self.info.duality_gap_rel = cp.zeros(1, dtype=cp.float64)
-        self.info.reg_limit = cp.zeros(1, dtype=cp.float64)
-        self.info.setup_time = cp.zeros(1, dtype=cp.float64)
-        self.info.update_time = cp.zeros(1, dtype=cp.float64)
-        self.info.solve_time = cp.zeros(1, dtype=cp.float64)
-        self.info.kkt_factor_time = cp.zeros(1, dtype=cp.float64)
-        self.info.kkt_solve_time = cp.zeros(1, dtype=cp.float64)
-        self.info.run_time = cp.zeros(1, dtype=cp.float64)
+        self.info.init()

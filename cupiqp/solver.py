@@ -5,7 +5,7 @@ import nvtx
 
 from .settings import Settings
 from .data import Data
-from .results import Result, Status, Variables
+from .results import Result, Status, Variables, InfoHost
 from .kkt_systems import KKTSystem
 from .preconditioner import RuizEquilibration
 from .utils import cuda_graph_capture
@@ -84,6 +84,7 @@ class SolverBase:
         self._prox_vars.init(self._data)
 
         self._kkt_system.init(self._data, self.settings)
+        self._info_host = InfoHost()
 
         self._work_z_1 = cp.empty(self._data.m)  # used to store intermediate results in _update_residuals_nr
         self._work_z_2 = cp.empty(self._data.m)  # used to store intermediate results in _update_residuals_nr
@@ -275,26 +276,32 @@ class SolverBase:
                     self._result.info.prev_primal_res[:] = self._result.info.primal_res
                     self._result.info.prev_dual_res[:] = self._result.info.dual_res
 
-                # ? The convergence criteria seems different from the one in the paper
-                if ((self._result.info.primal_res < self.settings.eps_abs or self._result.info.primal_res_rel < self.settings.eps_rel) and
-                    (self._result.info.dual_res < self.settings.eps_abs or self._result.info.dual_res_rel < self.settings.eps_rel) and
-                    (not self.settings.check_duality_gap or self._result.info.duality_gap < self.settings.eps_duality_gap_abs or self._result.info.duality_gap_rel < self.settings.eps_duality_gap_rel)):
+                self._update_residuals_r()
+
+                # fetch all info to host all at once, at the cost of one D2H memcpy
+                self._result.info.to_host(self._info_host)
+                info_host = self._info_host
+
+                # Convergence check
+                if ((info_host.primal_res < self.settings.eps_abs or info_host.primal_res_rel < self.settings.eps_rel) and
+                    (info_host.dual_res < self.settings.eps_abs or info_host.dual_res_rel < self.settings.eps_rel) and
+                    (not self.settings.check_duality_gap or info_host.duality_gap < self.settings.eps_duality_gap_abs or info_host.duality_gap_rel < self.settings.eps_duality_gap_rel)):
                     self._result.info.status = Status.PIQP_SOLVED
                     self._preconditioner.unscale_solution(self._result, self._data)
                     return self._result.info.status
-                
-                self._update_residuals_r()
 
-                if (self._result.info.no_dual_update > cp.minimum(5., self.settings.reg_finetune_dual_update_threshold) and
-                    self._result.info.primal_prox_inf > self.settings.infeasibility_threshold and
-                    (self._result.info.primal_res_reg < self.settings.eps_abs or self._result.info.primal_res_reg_rel < self.settings.eps_rel)):
+                # Primal infeasibility check
+                if (self._result.info.no_dual_update > min(5., self.settings.reg_finetune_dual_update_threshold) and
+                    info_host.primal_prox_inf > self.settings.infeasibility_threshold and
+                    (info_host.primal_res_reg < self.settings.eps_abs or info_host.primal_res_reg_rel < self.settings.eps_rel)):
                     self._result.info.status = Status.PIQP_PRIMAL_INFEASIBLE
                     self._preconditioner.unscale_solution(self._result, self._data)
                     return self._result.info.status
-                
-                if (self._result.info.no_primal_update > cp.minimum(5., self.settings.reg_finetune_primal_update_threshold) and
-                    self._result.info.dual_prox_inf > self.settings.infeasibility_threshold and
-                    (self._result.info.dual_res_reg < self.settings.eps_abs or self._result.info.dual_res_reg_rel < self.settings.eps_rel)):
+
+                # Dual infeasibility check
+                if (self._result.info.no_primal_update > min(5., self.settings.reg_finetune_primal_update_threshold) and
+                    info_host.dual_prox_inf > self.settings.infeasibility_threshold and
+                    (info_host.dual_res_reg < self.settings.eps_abs or info_host.dual_res_reg_rel < self.settings.eps_rel)):
                     self._result.info.status = Status.PIQP_DUAL_INFEASIBLE
                     self._preconditioner.unscale_solution(self._result, self._data)
                     return self._result.info.status
