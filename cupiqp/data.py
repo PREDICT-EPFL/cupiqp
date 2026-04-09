@@ -1,26 +1,25 @@
 from typing import Any
 from abc import ABC, abstractmethod
-import cupy as cp
+import torch
 from typing import Optional, Union
-import cupyx.scipy.sparse as sp
 
 from .typedef import PIQP_INF
 
-ArrayLike = Union[cp.ndarray, sp.spmatrix]
+ArrayLike = Union[torch.Tensor, Any]
 
 
 class Data(ABC):
-    def __init__(self, 
-                 P: ArrayLike, 
-                 c: ArrayLike, 
-                 A: Optional[ArrayLike] = None, 
-                 b: Optional[ArrayLike] = None, 
-                 G: Optional[ArrayLike] = None, 
-                 h_u: Optional[ArrayLike] = None, 
-                 h_l: Optional[ArrayLike] = None, 
-                 x_u: Optional[ArrayLike] = None, 
+    def __init__(self,
+                 P: ArrayLike,
+                 c: ArrayLike,
+                 A: Optional[ArrayLike] = None,
+                 b: Optional[ArrayLike] = None,
+                 G: Optional[ArrayLike] = None,
+                 h_u: Optional[ArrayLike] = None,
+                 h_l: Optional[ArrayLike] = None,
+                 x_u: Optional[ArrayLike] = None,
                  x_l: Optional[ArrayLike] = None):
-                
+
         if P.ndim != 2 or P.shape[0] != P.shape[1]:
             raise ValueError("P must be a square matrix.")
         if c.ndim != 1:
@@ -29,7 +28,7 @@ class Data(ABC):
             raise ValueError("Dimension mismatch between P and c.")
         self._P = self._as_float64_mat(P)
         self._c = self._as_float64_vec(c)
-        
+
         if A is not None and b is not None:
             if A.ndim != 2:
                 raise ValueError("A must be a two-dimensional array.")
@@ -39,15 +38,15 @@ class Data(ABC):
                 raise ValueError("Dimension mismatch between A and b.")
         self._A = self._as_float64_mat(A)
         self._b = self._as_float64_vec(b)
-        
+
         if G is not None:
             if G.ndim != 2:
                 raise ValueError("G must be a two-dimensional array.")
             if h_l is None and h_u is None:
                 raise ValueError("Either h_l or h_u should be provided.")
-            if h_l is not None and cp.shape(h_l) != (G.shape[0],):
+            if h_l is not None and tuple(h_l.shape) != (G.shape[0],):
                 raise ValueError(f"h_l must have shape {(G.shape[0],)}, got {h_l.shape}")
-            if h_u is not None and cp.shape(h_u) != (G.shape[0],):
+            if h_u is not None and tuple(h_u.shape) != (G.shape[0],):
                 raise ValueError(f"h_u must have shape {(G.shape[0],)}, got {h_u.shape}")
         else:
             if h_u is not None or h_l is not None:
@@ -68,8 +67,8 @@ class Data(ABC):
     def _as_float64_mat(self, M: Union[Any, None]) -> Any:
         pass
 
-    def _as_float64_vec(self, v: Union[cp.ndarray, None]) -> cp.ndarray:
-        return v.astype(cp.float64) if v is not None else cp.zeros((0,), dtype=cp.float64)
+    def _as_float64_vec(self, v: Union[torch.Tensor, None]) -> torch.Tensor:
+        return v.to(dtype=torch.float64) if v is not None else torch.zeros(0, dtype=torch.float64, device='cuda')
 
     def _finalize(self):
         """Shared post-init: preprocessing + constraints RHS norm.
@@ -78,8 +77,8 @@ class Data(ABC):
         _G, _h_l, _h_u, _x_l, _x_u have been populated.
         """
         self._preprocess()
-        self._x_b_scaling = cp.ones(self.n, dtype=cp.float64)  # diagonal scaling for box constraints
-        self._constraints_rhs_inf_norm = cp.empty(1, dtype=cp.float64)
+        self._x_b_scaling = torch.ones(self.n, dtype=torch.float64, device='cuda')  # diagonal scaling for box constraints
+        self._constraints_rhs_inf_norm = torch.empty(1, dtype=torch.float64, device='cuda')
         self._compute_constraints_rhs_inf_norm()
 
     def _preprocess(self):
@@ -99,18 +98,18 @@ class Data(ABC):
         inf_norm = self._constraints_rhs_inf_norm
         inf_norm[:] = 0.
         if self.p > 0:
-            cp.maximum(inf_norm, cp.linalg.norm(self.b, ord=cp.inf), out=inf_norm)
+            torch.maximum(inf_norm, torch.linalg.norm(self.b, ord=float('inf')).unsqueeze(0), out=inf_norm)
         if self.num_hu > 0:
-            cp.maximum(inf_norm, cp.linalg.norm(self.h_u[self.idx_hu], ord=cp.inf), out=inf_norm)
+            torch.maximum(inf_norm, torch.linalg.norm(self.h_u[self.idx_hu.long()], ord=float('inf')).unsqueeze(0), out=inf_norm)
         if self.num_hl > 0:
-            cp.maximum(inf_norm, cp.linalg.norm(self.h_l[self.idx_hl], ord=cp.inf), out=inf_norm)
+            torch.maximum(inf_norm, torch.linalg.norm(self.h_l[self.idx_hl.long()], ord=float('inf')).unsqueeze(0), out=inf_norm)
         if self.num_xu > 0:
-            cp.maximum(inf_norm, cp.linalg.norm(self.x_u[self.idx_xu], ord=cp.inf), out=inf_norm)
+            torch.maximum(inf_norm, torch.linalg.norm(self.x_u[self.idx_xu.long()], ord=float('inf')).unsqueeze(0), out=inf_norm)
         if self.num_xl > 0:
-            cp.maximum(inf_norm, cp.linalg.norm(self.x_l[self.idx_xl], ord=cp.inf), out=inf_norm)
+            torch.maximum(inf_norm, torch.linalg.norm(self.x_l[self.idx_xl.long()], ord=float('inf')).unsqueeze(0), out=inf_norm)
 
     @abstractmethod
-    def extract_P_diag(self, diag_P: cp.ndarray) -> None:
+    def extract_P_diag(self, diag_P: torch.Tensor) -> None:
         """Extract the diagonal of P into diag_P
         """
         pass
@@ -192,96 +191,96 @@ class Data(ABC):
     @abstractmethod
     def set_x_u(self, value: Any, check: bool = True):
         pass
-    
+
     @property
     def n(self):
         """Number of variables."""
         return self._P.shape[0]
-    
+
     @property
     def p(self):
         """Number of equality constraints."""
         return self._A.shape[0]
-    
+
     @property
     def m(self):
         """Number of inequality constraints."""
         return self._G.shape[0]
-    
+
     @property
     def num_hl(self):
         """Number of lower inequality constraints."""
-        return cp.size(self._idx_hl)
-    
+        return self._idx_hl.numel()
+
     @property
     def idx_hl(self):
         """Indices of lower inequality constraints."""
         return self._idx_hl
-    
+
     @property
     def num_hu(self):
         """Number of upper inequality constraints."""
-        return cp.size(self._idx_hu)
-    
+        return self._idx_hu.numel()
+
     @property
     def idx_hu(self):
         """Indices of upper inequality constraints."""
         return self._idx_hu
-    
+
     @property
     def num_xl(self):
         """Number of lower bound constraints."""
-        return cp.size(self._idx_xl)
-    
+        return self._idx_xl.numel()
+
     @property
     def idx_xl(self):
         """Indices of lower bound constraints."""
         return self._idx_xl
-    
+
     @property
     def num_xu(self):
         """Number of upper bound constraints."""
-        return cp.size(self._idx_xu)
-    
+        return self._idx_xu.numel()
+
     @property
     def idx_xu(self):
         """Indices of upper bound constraints."""
         return self._idx_xu
-    
+
     def _init_h_l(self):
         if self._h_l is not None:
-            self._idx_hl = cp.where(self._h_l > -PIQP_INF)[0].astype(cp.int32)
+            self._idx_hl = torch.where(self._h_l > -PIQP_INF)[0].to(torch.int32)
         else:
-            self._idx_hl = cp.empty((0,), dtype=cp.int32)
-            self._h_l = -2 * PIQP_INF * cp.ones((self.m,), dtype=cp.float64)
+            self._idx_hl = torch.empty(0, dtype=torch.int32, device='cuda')
+            self._h_l = -2 * PIQP_INF * torch.ones(self.m, dtype=torch.float64, device='cuda')
 
     def _init_h_u(self):
         if self._h_u is not None:
-            self._idx_hu = cp.where(self._h_u < PIQP_INF)[0].astype(cp.int32)
+            self._idx_hu = torch.where(self._h_u < PIQP_INF)[0].to(torch.int32)
         else:
-            self._idx_hu = cp.empty((0,), dtype=cp.int32)
-            self._h_u = 2 * PIQP_INF * cp.ones((self.m,), dtype=cp.float64)
-        
+            self._idx_hu = torch.empty(0, dtype=torch.int32, device='cuda')
+            self._h_u = 2 * PIQP_INF * torch.ones(self.m, dtype=torch.float64, device='cuda')
+
     def disable_inf_constraints(self):
         """
         For inequalities like -inf < g'x < +inf, set g to 0 and upper/lower bound to +1/-1
         """
         for i in range(self.m):
             if self._h_l[i] <= -PIQP_INF and self._h_u[i] >= PIQP_INF:
-                self._G[i, :] = cp.zeros((self.n))
+                self._G[i, :] = torch.zeros(self.n, device='cuda')
                 self._h_l[i] = -1.
                 self._h_u[i] = 1.
-        
+
     def _init_x_l(self):
         if self._x_l is not None:
-            self._idx_xl = cp.where(self._x_l > -PIQP_INF)[0].astype(cp.int32)
+            self._idx_xl = torch.where(self._x_l > -PIQP_INF)[0].to(torch.int32)
         else:
-            self._idx_xl = cp.empty((0,), dtype=cp.int32)
-            self._x_l = -2 * PIQP_INF * cp.ones((self.n,), dtype=cp.float64)
+            self._idx_xl = torch.empty(0, dtype=torch.int32, device='cuda')
+            self._x_l = -2 * PIQP_INF * torch.ones(self.n, dtype=torch.float64, device='cuda')
 
     def _init_x_u(self):
         if self._x_u is not None:
-            self._idx_xu = cp.where(self._x_u < PIQP_INF)[0].astype(cp.int32)
+            self._idx_xu = torch.where(self._x_u < PIQP_INF)[0].to(torch.int32)
         else:
-            self._idx_xu = cp.empty((0,), dtype=cp.int32)
-            self._x_u = 2 * PIQP_INF * cp.ones((self.n,), dtype=cp.float64)
+            self._idx_xu = torch.empty(0, dtype=torch.int32, device='cuda')
+            self._x_u = 2 * PIQP_INF * torch.ones(self.n, dtype=torch.float64, device='cuda')

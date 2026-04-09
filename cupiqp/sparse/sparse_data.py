@@ -1,9 +1,11 @@
 from typing import Optional, Union
+import torch
 import cupy as cp
 from cupyx.scipy.sparse import csr_matrix, isspmatrix_csr
 
 
 from ..data import Data
+from ..typedef import PIQP_INF
 
 
 class SparseData(Data):
@@ -51,8 +53,20 @@ class SparseData(Data):
                 f"Dimension changed: expected {old.shape}, got {new.shape}"
             )
         
-    def extract_P_diag(self, diag_P: cp.ndarray):
-        diag_P[:] = self._P.diagonal()
+    def disable_inf_constraints(self):
+        """
+        For inequalities like -inf < g'x < +inf, set g to 0 and upper/lower bound to +1/-1.
+        Override base class: self._G is a CuPy CSR matrix, so we use cp.zeros for row zeroing,
+        while self._h_l and self._h_u are torch tensors from the parent class.
+        """
+        for i in range(self.m):
+            if self._h_l[i] <= -PIQP_INF and self._h_u[i] >= PIQP_INF:
+                self._G[i, :] = cp.zeros(self.n)
+                self._h_l[i] = -1.
+                self._h_u[i] = 1.
+
+    def extract_P_diag(self, diag_P: torch.Tensor):
+        diag_P[:] = torch.as_tensor(self._P.diagonal(), device='cuda')
 
     def set_P(self, value: csr_matrix, check: bool = True):
         if check:

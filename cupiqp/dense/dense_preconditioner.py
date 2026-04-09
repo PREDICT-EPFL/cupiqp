@@ -1,4 +1,4 @@
-import cupy as cp
+import torch
 
 from ..data import Data
 from ..preconditioner import RuizEquilibration
@@ -7,23 +7,23 @@ from ..preconditioner import RuizEquilibration
 class DenseRuizEquilibration(RuizEquilibration):
     """Ruiz equilibration for dense matrix backends."""
 
-    def eval_P_row_inf_norms(self, P: cp.ndarray, out: cp.ndarray):
-        out[:] = cp.linalg.norm(P, ord=cp.inf, axis=1)
-    
-    def eval_A_row_inf_norms(self, A: cp.ndarray, out: cp.ndarray):
-        out[:] = cp.linalg.norm(A, ord=cp.inf, axis=1)
-    
-    def eval_A_col_inf_norms(self, A: cp.ndarray, out: cp.ndarray):
-        out[:] = cp.linalg.norm(A, ord=cp.inf, axis=0)
-    
-    def eval_G_row_inf_norms(self, G: cp.ndarray, out: cp.ndarray):
-        out[:] = cp.linalg.norm(G, ord=cp.inf, axis=1)
-    
-    def eval_G_col_inf_norms(self, G: cp.ndarray, out: cp.ndarray):
-        out[:] = cp.linalg.norm(G, ord=cp.inf, axis=0)
+    def eval_P_row_inf_norms(self, P: torch.Tensor, out: torch.Tensor):
+        out[:] = torch.linalg.norm(P, ord=float('inf'), dim=1)
+
+    def eval_A_row_inf_norms(self, A: torch.Tensor, out: torch.Tensor):
+        out[:] = torch.linalg.norm(A, ord=float('inf'), dim=1)
+
+    def eval_A_col_inf_norms(self, A: torch.Tensor, out: torch.Tensor):
+        out[:] = torch.linalg.norm(A, ord=float('inf'), dim=0)
+
+    def eval_G_row_inf_norms(self, G: torch.Tensor, out: torch.Tensor):
+        out[:] = torch.linalg.norm(G, ord=float('inf'), dim=1)
+
+    def eval_G_col_inf_norms(self, G: torch.Tensor, out: torch.Tensor):
+        out[:] = torch.linalg.norm(G, ord=float('inf'), dim=0)
 
     def _scale_matrices(self, data: Data,
-                        d_x: cp.ndarray, d_y: cp.ndarray, d_z: cp.ndarray):
+                        d_x: torch.Tensor, d_y: torch.Tensor, d_z: torch.Tensor):
         data._P *= d_x[None, :]
         data._P *= d_x[:, None]
         data._c *= d_x
@@ -37,11 +37,11 @@ class DenseRuizEquilibration(RuizEquilibration):
             data._G *= d_z[:, None]
 
     def _apply_cost_scaling(self, data: Data):
-        P_abs = cp.abs(data._P)
-        P_utri = cp.triu(P_abs)
-        gamma = float(cp.mean(cp.maximum(cp.max(P_utri, axis=0), cp.max(P_utri, axis=1))))
+        P_abs = torch.abs(data._P)
+        P_utri = torch.triu(P_abs)
+        gamma = float(torch.mean(torch.maximum(torch.max(P_utri, dim=0).values, torch.max(P_utri, dim=1).values)))
         gamma = self._limit_scaling_scalar(gamma)
-        gamma = max(gamma, float(cp.max(cp.abs(data._c))))
+        gamma = max(gamma, float(torch.max(torch.abs(data._c))))
         gamma = self._limit_scaling_scalar(gamma)
         gamma = 1.0 / gamma
         data._P *= gamma
@@ -49,7 +49,7 @@ class DenseRuizEquilibration(RuizEquilibration):
         self.c_scaling *= gamma
 
     def _unscale_matrices(self, data: Data,
-                          d_x_inv: cp.ndarray, d_y_inv: cp.ndarray, d_z_inv: cp.ndarray):
+                          d_x_inv: torch.Tensor, d_y_inv: torch.Tensor, d_z_inv: torch.Tensor):
         c_inv = self._c_scaling_inv
 
         data._P *= c_inv
@@ -65,7 +65,7 @@ class DenseRuizEquilibration(RuizEquilibration):
             data._G *= d_z_inv[:, None]
 
     def _apply_stored_scaling(self, data: Data,
-                              d_x: cp.ndarray, d_y: cp.ndarray, d_z: cp.ndarray):
+                              d_x: torch.Tensor, d_y: torch.Tensor, d_z: torch.Tensor):
         c = self.c_scaling
 
         data._P *= c

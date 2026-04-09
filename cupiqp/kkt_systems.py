@@ -1,6 +1,6 @@
 import math
 
-import cupy as cp
+import torch
 import warp as wp
 import nvtx
 
@@ -41,26 +41,26 @@ class KKTSystem:
     """
     def __init__(self):
         return
-    
+
     def init(self, data: Data, settings: Settings):
         self._settings = settings
         self._use_iterative_refinement = False
 
-        self._rho = cp.empty(1)
-        self._delta = cp.empty(1)
-        self._x_reg = cp.empty(data.n)
-        self._z_reg = cp.empty(data.m)
-        self._P_diag = cp.empty(data.n)
+        self._rho = torch.empty(1, dtype=torch.float64, device='cuda')
+        self._delta = torch.empty(1, dtype=torch.float64, device='cuda')
+        self._x_reg = torch.empty(data.n, dtype=torch.float64, device='cuda')
+        self._z_reg = torch.empty(data.m, dtype=torch.float64, device='cuda')
+        self._P_diag = torch.empty(data.n, dtype=torch.float64, device='cuda')
 
         # used to store the rhs of the condensed KKT system
-        # K_condensed * [dx; dy; dz] = [rhs_x_bar; rhs_y_bar; rhs_z_bar], 
+        # K_condensed * [dx; dy; dz] = [rhs_x_bar; rhs_y_bar; rhs_z_bar],
         # where K_condensed is the condensed KKT matrix after eliminating duals of inequalities and box constraints and all slacks.
         # Since eliminating slacks and duals does not change rhs_y, we only need to store rhs_x_bar and rhs_z_bar.
-        self._rhs_x_bar = cp.empty(data.n)
-        self._rhs_z_bar = cp.empty(data.m)
+        self._rhs_x_bar = torch.empty(data.n, dtype=torch.float64, device='cuda')
+        self._rhs_z_bar = torch.empty(data.m, dtype=torch.float64, device='cuda')
 
-        self._work_x = cp.nan * cp.zeros(data.n)
-        self._work_z = cp.nan * cp.zeros(data.m)
+        self._work_x = torch.full((data.n,), float('nan'), dtype=torch.float64, device='cuda')
+        self._work_z = torch.full((data.m,), float('nan'), dtype=torch.float64, device='cuda')
 
         if settings.kkt_solver == "sparse_ldlt":
             self._kkt_solver = SparseKKTSolver(data, use_deterministic_mode=settings.use_deterministic_mode_for_cudss)
@@ -77,36 +77,36 @@ class KKTSystem:
         hl, hu, xl, xu = data.num_hl, data.num_hu, data.num_xl, data.num_xu
 
         # Stored slack values at current iteration
-        self._m_s_all = cp.zeros(num_ineq)
+        self._m_s_all = torch.zeros(num_ineq, dtype=torch.float64, device='cuda')
         self._m_s_l = self._m_s_all[:hl]
         self._m_s_u = self._m_s_all[hl:hl+hu]
         self._m_s_bl = self._m_s_all[hl+hu:hl+hu+xl]
         self._m_s_bu = self._m_s_all[hl+hu+xl:]
 
         # Stored 1/z values at current iteration
-        self._m_z_inv_all = cp.zeros(num_ineq)
+        self._m_z_inv_all = torch.zeros(num_ineq, dtype=torch.float64, device='cuda')
         self._m_z_l_inv = self._m_z_inv_all[:hl]
         self._m_z_u_inv = self._m_z_inv_all[hl:hl+hu]
         self._m_z_bl_inv = self._m_z_inv_all[hl+hu:hl+hu+xl]
         self._m_z_bu_inv = self._m_z_inv_all[hl+hu+xl:]
 
         # 1/(s/z + delta) used in factor and solve
-        self._w_delta_inv_all = cp.zeros(num_ineq)
+        self._w_delta_inv_all = torch.zeros(num_ineq, dtype=torch.float64, device='cuda')
         self._w_l_delta_inv = self._w_delta_inv_all[:hl]
         self._w_u_delta_inv = self._w_delta_inv_all[hl:hl+hu]
         self._w_bl_delta_inv = self._w_delta_inv_all[hl+hu:hl+hu+xl]
         self._w_bu_delta_inv = self._w_delta_inv_all[hl+hu+xl:]
 
         # Updated rhs after eliminating slacks
-        self._updated_rhs_z_all = cp.zeros(num_ineq)
+        self._updated_rhs_z_all = torch.zeros(num_ineq, dtype=torch.float64, device='cuda')
         self._updated_rhs_z_l = self._updated_rhs_z_all[:hl]
         self._updated_rhs_z_u = self._updated_rhs_z_all[hl:hl+hu]
         self._updated_rhs_z_bl = self._updated_rhs_z_all[hl+hu:hl+hu+xl]
         self._updated_rhs_z_bu = self._updated_rhs_z_all[hl+hu+xl:]
 
         # pre-allocate memory for condensed KKT iterative refinement (operates on x, y, z blocks only)
-        self._iter_refine_error_xyz = cp.zeros(data.n + data.p + data.m)
-        self._iter_refine_delta_xyz = cp.zeros(data.n+data.p+data.m)
+        self._iter_refine_error_xyz = torch.zeros(data.n + data.p + data.m, dtype=torch.float64, device='cuda')
+        self._iter_refine_delta_xyz = torch.zeros(data.n+data.p+data.m, dtype=torch.float64, device='cuda')
 
         # create kernels
         self._update_regulerization_step_1_kernel = create_update_regularizations_step_1_kernel()
@@ -135,13 +135,13 @@ class KKTSystem:
         if data.num_hl > 0:
             wp.launch(_build_inv_idx_kernel, dim=data.num_hl,
                       inputs=[data.idx_hl, self._inv_idx_hl], device="cuda")
- 
+
     @nvtx.annotate("KKTSystem::update_data")
     def update_data(self, data: Data, update_P: bool = False, update_A: bool = False, update_G: bool = False):
         self._kkt_solver.update_data(data, update_P, update_A, update_G)
 
     @nvtx.annotate("KKTSystem::update_scalings_and_factor")
-    def update_scalings_and_factor(self, data: Data, settings: Settings, iterative_refinement: bool, rho: cp.ndarray, delta: cp.ndarray, vars: Variables) -> bool:
+    def update_scalings_and_factor(self, data: Data, settings: Settings, iterative_refinement: bool, rho: torch.Tensor, delta: torch.Tensor, vars: Variables) -> bool:
         """
         Update the scaling factors and refactor the KKT matrix.
 
@@ -150,20 +150,20 @@ class KKTSystem:
         The variable vars is the current primal/dual variable values at this iteration, i.e., values of x, y, z_u, z_l, s_u, s_l, z_bu, z_bl, s_bu, s_bl at the current iteration.
         """
         self._update_reg_and_kkt(data, delta, rho, vars)
-        
+
         self._use_iterative_refinement = iterative_refinement
         factor_success = self._kkt_solver.factor() # ! this is implicitly assuming idx_hu and idx_hl cover all indices of inequalities 0:m
         return factor_success
-    
+
     @nvtx.annotate("KKTSystem::update_reg_and_kkt")
-    @cuda_graph_capture(key=lambda self, data, delta, rho, vars: (vars.buffer_ptr, delta.data.ptr, rho.data.ptr), enable=lambda self: self._settings.enable_cuda_graph)
-    def _update_reg_and_kkt(self, data: Data, delta: cp.ndarray, rho: cp.ndarray, vars: Variables):
-        """Update the regularization terms x_reg and z_reg for the condensed KKT system after eliminating slacks and duals of inequalities and box constraints. 
+    @cuda_graph_capture(key=lambda self, data, delta, rho, vars: (vars.buffer_ptr, delta.data_ptr(), rho.data_ptr()), enable=lambda self: self._settings.enable_cuda_graph)
+    def _update_reg_and_kkt(self, data: Data, delta: torch.Tensor, rho: torch.Tensor, vars: Variables):
+        """Update the regularization terms x_reg and z_reg for the condensed KKT system after eliminating slacks and duals of inequalities and box constraints.
         Also update the condensed KKT matrix with the new regularization terms."""
         self._rho[:] = rho
         self._delta[:] = delta
 
-        USE_WARP_IMPLEMENTATION = True  # set to False to use pure cupy implementation for updating regularization, which is easier to debug but slower.
+        USE_WARP_IMPLEMENTATION = True  # set to False to use pure torch implementation for updating regularization, which is easier to debug but slower.
         if USE_WARP_IMPLEMENTATION:
             wp.launch(
                 kernel=self._update_regulerization_step_1_kernel,
@@ -172,7 +172,7 @@ class KKTSystem:
                         self._m_s_all, self._m_z_inv_all, self._w_delta_inv_all,
                         delta],
                 device="cuda",
-                stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+                stream=wp.Stream(cuda_stream=torch.cuda.current_stream().cuda_stream),
             )
             wp.launch(
                 kernel=self._update_regulerization_step_2_kernel,
@@ -192,15 +192,15 @@ class KKTSystem:
                     self._z_reg,
                 ],
                 device="cuda",
-                stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+                stream=wp.Stream(cuda_stream=torch.cuda.current_stream().cuda_stream),
             )
 
         else:
             self._m_s_all[:] = vars.s_all
-            cp.reciprocal(vars.z_all, out=self._m_z_inv_all)
-            cp.multiply(self._m_s_all, self._m_z_inv_all, out=self._w_delta_inv_all)
-            cp.add(self._w_delta_inv_all, delta, out=self._w_delta_inv_all)
-            cp.reciprocal(self._w_delta_inv_all, out=self._w_delta_inv_all)
+            torch.reciprocal(vars.z_all, out=self._m_z_inv_all)
+            torch.mul(self._m_s_all, self._m_z_inv_all, out=self._w_delta_inv_all)
+            torch.add(self._w_delta_inv_all, delta, out=self._w_delta_inv_all)
+            torch.reciprocal(self._w_delta_inv_all, out=self._w_delta_inv_all)
 
             self._x_reg[:] = rho[0]
             xbs_xu = data.x_b_scaling[data.idx_xu]
@@ -210,10 +210,10 @@ class KKTSystem:
             self._z_reg.fill(0.)
             self._z_reg[data.idx_hu] += self._w_u_delta_inv
             self._z_reg[data.idx_hl] += self._w_l_delta_inv
-            cp.reciprocal(self._z_reg, out=self._z_reg)
+            torch.reciprocal(self._z_reg, out=self._z_reg)
 
         self._kkt_solver.update_kkt(data, delta, self._x_reg, self._z_reg)
-    
+
     @nvtx.annotate("KKTSystem::solve")
     def solve(self, data: Data, settings: Settings, rhs: Variables, lhs: Variables) -> None:
         self._prepare_rhs(data, rhs)
@@ -234,7 +234,7 @@ class KKTSystem:
             dim=data.num_hu+data.num_hl+data.num_xu+data.num_xl,
             inputs=[rhs.z_all, rhs.s_all, self._m_z_inv_all, self._updated_rhs_z_all],
             device="cuda",
-            stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+            stream=wp.Stream(cuda_stream=torch.cuda.current_stream().cuda_stream),
         )
         wp.launch(
             kernel=self._eliminate_duals_kernel,
@@ -253,23 +253,23 @@ class KKTSystem:
                 self._rhs_z_bar,
             ],
             device="cuda",
-            stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+            stream=wp.Stream(cuda_stream=torch.cuda.current_stream().cuda_stream),
         )
 
-        # # ! ALTERNATIVE IMPLEMENTATION (pure cupy operations)
+        # # ! ALTERNATIVE IMPLEMENTATION (pure torch operations)
         # ------ elliminate slack variables from rhs
         # # rhs_z_u - inv(Z_u) * r_s_u
-        # cp.multiply(self._m_z_u_inv, rhs.s_u, out=self._updated_rhs_z_u)
-        # cp.subtract(rhs.z_u, self._updated_rhs_z_u, out=self._updated_rhs_z_u)
+        # torch.mul(self._m_z_u_inv, rhs.s_u, out=self._updated_rhs_z_u)
+        # torch.sub(rhs.z_u, self._updated_rhs_z_u, out=self._updated_rhs_z_u)
         # # rhs_z_l - inv(Z_l) * r_s_l
-        # cp.multiply(self._m_z_l_inv, rhs.s_l, out=self._updated_rhs_z_l)
-        # cp.subtract(rhs.z_l, self._updated_rhs_z_l, out=self._updated_rhs_z_l)
+        # torch.mul(self._m_z_l_inv, rhs.s_l, out=self._updated_rhs_z_l)
+        # torch.sub(rhs.z_l, self._updated_rhs_z_l, out=self._updated_rhs_z_l)
         # # rhs_z_bu - inv(Z_bu) * r_s_bu
-        # cp.multiply(self._m_z_bu_inv, rhs.s_bu, out=self._updated_rhs_z_bu)
-        # cp.subtract(rhs.z_bu, self._updated_rhs_z_bu, out=self._updated_rhs_z_bu)
+        # torch.mul(self._m_z_bu_inv, rhs.s_bu, out=self._updated_rhs_z_bu)
+        # torch.sub(rhs.z_bu, self._updated_rhs_z_bu, out=self._updated_rhs_z_bu)
         # # rhs_z_bl - inv(Z_bl) * r_s_bl
-        # cp.multiply(self._m_z_bl_inv, rhs.s_bl, out=self._updated_rhs_z_bl)
-        # cp.subtract(rhs.z_bl, self._updated_rhs_z_bl, out=self._updated_rhs_z_bl)
+        # torch.mul(self._m_z_bl_inv, rhs.s_bl, out=self._updated_rhs_z_bl)
+        # torch.sub(rhs.z_bl, self._updated_rhs_z_bl, out=self._updated_rhs_z_bl)
 
         # ------ elliminate dual variables from rhs to yield one single rhs_z passing to kkt solver
         # To avoid avoid extra allocation, we use:
@@ -284,17 +284,17 @@ class KKTSystem:
         # self._work_z[data.idx_hu] += self._w_u_delta_inv * self._updated_rhs_z_u
         # self._work_z[data.idx_hl] -= self._w_l_delta_inv * self._updated_rhs_z_l
         # self._work_z[:] *= self._z_reg
-        
+
         # self._work_x[:] = rhs.x
-        # cp.multiply(self._w_bu_delta_inv, self._updated_rhs_z_bu, out=lhs.z_bu)
+        # torch.mul(self._w_bu_delta_inv, self._updated_rhs_z_bu, out=lhs.z_bu)
         # cp.add.at(self._work_x, data.idx_xu, lhs.z_bu)
-        # cp.multiply(self._w_bl_delta_inv, self._updated_rhs_z_bl, out=lhs.z_bl)
+        # torch.mul(self._w_bl_delta_inv, self._updated_rhs_z_bl, out=lhs.z_bl)
         # cp.negative(lhs.z_bl, out=lhs.z_bl)
         # cp.add.at(self._work_x, data.idx_xl, lhs.z_bl)
-        # self._work_z.fill(0)  # faster than cp.zeros assignment
-        # cp.multiply(self._w_u_delta_inv, self._updated_rhs_z_u, out=lhs.z_u) # use lhs.z_u as temporary storage
+        # self._work_z.fill(0)  # faster than torch.zeros assignment
+        # torch.mul(self._w_u_delta_inv, self._updated_rhs_z_u, out=lhs.z_u) # use lhs.z_u as temporary storage
         # cp.add.at(self._work_z, data.idx_hu, lhs.z_u)
-        # cp.multiply(self._w_l_delta_inv, self._updated_rhs_z_l, out=lhs.z_l)
+        # torch.mul(self._w_l_delta_inv, self._updated_rhs_z_l, out=lhs.z_l)
         # cp.negative(lhs.z_l, out=lhs.z_l)
         # cp.add.at(self._work_z, data.idx_hl, lhs.z_l)
         # self._work_z[:] *= self._z_reg
@@ -316,17 +316,17 @@ class KKTSystem:
                 data.idx_xl, self._w_bl_delta_inv, self._m_z_bl_inv, rhs.z_bl, rhs.s_bl, lhs.z_bl,
                 data.x_b_scaling],
             device="cuda",
-            stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+            stream=wp.Stream(cuda_stream=torch.cuda.current_stream().cuda_stream),
         )
         wp.launch(
             kernel=self._recover_slacks_kernel,
             dim=data.num_hu+data.num_hl+data.num_xu+data.num_xl,
             inputs=[rhs.s_all, lhs.z_all, self._m_s_all, self._m_z_inv_all, lhs.s_all],
             device="cuda",
-            stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+            stream=wp.Stream(cuda_stream=torch.cuda.current_stream().cuda_stream),
         )
 
-        # # ! ALTERNATIVE IMPLEMENTATION (pure cupy operations)
+        # # ! ALTERNATIVE IMPLEMENTATION (pure torch operations)
 
         # ----- recover dual variables on lhs
         # The below code is equivalent to:
@@ -334,7 +334,7 @@ class KKTSystem:
         # lhs.z_l[:] = self._w_l_delta_inv * (-G_dx[data.idx_hl] - self._updated_rhs_z_l)  # delta_z_l
         # lhs.z_bu[:] = self._w_bu_delta_inv * (lhs.x[data.idx_xu] - rhs.z_bu + self._m_z_bu_inv * rhs.s_bu)  # delta_z_bu
         # lhs.z_bl[:] = -self._w_bl_delta_inv * (lhs.x[data.idx_xl] + rhs.z_bl - self._m_z_bl_inv * rhs.s_bl)  # delta_z_bl
-        
+
         # lhs.z_u[:] = self._work_z[data.idx_hu]
         # lhs.z_u -= self._updated_rhs_z_u
         # lhs.z_u *= self._w_u_delta_inv
@@ -344,16 +344,16 @@ class KKTSystem:
         # lhs.z_l -= self._updated_rhs_z_l
         # lhs.z_l *= self._w_l_delta_inv
 
-        # cp.multiply(self._m_z_bu_inv, rhs.s_bu, out=lhs.z_bu)
+        # torch.mul(self._m_z_bu_inv, rhs.s_bu, out=lhs.z_bu)
         # lhs.z_bu += lhs.x[data.idx_xu]
         # lhs.z_bu -= rhs.z_bu
         # lhs.z_bu *= self._w_bu_delta_inv
 
-        # cp.multiply(self._m_z_bl_inv, rhs.s_bl, out=lhs.z_bl)
+        # torch.mul(self._m_z_bl_inv, rhs.s_bl, out=lhs.z_bl)
         # lhs.z_bl -= lhs.x[data.idx_xl]
         # lhs.z_bl -= rhs.z_bl
         # lhs.z_bl *= self._w_bl_delta_inv
-        
+
         # ----- recover slack variable on lhs
         # The below code is equivalent to:
         # lhs.s_u[:] = self._m_z_u_inv * (rhs.s_u - self._m_s_u * lhs.z_u)  # delta_s_u = inv(Z_u) (r_s_u - S_u delta_z_u)
@@ -361,26 +361,26 @@ class KKTSystem:
         # lhs.s_bu[:] = self._m_z_bu_inv * (rhs.s_bu - self._m_s_bu * lhs.z_bu)  # delta_s_bu = inv(Z_bu) (r_s_bu - S_bu delta_z_bu)
         # lhs.s_bl[:] = self._m_z_bl_inv * (rhs.s_bl - self._m_s_bl * lhs.z_bl)  # delta_s_bl = inv(Z_bl) (r_s_bl - S_bl delta_z_bl)
 
-        # cp.multiply(self._m_s_u, lhs.z_u, out=lhs.s_u)
-        # cp.subtract(rhs.s_u, lhs.s_u, out=lhs.s_u)
-        # cp.multiply(self._m_z_u_inv, lhs.s_u, out=lhs.s_u)
+        # torch.mul(self._m_s_u, lhs.z_u, out=lhs.s_u)
+        # torch.sub(rhs.s_u, lhs.s_u, out=lhs.s_u)
+        # torch.mul(self._m_z_u_inv, lhs.s_u, out=lhs.s_u)
 
-        # cp.multiply(self._m_s_l, lhs.z_l, out=lhs.s_l)
-        # cp.subtract(rhs.s_l, lhs.s_l, out=lhs.s_l)
-        # cp.multiply(self._m_z_l_inv, lhs.s_l, out=lhs.s_l)
+        # torch.mul(self._m_s_l, lhs.z_l, out=lhs.s_l)
+        # torch.sub(rhs.s_l, lhs.s_l, out=lhs.s_l)
+        # torch.mul(self._m_z_l_inv, lhs.s_l, out=lhs.s_l)
 
-        # cp.multiply(self._m_s_bu, lhs.z_bu, out=lhs.s_bu)
-        # cp.subtract(rhs.s_bu, lhs.s_bu, out=lhs.s_bu)
-        # cp.multiply(self._m_z_bu_inv, lhs.s_bu, out=lhs.s_bu)
+        # torch.mul(self._m_s_bu, lhs.z_bu, out=lhs.s_bu)
+        # torch.sub(rhs.s_bu, lhs.s_bu, out=lhs.s_bu)
+        # torch.mul(self._m_z_bu_inv, lhs.s_bu, out=lhs.s_bu)
 
-        # cp.multiply(self._m_s_bl, lhs.z_bl, out=lhs.s_bl)
-        # cp.subtract(rhs.s_bl, lhs.s_bl, out=lhs.s_bl)
-        # cp.multiply(self._m_z_bl_inv, lhs.s_bl, out=lhs.s_bl)
+        # torch.mul(self._m_s_bl, lhs.z_bl, out=lhs.s_bl)
+        # torch.sub(rhs.s_bl, lhs.s_bl, out=lhs.s_bl)
+        # torch.mul(self._m_z_bl_inv, lhs.s_bl, out=lhs.s_bl)
 
     @nvtx.annotate("KKTSystem::iterative_refinement")
     def iterative_refinement(self, data: Data, settings: Settings,
-                             rhs_x: cp.ndarray, rhs_y: cp.ndarray, rhs_z: cp.ndarray,
-                             lhs_x: cp.ndarray, lhs_y: cp.ndarray, lhs_z: cp.ndarray) -> bool:
+                             rhs_x: torch.Tensor, rhs_y: torch.Tensor, rhs_z: torch.Tensor,
+                             lhs_x: torch.Tensor, lhs_y: torch.Tensor, lhs_z: torch.Tensor) -> bool:
         """Iterative refinement on the condensed 3-block KKT system.
 
         Refines (lhs_x, lhs_y, lhs_z) in-place so that
@@ -396,16 +396,16 @@ class KKTSystem:
         ref_lhs_y = self._iter_refine_delta_xyz[data.n:data.n+data.p]
         ref_lhs_z = self._iter_refine_delta_xyz[data.n+data.p:]
 
-        rhs_norm = float(cp.max(cp.abs(rhs_x)))
+        rhs_norm = float(torch.max(torch.abs(rhs_x)))
         if data.p > 0:
-            rhs_norm = max(rhs_norm, float(cp.max(cp.abs(rhs_y))))
+            rhs_norm = max(rhs_norm, float(torch.max(torch.abs(rhs_y))))
         if data.m > 0:
-            rhs_norm = max(rhs_norm, float(cp.max(cp.abs(rhs_z))))
+            rhs_norm = max(rhs_norm, float(torch.max(torch.abs(rhs_z))))
 
         # Initial error computed on first iteration; subsequent iterations
         # reuse ref_err from candidate evaluation at end of previous iteration.
         refine_error = math.inf
-        VERBOSE_IR = True
+        VERBOSE_IR = False
         tol = settings.iterative_refinement_eps_abs + settings.iterative_refinement_eps_rel * rhs_norm
 
         for i in range(settings.iterative_refinement_max_iter):
@@ -420,7 +420,7 @@ class KKTSystem:
                     ref_err_x, ref_err_y, ref_err_z)
 
             prev_refine_error = refine_error
-            refine_error = float(cp.linalg.norm(self._iter_refine_error_xyz[:data.n + data.p + data.m], ord=cp.inf))
+            refine_error = float(torch.linalg.norm(self._iter_refine_error_xyz[:data.n + data.p + data.m], ord=float('inf')))
 
             if VERBOSE_IR:
                 if i == 0:
@@ -437,9 +437,9 @@ class KKTSystem:
                 if VERBOSE_IR:
                     print(f"  IR: converged at iter {i}")
                 if i > 0:
-                    cp.copyto(lhs_x, ref_lhs_x)
-                    cp.copyto(lhs_y, ref_lhs_y)
-                    cp.copyto(lhs_z, ref_lhs_z)
+                    lhs_x.copy_(ref_lhs_x)
+                    lhs_y.copy_(ref_lhs_y)
+                    lhs_z.copy_(ref_lhs_z)
                 break
 
             if i > 0:
@@ -448,17 +448,17 @@ class KKTSystem:
                     if improvement_rate > 1.0:
                         if VERBOSE_IR:
                             print(f"  IR: slow improvement ({improvement_rate:.2f}x < {settings.iterative_refinement_min_improvement_rate:.1f}x), accepting candidate")
-                        cp.copyto(lhs_x, ref_lhs_x)
-                        cp.copyto(lhs_y, ref_lhs_y)
-                        cp.copyto(lhs_z, ref_lhs_z)
+                        lhs_x.copy_(ref_lhs_x)
+                        lhs_y.copy_(ref_lhs_y)
+                        lhs_z.copy_(ref_lhs_z)
                     else:
                         if VERBOSE_IR:
                             print(f"  IR: no improvement ({improvement_rate:.2f}x), rejecting candidate")
                     break
                 # Accept candidate
-                cp.copyto(lhs_x, ref_lhs_x)
-                cp.copyto(lhs_y, ref_lhs_y)
-                cp.copyto(lhs_z, ref_lhs_z)
+                lhs_x.copy_(ref_lhs_x)
+                lhs_y.copy_(ref_lhs_y)
+                lhs_z.copy_(ref_lhs_z)
 
             # Solve for correction: K * ref_lhs = ref_err
             self._kkt_solver.solve(data,
@@ -474,8 +474,8 @@ class KKTSystem:
 
     @nvtx.annotate("KKTSystem::mul_condensed_kkt")
     def mul_condensed_kkt(self, data: Data,
-                          lhs_x: cp.ndarray, lhs_y: cp.ndarray, lhs_z: cp.ndarray,
-                          rhs_x: cp.ndarray, rhs_y: cp.ndarray, rhs_z: cp.ndarray) -> None:
+                          lhs_x: torch.Tensor, lhs_y: torch.Tensor, lhs_z: torch.Tensor,
+                          rhs_x: torch.Tensor, rhs_y: torch.Tensor, rhs_z: torch.Tensor) -> None:
         """
         Compute the matrix-vector product with the condensed (reduced) KKT matrix:
 
@@ -508,9 +508,9 @@ class KKTSystem:
 
     @nvtx.annotate("KKTSystem::get_refinement_error")
     def get_refinement_error(self, data: Data,
-                         lhs_x: cp.ndarray, lhs_y: cp.ndarray, lhs_z: cp.ndarray,
-                         rhs_x: cp.ndarray, rhs_y: cp.ndarray, rhs_z: cp.ndarray,
-                         err_x: cp.ndarray, err_y: cp.ndarray, err_z: cp.ndarray) -> float:
+                         lhs_x: torch.Tensor, lhs_y: torch.Tensor, lhs_z: torch.Tensor,
+                         rhs_x: torch.Tensor, rhs_y: torch.Tensor, rhs_z: torch.Tensor,
+                         err_x: torch.Tensor, err_y: torch.Tensor, err_z: torch.Tensor) -> float:
         """
         Compute the residual error of the condensed KKT solve:
             err = rhs - KKT * lhs
@@ -525,27 +525,27 @@ class KKTSystem:
         """
         # err = rhs - KKT * lhs
         self.mul_condensed_kkt(data, lhs_x, lhs_y, lhs_z, err_x, err_y, err_z)
-        cp.subtract(rhs_x, err_x, out=err_x)
-        cp.subtract(rhs_y, err_y, out=err_y)
-        cp.subtract(rhs_z, err_z, out=err_z)
+        torch.sub(rhs_x, err_x, out=err_x)
+        torch.sub(rhs_y, err_y, out=err_y)
+        torch.sub(rhs_z, err_z, out=err_z)
 
         # return max(||err_x||_inf, ||err_y||_inf, ||err_z||_inf)
-        norm = float(cp.max(cp.abs(err_x)))
-        if err_y.size > 0:
-            norm = max(norm, float(cp.max(cp.abs(err_y))))
-        if err_z.size > 0:
-            norm = max(norm, float(cp.max(cp.abs(err_z))))
+        norm = float(torch.max(torch.abs(err_x)))
+        if err_y.size(0) > 0:
+            norm = max(norm, float(torch.max(torch.abs(err_y))))
+        if err_z.size(0) > 0:
+            norm = max(norm, float(torch.max(torch.abs(err_z))))
         return norm
 
     @nvtx.annotate("KKTSystem::eval_P_x")
-    def eval_P_x(self, data: Data, alpha: float, x: cp.ndarray, z: cp.ndarray):
+    def eval_P_x(self, data: Data, alpha: float, x: torch.Tensor, z: torch.Tensor):
         """
         Evaluate alpha * P * x
         """
         self._kkt_solver.eval_P_x(data, alpha, x, z)
-    
+
     @nvtx.annotate("KKTSystem::eval_A_xn")
-    def eval_A_xn(self, data: Data, alpha_n: float, xn: cp.ndarray, zn: cp.ndarray):
+    def eval_A_xn(self, data: Data, alpha_n: float, xn: torch.Tensor, zn: torch.Tensor):
         """
         Evaluate Ax with scaling factor alpha_n:
         zn = alpha_n * A * xn
@@ -553,7 +553,7 @@ class KKTSystem:
         self._kkt_solver.eval_A_xn(data, alpha_n, xn, zn)
 
     @nvtx.annotate("KKTSystem::eval_AT_xt")
-    def eval_AT_xt(self, data: Data, alpha_t: float, xt: cp.ndarray, zt: cp.ndarray):
+    def eval_AT_xt(self, data: Data, alpha_t: float, xt: torch.Tensor, zt: torch.Tensor):
         """
         Evaluate A^T xt with scaling factor alpha_t:
         zt = alpha_t * A^T * xt
@@ -561,7 +561,7 @@ class KKTSystem:
         self._kkt_solver.eval_AT_xt(data, alpha_t, xt, zt)
 
     @nvtx.annotate("KKTSystem::eval_G_xn")
-    def eval_G_xn(self, data: Data, alpha_n: float, xn: cp.ndarray, zn: cp.ndarray):
+    def eval_G_xn(self, data: Data, alpha_n: float, xn: torch.Tensor, zn: torch.Tensor):
         """
         Evaluate Gx with scaling factor alpha_n:
         zn = alpha_n * G * xn
@@ -569,7 +569,7 @@ class KKTSystem:
         self._kkt_solver.eval_G_xn(data, alpha_n, xn, zn)
 
     @nvtx.annotate("KKTSystem::eval_GT_xt")
-    def eval_GT_xt(self, data: Data, alpha_t: float, xt: cp.ndarray, zt: cp.ndarray):
+    def eval_GT_xt(self, data: Data, alpha_t: float, xt: torch.Tensor, zt: torch.Tensor):
         """
         Evaluate G^T xt with scaling factor alpha_t:
         zt = alpha_t * G^T * xt
@@ -853,7 +853,7 @@ def create_recover_duals_kernel(num_hu: int, num_hl: int, num_xu: int, num_xl: i
 
 def create_recover_slacks_kernel():
     """Create kernel specialized for eliminating slacks. Performs the operation:
-    
+
         updated_lhs_z_u = inv(Z_u) (r_s_u - S_u lhs_z_u)
         updated_lhs_s_l = inv(Z_l) (r_s_l - S_l lhs_z_l)
         updated_lhs_s_bu = inv(Z_bu) (r_s_bu - S_bu lhs_z_bu)

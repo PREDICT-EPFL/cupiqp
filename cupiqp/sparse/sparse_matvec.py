@@ -14,6 +14,7 @@ directly, bypassing CuPy's Python-level ``_setStream`` guard which raises
 
 import ctypes
 import ctypes.util
+import torch
 import cupy as cp
 import cupyx.scipy.sparse as cpsp
 from cupy.cuda import cusparse
@@ -248,16 +249,16 @@ class SparseMatVecProduct:
             If not None, a raw CUDA stream pointer to set for this operation.
             If None (default), uses CuPy's current stream.
         """
-        # if not set, use the current CuPy stream
+        # if not set, use the current torch CUDA stream
         if stream_ptr is None:
-            stream_ptr = cp.cuda.get_current_stream().ptr
+            stream_ptr = torch.cuda.current_stream().cuda_stream
         _cusparse_lib.cusparseSetStream(self._cusparse_handle, stream_ptr)
 
         _alpha = ctypes.c_double(alpha)
         _beta = ctypes.c_double(beta)
 
-        _cusparse_lib.cusparseDnVecSetValues(self._x_desc, x.data.ptr)
-        _cusparse_lib.cusparseDnVecSetValues(self._y_desc, y.data.ptr)
+        _cusparse_lib.cusparseDnVecSetValues(self._x_desc, x.data_ptr())
+        _cusparse_lib.cusparseDnVecSetValues(self._y_desc, y.data_ptr())
 
         status = _cusparse_lib.cusparseSpMV(
             self._cusparse_handle,

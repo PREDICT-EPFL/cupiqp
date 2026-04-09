@@ -1,5 +1,6 @@
 from typing import Optional
 import numpy as np
+import torch
 import cupy as cp
 from cupyx.scipy.sparse import csr_matrix, diags, bmat
 import nvtx
@@ -43,7 +44,7 @@ class SparseKKTSolver(KKTSolverBase):
 
         # setup direct solver for KKT factorization and solves
         self._lin_sys_solver = CudssSparseDirectSolver(self._kkt_mat, use_deterministic_mode=use_deterministic_mode)
-        plan_success = self._lin_sys_solver.plan(cuda_stream=cp.cuda.get_current_stream().ptr)  # symbolic factorization and reordering
+        plan_success = self._lin_sys_solver.plan(cuda_stream=torch.cuda.current_stream().cuda_stream)  # symbolic factorization and reordering
         if not plan_success:
             raise RuntimeError("Sparse direct solver planning failed.")
 
@@ -174,52 +175,52 @@ class SparseKKTSolver(KKTSolverBase):
         self._diag_z_indices = diag_idx[n+p : n+p+m]
     
     @nvtx.annotate("SparseKKTSolver::update_kkt")
-    def update_kkt(self, data: SparseData, delta: cp.ndarray, x_reg: cp.ndarray, z_reg: cp.ndarray) -> None:
+    def update_kkt(self, data: SparseData, delta: torch.Tensor, x_reg: torch.Tensor, z_reg: torch.Tensor) -> None:
         self._kkt_mat.data[self._diag_x_indices] = data.P.diagonal()
-        self._kkt_mat.data[self._diag_x_indices] += x_reg        
-        self._kkt_mat.data[self._diag_y_indices] = -delta
-        self._kkt_mat.data[self._diag_z_indices] = -z_reg
+        self._kkt_mat.data[self._diag_x_indices] += cp.asarray(x_reg)
+        self._kkt_mat.data[self._diag_y_indices] = -cp.asarray(delta)
+        self._kkt_mat.data[self._diag_z_indices] = -cp.asarray(z_reg)
     
     @nvtx.annotate("SparseKKTSolver::factor")
     def factor(self) -> bool:
-        return self._lin_sys_solver.factor(cuda_stream=cp.cuda.get_current_stream().ptr)
+        return self._lin_sys_solver.factor(cuda_stream=torch.cuda.current_stream().cuda_stream)
 
     @nvtx.annotate("SparseKKTSolver::solve")
-    def solve(self, data: SparseData, rhs_x: cp.ndarray, rhs_y: cp.ndarray, rhs_z: cp.ndarray, delta_x: cp.ndarray, delta_y: cp.ndarray, delta_z: cp.ndarray):
+    def solve(self, data: SparseData, rhs_x: torch.Tensor, rhs_y: torch.Tensor, rhs_z: torch.Tensor, delta_x: torch.Tensor, delta_y: torch.Tensor, delta_z: torch.Tensor):
         """
         Solve the KKT system using the factorized KKT matrix.
         """
-        stream_ptr = cp.cuda.get_current_stream().ptr
+        stream_ptr = torch.cuda.current_stream().cuda_stream
 
         # ! cp.cuda.runtime.memcpyAsync has lower launch overhead than multiple small cp.copyto() calls
         # self._rhs <= [rhs_x, rhs_y, rhs_z]
-        cp.cuda.runtime.memcpyAsync(self._lin_sys_solver.rhs.data.ptr, rhs_x.data.ptr, data.n * 8, 1, stream_ptr)
-        cp.cuda.runtime.memcpyAsync(self._lin_sys_solver.rhs.data.ptr + data.n * 8, rhs_y.data.ptr, data.p * 8, 1, stream_ptr)
-        cp.cuda.runtime.memcpyAsync(self._lin_sys_solver.rhs.data.ptr + (data.n+data.p) * 8, rhs_z.data.ptr, data.m * 8, 1, stream_ptr)
+        cp.cuda.runtime.memcpyAsync(self._lin_sys_solver.rhs.data.ptr, rhs_x.data_ptr(), data.n * 8, 1, stream_ptr)
+        cp.cuda.runtime.memcpyAsync(self._lin_sys_solver.rhs.data.ptr + data.n * 8, rhs_y.data_ptr(), data.p * 8, 1, stream_ptr)
+        cp.cuda.runtime.memcpyAsync(self._lin_sys_solver.rhs.data.ptr + (data.n+data.p) * 8, rhs_z.data_ptr(), data.m * 8, 1, stream_ptr)
 
         self._lin_sys_solver.solve(cuda_stream=stream_ptr)
 
         # [delta_x, delta_y, delta_z] <= self._sol
-        cp.cuda.runtime.memcpyAsync(delta_x.data.ptr, self._lin_sys_solver.sol.data.ptr, data.n * 8, 1, stream_ptr)
-        cp.cuda.runtime.memcpyAsync(delta_y.data.ptr, self._lin_sys_solver.sol.data.ptr + data.n * 8, data.p * 8, 1, stream_ptr)
-        cp.cuda.runtime.memcpyAsync(delta_z.data.ptr, self._lin_sys_solver.sol.data.ptr + (data.n+data.p) * 8, data.m * 8, 1, stream_ptr)
+        cp.cuda.runtime.memcpyAsync(delta_x.data_ptr(), self._lin_sys_solver.sol.data.ptr, data.n * 8, 1, stream_ptr)
+        cp.cuda.runtime.memcpyAsync(delta_y.data_ptr(), self._lin_sys_solver.sol.data.ptr + data.n * 8, data.p * 8, 1, stream_ptr)
+        cp.cuda.runtime.memcpyAsync(delta_z.data_ptr(), self._lin_sys_solver.sol.data.ptr + (data.n+data.p) * 8, data.m * 8, 1, stream_ptr)
 
     @nvtx.annotate("SparseKKTSolver::eval_P_x")
-    def eval_P_x(self, data: SparseData, alpha: float, x: cp.ndarray, z: cp.ndarray):
-        self._spmv_P(x, z, alpha=alpha, beta=0.0, stream_ptr=cp.cuda.get_current_stream().ptr)
-    
+    def eval_P_x(self, data: SparseData, alpha: float, x: torch.Tensor, z: torch.Tensor):
+        self._spmv_P(x, z, alpha=alpha, beta=0.0, stream_ptr=torch.cuda.current_stream().cuda_stream)
+
     @nvtx.annotate("SparseKKTSolver::eval_A_xn")
-    def eval_A_xn(self, data: SparseData, alpha_n: float, xn: cp.ndarray, zn: cp.ndarray):
-        self._spmv_A(xn, zn, alpha=alpha_n, beta=0.0, stream_ptr=cp.cuda.get_current_stream().ptr)
+    def eval_A_xn(self, data: SparseData, alpha_n: float, xn: torch.Tensor, zn: torch.Tensor):
+        self._spmv_A(xn, zn, alpha=alpha_n, beta=0.0, stream_ptr=torch.cuda.current_stream().cuda_stream)
 
     @nvtx.annotate("SparseKKTSolver::eval_AT_xt")
-    def eval_AT_xt(self, data: SparseData, alpha_t: float, xt: cp.ndarray, zt: cp.ndarray):
-        self._spmv_AT(xt, zt, alpha=alpha_t, beta=0.0, stream_ptr=cp.cuda.get_current_stream().ptr)
+    def eval_AT_xt(self, data: SparseData, alpha_t: float, xt: torch.Tensor, zt: torch.Tensor):
+        self._spmv_AT(xt, zt, alpha=alpha_t, beta=0.0, stream_ptr=torch.cuda.current_stream().cuda_stream)
 
     @nvtx.annotate("SparseKKTSolver::eval_G_xn")
-    def eval_G_xn(self, data: SparseData, alpha_n: float, xn: cp.ndarray, zn: cp.ndarray):
-        self._spmv_G(xn, zn, alpha=alpha_n, beta=0.0, stream_ptr=cp.cuda.get_current_stream().ptr)
+    def eval_G_xn(self, data: SparseData, alpha_n: float, xn: torch.Tensor, zn: torch.Tensor):
+        self._spmv_G(xn, zn, alpha=alpha_n, beta=0.0, stream_ptr=torch.cuda.current_stream().cuda_stream)
 
     @nvtx.annotate("SparseKKTSolver::eval_GT_xt")
-    def eval_GT_xt(self, data: SparseData, alpha_t: float, xt: cp.ndarray, zt: cp.ndarray):
-        self._spmv_GT(xt, zt, alpha=alpha_t, beta=0.0, stream_ptr=cp.cuda.get_current_stream().ptr)
+    def eval_GT_xt(self, data: SparseData, alpha_t: float, xt: torch.Tensor, zt: torch.Tensor):
+        self._spmv_GT(xt, zt, alpha=alpha_t, beta=0.0, stream_ptr=torch.cuda.current_stream().cuda_stream)

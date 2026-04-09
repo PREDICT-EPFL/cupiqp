@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 import nvtx
-import cupy as cp
+import torch
 
 from .data import Data
 from .results import Variables
@@ -42,8 +42,8 @@ class RuizEquilibration(ABC):
     """
 
     def __init__(self, n: int, p: int, m: int,
-                 idx_xl: cp.ndarray,
-                 idx_xu: cp.ndarray,
+                 idx_xl: torch.Tensor,
+                 idx_xu: torch.Tensor,
                  min_scaling: float = 1e-4,
                  max_scaling: float = 1e4,
                  convergence_tol: float = 1e-3,
@@ -58,66 +58,66 @@ class RuizEquilibration(ABC):
         self.convergence_tol = convergence_tol
 
         # Combined scaling: delta[0:n] for x, delta[n:n+p] for y, delta[n+p:] for z
-        self._delta = cp.ones(n + p + m, dtype=cp.float64)
-        self._delta_inv = cp.ones(n + p + m, dtype=cp.float64)
+        self._delta = torch.ones(n + p + m, dtype=torch.float64, device='cuda')
+        self._delta_inv = torch.ones(n + p + m, dtype=torch.float64, device='cuda')
 
         # Box constraint scaling (accumulated product of delta_b_iter across Ruiz iterations)
-        self._delta_b = cp.ones(n, dtype=cp.float64)
-        self._delta_b_inv = cp.ones(n, dtype=cp.float64)
+        self._delta_b = torch.ones(n, dtype=torch.float64, device='cuda')
+        self._delta_b_inv = torch.ones(n, dtype=torch.float64, device='cuda')
 
         # Cost scaling (scalar stored as 1-element array)
-        self._c_scaling = cp.ones(1, dtype=cp.float64)
-        self._c_scaling_inv = cp.ones(1, dtype=cp.float64)
+        self._c_scaling = torch.ones(1, dtype=torch.float64, device='cuda')
+        self._c_scaling_inv = torch.ones(1, dtype=torch.float64, device='cuda')
 
         # x_b_scaling: starts at {0,1} (1 for bounded variables, 0 otherwise)
         # and evolves as x_b_scaling *= delta_b_iter * delta_x each Ruiz iteration.
         # This tracks the diagonal of the box constraint block in the KKT matrix.
-        self._x_b_scaling_init = cp.zeros(n, dtype=cp.float64)
-        bounded = cp.zeros(n, dtype=bool)
-        if idx_xl.size > 0:
-            bounded[idx_xl] = True
-        if idx_xu.size > 0:
-            bounded[idx_xu] = True
+        self._x_b_scaling_init = torch.zeros(n, dtype=torch.float64, device='cuda')
+        bounded = torch.zeros(n, dtype=torch.bool, device='cuda')
+        if idx_xl.numel() > 0:
+            bounded[idx_xl.long()] = True
+        if idx_xu.numel() > 0:
+            bounded[idx_xu.long()] = True
         self._x_b_scaling_init[bounded] = 1.0
-        self._x_b_scaling = cp.copy(self._x_b_scaling_init)
+        self._x_b_scaling = self._x_b_scaling_init.clone()
 
-        self._delta_iter = cp.empty(n + p + m, dtype=cp.float64)  # used to store current Ruiz iteration scaling factors
-        self._delta_b_iter = cp.empty(n, dtype=cp.float64) # used to store current Ruiz iteration box scaling factors
+        self._delta_iter = torch.empty(n + p + m, dtype=torch.float64, device='cuda')  # used to store current Ruiz iteration scaling factors
+        self._delta_b_iter = torch.empty(n, dtype=torch.float64, device='cuda') # used to store current Ruiz iteration box scaling factors
 
-        self._work_n = cp.empty(n, dtype=cp.float64)  # temp workspace of size n
+        self._work_n = torch.empty(n, dtype=torch.float64, device='cuda')  # temp workspace of size n
 
     @property
-    def c_scaling_inv(self) -> cp.ndarray:
+    def c_scaling_inv(self) -> torch.Tensor:
         return self._c_scaling_inv
 
     @property
-    def delta(self) -> cp.ndarray:
+    def delta(self) -> torch.Tensor:
         return self._delta
 
     @property
-    def delta_inv(self) -> cp.ndarray:
+    def delta_inv(self) -> torch.Tensor:
         return self._delta_inv
 
     @property
-    def delta_b(self) -> cp.ndarray:
+    def delta_b(self) -> torch.Tensor:
         return self._delta_b
 
     @property
-    def delta_b_inv(self) -> cp.ndarray:
+    def delta_b_inv(self) -> torch.Tensor:
         return self._delta_b_inv
 
     @property
-    def x_b_scaling(self) -> cp.ndarray:
+    def x_b_scaling(self) -> torch.Tensor:
         return self._x_b_scaling
 
     def reset(self):
-        self._delta.fill(1.0)
-        self._delta_inv.fill(1.0)
-        self._delta_b.fill(1.0)
-        self._delta_b_inv.fill(1.0)
-        self._c_scaling.fill(1.0)
-        self._c_scaling_inv.fill(1.0)
-        cp.copyto(self._x_b_scaling, self._x_b_scaling_init)
+        self._delta.fill_(1.0)
+        self._delta_inv.fill_(1.0)
+        self._delta_b.fill_(1.0)
+        self._delta_b_inv.fill_(1.0)
+        self._c_scaling.fill_(1.0)
+        self._c_scaling_inv.fill_(1.0)
+        self._x_b_scaling.copy_(self._x_b_scaling_init)
 
     @nvtx.annotate("RuizEquilibration::scale_data")
     def scale_data(self, data: Data, scale_cost: bool, max_iter: int):
@@ -127,15 +127,15 @@ class RuizEquilibration(ABC):
         for _ in range(max_iter):
             # Compute KKT row/column inf-norms
             self._compute_kkt_norms(data, self._delta_iter, self._delta_b_iter)
-            cp.maximum(self._delta_iter[:n], self._x_b_scaling, out=self._delta_iter[:n])
+            torch.maximum(self._delta_iter[:n], self._x_b_scaling, out=self._delta_iter[:n])
             self._delta_b_iter[:] = self._x_b_scaling
 
             self._limit_scaling(self._delta_iter)
             self._limit_scaling(self._delta_b_iter)
-            cp.sqrt(self._delta_iter, out=self._delta_iter)
-            cp.reciprocal(self._delta_iter, out=self._delta_iter)
-            cp.sqrt(self._delta_b_iter, out=self._delta_b_iter)
-            cp.reciprocal(self._delta_b_iter, out=self._delta_b_iter)
+            torch.sqrt(self._delta_iter, out=self._delta_iter)
+            torch.reciprocal(self._delta_iter, out=self._delta_iter)
+            torch.sqrt(self._delta_b_iter, out=self._delta_b_iter)
+            torch.reciprocal(self._delta_b_iter, out=self._delta_b_iter)
 
             d_x = self._delta_iter[:n]
             d_y = self._delta_iter[n:n+p]
@@ -154,19 +154,19 @@ class RuizEquilibration(ABC):
 
             # Check convergence
             conv = max(
-                float(cp.max(cp.abs(1.0 - self._delta_iter))),
-                float(cp.max(cp.abs(1.0 - self._delta_b_iter)))
+                float(torch.max(torch.abs(1.0 - self._delta_iter))),
+                float(torch.max(torch.abs(1.0 - self._delta_b_iter)))
             )
             if conv < self.convergence_tol:
                 break
 
         # Compute inverses
-        cp.reciprocal(self._delta, out=self._delta_inv)
-        cp.reciprocal(self._delta_b, out=self._delta_b_inv)
-        cp.reciprocal(self._c_scaling, out=self._c_scaling_inv)
+        torch.reciprocal(self._delta, out=self._delta_inv)
+        torch.reciprocal(self._delta_b, out=self._delta_b_inv)
+        torch.reciprocal(self._c_scaling, out=self._c_scaling_inv)
 
         # Write x_b_scaling to data for use by KKT system and solver
-        cp.copyto(data._x_b_scaling, self._x_b_scaling)
+        data._x_b_scaling.copy_(self._x_b_scaling)
 
         # Scale bounds
         self._scale_bounds(data)
@@ -181,7 +181,7 @@ class RuizEquilibration(ABC):
 
         self._unscale_matrices(data, d_x_inv, d_y_inv, d_z_inv)
         self._unscale_bounds(data)
-        data._x_b_scaling.fill(1.0)
+        data._x_b_scaling.fill_(1.0)
         self._x_b_scaling *= self._delta_b_inv * d_x_inv
         self.reset()
 
@@ -195,7 +195,7 @@ class RuizEquilibration(ABC):
 
         self._apply_stored_scaling(data, d_x, d_y, d_z)
 
-        cp.copyto(data._x_b_scaling, self._x_b_scaling)
+        data._x_b_scaling.copy_(self._x_b_scaling)
         self._scale_bounds(data)
 
     @nvtx.annotate("RuizEquilibration::unscale_solution")
@@ -224,57 +224,57 @@ class RuizEquilibration(ABC):
     # Primal / dual / slack scaling and unscaling
     # ------------------------------------------------------------------
 
-    def unscale_primal(self, x: cp.ndarray) -> cp.ndarray:
+    def unscale_primal(self, x: torch.Tensor) -> torch.Tensor:
         """x_orig = delta_x * x_scaled"""
         return x * self._delta[:self.n]
 
-    def scale_primal(self, x: cp.ndarray) -> cp.ndarray:
+    def scale_primal(self, x: torch.Tensor) -> torch.Tensor:
         """x_scaled = delta_inv_x * x_orig"""
         return x * self._delta_inv[:self.n]
 
-    def unscale_dual_eq(self, y: cp.ndarray) -> cp.ndarray:
+    def unscale_dual_eq(self, y: torch.Tensor) -> torch.Tensor:
         """y_orig = c_inv * delta_y * y_scaled"""
         return y * self._c_scaling_inv * self._delta[self.n:self.n + self.p]
 
-    def scale_dual_eq(self, y: cp.ndarray) -> cp.ndarray:
+    def scale_dual_eq(self, y: torch.Tensor) -> torch.Tensor:
         """y_scaled = c * delta_inv_y * y_orig"""
         return y * self._c_scaling * self._delta_inv[self.n:self.n + self.p]
 
-    def unscale_dual_ineq(self, z: cp.ndarray, idx: cp.ndarray) -> cp.ndarray:
+    def unscale_dual_ineq(self, z: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
         """z_orig = c_inv * delta_z[idx] * z_scaled"""
-        return z * self._c_scaling_inv * self._delta[self.n + self.p + idx]
+        return z * self._c_scaling_inv * self._delta[self.n + self.p + idx.long()]
 
-    def unscale_dual_b(self, z_b: cp.ndarray, idx: cp.ndarray) -> cp.ndarray:
+    def unscale_dual_b(self, z_b: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
         """z_b_orig = c_inv * delta_b[idx] * z_b_scaled"""
-        return z_b * self._c_scaling_inv * self._delta_b[idx]
+        return z_b * self._c_scaling_inv * self._delta_b[idx.long()]
 
-    def unscale_slack_ineq(self, s: cp.ndarray, idx: cp.ndarray) -> cp.ndarray:
+    def unscale_slack_ineq(self, s: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
         """s_orig = delta_inv_z[idx] * s_scaled"""
-        return s * self._delta_inv[self.n + self.p + idx]
+        return s * self._delta_inv[self.n + self.p + idx.long()]
 
-    def unscale_slack_b(self, s_b: cp.ndarray, idx: cp.ndarray) -> cp.ndarray:
+    def unscale_slack_b(self, s_b: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
         """s_b_orig = delta_b_inv[idx] * s_b_scaled"""
-        return s_b * self._delta_b_inv[idx]
+        return s_b * self._delta_b_inv[idx.long()]
 
     # ------------------------------------------------------------------
     # Residual unscaling (used every iteration for convergence checks)
     # ------------------------------------------------------------------
 
-    def unscale_dual_res(self, v: cp.ndarray) -> cp.ndarray:
+    def unscale_dual_res(self, v: torch.Tensor) -> torch.Tensor:
         """v_orig = c_inv * delta_inv_x * v_scaled"""
         return v * self._c_scaling_inv * self._delta_inv[:self.n]
 
-    def unscale_primal_res_eq(self, v: cp.ndarray) -> cp.ndarray:
+    def unscale_primal_res_eq(self, v: torch.Tensor) -> torch.Tensor:
         """v_orig = delta_inv_y * v_scaled"""
         return v * self._delta_inv[self.n:self.n + self.p]
 
-    def unscale_primal_res_ineq(self, v: cp.ndarray, idx: cp.ndarray) -> cp.ndarray:
+    def unscale_primal_res_ineq(self, v: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
         """v_orig = delta_inv_z[idx] * v_scaled"""
-        return v * self._delta_inv[self.n + self.p + idx]
+        return v * self._delta_inv[self.n + self.p + idx.long()]
 
-    def unscale_primal_res_b(self, v: cp.ndarray, idx: cp.ndarray) -> cp.ndarray:
+    def unscale_primal_res_b(self, v: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
         """v_orig = delta_b_inv[idx] * v_scaled"""
-        return v * self._delta_b_inv[idx]
+        return v * self._delta_b_inv[idx.long()]
 
     # ------------------------------------------------------------------
     # Cost unscaling
@@ -284,7 +284,7 @@ class RuizEquilibration(ABC):
         """cost_orig = c_inv * cost_scaled"""
         return float(cost * self._c_scaling_inv)
 
-    def _compute_kkt_norms(self, data: Data, d: cp.ndarray, d_b: cp.ndarray):
+    def _compute_kkt_norms(self, data: Data, d: torch.Tensor, d_b: torch.Tensor):
         """Compute inf-norms of each KKT row/column into d[0:n+p+m].
 
         d[:n]     = max over P columns, A columns, G columns
@@ -296,41 +296,41 @@ class RuizEquilibration(ABC):
         self.eval_P_row_inf_norms(data.P, d[:n])
         if p > 0:
             self.eval_A_col_inf_norms(data.A, self._work_n)
-            d[:n] = cp.maximum(d[:n], self._work_n)
+            d[:n] = torch.maximum(d[:n], self._work_n)
             self.eval_A_row_inf_norms(data.A, d[n:n+p])
         if m > 0:
             self.eval_G_col_inf_norms(data.G, self._work_n)
-            d[:n] = cp.maximum(d[:n], self._work_n)
+            d[:n] = torch.maximum(d[:n], self._work_n)
             self.eval_G_row_inf_norms(data.G, d[n+p:n+p+m])
 
     @abstractmethod
-    def eval_P_row_inf_norms(self, P, out: cp.ndarray):
+    def eval_P_row_inf_norms(self, P, out: torch.Tensor):
         """Compute infinity norms of rows of P. The shape of P is (n, n). Return shape is (n,)."""
         pass
 
     @abstractmethod
-    def eval_A_row_inf_norms(self, A, out: cp.ndarray):
+    def eval_A_row_inf_norms(self, A, out: torch.Tensor):
         """Compute infinity norms of rows of A. The shape of A is (p, n). Return shape is (p,)."""
         pass
 
     @abstractmethod
-    def eval_A_col_inf_norms(self, A, out: cp.ndarray):
+    def eval_A_col_inf_norms(self, A, out: torch.Tensor):
         """Compute infinity norms of columns of A. The shape of A is (p, n). Return shape is (n,)."""
         pass
 
     @abstractmethod
-    def eval_G_row_inf_norms(self, G, out: cp.ndarray):
+    def eval_G_row_inf_norms(self, G, out: torch.Tensor):
         """Compute infinity norms of rows of G. The shape of G is (m, n). Return shape is (m,)."""
         pass
 
     @abstractmethod
-    def eval_G_col_inf_norms(self, G, out: cp.ndarray):
+    def eval_G_col_inf_norms(self, G, out: torch.Tensor):
         """Compute infinity norms of columns of G. The shape of G is (m, n). Return shape is (n,)."""
         pass
 
     @abstractmethod
     def _scale_matrices(self, data: Data,
-                        d_x: cp.ndarray, d_y: cp.ndarray, d_z: cp.ndarray):
+                        d_x: torch.Tensor, d_y: torch.Tensor, d_z: torch.Tensor):
         """Apply one Ruiz iteration scaling: P = D_x*P*D_x, A = D_y*A*D_x, G = D_z*G*D_x."""
         pass
 
@@ -341,13 +341,13 @@ class RuizEquilibration(ABC):
 
     @abstractmethod
     def _unscale_matrices(self, data: Data,
-                          d_x_inv: cp.ndarray, d_y_inv: cp.ndarray, d_z_inv: cp.ndarray):
+                          d_x_inv: torch.Tensor, d_y_inv: torch.Tensor, d_z_inv: torch.Tensor):
         """Reverse all matrix scaling using stored inverses."""
         pass
 
     @abstractmethod
     def _apply_stored_scaling(self, data: Data,
-                              d_x: cp.ndarray, d_y: cp.ndarray, d_z: cp.ndarray):
+                              d_x: torch.Tensor, d_y: torch.Tensor, d_z: torch.Tensor):
         """Re-apply stored scaling to fresh data (reuse_prev_scaling path)."""
         pass
 
@@ -355,9 +355,9 @@ class RuizEquilibration(ABC):
     # Shared helpers
     # ------------------------------------------------------------------
 
-    def _limit_scaling(self, d: cp.ndarray):
+    def _limit_scaling(self, d: torch.Tensor):
         d[d < self.min_scaling] = 1.0
-        cp.minimum(d, self.max_scaling, out=d)
+        torch.minimum(d, torch.tensor(self.max_scaling, dtype=d.dtype, device=d.device), out=d)
 
     def _limit_scaling_scalar(self, d: float) -> float:
         if d < self.min_scaling:
@@ -377,9 +377,9 @@ class RuizEquilibration(ABC):
             data._h_l *= d_z
             data._h_u *= d_z
         if data.num_xl > 0:
-            data._x_l[data.idx_xl] *= self._delta_b[data.idx_xl]
+            data._x_l[data.idx_xl.long()] *= self._delta_b[data.idx_xl.long()]
         if data.num_xu > 0:
-            data._x_u[data.idx_xu] *= self._delta_b[data.idx_xu]
+            data._x_u[data.idx_xu.long()] *= self._delta_b[data.idx_xu.long()]
 
     def _unscale_bounds(self, data: Data):
         n, p, m = self.n, self.p, self.m
@@ -392,6 +392,6 @@ class RuizEquilibration(ABC):
             data._h_l *= d_z_inv
             data._h_u *= d_z_inv
         if data.num_xl > 0:
-            data._x_l[data.idx_xl] *= self._delta_b_inv[data.idx_xl]
+            data._x_l[data.idx_xl.long()] *= self._delta_b_inv[data.idx_xl.long()]
         if data.num_xu > 0:
-            data._x_u[data.idx_xu] *= self._delta_b_inv[data.idx_xu]
+            data._x_u[data.idx_xu.long()] *= self._delta_b_inv[data.idx_xu.long()]

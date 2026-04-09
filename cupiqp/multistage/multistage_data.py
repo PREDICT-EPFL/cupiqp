@@ -1,5 +1,5 @@
 from typing import Optional
-import cupy as cp
+import torch
 import warp as wp
 
 from ..data import Data
@@ -21,9 +21,9 @@ class MultistageData(Data):
     Where P is block-tridiagonal, A and G are block-bidiagonal,
     and all vectors are block-wise (BlockVec).
 
-    Flat CuPy arrays (_c, _b, _h_l, …) are zero-copy DLPack views of the
+    Flat PyTorch tensors (_c, _b, _h_l, ...) are zero-copy DLPack views of the
     underlying Warp buffers.  Updating the Warp buffer (e.g. via ``set_c``)
-    automatically makes the flat view reflect the new values — no explicit
+    automatically makes the flat view reflect the new values -- no explicit
     sync step is needed.
     """
 
@@ -66,7 +66,7 @@ class MultistageData(Data):
         elif A is None and b is None:
             self._A = None
             self._b_blk = None
-            self._b = cp.zeros(0, dtype=cp.float64)
+            self._b = torch.zeros(0, dtype=torch.float64, device='cuda')
         else:
             raise ValueError("A and b must both be provided or both be None")
 
@@ -91,7 +91,7 @@ class MultistageData(Data):
         # ---- x_u, x_l (box constraints) ----
         if x_u is not None:
             self._x_u_block = x_u
-            self._x_u = self._block_vec_to_flat(x_u).astype(cp.float64)
+            self._x_u = self._block_vec_to_flat(x_u).to(dtype=torch.float64)
             if self._x_u.shape[0] != _n:
                 raise ValueError(
                     f"x_u has {self._x_u.shape[0]} elements, expected {_n}"
@@ -102,7 +102,7 @@ class MultistageData(Data):
 
         if x_l is not None:
             self._x_l_block = x_l
-            self._x_l = self._block_vec_to_flat(x_l).astype(cp.float64)
+            self._x_l = self._block_vec_to_flat(x_l).to(dtype=torch.float64)
             if self._x_l.shape[0] != _n:
                 raise ValueError(
                     f"x_l has {self._x_l.shape[0]} elements, expected {_n}"
@@ -113,11 +113,11 @@ class MultistageData(Data):
 
         # preprocessing (reuses inherited _init_h_l / _init_h_u / _init_x_l / _init_x_u)
         self._preprocess()
-        self._x_b_scaling = cp.ones(_n, dtype=cp.float64)
-        self._constraints_rhs_inf_norm = cp.empty(1, dtype=cp.float64)
+        self._x_b_scaling = torch.ones(_n, dtype=torch.float64, device='cuda')
+        self._constraints_rhs_inf_norm = torch.empty(1, dtype=torch.float64, device='cuda')
         self._compute_constraints_rhs_inf_norm()
 
-        # cache flat dlpack views for allocation-free update() path, 
+        # cache flat dlpack views for allocation-free update() path,
         # points directly into the warp block data buffers.
         self._c_flat_view = self._block_vec_to_flat(self._c_blk)
         if self._b_blk is not None:
@@ -167,26 +167,26 @@ class MultistageData(Data):
         N = self._G.N
         r = self._G.rows_of_blocks
 
-        # cupy views of the warp block arrays (zero-copy)
-        D_cp = cp.from_dlpack(wp.to_dlpack(self._G.D))  # (N, r, c)
-        E_cp = cp.from_dlpack(wp.to_dlpack(self._G.E))  # (N, r, c)
+        # torch views of the warp block arrays (zero-copy)
+        D_t = torch.utils.dlpack.from_dlpack(wp.to_dlpack(self._G.D))  # (N, r, c)
+        E_t = torch.utils.dlpack.from_dlpack(wp.to_dlpack(self._G.E))  # (N, r, c)
 
         inf_mask_2d = inf_mask.reshape(N + 1, r)
 
         # D blocks occupy block rows 0..N-1
         D_mask = inf_mask_2d[:N]
         if D_mask.any():
-            D_cp[D_mask] = 0.0
+            D_t[D_mask] = 0.0
 
         # E blocks occupy block rows 1..N (stored as E[0..N-1])
         E_mask = inf_mask_2d[1:]
         if E_mask.any():
-            E_cp[E_mask] = 0.0
+            E_t[E_mask] = 0.0
 
         self._h_l[inf_mask] = -1.0
         self._h_u[inf_mask] = 1.0
 
-    def extract_P_diag(self, diag_P: cp.ndarray):
+    def extract_P_diag(self, diag_P: torch.Tensor):
         raise NotImplementedError
 
     def set_P(self, value: BlockTridiagMat, check: bool = True):
@@ -251,9 +251,9 @@ class MultistageData(Data):
         self._x_u[:] = self._x_u_flat_view
 
     @staticmethod
-    def _block_vec_to_flat(bv: BlockVec) -> cp.ndarray:
-        """Zero-copy flat cupy view of a BlockVec's warp data."""
-        return cp.from_dlpack(wp.to_dlpack(bv.data)).reshape(-1)
+    def _block_vec_to_flat(bv: BlockVec) -> torch.Tensor:
+        """Zero-copy flat torch view of a BlockVec's warp data."""
+        return torch.utils.dlpack.from_dlpack(wp.to_dlpack(bv.data)).reshape(-1)
 
     @staticmethod
     def _validate_bidiag(mat, block_size, num_blocks, name):

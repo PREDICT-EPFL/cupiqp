@@ -1,6 +1,7 @@
 import os, importlib.util
 from abc import ABC, abstractmethod
 import numpy as np
+import torch
 import cupy as cp
 from cupyx.scipy.sparse import csr_matrix
 import nvtx
@@ -84,7 +85,7 @@ class CudssSparseDirectSolver(SparseDirectSolver):
             b=self._rhs,
             options=opts,
             execution=exe,
-            stream=cp.cuda.get_current_stream().ptr,
+            stream=torch.cuda.current_stream().cuda_stream,
             )
         self._cudss_solver.plan_config.reordering_algorithm = DirectSolverAlgType.ALG_DEFAULT
         self._cudss_solver.solution_config.ir_num_steps = 0  # NOTE: iterative refinement steps, to be tuned

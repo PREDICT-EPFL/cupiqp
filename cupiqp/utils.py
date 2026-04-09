@@ -1,6 +1,6 @@
 from typing import Callable, Optional
 import functools
-import cupy as cp
+import torch
 
 
 def cuda_graph_capture(key: Optional[Callable] = None, enable: Optional[Callable] = None):
@@ -24,7 +24,7 @@ def cuda_graph_capture(key: Optional[Callable] = None, enable: Optional[Callable
         @cuda_graph_capture(key=lambda self: (self._result.buffer_ptr,))
         def _calculate_sigma(self):
             self._result.info.sigma[:] = 0.
-            self._result.info.sigma += cp.dot(...)
+            self._result.info.sigma += torch.dot(...)
             ...
     """
     def decorator(fn):
@@ -42,13 +42,18 @@ def cuda_graph_capture(key: Optional[Callable] = None, enable: Optional[Callable
             k = key(self, *args, **kwargs) if key is not None else None
 
             if k not in cache:
-                stream = cp.cuda.Stream(non_blocking=True)
-                stream.begin_capture()
-                with stream:
+                # PyTorch CUDA graph capture requires a warm-up run
+                stream = torch.cuda.Stream()
+                with torch.cuda.stream(stream):
                     fn(self, *args, **kwargs)
-                cache[k] = stream.end_capture()
+                torch.cuda.current_stream().wait_stream(stream)
 
-            cache[k].launch()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=stream):
+                    fn(self, *args, **kwargs)
+                cache[k] = graph
+
+            cache[k].replay()
 
         return wrapper
 
@@ -58,14 +63,14 @@ def cuda_graph_capture(key: Optional[Callable] = None, enable: Optional[Callable
 def print_matlab_format(arr, name=None):
     """
     Print a numpy array in MATLAB format.
-    
+
     Args:
         arr: numpy array (1D or 2D)
         name: optional name for the array
     """
     if name:
         print(f"{name} = ", end="")
-    
+
     if arr.ndim == 1:
         # 1D array
         print("[", end="")

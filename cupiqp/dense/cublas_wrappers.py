@@ -32,13 +32,14 @@ def _load_cublas_lib() -> ctypes.CDLL:
     """Load the cuBLAS shared library via ctypes."""
     # Try the version matching the active CUDA runtime first.
     try:
-        import cupy.cuda.runtime as rt
-        major = rt.runtimeGetVersion() // 1000  # e.g. 12040 -> 12
-        versioned = f"libcublas.so.{major}"
-        try:
-            return ctypes.CDLL(versioned)
-        except OSError:
-            pass
+        import torch
+        cuda_version = torch.version.cuda
+        if cuda_version:
+            major = int(cuda_version.split('.')[0])
+            try:
+                return ctypes.CDLL(f"libcublas.so.{major}")
+            except OSError:
+                pass
     except Exception:
         pass
 
@@ -182,7 +183,7 @@ def cublas_destroy_handle(handle):
     status = _destroy(handle)
     if status != 0:
         raise RuntimeError(f"cublasDestroy failed with status {status}")
-    
+
 def cublas_set_stream(handle, cuda_stream):
     """Associate a CUDA stream with the cuBLAS handle.
 
@@ -193,17 +194,17 @@ def cublas_set_stream(handle, cuda_stream):
     status = _set_stream(handle, cuda_stream)
     if status != 0:
         raise RuntimeError(f"cublasSetStream failed with status {status}")
-    
+
 def dgemv(handle, mat, x, y, transa=False, alpha=1.0, beta=0.0):
     """``y = alpha * op(mat) * x + beta * y``  (CUDA graph safe).
 
     Parameters
     ----------
     handle : int
-        cuBLAS handle (from ``cp.cuda.Device().cublas_handle``).
-    mat : cp.ndarray
-        2-D device array, dtype float64, C- or F-contiguous.
-    x, y : cp.ndarray
+        cuBLAS handle.
+    mat : torch.Tensor
+        2-D device tensor, dtype float64, contiguous.
+    x, y : torch.Tensor
         Input / output vectors (1-D, float64).
     transa : bool
         If False, compute ``mat @ x``.  If True, compute ``mat.T @ x``.
@@ -211,10 +212,12 @@ def dgemv(handle, mat, x, y, transa=False, alpha=1.0, beta=0.0):
         Host scalars baked into the graph node at capture time.
     """
     rows, cols = mat.shape
-    if mat.flags["F_CONTIGUOUS"]:
+    # Check for F-contiguous: stride(0) == 1 means column-major
+    if mat.stride(0) == 1:
         m, n, lda = rows, cols, rows
         op = OP_N if not transa else OP_T
     else:
+        # C-contiguous (stride(1) == 1): cuBLAS sees as column-major transposed
         m, n, lda = cols, rows, cols
         op = OP_T if not transa else OP_N
 
@@ -223,9 +226,9 @@ def dgemv(handle, mat, x, y, transa=False, alpha=1.0, beta=0.0):
 
     _dgemv(
         handle, op, m, n,
-        ctypes.addressof(_alpha), mat.data.ptr, lda,
-        x.data.ptr, 1,
-        ctypes.addressof(_beta), y.data.ptr, 1,
+        ctypes.addressof(_alpha), mat.data_ptr(), lda,
+        x.data_ptr(), 1,
+        ctypes.addressof(_beta), y.data_ptr(), 1,
     )
 
 
@@ -276,4 +279,3 @@ def ddot(handle, n, x_ptr, incx, y_ptr, incy, result_ptr):
 def set_pointer_mode(handle, mode):
     """Set cuBLAS pointer mode (``POINTER_HOST`` or ``POINTER_DEVICE``)."""
     _set_pointer_mode(handle, mode)
-

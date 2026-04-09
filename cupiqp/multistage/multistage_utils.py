@@ -1,5 +1,5 @@
 import warp as wp
-import cupyx.scipy.sparse as cpsp
+from typing import Any
 
 
 def create_csr_add_btd_kernel(num_blocks: int, block_size: int, dtype=wp.float64):
@@ -22,17 +22,17 @@ def create_csr_add_btd_kernel(num_blocks: int, block_size: int, dtype=wp.float64
 
         if row >= num_blocks_static * block_size_static:
             return
-        
+
         start = row_ptr[row]
         end = row_ptr[row + 1]
-        
+
         br = row // block_size_static       # block row index
         lr = row - br * block_size_static   # local row index within the block
-        
+
         for p in range(start, end):
             c = col_idx[p]
             v = vals[p]
-            
+
             bc = c // block_size_static       # block column index
             lc = c - bc * block_size_static   # local column index within the block
 
@@ -40,11 +40,11 @@ def create_csr_add_btd_kernel(num_blocks: int, block_size: int, dtype=wp.float64
             if br == bc:
                 diag_data[br, lr, lc] += alpha * v
             # lower off-diagonal
-            elif br == bc + 1:                
+            elif br == bc + 1:
                 off_lower_data[br - 1, lr, lc] += alpha * v
             else:
                 pass
-        
+
     return _csr_add_btd_kernel
 
 
@@ -60,7 +60,7 @@ def create_block_tridiag_diaad_kernel(block_size: int, dtype=wp.float64):
         br = row // block_size_static
         lr = row - br * block_size_static
         diag_blocks[br, lr, lr] += x[row]
-        
+
     return _block_tridiag_diaad_kernel
 
 
@@ -223,14 +223,14 @@ class BlockBidiagMat:
     """
     Used to store the A and G matrices in the multistage problem, which have a block lower bidiagonal structure.
 
-    A = 
+    A =
     [
-    D0                                   
-    E0  D1                               
-        E1  D2                           
-            E2  D3                       
-                    ...                  
-                    E_{N-2} D_{N-1}      
+    D0
+    E0  D1
+        E1  D2
+            E2  D3
+                    ...
+                    E_{N-2} D_{N-1}
                             E_{N-1}
     ]
     """
@@ -384,31 +384,31 @@ class BlockTridiagMat:
         self.block_size = block_size
         self.diag_blocks = DenseBlocks(num_blocks=num_diag_blocks, rows=block_size, cols=block_size, dtype=dtype, device=device)
         self.off_diag_blocks_lower = DenseBlocks(num_blocks=num_diag_blocks-1, rows=block_size, cols=block_size, dtype=dtype, device=device)
-        
+
         self._csr_add_to_btd_kernel = create_csr_add_btd_kernel(num_diag_blocks, block_size, dtype)
 
     @property
     def num_diag_blocks(self):
         return self.diag_blocks.data.shape[0]
-    
+
     @property
     def rows(self):
         return self.num_diag_blocks * self.diag_blocks.data.shape[1]
-    
+
     @property
     def cols(self):
         return self.num_diag_blocks * self.diag_blocks.data.shape[2]
 
-    @classmethod 
-    def from_csr(cls, A_csr: cpsp.csr_matrix, block_size: int, dtype=wp.float64, device="cuda"):
+    @classmethod
+    def from_csr(cls, A_csr: Any, block_size: int, dtype=wp.float64, device="cuda"):
         if A_csr.shape[0] != A_csr.shape[1]:
             raise ValueError("The CSR matrix must be square")
-        
+
         # create BlockTridiagMat instance
         num_diag_blocks = A_csr.shape[0] // block_size
-        A_blk_tridiag = cls(num_diag_blocks=num_diag_blocks, block_size=block_size, dtype=dtype, device=device)        
-        
-        
+        A_blk_tridiag = cls(num_diag_blocks=num_diag_blocks, block_size=block_size, dtype=dtype, device=device)
+
+
         wp.launch(
             kernel=A_blk_tridiag._csr_add_to_btd_kernel,
             dim=A_csr.shape[0],
@@ -422,13 +422,13 @@ class BlockTridiagMat:
             device=device
         )
         return A_blk_tridiag
-    
-    def copy_from_csr(self, A_csr: cpsp.csr_matrix):
+
+    def copy_from_csr(self, A_csr: Any):
         if A_csr.shape[0] != A_csr.shape[1]:
             raise ValueError("The CSR matrix must be square")
         if A_csr.shape[0] != self.rows:
             raise ValueError("The CSR matrix size must match the block matrix size")
-        
+
         wp.launch(
             kernel=self._csr_add_to_btd_kernel,
             dim=A_csr.shape[0],
@@ -442,13 +442,13 @@ class BlockTridiagMat:
             device=self.diag_blocks.data.device
         )
 
-    def add_with_csr(self, alpha: float, A_csr: cpsp.csr_matrix, beta: float = 1.0):
+    def add_with_csr(self, alpha: float, A_csr: Any, beta: float = 1.0):
         """self += alpha * A_csr"""
         if A_csr.shape[0] != A_csr.shape[1]:
             raise ValueError("The CSR matrix must be square")
         if A_csr.shape[0] != self.rows:
             raise ValueError("The CSR matrix size must match the block matrix size")
-        
+
         wp.launch(
             kernel=self._csr_add_to_btd_kernel,
             dim=A_csr.shape[0],
@@ -466,10 +466,10 @@ class BlockTridiagMat:
         """self += diag(x)"""
         block_size = self.diag_blocks.data.shape[1]
         num_blocks = self.num_diag_blocks
-        
+
         if x.shape[0] != self.rows:
             raise ValueError("Dimension mismatch in add_on_diag")
-            
+
         wp.launch(
             kernel=self._add_on_diag_kernel,
             dim=self.rows,

@@ -1,7 +1,8 @@
 import ctypes
 import ctypes.util
-import cupy as cp
-from cupy_backends.cuda.libs import cublas, cusolver
+import torch
+
+from .cublas_wrappers import FILL_UPPER
 
 
 # ---------------------------------------------------------------------------
@@ -9,12 +10,13 @@ from cupy_backends.cuda.libs import cublas, cusolver
 # ---------------------------------------------------------------------------
 def _load_cusolver_lib() -> ctypes.CDLL:
     try:
-        import cupy.cuda.runtime as rt
-        major = rt.runtimeGetVersion() // 1000
-        try:
-            return ctypes.CDLL(f"libcusolver.so.{major}")
-        except OSError:
-            pass
+        cuda_version = torch.version.cuda
+        if cuda_version:
+            major = int(cuda_version.split('.')[0])
+            try:
+                return ctypes.CDLL(f"libcusolver.so.{major}")
+            except OSError:
+                pass
     except Exception:
         pass
     for name in ("libcusolver.so", "cusolver"):
@@ -42,6 +44,50 @@ _cusolver_dn_set_stream = _cusolver_lib.cusolverDnSetStream
 _cusolver_dn_set_stream.restype = ctypes.c_int
 _cusolver_dn_set_stream.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
 
+# cusolverDnDpotrf
+_cusolver_dn_dpotrf_buffer_size = _cusolver_lib.cusolverDnDpotrf_bufferSize
+_cusolver_dn_dpotrf_buffer_size.restype = ctypes.c_int
+_cusolver_dn_dpotrf_buffer_size.argtypes = [
+    ctypes.c_void_p,  # handle
+    ctypes.c_int,     # uplo
+    ctypes.c_int,     # n
+    ctypes.c_void_p,  # A
+    ctypes.c_int,     # lda
+    ctypes.POINTER(ctypes.c_int),  # lwork
+]
+
+_cusolver_dn_dpotrf = _cusolver_lib.cusolverDnDpotrf
+_cusolver_dn_dpotrf.restype = ctypes.c_int
+_cusolver_dn_dpotrf.argtypes = [
+    ctypes.c_void_p,  # handle
+    ctypes.c_int,     # uplo
+    ctypes.c_int,     # n
+    ctypes.c_void_p,  # A
+    ctypes.c_int,     # lda
+    ctypes.c_void_p,  # workspace
+    ctypes.c_int,     # lwork
+    ctypes.c_void_p,  # devInfo
+]
+
+# cusolverDnDpotrs
+_cusolver_dn_dpotrs = _cusolver_lib.cusolverDnDpotrs
+_cusolver_dn_dpotrs.restype = ctypes.c_int
+_cusolver_dn_dpotrs.argtypes = [
+    ctypes.c_void_p,  # handle
+    ctypes.c_int,     # uplo
+    ctypes.c_int,     # n
+    ctypes.c_int,     # nrhs
+    ctypes.c_void_p,  # A
+    ctypes.c_int,     # lda
+    ctypes.c_void_p,  # B
+    ctypes.c_int,     # ldb
+    ctypes.c_void_p,  # devInfo
+]
+
+# cuSOLVER fill mode constants
+CUBLAS_FILL_MODE_LOWER = 0
+CUBLAS_FILL_MODE_UPPER = 1
+
 
 def cusolver_create_handle():
     """Create a new cuSOLVER dense handle."""
@@ -68,41 +114,26 @@ def cusolver_set_stream(handle, stream_ptr):
 
 class CholeskyInplaceSolver:
     """Perform in-place dense Cholesky factorization and solves using cuSOLVER.
-    
-    Code insipred by cupy.linalg.cholesky implementation, but adapted for repeated use
+
+    Code inspired by cupy.linalg.cholesky implementation, but adapted for repeated use
     on the same size matrix without repeated allocations.
     """
-    def __init__(self, n: int, dtype = cp.float64):
+    def __init__(self, n: int, dtype=torch.float64):
         self.n = n
-        self._dtype = cp.dtype(dtype).char
         self._cusolver_handle = cusolver_create_handle()
-        
-        if self._dtype == 'f':
-            self._potrf = cusolver.spotrf
-            self._potrs = cusolver.spotrs
-            buffer_func = cusolver.spotrf_bufferSize
-        elif self._dtype == 'd':
-            self._potrf = cusolver.dpotrf
-            self._potrs = cusolver.dpotrs
-            buffer_func = cusolver.dpotrf_bufferSize
-        elif self._dtype == 'F':
-            self._potrf = cusolver.cpotrf
-            self._potrs = cusolver.cpotrs
-            buffer_func = cusolver.cpotrf_bufferSize
-        elif self._dtype == 'D':
-            self._potrf = cusolver.zpotrf
-            self._potrs = cusolver.zpotrs
-            buffer_func = cusolver.zpotrf_bufferSize
-        else:
-            raise ValueError(f"Unsupported dtype: {dtype}")
 
-        self._dev_info = cp.empty(1, dtype=cp.int32)
-        self._buffersize = buffer_func(self._cusolver_handle, cublas.CUBLAS_FILL_MODE_UPPER, n, 0, n)
-        self._workspace = cp.empty(self._buffersize, dtype=self._dtype)
-        
+        # Get buffer size
+        lwork = ctypes.c_int(0)
+        _cusolver_dn_dpotrf_buffer_size(
+            self._cusolver_handle, CUBLAS_FILL_MODE_UPPER, n, 0, n, ctypes.byref(lwork))
+
+        self._buffersize = lwork.value
+        self._workspace = torch.empty(self._buffersize, dtype=torch.float64, device='cuda')
+        self._dev_info = torch.empty(1, dtype=torch.int32, device='cuda')
+
         self._factor_ptr = None
         self._uplo = None
-        self._ctx_A = None # holds reference to A
+        self._ctx_A = None  # holds reference to A
 
     def __del__(self):
         handle = getattr(self, "_cusolver_handle", None)
@@ -112,43 +143,47 @@ class CholeskyInplaceSolver:
             except Exception:
                 pass
 
-    def factorize(self, A: cp.ndarray) -> bool:
-        # point the cusolver handle at CuPy's current stream
-        cusolver_set_stream(self._cusolver_handle, cp.cuda.get_current_stream().ptr)
-        if not cp.dtype(A.dtype).char == self._dtype:
-            raise TypeError(f"Input matrix dtype {A.dtype} does not match solver dtype {self._dtype}.")
+    def factorize(self, A: torch.Tensor) -> bool:
+        # point the cusolver handle at torch's current stream
+        cusolver_set_stream(self._cusolver_handle, torch.cuda.current_stream().cuda_stream)
+
+        if A.dtype != torch.float64:
+            raise TypeError(f"Input matrix dtype {A.dtype} does not match solver dtype float64.")
         if A.shape[0] != self.n or A.shape[1] != self.n:
             raise ValueError(f"Shape mismatch. Expected ({self.n}, {self.n}), got {A.shape}")
-        
+
         # Layout Detection
-        if A.flags.f_contiguous:
-            self._uplo = cublas.CUBLAS_FILL_MODE_LOWER
-        elif A.flags.c_contiguous:
-            self._uplo = cublas.CUBLAS_FILL_MODE_UPPER
+        # For C-contiguous (row-major), cuSOLVER sees it as column-major upper = row-major lower
+        if A.stride(0) == 1:
+            # F-contiguous
+            self._uplo = CUBLAS_FILL_MODE_LOWER
+        elif A.stride(1) == 1:
+            # C-contiguous
+            self._uplo = CUBLAS_FILL_MODE_UPPER
         else:
             raise ValueError("Matrix A must be contiguous (C or F order).")
 
         # Keep A alive!
-        self._ctx_A = A  
-        self._factor_ptr = A.data.ptr
-        
-        self._potrf(
+        self._ctx_A = A
+        self._factor_ptr = A.data_ptr()
+
+        _cusolver_dn_dpotrf(
             self._cusolver_handle,
             self._uplo,
             self.n,
             self._factor_ptr,
             self.n,
-            self._workspace.data.ptr,
+            self._workspace.data_ptr(),
             self._buffersize,
-            self._dev_info.data.ptr
+            self._dev_info.data_ptr()
         )
 
-        factorization_success = cp.all(self._dev_info == 0)  # dev_info == 0 indicates success
+        factorization_success = torch.all(self._dev_info == 0)  # dev_info == 0 indicates success
         return factorization_success
 
-    def solve(self, B: cp.ndarray):
+    def solve(self, B: torch.Tensor):
         """Combined forward and backward substitution to solve Ax = B."""
-        cusolver_set_stream(self._cusolver_handle, cp.cuda.get_current_stream().ptr)
+        cusolver_set_stream(self._cusolver_handle, torch.cuda.current_stream().cuda_stream)
         if self._factor_ptr is None:
             raise RuntimeError("You must call factorize() before solve().")
 
@@ -162,18 +197,17 @@ class CholeskyInplaceSolver:
             nrhs = B.shape[1]
             ldb = self.n
 
-        if not (B.flags.c_contiguous or B.flags.f_contiguous):
-             raise ValueError("RHS B must be contiguous.")
+        if not B.is_contiguous():
+            raise ValueError("RHS B must be contiguous.")
 
-        self._potrs(
+        _cusolver_dn_dpotrs(
             self._cusolver_handle,
             self._uplo,
             self.n,
             nrhs,
             self._factor_ptr,
             self.n,
-            B.data.ptr,
+            B.data_ptr(),
             ldb,
-            self._dev_info.data.ptr
+            self._dev_info.data_ptr()
         )
-
