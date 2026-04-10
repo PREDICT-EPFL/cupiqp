@@ -1,16 +1,15 @@
-
+"""MPC benchmark: quadcopter stabilization using cupiqp (PyTorch/Warp backends)."""
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
-from scipy import sparse	
-
-
-from cupiqp import SolverBase
-
+import torch
+import time
+from scipy import sparse
 
 INF = np.inf
+PIQP_INF = 1e20
 
 # Discrete time model of a quadcopter
 Ad = sparse.csc_matrix([
@@ -46,7 +45,6 @@ Bd = sparse.csc_matrix([
 u0 = 10.5916
 umin = np.array([9.6, 9.6, 9.6, 9.6]) - u0
 umax = np.array([13., 13., 13., 13.]) - u0
-
 xmin = np.array([-np.pi/6,-np.pi/6,-INF,-INF,-INF,-1.,
                  -INF,-INF,-INF,-INF,-INF,-INF])
 xmax = np.array([ np.pi/6, np.pi/6, INF, INF, INF, INF,
@@ -64,109 +62,110 @@ xr = np.array([0.,0.,1.,0.,0.,0.,0.,0.,0.,0.,0.,0.])
 # Prediction horizon
 N = 10
 
-# Cast MPC problem to a QP: x = (x(0),x(1),...,x(N),u(0),...,u(N-1))
-# - quadratic objective
+# Cast MPC problem to a QP
 P = sparse.block_diag([sparse.kron(sparse.eye(N), Q), QN,
                        sparse.kron(sparse.eye(N), R)], format='csc')
-# - linear objective
 q = np.hstack([np.kron(np.ones(N), -Q@xr), -QN@xr, np.zeros(N*nu)])
-# - linear dynamics
+
 Ax = sparse.kron(sparse.eye(N+1),-sparse.eye(nx)) + sparse.kron(sparse.eye(N+1, k=-1), Ad)
 Bu = sparse.kron(sparse.vstack([sparse.csc_matrix((1, N)), sparse.eye(N)]), Bd)
 Aeq = sparse.hstack([Ax, Bu])
 leq = np.hstack([-x0, np.zeros(N*nx)])
-ueq = leq
-# - input and state constraints
+
 Aineq = sparse.eye((N+1)*nx + N*nu)
 lineq = np.hstack([np.kron(np.ones(N+1), xmin), np.kron(np.ones(N), umin)])
 uineq = np.hstack([np.kron(np.ones(N+1), xmax), np.kron(np.ones(N), umax)])
-# - OSQP constraints
-A = sparse.vstack([Aeq, Aineq], format='csc')
-l = np.hstack([leq, lineq])
-u = np.hstack([ueq, uineq])
 
-idx_l_inf = np.where(lineq <= -1e5)[0]
-idx_u_inf = np.where(uineq >= 1e5)[0]
-lineq[idx_l_inf] = -1e5 * np.ones_like(idx_l_inf)
-uineq[idx_u_inf] = 1e5 * np.ones_like(idx_u_inf)
+# Clamp to PIQP sentinel
+lineq = np.clip(lineq, -PIQP_INF, PIQP_INF)
+uineq = np.clip(uineq, -PIQP_INF, PIQP_INF)
 
-x_l = -INF * np.ones_like(q)
-x_u = INF * np.ones_like(q)
-
-x_u = 1e3 * np.ones_like(q)
 x_l = -1e3 * np.ones_like(q)
+x_u = 1e3 * np.ones_like(q)
 
-# Solve with OSQP:
-import osqp
-prob = osqp.OSQP()
+n_vars = P.shape[0]
+print(f"QP: n={n_vars}, p={Aeq.shape[0]}, m={Aineq.shape[0]}")
 
-# Setup workspace
-prob.setup(P, q, A, l, u, warm_starting=True, verbose=True)
-res = prob.solve()
+# Helper: numpy -> torch GPU tensor
+def to_gpu(arr):
+    return torch.tensor(np.asarray(arr), dtype=torch.float64, device='cuda')
 
-print("Run time: ", res.info.run_time)
-
+# ============================================================
+# CPU PIQP baseline
+# ============================================================
+print("\n=== CPU PIQP (sparse) ===")
 import piqp
 solver_cpu = piqp.SparseSolver()
-solver_cpu.settings.verbose = True
-solver_cpu.settings.iterative_refinement_always_enabled = True
+solver_cpu.settings.verbose = False
 solver_cpu.setup(P, q, Aeq, leq, Aineq, lineq, uineq, x_l, x_u)
-solver_cpu.solve()
+solver_cpu.solve()  # warmup
 
+times_cpu = []
+for _ in range(10):
+    t0 = time.time()
+    solver_cpu.solve()
+    t1 = time.time()
+    times_cpu.append((t1-t0)*1000)
+print(f"CPU PIQP: {np.mean(times_cpu):.3f} +/- {np.std(times_cpu):.3f} ms (min={np.min(times_cpu):.3f})")
 
-import cupy as cp
+# ============================================================
+# cupiqp sparse (cuDSS) — sparse backend still uses CuPy CSR
+# ============================================================
+print("\n=== cupiqp sparse (cuDSS) ===")
 from cupyx.scipy.sparse import csr_matrix
+from cupiqp import SolverBase
 
-solver = SolverBase()
-solver.settings.kkt_solver = 'sparse_ldlt'
-# solver.settings.debug = True
-solver.settings.verbose = True
-solver.settings.max_iter = 30
-solver.settings.iterative_refinement_always_enabled = False
+solver_sparse = SolverBase()
+solver_sparse.settings.kkt_solver = 'sparse_ldlt'
+solver_sparse.settings.verbose = False
+solver_sparse.settings.max_iter = 100
+solver_sparse.settings.enable_cuda_graph = False  # mixed CuPy CSR + torch tensors prevents graph capture
+solver_sparse.setup(
+    P=csr_matrix(P), c=to_gpu(q),
+    A=csr_matrix(Aeq), b=to_gpu(leq),
+    G=csr_matrix(Aineq), h_u=to_gpu(uineq), h_l=to_gpu(lineq),
+    x_u=to_gpu(x_u), x_l=to_gpu(x_l))
+solver_sparse.solve(); torch.cuda.synchronize()  # warmup
 
-with cp.cuda.Device(0):
-	solver.setup(
-		P=csr_matrix(P),  # Convert scipy sparse to cupy sparse directly
-		c=cp.array(q),
-		A=csr_matrix(Aeq),  # Convert scipy sparse to cupy sparse directly
-		b=cp.array(leq),
-		G=csr_matrix(Aineq),  # Convert scipy sparse to cupy sparse directly
-		h_u=cp.array(uineq),
-		h_l=cp.array(lineq),
-		x_u=cp.array(x_u),
-		x_l=cp.array(x_l)
-	)
+times_sparse = []
+for _ in range(10):
+    t0 = time.time()
+    solver_sparse.solve()
+    torch.cuda.synchronize()
+    t1 = time.time()
+    times_sparse.append((t1-t0)*1000)
+print(f"cupiqp sparse: {np.mean(times_sparse):.3f} +/- {np.std(times_sparse):.3f} ms (min={np.min(times_sparse):.3f})")
+print(f"  status={solver_sparse._result.info.status}, iter={solver_sparse._result.info.iter}")
 
-	result = solver.solve()
+# ============================================================
+# cupiqp dense (Cholesky) — fully PyTorch
+# ============================================================
+print("\n=== cupiqp dense (Cholesky) ===")
+solver_dense = SolverBase()
+solver_dense.settings.kkt_solver = 'dense_cholesky'
+solver_dense.settings.verbose = False
+solver_dense.settings.max_iter = 100
+solver_dense.setup(
+    P=to_gpu(P.toarray()), c=to_gpu(q),
+    A=to_gpu(Aeq.toarray()), b=to_gpu(leq),
+    G=to_gpu(Aineq.toarray()), h_u=to_gpu(uineq), h_l=to_gpu(lineq),
+    x_u=to_gpu(x_u), x_l=to_gpu(x_l))
+solver_dense.solve(); torch.cuda.synchronize()  # warmup
 
-print("status: ", solver._result.info.status)
+times_dense = []
+for _ in range(10):
+    t0 = time.time()
+    solver_dense.solve()
+    torch.cuda.synchronize()
+    t1 = time.time()
+    times_dense.append((t1-t0)*1000)
+print(f"cupiqp dense: {np.mean(times_dense):.3f} +/- {np.std(times_dense):.3f} ms (min={np.min(times_dense):.3f})")
+print(f"  status={solver_dense._result.info.status}, iter={solver_dense._result.info.iter}")
 
-
-
-solver = SolverBase()
-solver.settings.kkt_solver = 'dense_cholesky'
-# solver.settings.debug = True
-solver.settings.verbose = True
-solver.settings.max_iter = 30
-solver.settings.iterative_refinement_always_enabled = False
-
-with cp.cuda.Device(0):
-	solver.setup(
-		P=cp.array(P.toarray()),  # Convert scipy sparse to cupy dense directly
-		c=cp.array(q),
-		A=cp.array(Aeq.toarray()),
-		b=cp.array(leq),
-		G=cp.array(Aineq.toarray()),  # Convert scipy sparse to cupy sparse directly
-		h_u=cp.array(uineq),
-		h_l=cp.array(lineq),
-		x_u=cp.array(x_u),
-		x_l=cp.array(x_l)
-	)
-
-	result = solver.solve()
-
-print("status: ", solver._result.info.status)
-
-	
-
-
+# ============================================================
+# Summary
+# ============================================================
+print(f"\n=== Summary ===")
+print(f"CPU PIQP (sparse):   {np.mean(times_cpu):.3f} ms")
+print(f"cupiqp sparse:       {np.mean(times_sparse):.3f} ms")
+print(f"cupiqp dense:        {np.mean(times_dense):.3f} ms")
