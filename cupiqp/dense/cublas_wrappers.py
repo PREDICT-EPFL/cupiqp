@@ -143,6 +143,29 @@ _ddot.argtypes = [
     ctypes.c_void_p,  # result (pointer to double)
 ]
 
+_dgemm_strided_batched = _lib.cublasDgemmStridedBatched
+_dgemm_strided_batched.restype = ctypes.c_int
+_dgemm_strided_batched.argtypes = [
+    ctypes.c_void_p,     # handle
+    ctypes.c_int,        # transa
+    ctypes.c_int,        # transb
+    ctypes.c_int,        # m
+    ctypes.c_int,        # n
+    ctypes.c_int,        # k
+    ctypes.c_void_p,     # alpha  (host pointer to double)
+    ctypes.c_void_p,     # A      (device pointer)
+    ctypes.c_int,        # lda
+    ctypes.c_longlong,   # strideA
+    ctypes.c_void_p,     # B      (device pointer)
+    ctypes.c_int,        # ldb
+    ctypes.c_longlong,   # strideB
+    ctypes.c_void_p,     # beta   (host pointer to double)
+    ctypes.c_void_p,     # C      (device pointer)
+    ctypes.c_int,        # ldc
+    ctypes.c_longlong,   # strideC
+    ctypes.c_int,        # batchCount
+]
+
 _set_pointer_mode = _lib.cublasSetPointerMode_v2
 _set_pointer_mode.restype = ctypes.c_int
 _set_pointer_mode.argtypes = [
@@ -271,6 +294,133 @@ def ddgmm(handle, mode, m, n, a_ptr, lda, x_ptr, incx, c_ptr, ldc):
 def ddot(handle, n, x_ptr, incx, y_ptr, incy, result_ptr):
     """``result = x^T * y``  (result is a device pointer)."""
     _ddot(handle, n, x_ptr, incx, y_ptr, incy, result_ptr)
+
+
+def dgemm_strided_batched(handle, A, B, C,
+                          transa=False, transb=False,
+                          alpha=1.0, beta=0.0):
+    r"""Batched GEMM on C-contiguous 3-D arrays.
+
+    .. math::
+
+        C_i = \alpha\;\mathrm{op}(A_i)\;B_i + \beta\;C_i
+        \qquad i = 0 \ldots \text{batch}-1
+
+    where :math:`\mathrm{op}(X) = X` when *trans\*=False* and
+    :math:`X^\top` when *trans\*=True*.
+
+    Parameters
+    ----------
+    handle : int
+        cuBLAS handle.
+    A : cp.ndarray
+        Shape ``(batch, rA, cA)``, C-contiguous, float64.
+    B : cp.ndarray
+        Shape ``(batch, rB, cB)``, C-contiguous, float64.
+    C : cp.ndarray
+        Shape ``(batch, rC, cC)``, C-contiguous, float64.  Modified **in-place**.
+    transa, transb : bool
+        Whether to transpose A / B before multiplication.
+    alpha, beta : float
+        Host scalars (baked into a CUDA graph at capture time).
+    """
+    batch = A.shape[0]
+    rA, cA = A.shape[1], A.shape[2]
+    rB, cB = B.shape[1], B.shape[2]
+
+    # ------------------------------------------------------------------
+    # Row-major (Python) → column-major (cuBLAS) mapping
+    #
+    # A C-contiguous (r, c) matrix is stored identically to a
+    # column-major (c, r) matrix, i.e. the cuBLAS view is the
+    # transpose.
+    #
+    # We want:  C = alpha * opA(A) @ opB(B) + beta * C
+    # Taking transposes:
+    #   C^T = alpha * opB(B)^T @ opA(A)^T + beta * C^T
+    #       = alpha * op_b_cm(B_cm) @ op_a_cm(A_cm) + beta * C_cm
+    #
+    # where op_x_cm maps the Python flag to the cuBLAS op applied to
+    # the transposed (column-major) matrix:
+    #   transa=False → opA(A)^T = A^T = A_cm  → OP_N on A_cm
+    #   transa=True  → opA(A)^T = A   = A_cm^T → OP_T on A_cm
+    # ------------------------------------------------------------------
+    op_a_cm = OP_N if not transa else OP_T
+    op_b_cm = OP_N if not transb else OP_T
+
+    # cuBLAS dgemm:  C_blas = alpha * op(A_blas) @ op(B_blas) + beta * C_blas
+    # We identify:  A_blas = B_cm,  B_blas = A_cm  (swapped)
+    #               op on A_blas = op_b_cm,  op on B_blas = op_a_cm
+
+    # Dimensions of op(A_blas) = op_b_cm(B_cm):
+    #   B_cm is (cB, rB);  OP_N → (cB, rB);  OP_T → (rB, cB)
+    if not transb:
+        m_blas, k_blas = cB, rB
+    else:
+        m_blas, k_blas = rB, cB
+
+    # Dimensions of op(B_blas) = op_a_cm(A_cm):
+    #   A_cm is (cA, rA);  OP_N → (cA, rA);  OP_T → (rA, cA)
+    if not transa:
+        n_blas = rA
+    else:
+        n_blas = cA
+
+    # Leading dimensions (column-major storage rows)
+    lda_blas = cB   # B_cm has cB leading rows
+    ldb_blas = cA   # A_cm has cA leading rows
+    ldc_blas = C.shape[2]  # C_cm has cC leading rows
+
+    # NOTE: use actual array strides to support non-contiguous views
+    # strides[0] means how many bytes to move to the next axis of this array (here [0] means batch). For double, itemsize is always 8 bytes 
+    strideA_blas = B.strides[0] // B.itemsize
+    strideB_blas = A.strides[0] // A.itemsize
+    strideC_blas = C.strides[0] // C.itemsize
+
+    _alpha = ctypes.c_double(alpha)
+    _beta = ctypes.c_double(beta)
+
+    _dgemm_strided_batched(
+        handle,
+        op_b_cm, op_a_cm,
+        m_blas, n_blas, k_blas,
+        ctypes.addressof(_alpha),
+        B.data.ptr, lda_blas, strideA_blas,
+        A.data.ptr, ldb_blas, strideB_blas,
+        ctypes.addressof(_beta),
+        C.data.ptr, ldc_blas, strideC_blas,
+        batch,
+    )
+
+
+def dgemv_strided_batched(handle, mat, x, y,
+                          transa=False, alpha=1.0, beta=0.0):
+    r"""Batched matrix-vector product via strided batched GEMM.
+
+    .. math::
+
+        y_i = \alpha\;\mathrm{op}(M_i)\;x_i + \beta\;y_i
+
+    Parameters
+    ----------
+    handle : int
+        cuBLAS handle.
+    mat : cp.ndarray
+        Shape ``(batch, rows, cols)``, C-contiguous, float64.
+    x : cp.ndarray
+        Shape ``(batch, k)``, C-contiguous, float64.
+    y : cp.ndarray
+        Shape ``(batch, m)``, C-contiguous, float64.  Modified **in-place**.
+    transa : bool
+        If *False*, compute ``mat @ x``.  If *True*, compute ``mat.T @ x``.
+    alpha, beta : float
+        Host scalars.
+    """
+    batch = mat.shape[0]
+    x3 = x.reshape(batch, x.shape[1], 1)
+    y3 = y.reshape(batch, y.shape[1], 1)
+    dgemm_strided_batched(handle, mat, x3, y3,
+                          transa=transa, alpha=alpha, beta=beta)
 
 
 def set_pointer_mode(handle, mode):

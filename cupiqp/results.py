@@ -1,68 +1,73 @@
 import cupy as cp
 import numpy as np
 from enum import Enum, IntEnum, auto
-from dataclasses import dataclass
 import nvtx
 
 from .data import Data
 
 class Status(Enum):
     PIQP_UNSOLVED = -1
-    PIQP_SOLVED= 0
-    PIQP_MAX_ITER_REACHED= 1
-    PIQP_PRIMAL_INFEASIBLE= 2
-    PIQP_DUAL_INFEASIBLE= 3
-    PIQP_NUMERICAL_ISSUES= 4
+    PIQP_SOLVED = 0
+    PIQP_MAX_ITER_REACHED = 1
+    PIQP_PRIMAL_INFEASIBLE = 2
+    PIQP_DUAL_INFEASIBLE = 3
+    PIQP_NUMERICAL_ISSUES = 4
 
 
 class Variables:
-    """
-    Class to hold optimization variables.
+    """Optimization variables for a batch of B QPs.
 
-    All variables are backed by two contiguous buffers:
-      _primal_buf: [x | s_l | s_u | s_bl | s_bu]
-      _dual_buf:   [y | z_l | z_u | z_bl | z_bu]
+    Two contiguous buffers per problem, laid out as::
 
-    Individual variable attributes (x, y, s_l, z_u, ...) are zero-copy views
+        _primal_buffer : (B, num_var + num_ineq)  — [x | s_l | s_u | s_bl | s_bu]
+        _dual_buffer   : (B, num_eq + num_ineq)   — [y | z_l | z_u | z_bl | z_bu]
+
+    Individual variable attributes (x, y, s_l, z_u, ...) are zero-copy (B, *) views
     into these buffers. Properties with custom setters ensure assignments
-    always write in-place, preserving the contiguous layout.
+    always write in-place to preserve the contiguous layout.
     """
+
     def __init__(self):
         pass
 
-    def init(self, data: Data):
-        self.n = data.n        # Number of primal variables
-        self.p = data.p        # Number of equality constraints
-        self.m = data.m        # Number of inequality constraints
+    def init(self, data):
+        self._batch_size = data.batch_size
+        self.n = data.n
+        self.p = data.p
+        self.m = data.m
         self.num_ineq = data.num_hl + data.num_hu + data.num_xl + data.num_xu
 
-        # Primal buffer: [x | s_l | s_u | s_bl | s_bu] (here we regard slacks as primal variables)
-        self._primal_buffer = cp.empty(data.n + self.num_ineq)
-        self._x = self._primal_buffer[:data.n]
-        self._s_all = self._primal_buffer[data.n:]  # all slack variables
-        offset = data.n
-        self._s_l  = self._primal_buffer[offset : offset + data.num_hl]
+        B = self._batch_size
+
+        # Primal buffer: [x | s_l | s_u | s_bl | s_bu]
+        self._primal_buffer = cp.empty((B, data.n + self.num_ineq), dtype=cp.float64)
+        offset = 0
+        self._x = self._primal_buffer[:, offset : offset+data.n]
+        self._s_all = self._primal_buffer[:, data.n:]
+        offset += data.n
+        self._s_l = self._primal_buffer[:, offset : offset+data.num_hl]
         offset += data.num_hl
-        self._s_u  = self._primal_buffer[offset : offset + data.num_hu]
+        self._s_u = self._primal_buffer[:, offset : offset+data.num_hu]
         offset += data.num_hu
-        self._s_bl = self._primal_buffer[offset : offset + data.num_xl]
+        self._s_bl = self._primal_buffer[:, offset : offset+data.num_xl]
         offset += data.num_xl
-        self._s_bu = self._primal_buffer[offset : offset + data.num_xu]
+        self._s_bu = self._primal_buffer[:, offset : offset+data.num_xu]
 
         # Dual buffer: [y | z_l | z_u | z_bl | z_bu]
-        self._dual_buffer = cp.empty(data.p + self.num_ineq)
-        self._y = self._dual_buffer[:data.p]
-        self._z_all = self._dual_buffer[data.p:]  # all dual variables (for inequalities)
-        offset = data.p
-        self._z_l  = self._dual_buffer[offset : offset + data.num_hl]
+        self._dual_buffer = cp.empty((B, data.p + self.num_ineq), dtype=cp.float64)
+        offset = 0
+        self._y = self._dual_buffer[:, offset : offset+data.p]
+        self._z_all = self._dual_buffer[:, data.p:]
+        offset += data.p
+        self._z_l = self._dual_buffer[:, offset : offset+data.num_hl]
         offset += data.num_hl
-        self._z_u  = self._dual_buffer[offset : offset + data.num_hu]
+        self._z_u = self._dual_buffer[:, offset : offset+data.num_hu]
         offset += data.num_hu
-        self._z_bl = self._dual_buffer[offset : offset + data.num_xl]
+        self._z_bl = self._dual_buffer[:, offset : offset+data.num_xl]
         offset += data.num_xl
-        self._z_bu = self._dual_buffer[offset : offset + data.num_xu]
+        self._z_bu = self._dual_buffer[:, offset : offset+data.num_xu]
 
-    # -- Properties: getters return views, setters copy in-place --
+    # -- Properties: getters return (batch_size, *) views, setters copy in-place --
 
     @property
     def x(self): return self._x
@@ -134,16 +139,20 @@ class Variables:
     @duals_all.setter
     def duals_all(self, value): self._dual_buffer[:] = value
 
+    @property
+    def batch_size(self) -> int:
+        return self._batch_size
+
     def all_finite(self) -> bool:
-        return (cp.isfinite(self._primal_buffer).all() and
-                cp.isfinite(self._dual_buffer).all())
+        """Test purpose only"""
+        return bool(
+            cp.isfinite(self._primal_buffer).all() and
+            cp.isfinite(self._dual_buffer).all()
+        )
 
     @property
     def buffer_ptr(self) -> tuple:
-        """
-        Returns a tuple of memory addresses of the underlying arrays.
-        Used for CUDA graph caching keys.
-        """
+        """Memory addresses for CUDA graph cache keys."""
         return (
             self._primal_buffer.data.ptr,
             self._dual_buffer.data.ptr,
@@ -154,7 +163,7 @@ class Variables:
                 cp.allclose(self._dual_buffer, other._dual_buffer, rtol=rtol, atol=atol))
 
     def __str__(self) -> str:
-        return (f"Variables:\n"
+        return (f"Variables (B={self._batch_size}):\n"
             f"  x:    {self.x}\n"
             f"  y:    {self.y}\n"
             f"  z_u:  {self.z_u}\n"
@@ -167,14 +176,15 @@ class Variables:
             f"  s_bl: {self.s_bl}")
 
     def to_array(self) -> cp.ndarray:
-        return cp.concatenate((self._primal_buffer, self._dual_buffer))
+        """Test purpose only."""
+        return cp.concatenate((self._primal_buffer, self._dual_buffer), axis=1)
 
     def set_random(self):
         """Testing purpose only: set all variables to random values."""
         cp.random.seed(0)
         self._x[:] = cp.random.randn(*self._x.shape)
         self._y[:] = cp.random.randn(*self._y.shape)
-        self._z_u[:] = cp.random.rand(*self._z_u.shape) + 1.0  # ensure positivity
+        self._z_u[:] = cp.random.rand(*self._z_u.shape) + 1.0  # ensure positiveness
         self._z_l[:] = cp.random.rand(*self._z_l.shape) + 1.0
         self._z_bu[:] = cp.random.rand(*self._z_bu.shape) + 1.0
         self._z_bl[:] = cp.random.rand(*self._z_bl.shape) + 1.0
@@ -182,7 +192,7 @@ class Variables:
         self._s_l[:] = cp.random.rand(*self._s_l.shape) + 1.0
         self._s_bu[:] = cp.random.rand(*self._s_bu.shape) + 1.0
         self._s_bl[:] = cp.random.rand(*self._s_bl.shape) + 1.0
-    
+
 class InfoIdx(IntEnum):
     """Index mapping for the contiguous Info scalar buffer."""
     def _generate_next_value_(name, start, count, last_values):
@@ -219,56 +229,70 @@ class InfoIdx(IntEnum):
     run_time = auto()
 
 class Info:
+    """Per-problem solver info — ``(B, num_fields)`` GPU buffer.
+
+    Each problem independently tracks rho, delta, mu, residuals, etc.
+    For B=1 this is a ``(1, num_fields)`` buffer.
     """
-    Solver info scalars stored in single contiguous GPU buffer.
-    """
-    # auto-generate properties from InfoIdx: getter returns array view, setter copies in-place
+
+    # Auto-generate properties from InfoIdx: getter returns (B,) view,
+    # setter copies in-place.
     for idx in InfoIdx:
         def _make(i=idx):
             def getter(self):
-                return self._views[i]
-            def setter(self, value): 
-                self._views[i][:] = value
+                return self._buffer[:, i]
+            def setter(self, value):
+                self._buffer[:, i] = value
             return property(getter, setter)
         locals()[idx.name] = _make()
     del idx, _make
 
-    def __init__(self):
-        self.status: Status = Status.PIQP_UNSOLVED
-        self.iter: int = 0
-        self.factor_retires: int = 0
-        self.no_primal_update: int = 0  # dual infeasibility detection counter
-        self.no_dual_update: int = 0    # primal infeasibility detection counter
+    def __init__(self, batch_size: int = 1):
+        self._batch_size = batch_size
+        self.status = np.full(batch_size, Status.PIQP_UNSOLVED.value, dtype=np.int32)
+        self.iter = np.zeros(batch_size, dtype=np.int32)
+        self.factor_retires = np.zeros(batch_size, dtype=np.int32)
+        self.no_primal_update = np.zeros(batch_size, dtype=np.int32)
+        self.no_dual_update = np.zeros(batch_size, dtype=np.int32)
 
     def init(self):
-        self._buffer = cp.zeros(len(InfoIdx), dtype=cp.float64)  # one contiguous GPU buffer for all scalar fields
-        self._views = tuple(self._buffer[i:i+1] for i in range(len(InfoIdx)))
+        self._buffer = cp.zeros((self._batch_size, len(InfoIdx)), dtype=cp.float64)
 
     @nvtx.annotate("Info:to_host")
     def to_host(self, info_host: 'InfoHost'):
         cp.asnumpy(self._buffer, out=info_host._buffer)
 
+    @property
+    def batch_size(self) -> int:
+        return self._batch_size
+
 
 class InfoHost:
     """
     A mirror of Info on the host side (CPU). The purpose is to fetch all device-side info to host all at once, instead of multiple time to reduce overhead.
-    """
-    __slots__ = ('_buffer',)
 
-    # auto-generate read-only properties from InfoIdx
+    Each property returns a ``(B,)`` NumPy array.
+    """
+    __slots__ = ('_buffer', '_batch_size')
+
     for _idx in InfoIdx:
-        locals()[_idx.name] = property(lambda self, i=_idx: self._buffer[i])
+        locals()[_idx.name] = property(lambda self, i=_idx: self._buffer[:, i])
     del _idx
 
-    def __init__(self):
-        self._buffer = np.empty(len(InfoIdx))
+    def __init__(self, batch_size: int = 1):
+        self._batch_size = batch_size
+        self._buffer = np.empty((batch_size, len(InfoIdx)), dtype=np.float64)
+
 
 
 class Result(Variables):
-    def __init__(self):
+    """Combined variables + per-problem info."""
+    def __init__(self, batch_size: int = 1):
         super().__init__()
-        self.info = Info()
+        self.info = Info(batch_size)
 
-    def init(self, data: Data):
+    def init(self, data):
+        assert data.batch_size == self.info.batch_size, \
+            f"batch_size mismatch: Result({self.info.batch_size}) vs data({data.batch_size})"
         super().init(data)
         self.info.init()

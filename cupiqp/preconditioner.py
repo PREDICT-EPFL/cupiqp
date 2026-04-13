@@ -7,7 +7,10 @@ from .results import Variables
 
 
 class RuizEquilibration(ABC):
-    """Ruiz equilibration preconditioner for QP problems.
+    """Ruiz equilibration preconditioner for QP problems — batched.
+
+    All scaling vectors carry a leading batch dimension ``(B, ...)``.
+    For single problems, ``B = 1``.
 
     Iteratively scale the following matrix so that each row/column has inf-norm close to 1:
 
@@ -41,50 +44,57 @@ class RuizEquilibration(ABC):
         z_b_orig = c_inv * delta_b * z_b_scaled
     """
 
-    def __init__(self, n: int, p: int, m: int,
+    def __init__(self, B: int, n: int, p: int, m: int,
                  idx_xl: cp.ndarray,
                  idx_xu: cp.ndarray,
                  min_scaling: float = 1e-4,
                  max_scaling: float = 1e4,
                  convergence_tol: float = 1e-3,
-                 max_iter: int = 10
                  ):
+        self.B = B
         self.n = n
         self.p = p
         self.m = m
-        self.max_iter = max_iter
         self.min_scaling = min_scaling
         self.max_scaling = max_scaling
         self.convergence_tol = convergence_tol
 
-        # Combined scaling: delta[0:n] for x, delta[n:n+p] for y, delta[n+p:] for z
-        self._delta = cp.ones(n + p + m, dtype=cp.float64)
-        self._delta_inv = cp.ones(n + p + m, dtype=cp.float64)
+        # Combined scaling: (B, n+p+m) — delta[:, :n] for x, delta[:, n:n+p] for y, etc.
+        self._delta = cp.ones((B, n + p + m), dtype=cp.float64)
+        self._delta_inv = cp.ones((B, n + p + m), dtype=cp.float64)
 
-        # Box constraint scaling (accumulated product of delta_b_iter across Ruiz iterations)
-        self._delta_b = cp.ones(n, dtype=cp.float64)
-        self._delta_b_inv = cp.ones(n, dtype=cp.float64)
+        # Box constraint scaling: (B, n)
+        self._delta_b = cp.ones((B, n), dtype=cp.float64)
+        self._delta_b_inv = cp.ones((B, n), dtype=cp.float64)
 
-        # Cost scaling (scalar stored as 1-element array)
-        self._c_scaling = cp.ones(1, dtype=cp.float64)
-        self._c_scaling_inv = cp.ones(1, dtype=cp.float64)
+        # Cost scaling: (B,)
+        self._c_scaling = cp.ones(B, dtype=cp.float64)
+        self._c_scaling_inv = cp.ones(B, dtype=cp.float64)
 
-        # x_b_scaling: starts at {0,1} (1 for bounded variables, 0 otherwise)
-        # and evolves as x_b_scaling *= delta_b_iter * delta_x each Ruiz iteration.
-        # This tracks the diagonal of the box constraint block in the KKT matrix.
-        self._x_b_scaling_init = cp.zeros(n, dtype=cp.float64)
+        # x_b_scaling: (B, n) — 1 for bounded variables, 0 for unbounded.
+        # Bound structure is shared across batch, so init is the same for all b.
+        self._x_b_scaling_init = cp.zeros((B, n), dtype=cp.float64)
         bounded = cp.zeros(n, dtype=bool)
         if idx_xl.size > 0:
             bounded[idx_xl] = True
         if idx_xu.size > 0:
             bounded[idx_xu] = True
-        self._x_b_scaling_init[bounded] = 1.0
+        self._x_b_scaling_init[:, bounded] = 1.0
         self._x_b_scaling = cp.copy(self._x_b_scaling_init)
 
-        self._delta_iter = cp.empty(n + p + m, dtype=cp.float64)  # used to store current Ruiz iteration scaling factors
-        self._delta_b_iter = cp.empty(n, dtype=cp.float64) # used to store current Ruiz iteration box scaling factors
+        # Per-iteration workspace: (B, n+p+m) and (B, n)
+        self._delta_iter = cp.empty((B, n + p + m), dtype=cp.float64)
+        self._delta_b_iter = cp.empty((B, n), dtype=cp.float64)
 
-        self._work_n = cp.empty(n, dtype=cp.float64)  # temp workspace of size n
+        self._work_n = cp.empty((B, n), dtype=cp.float64)
+
+    @property
+    def c_scaling(self) -> cp.ndarray:
+        return self._c_scaling
+
+    @c_scaling.setter
+    def c_scaling(self, value):
+        self._c_scaling[:] = value
 
     @property
     def c_scaling_inv(self) -> cp.ndarray:
@@ -125,9 +135,9 @@ class RuizEquilibration(ABC):
         n, p = self.n, self.p
 
         for _ in range(max_iter):
-            # Compute KKT row/column inf-norms
+            # Compute KKT row/column inf-norms → (B, n+p+m)
             self._compute_kkt_norms(data, self._delta_iter, self._delta_b_iter)
-            cp.maximum(self._delta_iter[:n], self._x_b_scaling, out=self._delta_iter[:n])
+            cp.maximum(self._delta_iter[:, :n], self._x_b_scaling, out=self._delta_iter[:, :n])
             self._delta_b_iter[:] = self._x_b_scaling
 
             self._limit_scaling(self._delta_iter)
@@ -137,9 +147,9 @@ class RuizEquilibration(ABC):
             cp.sqrt(self._delta_b_iter, out=self._delta_b_iter)
             cp.reciprocal(self._delta_b_iter, out=self._delta_b_iter)
 
-            d_x = self._delta_iter[:n]
-            d_y = self._delta_iter[n:n+p]
-            d_z = self._delta_iter[n+p:]
+            d_x = self._delta_iter[:, :n]        # (B, n)
+            d_y = self._delta_iter[:, n:n+p]     # (B, p)
+            d_z = self._delta_iter[:, n+p:]      # (B, m)
 
             # Apply scaling
             self._scale_matrices(data, d_x, d_y, d_z)
@@ -152,7 +162,7 @@ class RuizEquilibration(ABC):
             if scale_cost:
                 self._apply_cost_scaling(data)
 
-            # Check convergence
+            # Check convergence (worst over batch)
             conv = max(
                 float(cp.max(cp.abs(1.0 - self._delta_iter))),
                 float(cp.max(cp.abs(1.0 - self._delta_b_iter)))
@@ -175,9 +185,9 @@ class RuizEquilibration(ABC):
     def unscale_data(self, data: Data):
         """Reverse all scaling transformations on the problem data."""
         n, p = self.n, self.p
-        d_x_inv = self._delta_inv[:n]
-        d_y_inv = self._delta_inv[n:n+p]
-        d_z_inv = self._delta_inv[n+p:]
+        d_x_inv = self._delta_inv[:, :n]
+        d_y_inv = self._delta_inv[:, n:n+p]
+        d_z_inv = self._delta_inv[:, n+p:]
 
         self._unscale_matrices(data, d_x_inv, d_y_inv, d_z_inv)
         self._unscale_bounds(data)
@@ -189,9 +199,9 @@ class RuizEquilibration(ABC):
     def apply_scaling(self, data: Data):
         """Re-apply stored scaling to fresh (unscaled) data."""
         n, p = self.n, self.p
-        d_x = self._delta[:n]
-        d_y = self._delta[n:n + p]
-        d_z = self._delta[n + p:]
+        d_x = self._delta[:, :n]
+        d_y = self._delta[:, n:n + p]
+        d_z = self._delta[:, n + p:]
 
         self._apply_stored_scaling(data, d_x, d_y, d_z)
 
@@ -226,35 +236,35 @@ class RuizEquilibration(ABC):
 
     def unscale_primal(self, x: cp.ndarray) -> cp.ndarray:
         """x_orig = delta_x * x_scaled"""
-        return x * self._delta[:self.n]
+        return x * self._delta[:, :self.n]
 
     def scale_primal(self, x: cp.ndarray) -> cp.ndarray:
         """x_scaled = delta_inv_x * x_orig"""
-        return x * self._delta_inv[:self.n]
+        return x * self._delta_inv[:, :self.n]
 
     def unscale_dual_eq(self, y: cp.ndarray) -> cp.ndarray:
         """y_orig = c_inv * delta_y * y_scaled"""
-        return y * self._c_scaling_inv * self._delta[self.n:self.n + self.p]
+        return y * self._c_scaling_inv[:, None] * self._delta[:, self.n:self.n + self.p]
 
     def scale_dual_eq(self, y: cp.ndarray) -> cp.ndarray:
         """y_scaled = c * delta_inv_y * y_orig"""
-        return y * self._c_scaling * self._delta_inv[self.n:self.n + self.p]
+        return y * self._c_scaling[:, None] * self._delta_inv[:, self.n:self.n + self.p]
 
     def unscale_dual_ineq(self, z: cp.ndarray, idx: cp.ndarray) -> cp.ndarray:
         """z_orig = c_inv * delta_z[idx] * z_scaled"""
-        return z * self._c_scaling_inv * self._delta[self.n + self.p + idx]
+        return z * self._c_scaling_inv[:, None] * self._delta[:, self.n + self.p + idx]
 
     def unscale_dual_b(self, z_b: cp.ndarray, idx: cp.ndarray) -> cp.ndarray:
         """z_b_orig = c_inv * delta_b[idx] * z_b_scaled"""
-        return z_b * self._c_scaling_inv * self._delta_b[idx]
+        return z_b * self._c_scaling_inv[:, None] * self._delta_b[:, idx]
 
     def unscale_slack_ineq(self, s: cp.ndarray, idx: cp.ndarray) -> cp.ndarray:
         """s_orig = delta_inv_z[idx] * s_scaled"""
-        return s * self._delta_inv[self.n + self.p + idx]
+        return s * self._delta_inv[:, self.n + self.p + idx]
 
     def unscale_slack_b(self, s_b: cp.ndarray, idx: cp.ndarray) -> cp.ndarray:
         """s_b_orig = delta_b_inv[idx] * s_b_scaled"""
-        return s_b * self._delta_b_inv[idx]
+        return s_b * self._delta_b_inv[:, idx]
 
     # ------------------------------------------------------------------
     # Residual unscaling (used every iteration for convergence checks)
@@ -262,94 +272,94 @@ class RuizEquilibration(ABC):
 
     def unscale_dual_res(self, v: cp.ndarray) -> cp.ndarray:
         """v_orig = c_inv * delta_inv_x * v_scaled"""
-        return v * self._c_scaling_inv * self._delta_inv[:self.n]
+        return v * self._c_scaling_inv[:, None] * self._delta_inv[:, :self.n]
 
     def unscale_primal_res_eq(self, v: cp.ndarray) -> cp.ndarray:
         """v_orig = delta_inv_y * v_scaled"""
-        return v * self._delta_inv[self.n:self.n + self.p]
+        return v * self._delta_inv[:, self.n:self.n + self.p]
 
     def unscale_primal_res_ineq(self, v: cp.ndarray, idx: cp.ndarray) -> cp.ndarray:
         """v_orig = delta_inv_z[idx] * v_scaled"""
-        return v * self._delta_inv[self.n + self.p + idx]
+        return v * self._delta_inv[:, self.n + self.p + idx]
 
     def unscale_primal_res_b(self, v: cp.ndarray, idx: cp.ndarray) -> cp.ndarray:
         """v_orig = delta_b_inv[idx] * v_scaled"""
-        return v * self._delta_b_inv[idx]
+        return v * self._delta_b_inv[:, idx]
 
     # ------------------------------------------------------------------
     # Cost unscaling
     # ------------------------------------------------------------------
 
-    def unscale_cost(self, cost: float) -> float:
+    def unscale_cost(self, cost: cp.ndarray) -> cp.ndarray:
         """cost_orig = c_inv * cost_scaled"""
-        return float(cost * self._c_scaling_inv)
+        return cost * self._c_scaling_inv
 
     def _compute_kkt_norms(self, data: Data, d: cp.ndarray, d_b: cp.ndarray):
-        """Compute inf-norms of each KKT row/column into d[0:n+p+m].
+        """Compute inf-norms of each KKT row/column into d — shape (B, n+p+m).
 
-        d[:n]     = max over P columns, A columns, G columns
-        d[n:n+p]  = A row norms
-        d[n+p:]   = G row norms
-        d_b is NOT set here (handled by the base class).
+        d[:, :n]     = max over P columns, A columns, G columns
+        d[:, n:n+p]  = A row norms
+        d[:, n+p:]   = G row norms
+        d_b is NOT set here (handled by caller).
         """
         n, p, m = self.n, self.p, self.m
-        self.eval_P_row_inf_norms(data.P, d[:n])
+        self.eval_P_row_inf_norms(data.P, d[:, :n])
         if p > 0:
             self.eval_A_col_inf_norms(data.A, self._work_n)
-            d[:n] = cp.maximum(d[:n], self._work_n)
-            self.eval_A_row_inf_norms(data.A, d[n:n+p])
+            d[:, :n] = cp.maximum(d[:, :n], self._work_n)
+            self.eval_A_row_inf_norms(data.A, d[:, n:n+p])
         if m > 0:
             self.eval_G_col_inf_norms(data.G, self._work_n)
-            d[:n] = cp.maximum(d[:n], self._work_n)
-            self.eval_G_row_inf_norms(data.G, d[n+p:n+p+m])
+            d[:, :n] = cp.maximum(d[:, :n], self._work_n)
+            self.eval_G_row_inf_norms(data.G, d[:, n+p:n+p+m])
 
     @abstractmethod
     def eval_P_row_inf_norms(self, P, out: cp.ndarray):
-        """Compute infinity norms of rows of P. The shape of P is (n, n). Return shape is (n,)."""
-        pass
+        """Row inf-norms of P. P: (B, n, n), out: (B, n)."""
+        ...
 
     @abstractmethod
     def eval_A_row_inf_norms(self, A, out: cp.ndarray):
-        """Compute infinity norms of rows of A. The shape of A is (p, n). Return shape is (p,)."""
-        pass
+        """Row inf-norms of A. A: (B, p, n), out: (B, p)."""
+        ...
 
     @abstractmethod
     def eval_A_col_inf_norms(self, A, out: cp.ndarray):
-        """Compute infinity norms of columns of A. The shape of A is (p, n). Return shape is (n,)."""
-        pass
+        """Column inf-norms of A. A: (B, p, n), out: (B, n)."""
+        ...
 
     @abstractmethod
     def eval_G_row_inf_norms(self, G, out: cp.ndarray):
-        """Compute infinity norms of rows of G. The shape of G is (m, n). Return shape is (m,)."""
-        pass
+        """Row inf-norms of G. G: (B, m, n), out: (B, m)."""
+        ...
 
     @abstractmethod
     def eval_G_col_inf_norms(self, G, out: cp.ndarray):
-        """Compute infinity norms of columns of G. The shape of G is (m, n). Return shape is (n,)."""
-        pass
+        """Column inf-norms of G. G: (B, m, n), out: (B, n)."""
+        ...
 
     @abstractmethod
     def _scale_matrices(self, data: Data,
                         d_x: cp.ndarray, d_y: cp.ndarray, d_z: cp.ndarray):
-        """Apply one Ruiz iteration scaling: P = D_x*P*D_x, A = D_y*A*D_x, G = D_z*G*D_x."""
-        pass
+        """Apply one Ruiz iteration scaling. d_x: (B, n), d_y: (B, p), d_z: (B, m)."""
+        ...
 
     @abstractmethod
     def _apply_cost_scaling(self, data: Data):
-        """Compute gamma from P norms and ||c||, scale P and c by gamma to avoid the cost is dominated by P term or c term"""
-        pass
+        """Compute gamma from P norms and ||c||, scale P and c by gamma."""
+        ...
 
     @abstractmethod
     def _unscale_matrices(self, data: Data,
                           d_x_inv: cp.ndarray, d_y_inv: cp.ndarray, d_z_inv: cp.ndarray):
         """Reverse all matrix scaling using stored inverses."""
-        pass
+        ...
 
     @abstractmethod
     def _apply_stored_scaling(self, data: Data,
                               d_x: cp.ndarray, d_y: cp.ndarray, d_z: cp.ndarray):
         """Re-apply stored scaling to fresh data (reuse_prev_scaling path)."""
-        pass
+        ...
 
     # ------------------------------------------------------------------
     # Shared helpers
@@ -368,8 +378,8 @@ class RuizEquilibration(ABC):
 
     def _scale_bounds(self, data: Data):
         n, p, m = self.n, self.p, self.m
-        d_y = self._delta[n:n + p]
-        d_z = self._delta[n + p:]
+        d_y = self._delta[:, n:n + p]    # (B, p)
+        d_z = self._delta[:, n + p:]     # (B, m)
 
         if p > 0:
             data._b *= d_y
@@ -377,14 +387,14 @@ class RuizEquilibration(ABC):
             data._h_l *= d_z
             data._h_u *= d_z
         if data.num_xl > 0:
-            data._x_l[data.idx_xl] *= self._delta_b[data.idx_xl]
+            data._x_l[:, data.idx_xl] *= self._delta_b[:, data.idx_xl]
         if data.num_xu > 0:
-            data._x_u[data.idx_xu] *= self._delta_b[data.idx_xu]
+            data._x_u[:, data.idx_xu] *= self._delta_b[:, data.idx_xu]
 
     def _unscale_bounds(self, data: Data):
         n, p, m = self.n, self.p, self.m
-        d_y_inv = self._delta_inv[n:n + p]
-        d_z_inv = self._delta_inv[n + p:]
+        d_y_inv = self._delta_inv[:, n:n + p]
+        d_z_inv = self._delta_inv[:, n + p:]
 
         if p > 0:
             data._b *= d_y_inv
@@ -392,6 +402,6 @@ class RuizEquilibration(ABC):
             data._h_l *= d_z_inv
             data._h_u *= d_z_inv
         if data.num_xl > 0:
-            data._x_l[data.idx_xl] *= self._delta_b_inv[data.idx_xl]
+            data._x_l[:, data.idx_xl] *= self._delta_b_inv[:, data.idx_xl]
         if data.num_xu > 0:
-            data._x_u[data.idx_xu] *= self._delta_b_inv[data.idx_xu]
+            data._x_u[:, data.idx_xu] *= self._delta_b_inv[:, data.idx_xu]
