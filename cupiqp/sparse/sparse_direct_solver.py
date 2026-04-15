@@ -141,12 +141,25 @@ class CudssSparseDirectSolver(SparseDirectSolver):
                 _det_flag.dtype.itemsize,
             )
 
-        # # Iterative refinement helpers (B = 1 only for now)
-        # if batch_size == 1:
-        #     self._mat_vec_prod = SparseMatVecProduct(self._mat[0], transa=False)
-        #     self._res = cp.empty_like(self._rhs)
-        #     self._rhs_saved = cp.empty_like(self._rhs)
-        #     self._sol_ir = cp.empty_like(self._sol)
+        # Use raw cuDSS handles for direct execute() calls in solve(),
+        # bypassing nvmath's _allocate_batched_result overhead.
+        self._cudss_handle = self._cudss_solver.handle
+        self._cudss_config = self._cudss_solver.config_ptr
+        self._cudss_data   = self._cudss_solver.data_ptr
+        self._cudss_a      = self._cudss_solver.a_ptr
+        self._cudss_x      = self._cudss_solver.x_ptr
+        self._cudss_b      = self._cudss_solver.b_ptr
+
+        # Point x-descriptor at our pre-allocated _sol buffer (done once).
+        if batch_size == 1:
+            cudss_bindings.matrix_set_values(self._cudss_x, self._sol.data.ptr)
+        else:
+            row_bytes = self._dim * 8
+            ptrs = np.array([self._sol.data.ptr + i * row_bytes
+                             for i in range(batch_size)], dtype=np.uint64)
+            self._sol_ptrs_dev = cp.array(ptrs)  # prevent GC — descriptor holds this pointer
+            cudss_bindings.matrix_set_batch_values(
+                self._cudss_x, self._sol_ptrs_dev.data.ptr)
 
     def __del__(self):
         cudss_solver = getattr(self, "_cudss_solver", None)
@@ -204,24 +217,24 @@ class CudssSparseDirectSolver(SparseDirectSolver):
     @nvtx.annotate("CudssSparseDirectSolver::solve")
     def solve(self,
               cuda_stream: int,
-              iterative_refinement: bool = False, 
-              ir_abs_tol: float = 1e-12, 
+              iterative_refinement: bool = False,
+              ir_abs_tol: float = 1e-12,
               ir_rel_tol: float = 1e-12,
-              ir_max_iter: int = 10, 
+              ir_max_iter: int = 10,
               ir_min_improvement_rate: float = 5.0
-              ) -> None:       
-        if self._batch_size == 1:
-            self._sol[0][:] = self._cudss_solver.solve(stream=cuda_stream)
-        else:
-            # Explicit batching: sol is a list/tuple of B solution arrays
-            # TODO: how can we avoid malloc here?
-            sol = self._cudss_solver.solve(stream=cuda_stream)
-            for b in range(self._batch_size):
-                self._sol[b][:] = sol[b]
+              ) -> None:
+        # Bypass nvmath's solve() which allocates B fresh arrays every call.
+        # x_ptr already points at self._sol (set once in __init__), so cuDSS
+        # writes directly into our buffer — zero allocation, zero copy.
+        cudss_bindings.set_stream(self._cudss_handle, cuda_stream)
+        cudss_bindings.execute(
+            self._cudss_handle, cudss_bindings.Phase.SOLVE,
+            self._cudss_config, self._cudss_data,
+            self._cudss_a, self._cudss_x, self._cudss_b,
+        )
 
         if iterative_refinement:
             raise NotImplementedError("Iterative refinement in CudssSparseDirectSolver is not implemented yet.")
-            # self.iterative_refinement(cuda_stream, ir_abs_tol, ir_rel_tol, ir_max_iter, ir_min_improvement_rate)
 
     # @nvtx.annotate("SparseDirectSolver::iterative_refinement")
     # def iterative_refinement(self, cuda_stream: int, abs_tol: float, rel_tol: float, max_iter: int, min_improvement_rate: float) -> None:
