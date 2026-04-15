@@ -157,6 +157,7 @@ class CudssSparseDirectSolver(SparseDirectSolver):
                 pass
             self._cudss_solver = None
 
+    @nvtx.annotate("CudssSparseDirectSolver::plan")
     def plan(self, cuda_stream: int) -> bool:
         try:
             plan_info = self._cudss_solver.plan(stream=cuda_stream)
@@ -167,6 +168,7 @@ class CudssSparseDirectSolver(SparseDirectSolver):
 
         return True
 
+    @nvtx.annotate("CudssSparseDirectSolver::factor")
     def factor(self, cuda_stream: int) -> bool:
         try:
             fac_info = self._cudss_solver.factorize(stream=cuda_stream)
@@ -199,6 +201,7 @@ class CudssSparseDirectSolver(SparseDirectSolver):
 
         return True
 
+    @nvtx.annotate("CudssSparseDirectSolver::solve")
     def solve(self,
               cuda_stream: int,
               iterative_refinement: bool = False, 
