@@ -275,26 +275,46 @@ class SparseKKTSolver(KKTSolverBase):
         """
         stream_ptr = cp.cuda.get_current_stream().ptr
         n, p, m = data.n, data.p, data.m
+        B = self._batch_size
+        dim = n + p + m  # cuDSS rhs/sol row length
+        rhs_ptr = self._lin_sys_solver.rhs.data.ptr
 
-        for b in range(self._batch_size):
-            solver_rhs = self._lin_sys_solver.rhs[b]
-            # Assemble [rhs_x, rhs_y, rhs_z] into solver's contiguous rhs buffer
-            cp.cuda.runtime.memcpyAsync(solver_rhs.data.ptr, rhs_x[b].data.ptr, n * 8, 1, stream_ptr)
-            if p > 0:
-                cp.cuda.runtime.memcpyAsync(solver_rhs.data.ptr + n * 8, rhs_y[b].data.ptr, p * 8, 1, stream_ptr)
-            if m > 0:
-                cp.cuda.runtime.memcpyAsync(solver_rhs.data.ptr + (n+p) * 8, rhs_z[b].data.ptr, m * 8, 1, stream_ptr)
+        # Assemble [rhs_x | rhs_y | rhs_z] into solver's (B, dim) rhs buffer.
+        # Each source may have a different row stride (non-contiguous view),
+        # so we use memcpy2DAsync to scatter each block into the right columns.
+        cp.cuda.runtime.memcpy2DAsync(
+            rhs_ptr, dim * 8,
+            rhs_x.data.ptr, rhs_x.strides[0],
+            n * 8, B, 3, stream_ptr)
+        if p > 0:
+            cp.cuda.runtime.memcpy2DAsync(
+                rhs_ptr + n * 8, dim * 8,
+                rhs_y.data.ptr, rhs_y.strides[0],
+                p * 8, B, 3, stream_ptr)
+        if m > 0:
+            cp.cuda.runtime.memcpy2DAsync(
+                rhs_ptr + (n + p) * 8, dim * 8,
+                rhs_z.data.ptr, rhs_z.strides[0],
+                m * 8, B, 3, stream_ptr)
 
         self._lin_sys_solver.solve(cuda_stream=stream_ptr)
 
-        for b in range(self._batch_size):
-            solver_sol = self._lin_sys_solver.sol[b]
-            # Disassemble solver's solution into [delta_x, delta_y, delta_z]
-            cp.cuda.runtime.memcpyAsync(delta_x[b].data.ptr, solver_sol.data.ptr, n * 8, 1, stream_ptr)
-            if p > 0:
-                cp.cuda.runtime.memcpyAsync(delta_y[b].data.ptr, solver_sol.data.ptr + n * 8, p * 8, 1, stream_ptr)
-            if m > 0:
-                cp.cuda.runtime.memcpyAsync(delta_z[b].data.ptr, solver_sol.data.ptr + (n+p) * 8, m * 8, 1, stream_ptr)
+        # Disassemble solver's (B, dim) sol buffer into [delta_x, delta_y, delta_z].
+        sol_ptr = self._lin_sys_solver.sol.data.ptr
+        cp.cuda.runtime.memcpy2DAsync(
+            delta_x.data.ptr, delta_x.strides[0],
+            sol_ptr, dim * 8,
+            n * 8, B, 3, stream_ptr)
+        if p > 0:
+            cp.cuda.runtime.memcpy2DAsync(
+                delta_y.data.ptr, delta_y.strides[0],
+                sol_ptr + n * 8, dim * 8,
+                p * 8, B, 3, stream_ptr)
+        if m > 0:
+            cp.cuda.runtime.memcpy2DAsync(
+                delta_z.data.ptr, delta_z.strides[0],
+                sol_ptr + (n + p) * 8, dim * 8,
+                m * 8, B, 3, stream_ptr)
 
     # ------------------------------------------------------------------
     # Sparse matrix-vector products (single kernel for all B)
