@@ -1,19 +1,34 @@
-"""Graph-safe cuSPARSE SpMV wrapper.
+"""Graph-safe cuSPARSE SpMV wrapper with native batching.
 
 CuPy's ``cupyx.cusparse.spmv`` allocates a workspace buffer on every call,
 which breaks CUDA graph capture.  This module provides a thin wrapper that
 pre-allocates all cuSPARSE descriptors and the workspace buffer once at
 construction time so that ``__call__`` only invokes ``cusparseSpMV`` -- no
-allocation, no host-device sync -- making it safe for stream capture and 
+allocation, no host-device sync -- making it safe for stream capture and
 also more efficient.
 
-The ``__call__`` method uses **ctypes** to invoke the cuSPARSE C API
-directly, bypassing CuPy's Python-level ``_setStream`` guard which raises
-``NotImplementedError`` when called during CUDA stream capture.
+Batching (B > 1):
+
+When a *list* of B CSR matrices (sharing the same sparsity pattern) is
+passed, a single block-diagonal CSR matrix is built internally::
+
+    [ A_0              ]   [ x_0 ]   [ y_0 ]
+    [      A_1         ] * [ x_1 ] = [ y_1 ]
+    [           ...    ]   [ ... ]   [ ... ]
+    [              A_B ]   [ x_B ]   [ y_B ]
+
+A single ``cusparseSpMV`` call on the stacked vectors processes all B
+problems simultaneously.  The individual matrices' ``.data`` attributes
+are reassigned to contiguous views of a packed buffer so that later
+in-place modifications (e.g. preconditioner scaling) are automatically
+visible to the cuSPARSE descriptor.
+
+For B = 1 (a single CSR matrix) the original, SpMV is directly called
 """
 
 import ctypes
 import ctypes.util
+from typing import Sequence
 import cupy as cp
 import cupyx.scipy.sparse as cpsp
 from cupy.cuda import cusparse
@@ -37,8 +52,6 @@ def _load_cusparse_lib():
 
 _cusparse_lib = _load_cusparse_lib()
 
-# cusparseStatus_t cusparseSpMV(handle, opA, alpha, matA, vecX,
-#                                beta, vecY, computeType, alg, externalBuffer)
 _cusparse_lib.cusparseSpMV.restype = ctypes.c_int
 _cusparse_lib.cusparseSpMV.argtypes = [
     ctypes.c_void_p,  # handle
@@ -145,33 +158,41 @@ def _create_mat_desc(mat, compute_type: int) -> int:
         )
 
 
-
 class SparseMatVecProduct:
-    """CUDA-graph-safe sparse matrix-vector product: ``y = alpha * op(A) * x + beta * y``.
+    """CUDA-graph-safe sparse matrix-vector product.
+
+    Computes ``y = alpha * op(A) * x + beta * y``.
 
     Parameters
     ----------
-    mat : cupyx.scipy.sparse.csr_matrix | csc_matrix | coo_matrix
-        The sparse matrix.  Must stay alive and its data buffers must not be
-        reallocated for the lifetime of this object.
+    mat : csr_matrix | csc_matrix | coo_matrix | list[csr_matrix]
+        A single sparse matrix (B = 1), or a list of B CSR matrices that
+        share the same sparsity pattern (B > 1).
     transa : bool
         If ``True``, compute ``A^T * x`` instead of ``A * x``.
 
     Notes
     -----
-    ``alpha`` and ``beta`` are supplied at call time.  If this op is captured
-    inside a CUDA graph, both scalars are baked into the captured node and
-    must remain the same on every replay; re-capture if they need to change.
-
-    cuSPARSE does not support ``CUSPARSE_OPERATION_TRANSPOSE`` for COO matrices.
-    Convert to CSR or CSC first if you need ``transa=True`` with a COO matrix.
+    For B > 1 the individual matrices' ``.data`` attributes are reassigned
+    to contiguous views of an internal packed buffer.  Any subsequent
+    in-place modification of those arrays (e.g. ``mat.data *= scale``)
+    is automatically visible to the cuSPARSE descriptor.
     """
 
     def __init__(
         self,
-        mat: cpsp.spmatrix,
+        mat: Sequence[cpsp.csr_matrix],
         transa: bool = False,
     ):
+        assert isinstance(mat, Sequence) and len(mat) > 0
+        assert isinstance(mat[0], cpsp.csr_matrix)
+        self._batch_size = len(mat)
+        if self._batch_size == 1:
+            self._init_single(mat[0], transa)
+        else:
+            self._init_batched(list(mat), transa)
+
+    def _init_single(self, mat, transa):
         self._cusparse_handle = _create_cusparse_handle()
 
         # ---- operation ----
@@ -218,6 +239,93 @@ class SparseMatVecProduct:
         # Keep mat alive so its device buffers aren't freed.
         self._mat_ref = mat
 
+    def _init_batched(self, mats, transa):
+        B = self._batch_size
+        template = mats[0]
+        rows, cols = template.shape
+        nnz = template.nnz
+
+        # -- pack matrix data contiguously: [data_0 | data_1 | ... ] ----
+        # Check whether data is already packed (e.g. by SparseData).
+        if self._is_data_packed(mats, nnz):
+            # Reuse existing contiguous buffer
+            self._packed_data = cp.ndarray(
+                B * nnz, dtype=cp.float64,
+                memptr=cp.cuda.MemoryPointer(mats[0].data.data.mem, mats[0].data.data.ptr - mats[0].data.data.mem.ptr),
+            )
+        else:
+            self._packed_data = cp.empty(B * nnz, dtype=cp.float64)
+            for b in range(B):
+                view = self._packed_data[b * nnz : (b + 1) * nnz]
+                view[:] = mats[b].data
+                mats[b].data = view
+
+        # -- build block-diagonal structure via bmat --------------------
+        # bmat gives us correct indptr/indices; we replace .data with our
+        # packed buffer so in-place modifications stay visible.
+        from cupyx.scipy.sparse import bmat as sp_bmat
+        blocks = [[None] * B for _ in range(B)]
+        for b in range(B):
+            blocks[b][b] = mats[b]
+        self._block_diag = sp_bmat(blocks, format='csr', dtype=cp.float64)
+        # Wire the packed data into the block-diagonal CSR
+        self._block_diag.data = self._packed_data
+
+        # -- cuSPARSE setup ---------------------------------------------
+        self._cusparse_handle = _create_cusparse_handle()
+        self._compute_type = rt.CUDA_R_64F
+        self._op = (
+            cusparse.CUSPARSE_OPERATION_TRANSPOSE
+            if transa
+            else cusparse.CUSPARSE_OPERATION_NON_TRANSPOSE
+        )
+        self._alg = cusparse.CUSPARSE_MV_ALG_DEFAULT
+
+        self._mat_desc = _create_mat_desc(self._block_diag, self._compute_type)
+
+        # Dense vector descriptors sized for the stacked vectors
+        if transa:
+            x_size, y_size = B * rows, B * cols
+        else:
+            x_size, y_size = B * cols, B * rows
+
+        dummy_x = cp.empty(x_size, dtype=cp.float64)
+        dummy_y = cp.empty(y_size, dtype=cp.float64)
+        self._x_desc = cusparse.createDnVec(x_size, dummy_x.data.ptr, self._compute_type)
+        self._y_desc = cusparse.createDnVec(y_size, dummy_y.data.ptr, self._compute_type)
+
+        # Workspace
+        _alpha_placeholder = ctypes.c_double(1.0)
+        _beta_placeholder = ctypes.c_double(0.0)
+        buf_size = cusparse.spMV_bufferSize(
+            self._cusparse_handle,
+            self._op,
+            ctypes.addressof(_alpha_placeholder),
+            self._mat_desc,
+            self._x_desc,
+            ctypes.addressof(_beta_placeholder),
+            self._y_desc,
+            self._compute_type,
+            self._alg,
+        )
+        self._buffer = cp.empty(max(buf_size, 1), dtype=cp.uint8)
+
+        # Keep refs alive
+        self._mat_ref = mats
+
+    @staticmethod
+    def _is_data_packed(mats, nnz):
+        """Return True if the matrices' data arrays already form a contiguous
+        packed buffer with stride ``nnz * 8`` bytes between consecutive blocks."""
+        if len(mats) < 2:
+            return True
+        stride = nnz * 8  # bytes
+        ptr0 = mats[0].data.data.ptr
+        for b in range(1, len(mats)):
+            if mats[b].data.data.ptr != ptr0 + b * stride:
+                return False
+        return True
+
     def __call__(
         self,
         x: cp.ndarray,
@@ -228,27 +336,8 @@ class SparseMatVecProduct:
     ) -> None:
         """Execute ``y = alpha * op(A) * x + beta * y``.
 
-        Safe to call inside ``stream.begin_capture() / end_capture()``.
-
-        ``cusparseDnVecSetValues`` is a pure host-side descriptor update
-        (no kernel launch), so updating the pointers before the SpMV kernel
-        is recorded is safe during stream capture.
-
-        Parameters
-        ----------
-        x : cp.ndarray
-            Input vector.
-        y : cp.ndarray
-            Output vector (updated in-place).
-        alpha : float
-            Scalar multiplier for ``op(A) * x``.  Defaults to ``1.0``.
-        beta : float
-            Scalar multiplier for the initial value of ``y``.  Defaults to ``0.0``.
-        stream_ptr : int, optional
-            If not None, a raw CUDA stream pointer to set for this operation.
-            If None (default), uses CuPy's current stream.
+        *x* and *y* are ``(B, k)`` arrays stacked contiguously in memory.
         """
-        # if not set, use the current CuPy stream
         if stream_ptr is None:
             stream_ptr = cp.cuda.get_current_stream().ptr
         _cusparse_lib.cusparseSetStream(self._cusparse_handle, stream_ptr)
