@@ -39,7 +39,7 @@ class SolverBase:
         # Detect if user provided batched (3D P) or non-batched (2D P) data.
         # DenseData auto-unsqueezes non-batched to (1, ...) internally,
         # but we track this so solve() returns the right type.
-        self._user_batched = hasattr(P, 'ndim') and P.ndim == 3
+        self._user_batched = (hasattr(P, 'ndim') and P.ndim == 3) or (isinstance(P, (list, tuple)) and len(P) > 1)
 
         if self.settings.kkt_solver == "dense_cholesky":
             from .dense.dense_data import DenseData
