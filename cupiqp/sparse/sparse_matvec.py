@@ -188,8 +188,10 @@ class SparseMatVecProduct:
         assert isinstance(mat[0], cpsp.csr_matrix)
         self._batch_size = len(mat)
         if self._batch_size == 1:
+            self._is_batched = False
             self._init_single(mat[0], transa)
         else:
+            self._is_batched = True
             self._init_batched(list(mat), transa)
 
     def _init_single(self, mat, transa):
@@ -283,16 +285,22 @@ class SparseMatVecProduct:
 
         self._mat_desc = _create_mat_desc(self._block_diag, self._compute_type)
 
-        # Dense vector descriptors sized for the stacked vectors
+        # Per-problem vector lengths (before stacking)
         if transa:
-            x_size, y_size = B * rows, B * cols
+            self._x_vec_len, self._y_vec_len = rows, cols
         else:
-            x_size, y_size = B * cols, B * rows
+            self._x_vec_len, self._y_vec_len = cols, rows
 
-        dummy_x = cp.empty(x_size, dtype=cp.float64)
-        dummy_y = cp.empty(y_size, dtype=cp.float64)
-        self._x_desc = cusparse.createDnVec(x_size, dummy_x.data.ptr, self._compute_type)
-        self._y_desc = cusparse.createDnVec(y_size, dummy_y.data.ptr, self._compute_type)
+        # Persistent contiguous buffers for cuSPARSE — callers may pass
+        # non-contiguous (B, k) views (e.g. column slices of Variables
+        # buffers). We always stage through these internal buffers using
+        # cudaMemcpy2DAsync (handles both contiguous and strided input).
+        x_size = B * self._x_vec_len
+        y_size = B * self._y_vec_len
+        self._x_buf = cp.empty(x_size, dtype=cp.float64)
+        self._y_buf = cp.empty(y_size, dtype=cp.float64)
+        self._x_desc = cusparse.createDnVec(x_size, self._x_buf.data.ptr, self._compute_type)
+        self._y_desc = cusparse.createDnVec(y_size, self._y_buf.data.ptr, self._compute_type)
 
         # Workspace
         _alpha_placeholder = ctypes.c_double(1.0)
@@ -336,7 +344,10 @@ class SparseMatVecProduct:
     ) -> None:
         """Execute ``y = alpha * op(A) * x + beta * y``.
 
-        *x* and *y* are ``(B, k)`` arrays stacked contiguously in memory.
+        For B=1, *x* and *y* are ``(1, k)`` contiguous arrays.
+        For B>1, *x* and *y* may be non-contiguous ``(B, k)`` views
+        (e.g. column slices of a wider Variables buffer); the method
+        stages through pre-allocated internal buffers automatically.
         """
         if stream_ptr is None:
             stream_ptr = cp.cuda.get_current_stream().ptr
@@ -345,8 +356,33 @@ class SparseMatVecProduct:
         _alpha = ctypes.c_double(alpha)
         _beta = ctypes.c_double(beta)
 
-        _cusparse_lib.cusparseDnVecSetValues(self._x_desc, x.data.ptr)
-        _cusparse_lib.cusparseDnVecSetValues(self._y_desc, y.data.ptr)
+        if not self._is_batched:
+            # B=1: use caller's buffers directly (always contiguous)
+            _cusparse_lib.cusparseDnVecSetValues(self._x_desc, x.data.ptr)
+            _cusparse_lib.cusparseDnVecSetValues(self._y_desc, y.data.ptr)
+        else:
+            # B>1: if caller's buffers are C-contiguous, point cuSPARSE
+            # at them directly (zero-copy).  Otherwise stage through
+            # pre-allocated internal buffers via cudaMemcpy2DAsync.
+            B = self._batch_size
+            xk, yk = self._x_vec_len, self._y_vec_len
+            x_contig = x.flags['C_CONTIGUOUS']
+            y_contig = y.flags['C_CONTIGUOUS']
+
+            if x_contig:
+                _cusparse_lib.cusparseDnVecSetValues(self._x_desc, x.data.ptr)
+            else:
+                rt.memcpy2DAsync(
+                    self._x_buf.data.ptr, xk * 8,
+                    x.data.ptr,           x.strides[0],
+                    xk * 8, B, 3, stream_ptr,
+                )
+                _cusparse_lib.cusparseDnVecSetValues(self._x_desc, self._x_buf.data.ptr)
+
+            if y_contig:
+                _cusparse_lib.cusparseDnVecSetValues(self._y_desc, y.data.ptr)
+            else:
+                _cusparse_lib.cusparseDnVecSetValues(self._y_desc, self._y_buf.data.ptr)
 
         status = _cusparse_lib.cusparseSpMV(
             self._cusparse_handle,
@@ -362,6 +398,13 @@ class SparseMatVecProduct:
         )
         if status != 0:
             raise RuntimeError(f"cusparseSpMV failed with status {status}")
+
+        if self._is_batched and not y_contig:
+            rt.memcpy2DAsync(
+                y.data.ptr,             y.strides[0],
+                self._y_buf.data.ptr,   yk * 8,
+                yk * 8, B, 3, stream_ptr,
+            )
 
     def __del__(self):
         try:

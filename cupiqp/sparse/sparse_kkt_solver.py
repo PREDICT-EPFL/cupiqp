@@ -299,36 +299,23 @@ class SparseKKTSolver(KKTSolverBase):
     # ------------------------------------------------------------------
     # Sparse matrix-vector products (single kernel for all B)
     # ------------------------------------------------------------------
-    # The block-diagonal cuSPARSE SpMV treats x and y as flat contiguous
-    # vectors [v_0 | v_1 | ... | v_{B-1}].  Variables views (e.g.
-    # result.x) are non-contiguous column slices of a larger buffer, so
-    # we must ensure contiguity before calling cuSPARSE.
-
-    def _spmv_safe(self, spmv, x, z, alpha, beta):
-        stream_ptr = cp.cuda.get_current_stream().ptr
-        x_c = cp.ascontiguousarray(x) if not x.flags['C_CONTIGUOUS'] else x
-        z_needs_copy = not z.flags['C_CONTIGUOUS']
-        z_c = cp.empty(z.shape, dtype=z.dtype) if z_needs_copy else z
-        spmv(x_c, z_c, alpha=alpha, beta=beta, stream_ptr=stream_ptr)
-        if z_needs_copy:
-            z[:] = z_c
 
     @nvtx.annotate("SparseKKTSolver::eval_P_x")
     def eval_P_x(self, data: SparseData, alpha: float, x: cp.ndarray, z: cp.ndarray):
-        self._spmv_safe(self._spmv_P, x, z, alpha, 0.0)
+        self._spmv_P(x, z, alpha=alpha, beta=0.0, stream_ptr=cp.cuda.get_current_stream().ptr)
 
     @nvtx.annotate("SparseKKTSolver::eval_A_xn")
     def eval_A_xn(self, data: SparseData, alpha_n: float, xn: cp.ndarray, zn: cp.ndarray):
-        self._spmv_safe(self._spmv_A, xn, zn, alpha_n, 0.0)
+        self._spmv_A(xn, zn, alpha=alpha_n, beta=0.0, stream_ptr=cp.cuda.get_current_stream().ptr)
 
     @nvtx.annotate("SparseKKTSolver::eval_AT_xt")
     def eval_AT_xt(self, data: SparseData, alpha_t: float, xt: cp.ndarray, zt: cp.ndarray):
-        self._spmv_safe(self._spmv_AT, xt, zt, alpha_t, 0.0)
+        self._spmv_AT(xt, zt, alpha=alpha_t, beta=0.0, stream_ptr=cp.cuda.get_current_stream().ptr)
 
     @nvtx.annotate("SparseKKTSolver::eval_G_xn")
     def eval_G_xn(self, data: SparseData, alpha_n: float, xn: cp.ndarray, zn: cp.ndarray):
-        self._spmv_safe(self._spmv_G, xn, zn, alpha_n, 0.0)
+        self._spmv_G(xn, zn, alpha=alpha_n, beta=0.0, stream_ptr=cp.cuda.get_current_stream().ptr)
 
     @nvtx.annotate("SparseKKTSolver::eval_GT_xt")
     def eval_GT_xt(self, data: SparseData, alpha_t: float, xt: cp.ndarray, zt: cp.ndarray):
-        self._spmv_safe(self._spmv_GT, xt, zt, alpha_t, 0.0)
+        self._spmv_GT(xt, zt, alpha=alpha_t, beta=0.0, stream_ptr=cp.cuda.get_current_stream().ptr)
