@@ -69,18 +69,30 @@ class BatchedQPData:
 class BatchedQPResult:
     """Unified result from batched QP solve."""
     x: np.ndarray            # (B, n) primal solution
-    setup_time_ms: float     # wall-clock time for setup in ms
-    solve_time_ms: float     # wall-clock time for solve in ms
+    setup_time_ms: float     # median wall-clock time for setup in ms
+    solve_time_ms: float     # median wall-clock time for solve in ms
+    solve_times_all: list    # all individual solve times in ms (excluding warmup)
     n_solved: int            # number of problems solved successfully
     total: int               # total number of problems
     index_unsolved: list[int]  # index of the failed problems (max itr reached or numerical error)
     solver_name: str         # name of the solver
 
+    @property
+    def solve_time_std(self) -> float:
+        """Standard deviation of solve times in ms."""
+        return float(np.std(self.solve_times_all)) if self.solve_times_all else 0.0
+
+    @property
+    def solve_time_stderr(self) -> float:
+        """Standard error of the mean of solve times in ms."""
+        n = len(self.solve_times_all)
+        return float(np.std(self.solve_times_all) / np.sqrt(n)) if n > 0 else 0.0
+
 
 class BatchedQPSolver(ABC):
     """Base class for batched QP solvers."""
 
-    def __init__(self, tol_abs: float = 1e-6, max_iter: int = 200):
+    def __init__(self, tol_abs: float = 1e-6, max_iter: int = 300):
         self.tol_abs = tol_abs
         self.max_iter = max_iter
 
@@ -121,6 +133,7 @@ class BatchedQPSolver(ABC):
 
         result.setup_time_ms = float(np.median(setup_times))
         result.solve_time_ms = float(np.median(solve_times))
+        result.solve_times_all = solve_times
         return result
 
 
@@ -183,7 +196,7 @@ class CupiqpBatchedSolver(BatchedQPSolver):
         n_solved = len(self._solver.result.info._status_value) - len(idx_unsolved)
         x = cp.asnumpy(self._solver.result.x)
         return BatchedQPResult(
-            x=x, setup_time_ms=0, solve_time_ms=0,  # filled by benchmark()
+            x=x, setup_time_ms=0, solve_time_ms=0, solve_times_all=[],  # filled by benchmark()
             n_solved=n_solved, total=self._data.B,
             solver_name=self.name,
             index_unsolved=idx_unsolved,
@@ -265,7 +278,7 @@ class QpaxBatchedSolver(BatchedQPSolver):
         n_solved = int(jnp.sum(converged))
         idx_unsolved = [i for i, converged_i in enumerate(converged) if not converged_i]
         return BatchedQPResult(
-            x=np.array(xs), setup_time_ms=0, solve_time_ms=0,
+            x=np.array(xs), setup_time_ms=0, solve_time_ms=0, solve_times_all=[],
             n_solved=n_solved, total=self._data.B,
             solver_name=self.name,
             index_unsolved=idx_unsolved,
@@ -345,7 +358,7 @@ class QpthBatchedSolver(BatchedQPSolver):
         n_solved = -1  # NOTE: qpth does not return status
 
         return BatchedQPResult(
-            x=x_np, setup_time_ms=0, solve_time_ms=0,
+            x=x_np, setup_time_ms=0, solve_time_ms=0, solve_times_all=[],
             n_solved=n_solved, total=self._data.B,
             solver_name=self.name,
             index_unsolved=[],
@@ -371,6 +384,8 @@ class MoreauBatchedSolver(BatchedQPSolver):
         s.t.  A_cone x + s = b_cone,  s in K
 
     where K = {0}^p x R+^(num_ineq) for equality + inequality constraints.
+
+    NOTE: The Moreau solver uses Sparse linear algebra by default!
     """
 
     @property
@@ -490,7 +505,7 @@ class MoreauBatchedSolver(BatchedQPSolver):
         x_np = sol.x.cpu().numpy()
 
         return BatchedQPResult(
-            x=x_np, setup_time_ms=0, solve_time_ms=0,
+            x=x_np, setup_time_ms=0, solve_time_ms=0, solve_times_all=[],
             n_solved=n_solved, total=self._data.B,
             solver_name=self.name,
             index_unsolved=idx_unsolved,
@@ -578,8 +593,9 @@ class JaxoptBatchedSolver(BatchedQPSolver):
         elapsed = time.perf_counter() - t0
 
         return BatchedQPResult(
-            x=np.array(xs), solve_time_ms=elapsed * 1000,
+            x=np.array(xs), setup_time_ms=0, solve_time_ms=elapsed * 1000, solve_times_all=[],
             n_solved=-1,  # NOTE: BoxOSQP doesn't report per-problem convergence easily
             total=self._data.B,
             solver_name=self.name,
+            index_unsolved=[],
         )
