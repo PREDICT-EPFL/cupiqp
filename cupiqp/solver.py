@@ -638,15 +638,18 @@ class SolverBase:
             - primal_obj = 0.5 x^T P x + c^T x
             - dual_obj = -0.5 x^T P x - b^T y - h_u^T z_u + h_l^T z_l - x_u^T z_bu + x_l^T z_bl
         """
-        # cuSPARSE/cuBLAS operations (outside graph capture for now)
+        # cuSPARSE/cuBLAS operations
         self._kkt_system.eval_P_x(self._data, -1., self._result.x, self._res_nr.x)
         # ||unscale_dual_res(P*x)||_inf -> _work_dual_res_norm (will be updated further inside graph)
         cp.absolute(self._res_nr.x, out=self._work_primals)
         self._work_primals *= self._unscale_dual_res_factor
         cp.max(self._work_primals, axis=1, out=self._work_dual_res_norm)
 
-        self._kkt_system.eval_A_xn(self._data, -1., self._result.x, self._res_nr.y)  # store -A*x in res_nr.y
-        self._kkt_system.eval_AT_xt(self._data, 1., self._result.y, self._res.x)  # store A^T*y in res.x
+        if self._data.p > 0:
+            self._kkt_system.eval_A_xn(self._data, -1., self._result.x, self._res_nr.y)  # store -A*x in res_nr.y
+            self._kkt_system.eval_AT_xt(self._data, 1., self._result.y, self._res.x)  # store A^T*y in res.x
+        else:
+            self._res.x.fill(0.)  # no equality constraints, A^T*y = 0
         # ||unscale_primal_res_eq(A*x)||_inf -> _work_primal_rel_norm (will be updated further inside graph)
         if self._data.p > 0:
             cp.absolute(self._res_nr.y, out=self._work_duals[:, :self._data.p])
