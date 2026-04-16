@@ -1,5 +1,6 @@
 import cupy as cp
 import numpy as np
+from typing import List
 from enum import Enum, IntEnum, auto
 import nvtx
 
@@ -249,7 +250,7 @@ class Info:
 
     def __init__(self, batch_size: int = 1):
         self._batch_size = batch_size
-        self.status = np.full(batch_size, Status.PIQP_UNSOLVED.value, dtype=np.int32)
+        self._status_value = np.full(batch_size, Status.PIQP_UNSOLVED.value, dtype=np.int32)
         self.iter = np.zeros(batch_size, dtype=np.int32)
         self.factor_retires = np.zeros(batch_size, dtype=np.int32)
         self.no_primal_update = np.zeros(batch_size, dtype=np.int32)
@@ -257,6 +258,11 @@ class Info:
 
     def init(self):
         self._buffer = cp.zeros((self._batch_size, len(InfoIdx)), dtype=cp.float64)
+
+    @property
+    def status(self) -> List[Status]:
+        """Per-problem status as a list of Status enums."""
+        return [Status(v) for v in self._status_value]
 
     @nvtx.annotate("Info:to_host")
     def to_host(self, info_host: 'InfoHost'):

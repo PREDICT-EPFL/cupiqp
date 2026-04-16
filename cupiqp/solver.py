@@ -256,7 +256,7 @@ class SolverBase:
         return self._solve_impl()
 
     def _solve_impl(self) -> Status:
-        self._result.info.status[:] = Status.PIQP_UNSOLVED.value
+        self._result.info._status_value[:] = Status.PIQP_UNSOLVED.value
         self._result.info.iter[:] = 0
         self._result.info.reg_limit[:] = self.settings.reg_lower_limit
         self._result.info.factor_retires[:] = 0
@@ -298,7 +298,7 @@ class SolverBase:
                 # All problems keep running until every one has terminated.
                 # ============================================================
                 settings = self.settings
-                still_unsolved = (self._result.info.status == Status.PIQP_UNSOLVED.value)  # CPU: numpy bool (B,)
+                still_unsolved = (self._result.info._status_value == Status.PIQP_UNSOLVED.value)  # CPU: numpy bool (B,)
 
                 # convergence check
                 primal_ok = (info_host.primal_res < settings.eps_abs) | (info_host.primal_res_rel < settings.eps_rel)
@@ -307,7 +307,7 @@ class SolverBase:
                 if settings.check_duality_gap:
                     gap_ok = (info_host.duality_gap < settings.eps_duality_gap_abs) | (info_host.duality_gap_rel < settings.eps_duality_gap_rel)
                     converged &= gap_ok
-                self._result.info.status[still_unsolved & converged] = Status.PIQP_SOLVED.value  # CPU write
+                self._result.info._status_value[still_unsolved & converged] = Status.PIQP_SOLVED.value  # CPU write
 
                 # primal infeasibility check
                 primal_infeasible = (
@@ -315,7 +315,7 @@ class SolverBase:
                     (info_host.primal_prox_inf > settings.infeasibility_threshold) &
                     ((info_host.primal_res_reg < settings.eps_abs) | (info_host.primal_res_reg_rel < settings.eps_rel))
                 )
-                self._result.info.status[still_unsolved & ~converged & primal_infeasible] = Status.PIQP_PRIMAL_INFEASIBLE.value  # CPU write
+                self._result.info._status_value[still_unsolved & ~converged & primal_infeasible] = Status.PIQP_PRIMAL_INFEASIBLE.value  # CPU write
 
                 # dual infeasibility check
                 dual_infeasible = (
@@ -323,10 +323,10 @@ class SolverBase:
                     (info_host.dual_prox_inf > settings.infeasibility_threshold) &
                     ((info_host.dual_res_reg < settings.eps_abs) | (info_host.dual_res_reg_rel < settings.eps_rel))
                 )
-                self._result.info.status[still_unsolved & ~converged & ~primal_infeasible & dual_infeasible] = Status.PIQP_DUAL_INFEASIBLE.value  # CPU write
+                self._result.info._status_value[still_unsolved & ~converged & ~primal_infeasible & dual_infeasible] = Status.PIQP_DUAL_INFEASIBLE.value  # CPU write
 
                 # exit if all problems have terminated
-                if np.all(self._result.info.status != Status.PIQP_UNSOLVED.value):
+                if np.all(self._result.info._status_value != Status.PIQP_UNSOLVED.value):
                     break
                 
                 # avoid getting too close to boundary which can result in a division by zero
@@ -367,7 +367,7 @@ class SolverBase:
                     self._print_iteration_info()
 
                 self._update_and_factorize_kkt()
-                if np.any(self._result.info.status == Status.PIQP_NUMERICAL_ISSUES.value):
+                if np.any(self._result.info._status_value == Status.PIQP_NUMERICAL_ISSUES.value):
                     break
 
                 if self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu == 0:
@@ -381,10 +381,10 @@ class SolverBase:
                     self._update_rho_delta_with_ineq()
 
         # Mark remaining unsolved as max iter reached
-        self._result.info.status[self._result.info.status == Status.PIQP_UNSOLVED.value] = Status.PIQP_MAX_ITER_REACHED.value
+        self._result.info._status_value[self._result.info._status_value == Status.PIQP_UNSOLVED.value] = Status.PIQP_MAX_ITER_REACHED.value
         if self._preconditioner is not None:
             self._preconditioner.unscale_solution(self._result, self._data)
-        statuses = [Status(self._result.info.status[i]) for i in range(self._data.batch_size)]
+        statuses = self._result.info.status
         if self._user_batched:
             return statuses
         else:
@@ -495,8 +495,8 @@ class SolverBase:
 
         if retries >= self.settings.max_factor_retires:
             # Mark all still-unsolved problems as numerical issues
-            still_unsolved = (self._result.info.status == Status.PIQP_UNSOLVED.value)
-            self._result.info.status[still_unsolved] = Status.PIQP_NUMERICAL_ISSUES.value
+            still_unsolved = (self._result.info._status_value == Status.PIQP_UNSOLVED.value)
+            self._result.info._status_value[still_unsolved] = Status.PIQP_NUMERICAL_ISSUES.value
 
     @nvtx.annotate("Solver::_run_full_newton_step")
     def _run_full_newton_step(self):
