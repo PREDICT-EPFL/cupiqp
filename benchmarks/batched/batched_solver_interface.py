@@ -427,11 +427,12 @@ class MoreauBatchedSolver(BatchedQPSolver):
 
         cones = moreau.Cones(num_zero_cones=num_zero, num_nonneg_cones=num_nonneg)
         ipm = moreau.IPMSettings(
-            tol_gap_abs=self.tol_abs,
             tol_feas=self.tol_abs,
         )
         settings = moreau.Settings(
+            batch_size=B,  # NOTE: passing the batch_size seems to enhance the Moreau's perform a lot!
             max_iter=self.max_iter,
+            enable_grad=False,
             ipm_settings=ipm,
             device="cuda",
             )
