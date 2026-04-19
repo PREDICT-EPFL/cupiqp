@@ -76,6 +76,7 @@ class BatchedQPResult:
     total: int               # total number of problems
     index_unsolved: list[int]  # index of the failed problems (max itr reached or numerical error)
     solver_name: str         # name of the solver
+    n_iter_max: int = -1     # max iteration count over the batch; -1 if solver does not expose it
 
     @property
     def solve_time_std(self) -> float:
@@ -90,7 +91,18 @@ class BatchedQPResult:
 
 
 class BatchedQPSolver(ABC):
-    """Base class for batched QP solvers."""
+    """Base class for batched QP solvers.
+
+    Lifecycle:
+        _prepare_data(data)  --  numpy → native conversion (NOT timed).
+        setup()              --  solver-specific init (allocate, JIT, factor pre-conditions).
+        solve()              --  the actual solve.
+
+    Splitting ``_prepare_data`` from ``setup`` makes timing fair: every solver
+    sees the input as numpy ``BatchedQPData``, but the cost of converting
+    to its native representation (cupy / jax / torch / scipy.sparse) is
+    counted as a one-off, not part of per-solve setup.
+    """
 
     def __init__(self, tol_abs: float = 1e-6, max_iter: int = 300):
         self.tol_abs = tol_abs
@@ -102,8 +114,17 @@ class BatchedQPSolver(ABC):
         ...
 
     @abstractmethod
-    def setup(self, data: BatchedQPData) -> None:
-        """Set up the solver with the given QP data."""
+    def _prepare_data(self, data: BatchedQPData) -> None:
+        """Convert numpy ``BatchedQPData`` to native arrays, store on ``self``.
+
+        Called once before timing begins. Must populate whatever ``self.*``
+        attributes ``setup()`` and ``solve()`` need.
+        """
+        ...
+
+    @abstractmethod
+    def setup(self) -> None:
+        """Solver-specific setup using the prepared data already on ``self``."""
         ...
 
     @abstractmethod
@@ -112,26 +133,31 @@ class BatchedQPSolver(ABC):
         ...
 
     def benchmark(self, data: BatchedQPData, n_repeats: int = 5) -> BatchedQPResult:
-        """Time setup and solve separately over n_repeats, return median.
+        """Time setup once and solve over n_repeats, return median.
 
-        First run is a warm-up (JIT compile, allocate, etc.) and is excluded.
+        ``_prepare_data`` runs once before timing. ``setup()`` runs once
+        (timed — includes any first-call JIT / symbolic-analysis cost).
+        The first solve is a warm-up and excluded; the remaining
+        ``n_repeats`` solves are timed.
         """
-        # Warm up
-        self.setup(data)
+        self._prepare_data(data)
+
+        t0 = time.perf_counter()
+        self.setup()
+        t1 = time.perf_counter()
+        setup_time_ms = (t1 - t0) * 1000
+
+        # Warm-up solve
         self.solve()
 
-        setup_times = []
         solve_times = []
         for _ in range(n_repeats):
             t0 = time.perf_counter()
-            self.setup(data)
-            t1 = time.perf_counter()
             result = self.solve()
-            t2 = time.perf_counter()
-            setup_times.append((t1 - t0) * 1000)
-            solve_times.append((t2 - t1) * 1000)
+            t1 = time.perf_counter()
+            solve_times.append((t1 - t0) * 1000)
 
-        result.setup_time_ms = float(np.median(setup_times))
+        result.setup_time_ms = setup_time_ms
         result.solve_time_ms = float(np.median(solve_times))
         result.solve_times_all = solve_times
         return result
@@ -148,39 +174,36 @@ try:
 except ImportError:
     _CUPIQP_AVAILABLE = False
 
-class CupiqpBatchedSolver(BatchedQPSolver):
-    """cuPIQP batched dense solver (GPU, CuPy)."""
+class CupiqpBatchedSolverBase(BatchedQPSolver):
+    """Base class for cuPIQP batched solvers (GPU, CuPy).
 
-    @property
-    def name(self) -> str:
-        return "cuPIQP"
+    Subclasses must implement ``_to_native()`` and set ``_kkt_solver``.
+    """
+    _kkt_solver: str  # set by subclass
 
-    @nvtx.annotate("cuPIQP::setup")
-    def setup(self, data: BatchedQPData) -> None:
+    @abstractmethod
+    def _to_native(self, data: BatchedQPData) -> dict:
+        """Convert BatchedQPData to kwargs for SolverBase.setup().
+
+        Returns a dict with keys: P, c, and optionally A, b, G, h_l, h_u, x_l, x_u.
+        """
+        ...
+
+    def _prepare_data(self, data: BatchedQPData) -> None:
         if not _CUPIQP_AVAILABLE:
             raise ImportError("cupiqp is required for CupiqpBatchedSolver")
         self._data = data
-        self._P = cp.array(data.P)
-        self._c = cp.array(data.c)
-        self._A = cp.array(data.A) if data.A is not None else None
-        self._b = cp.array(data.b) if data.b is not None else None
-        self._G = cp.array(data.G) if data.G is not None else None
-        self._h_l = cp.array(data.h_l) if data.h_l is not None else None
-        self._h_u = cp.array(data.h_u) if data.h_u is not None else None
-        self._x_l = cp.array(data.x_l) if data.x_l is not None else None
-        self._x_u = cp.array(data.x_u) if data.x_u is not None else None
+        self._setup_kwargs = self._to_native(data)
 
+    @nvtx.annotate("cuPIQP::setup")
+    def setup(self) -> None:
         self._solver = SolverBase()
-        self._solver.settings.kkt_solver = 'dense_cholesky'
+        self._solver.settings.kkt_solver = self._kkt_solver
         self._solver.settings.preconditioner_iter = 10
         self._solver.settings.max_iter = self.max_iter
         self._solver.settings.eps_abs = self.tol_abs
         self._solver.settings.verbose = False
-        self._solver.setup(
-            P=self._P, c=self._c, A=self._A, b=self._b,
-            G=self._G, h_u=self._h_u, h_l=self._h_l,
-            x_u=self._x_u, x_l=self._x_l,
-        )
+        self._solver.setup(**self._setup_kwargs)
 
     @nvtx.annotate("cuPIQP::solve")
     def solve(self) -> BatchedQPResult:
@@ -200,6 +223,52 @@ class CupiqpBatchedSolver(BatchedQPSolver):
             n_solved=n_solved, total=self._data.B,
             solver_name=self.name,
             index_unsolved=idx_unsolved,
+            n_iter_max=int(self._solver.result.info.iter.max()),
+        )
+
+
+class CupiqpDenseBatchedSolver(CupiqpBatchedSolverBase):
+    """cuPIQP with dense Cholesky backend."""
+    _kkt_solver = 'dense_cholesky'
+
+    @property
+    def name(self) -> str:
+        return "cupiqp-dense"
+
+    def _to_native(self, data: BatchedQPData) -> dict:
+        return dict(
+            P=cp.array(data.P), c=cp.array(data.c),
+            A=cp.array(data.A) if data.A is not None else None,
+            b=cp.array(data.b) if data.b is not None else None,
+            G=cp.array(data.G) if data.G is not None else None,
+            h_l=cp.array(data.h_l) if data.h_l is not None else None,
+            h_u=cp.array(data.h_u) if data.h_u is not None else None,
+            x_l=cp.array(data.x_l) if data.x_l is not None else None,
+            x_u=cp.array(data.x_u) if data.x_u is not None else None,
+        )
+
+
+class CupiqpSparseBatchedSolver(CupiqpBatchedSolverBase):
+    """cuPIQP with sparse direct backend."""
+    _kkt_solver = 'sparse_ldlt'
+
+    @property
+    def name(self) -> str:
+        return "cupiqp-sparse"
+
+    def _to_native(self, data: BatchedQPData) -> dict:
+        from scipy.sparse import csr_matrix as sp_csr
+        B = data.B
+        return dict(
+            P=[sp_csr(data.P[i]) for i in range(B)],
+            c=cp.array(data.c),
+            A=[sp_csr(data.A[i]) for i in range(B)] if data.A is not None else None,
+            b=cp.array(data.b) if data.b is not None else None,
+            G=[sp_csr(data.G[i]) for i in range(B)] if data.G is not None else None,
+            h_l=cp.array(data.h_l) if data.h_l is not None else None,
+            h_u=cp.array(data.h_u) if data.h_u is not None else None,
+            x_l=cp.array(data.x_l) if data.x_l is not None else None,
+            x_u=cp.array(data.x_u) if data.x_u is not None else None,
         )
 
 
@@ -220,8 +289,7 @@ class QpaxBatchedSolver(BatchedQPSolver):
     def name(self) -> str:
         return "qpax"
 
-    @nvtx.annotate("qpax::setup")
-    def setup(self, data: BatchedQPData) -> None:
+    def _prepare_data(self, data: BatchedQPData) -> None:
         if not _QPAX_AVAILABLE:
             raise ImportError("qpax is required for QpaxBatchedSolver")
         self._data = data
@@ -266,12 +334,14 @@ class QpaxBatchedSolver(BatchedQPSolver):
             self._Gs = jnp.zeros((B, 0, n))
             self._hs = jnp.zeros((B, 0))
 
+    @nvtx.annotate("qpax::setup")
+    def setup(self) -> None:
         solve_fn = partial(qpax.solve_qp, solver_tol=self.tol_abs, max_iter=self.max_iter)
         self._batch_solve = jit(vmap(solve_fn, in_axes=(0, 0, 0, 0, 0, 0)))
 
     @nvtx.annotate("qpax::solve")
     def solve(self) -> BatchedQPResult:
-        xs, _, _, _, converged, _ = self._batch_solve(
+        xs, _, _, _, converged, pdip_iter = self._batch_solve(
             self._Ps, self._cs, self._As, self._bs, self._Gs, self._hs)
         xs.block_until_ready()
 
@@ -282,6 +352,7 @@ class QpaxBatchedSolver(BatchedQPSolver):
             n_solved=n_solved, total=self._data.B,
             solver_name=self.name,
             index_unsolved=idx_unsolved,
+            n_iter_max=int(pdip_iter.max()),
         )
 
 
@@ -302,8 +373,7 @@ class QpthBatchedSolver(BatchedQPSolver):
     def name(self) -> str:
         return "qpth"
 
-    @nvtx.annotate("qpth::setup")
-    def setup(self, data: BatchedQPData) -> None:
+    def _prepare_data(self, data: BatchedQPData) -> None:
         if not _QPTH_AVAILABLE:
             raise ImportError("qpth is required for QpthBatchedSolver")
 
@@ -345,6 +415,8 @@ class QpthBatchedSolver(BatchedQPSolver):
             self._G = torch.empty(B, 0, n, dtype=torch.float64, device='cuda')
             self._h = torch.empty(B, 0, dtype=torch.float64, device='cuda')
 
+    @nvtx.annotate("qpth::setup")
+    def setup(self) -> None:
         self._qp_fn = QPFunction(verbose=0, maxIter=self.max_iter, eps=self.tol_abs, check_Q_spd=False)
 
     @nvtx.annotate("qpth::solve")
@@ -392,8 +464,7 @@ class MoreauBatchedSolver(BatchedQPSolver):
     def name(self) -> str:
         return "moreau"
 
-    @nvtx.annotate("moreau::setup")
-    def setup(self, data: BatchedQPData) -> None:
+    def _prepare_data(self, data: BatchedQPData) -> None:
         if not _MOREAU_AVAILABLE:
             raise ImportError("moreau is required for MoreauBatchedSolver")
         from scipy import sparse
@@ -437,36 +508,13 @@ class MoreauBatchedSolver(BatchedQPSolver):
 
         # P sparsity (same for all problems — use problem 0)
         P_np = data.P[0]
-        P_sp = sparse.csr_matrix(P_np)
-        A_sp = sparse.csr_matrix(A_cone_np)
-
-        cones = moreau.Cones(num_zero_cones=num_zero, num_nonneg_cones=num_nonneg)
-        ipm = moreau.IPMSettings(
-            tol_feas=self.tol_abs,
-        )
-        settings = moreau.Settings(
-            batch_size=B,  # NOTE: passing the batch_size seems to enhance the Moreau's perform a lot!
-            max_iter=self.max_iter,
-            enable_grad=False,
-            ipm_settings=ipm,
-            device="cuda",
-            )
-
-        self._solver = MoreauTorchSolver(
-            n=n, m=A_sp.shape[0],
-            P_row_offsets=torch.tensor(P_sp.indptr, dtype=torch.int32),
-            P_col_indices=torch.tensor(P_sp.indices, dtype=torch.int32),
-            A_row_offsets=torch.tensor(A_sp.indptr, dtype=torch.int32),
-            A_col_indices=torch.tensor(A_sp.indices, dtype=torch.int32),
-            cones=cones,
-            settings=settings,
-        )
+        self._P_sp = sparse.csr_matrix(P_np)
+        self._A_sp = sparse.csr_matrix(A_cone_np)
+        self._num_zero = num_zero
+        self._num_nonneg = num_nonneg
 
         # Batched values: (B, nnz_P) and (B, nnz_A)
-        # Extract nonzero values for each problem in the batch
-        P_nnz = P_sp.nnz
-        A_nnz = A_sp.nnz
-
+        P_nnz = self._P_sp.nnz
         self._P_vals = torch.zeros(B, P_nnz, dtype=torch.float64)
         for i in range(B):
             P_i = sparse.csr_matrix(data.P[i])
@@ -475,7 +523,7 @@ class MoreauBatchedSolver(BatchedQPSolver):
         # A_cone is the same structure for all problems, but values differ
         # for equality and inequality bounds
         self._A_vals = torch.tensor(
-            np.tile(A_sp.data[None, :], (B, 1)), dtype=torch.float64
+            np.tile(self._A_sp.data[None, :], (B, 1)), dtype=torch.float64
         )
 
         self._q = torch.tensor(data.c, dtype=torch.float64)
@@ -485,6 +533,33 @@ class MoreauBatchedSolver(BatchedQPSolver):
             self._b = torch.tensor(np.concatenate(b_parts_np, axis=1), dtype=torch.float64)
         else:
             self._b = torch.zeros(B, 0, dtype=torch.float64)
+
+    @nvtx.annotate("moreau::setup")
+    def setup(self) -> None:
+        B, n = self._data.B, self._data.n
+
+        cones = moreau.Cones(num_zero_cones=self._num_zero, num_nonneg_cones=self._num_nonneg)
+        ipm = moreau.IPMSettings(
+            direct_solve_method="cudss",  # NOTE: if not set it to cudss, maybe it switches to CPU when batch size is small?
+            tol_feas=self.tol_abs,
+            )
+        settings = moreau.Settings(
+            batch_size=B,  # NOTE: passing the batch_size seems to enhance the Moreau's perform a lot!
+            max_iter=self.max_iter,
+            enable_grad=False,
+            ipm_settings=ipm,
+            device="cuda",
+        )
+
+        self._solver = MoreauTorchSolver(
+            n=n, m=self._A_sp.shape[0],
+            P_row_offsets=torch.tensor(self._P_sp.indptr, dtype=torch.int32),
+            P_col_indices=torch.tensor(self._P_sp.indices, dtype=torch.int32),
+            A_row_offsets=torch.tensor(self._A_sp.indptr, dtype=torch.int32),
+            A_col_indices=torch.tensor(self._A_sp.indices, dtype=torch.int32),
+            cones=cones,
+            settings=settings,
+        )
 
     @nvtx.annotate("moreau::solve")
     def solve(self) -> BatchedQPResult:
@@ -509,6 +584,7 @@ class MoreauBatchedSolver(BatchedQPSolver):
             n_solved=n_solved, total=self._data.B,
             solver_name=self.name,
             index_unsolved=idx_unsolved,
+            n_iter_max=int(np.max(self._solver.info.iterations)),
         )
 
 
@@ -529,8 +605,7 @@ class JaxoptBatchedSolver(BatchedQPSolver):
     def name(self) -> str:
         return "jaxopt"
 
-    @nvtx.annotate("jaxopt::setup")
-    def setup(self, data: BatchedQPData) -> None:
+    def _prepare_data(self, data: BatchedQPData) -> None:
         if not _JAXOPT_AVAILABLE:
             raise ImportError("jaxopt is required for JaxoptBatchedSolver")
         self._data = data
@@ -568,12 +643,14 @@ class JaxoptBatchedSolver(BatchedQPSolver):
         self._l_full = jnp.concatenate(l_full_parts, axis=1)
         self._u_full = jnp.concatenate(u_full_parts, axis=1)
 
+    @nvtx.annotate("jaxopt::setup")
+    def setup(self) -> None:
         osqp = BoxOSQP(
             maxiter=self.max_iter,
             tol=self.tol_abs,
             jit=True,
             check_primal_dual_infeasability=True,
-            )
+        )
 
         def solve_one(Q, c, A, l, u):
             sol = osqp.run(
