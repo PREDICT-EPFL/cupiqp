@@ -664,8 +664,13 @@ class SolverBase:
 
         G_x = self._work_z_2  # reuse self._work_z_2 to store G*x
         GT_zu_minus_zl = self._step.x  # reuse self._step.x as temporary storage
-        self._kkt_system.eval_G_xn(self._data, 1., self._result.x, G_x)
-        self._kkt_system.eval_GT_xt(self._data, 1., self._work_z_1, GT_zu_minus_zl)
+        # NOTE: cublasDgemmStridedBatched performs many memset if m=0, so better not call it when unnecessary
+        if self._data.m > 0:
+            self._kkt_system.eval_G_xn(self._data, 1., self._result.x, G_x)
+            self._kkt_system.eval_GT_xt(self._data, 1., self._work_z_1, GT_zu_minus_zl)
+        else:
+            G_x.fill(0.)
+            GT_zu_minus_zl.fill(0)
 
         # ------------ update primal / dual objectives and duality gap ------------
         # primal objective: 0.5 x^T P x + c^T x
