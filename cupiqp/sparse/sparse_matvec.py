@@ -1,38 +1,12 @@
-"""Graph-safe cuSPARSE SpMV wrapper with native batching.
-
-CuPy's ``cupyx.cusparse.spmv`` allocates a workspace buffer on every call,
-which breaks CUDA graph capture.  This module provides a thin wrapper that
-pre-allocates all cuSPARSE descriptors and the workspace buffer once at
-construction time so that ``__call__`` only invokes ``cusparseSpMV`` -- no
-allocation, no host-device sync -- making it safe for stream capture and
-also more efficient.
-
-Batching (B > 1):
-
-When a *list* of B CSR matrices (sharing the same sparsity pattern) is
-passed, a single block-diagonal CSR matrix is built internally::
-
-    [ A_0              ]   [ x_0 ]   [ y_0 ]
-    [      A_1         ] * [ x_1 ] = [ y_1 ]
-    [           ...    ]   [ ... ]   [ ... ]
-    [              A_B ]   [ x_B ]   [ y_B ]
-
-A single ``cusparseSpMV`` call on the stacked vectors processes all B
-problems simultaneously.  The individual matrices' ``.data`` attributes
-are reassigned to contiguous views of a packed buffer so that later
-in-place modifications (e.g. preconditioner scaling) are automatically
-visible to the cuSPARSE descriptor.
-
-For B = 1 (a single CSR matrix) the original, SpMV is directly called
-"""
-
 import ctypes
 import ctypes.util
-from typing import Sequence
+from typing import Union
 import cupy as cp
-import cupyx.scipy.sparse as cpsp
+from cupyx.scipy.sparse import spmatrix, csr_matrix, csc_matrix, coo_matrix
 from cupy.cuda import cusparse
 import cupy.cuda.runtime as rt
+
+from .batched_csr import BatchedCsrMatrix
 
 # ---------------------------------------------------------------------------
 # Load cuSPARSE shared library once (module level) for graph-safe direct calls
@@ -112,95 +86,66 @@ def _idx_type(arr: cp.ndarray) -> int:
     )
 
 
-def _create_mat_desc(mat, compute_type: int) -> int:
-    """Create a cuSPARSE sparse-matrix descriptor for *mat*.
-
-    Supports CSR, CSC, and COO formats.  The descriptor reuses the matrix's
-    existing device memory; no copy is made.
-    """
-    rows, cols = mat.shape
-    if isinstance(mat, cpsp.csr_matrix):
-        return cusparse.createCsr(
-            rows, cols, mat.nnz,
-            mat.indptr.data.ptr,
-            mat.indices.data.ptr,
-            mat.data.data.ptr,
-            _idx_type(mat.indptr),
-            _idx_type(mat.indices),
-            cusparse.CUSPARSE_INDEX_BASE_ZERO,
-            compute_type,
-        )
-    elif isinstance(mat, cpsp.csc_matrix):
-        return cusparse.createCsc(
-            rows, cols, mat.nnz,
-            mat.indptr.data.ptr,
-            mat.indices.data.ptr,
-            mat.data.data.ptr,
-            _idx_type(mat.indptr),
-            _idx_type(mat.indices),
-            cusparse.CUSPARSE_INDEX_BASE_ZERO,
-            compute_type,
-        )
-    elif isinstance(mat, cpsp.coo_matrix):
-        return cusparse.createCoo(
-            rows, cols, mat.nnz,
-            mat.row.data.ptr,
-            mat.col.data.ptr,
-            mat.data.data.ptr,
-            _idx_type(mat.row),
-            cusparse.CUSPARSE_INDEX_BASE_ZERO,
-            compute_type,
-        )
-    else:
-        raise TypeError(
-            f"Unsupported sparse matrix type: {type(mat).__name__}. "
-            "Expected csr_matrix, csc_matrix, or coo_matrix."
-        )
 
 
-class SparseMatVecProduct:
-    """CUDA-graph-safe sparse matrix-vector product.
+class SingleSparseMatVecProduct:
+    """Graph-capture-safe sparse matrix-vector product for a single matrix.
 
-    Computes ``y = alpha * op(A) * x + beta * y``.
+    Computes ``y = alpha * op(A) * x + beta * y`` where ``A`` is a cupy
+    sparse matrix in CSR, CSC, or COO format and ``op`` is either identity
+    or transpose (``transa``).
+
+    Why a custom wrapper: ``cupyx.cusparse.spmv`` allocates its workspace
+    buffer on every call, which (a) prevents CUDA graph capture and (b)
+    adds per-call overhead. This class pre-allocates the cuSPARSE handle,
+    the sparse- and dense-vector descriptors, and the workspace buffer at
+    construction time. ``__call__`` then only rebinds the dense-vector
+    pointers and dispatches ``cusparseSpMV`` via a direct ctypes call —
+    no device allocation, no host-device sync, safe for stream capture.
+
+    Lifetime: the sparse matrix ``mat`` is kept alive through ``self._mat``
+    and the descriptor reuses its device buffers. In-place updates to
+    ``mat.data`` are therefore visible on subsequent calls as long as the
+    underlying allocation is not replaced (e.g. ``mat.data[:] = ...`` is
+    safe; ``mat.data = new_array`` is not).
 
     Parameters
     ----------
-    mat : csr_matrix | csc_matrix | coo_matrix | list[csr_matrix]
-        A single sparse matrix (B = 1), or a list of B CSR matrices that
-        share the same sparsity pattern (B > 1).
-    transa : bool
-        If ``True``, compute ``A^T * x`` instead of ``A * x``.
+    mat : csr_matrix | csc_matrix | coo_matrix
+        The sparse matrix. Device buffers are reused (no copy).
+    transa : bool, default False
+        If ``True``, compute ``A^T @ x`` instead of ``A @ x``.
 
-    Notes
-    -----
-    For B > 1 the individual matrices' ``.data`` attributes are reassigned
-    to contiguous views of an internal packed buffer.  Any subsequent
-    in-place modification of those arrays (e.g. ``mat.data *= scale``)
-    is automatically visible to the cuSPARSE descriptor.
+    Call signature
+    --------------
+    ``op(x, y, alpha=1.0, beta=0.0, stream_ptr=None)``
+        ``x`` is a 1-D float64 cupy array of length ``cols`` (or ``rows``
+        if ``transa``); ``y`` is a 1-D float64 cupy array of matching
+        output length. Both are used directly (no staging).
     """
 
     def __init__(
         self,
-        mat: Sequence[cpsp.csr_matrix],
+        mat: Union[csr_matrix, csc_matrix, coo_matrix],
         transa: bool = False,
     ):
-        assert isinstance(mat, Sequence) and len(mat) > 0
-        assert isinstance(mat[0], cpsp.csr_matrix)
-        self._batch_size = len(mat)
-        if self._batch_size == 1:
-            self._is_batched = False
-            self._init_single(mat[0], transa)
-        else:
-            self._is_batched = True
-            self._init_batched(list(mat), transa)
+        if not isinstance(mat, (csr_matrix, csc_matrix, coo_matrix)):
+            raise TypeError(
+                f"mat must be a csr_matrix, csc_matrix, or coo_matrix; "
+                f"got {type(mat).__name__}."
+            )
+        self._mat = mat
+        self._transa = transa
+        self._setup_cusparse()
+        
+    def _setup_cusparse(self):
 
-    def _init_single(self, mat, transa):
         self._cusparse_handle = _create_cusparse_handle()
 
         # ---- operation ----
         self._op = (
             cusparse.CUSPARSE_OPERATION_TRANSPOSE
-            if transa
+            if self._transa
             else cusparse.CUSPARSE_OPERATION_NON_TRANSPOSE
         )
 
@@ -208,13 +153,13 @@ class SparseMatVecProduct:
         self._compute_type = rt.CUDA_R_64F
 
         # ---- sparse matrix descriptor (reuses mat's existing device memory) ----
-        self._mat_desc = _create_mat_desc(mat, self._compute_type)
+        self._mat_desc = self._create_mat_desc(self._mat, self._compute_type)
 
         # ---- dense vector descriptors ----
-        if transa:
-            x_size, y_size = mat.shape[0], mat.shape[1]
+        if self._transa:
+            x_size, y_size = self._mat.shape[0], self._mat.shape[1]
         else:
-            x_size, y_size = mat.shape[1], mat.shape[0]
+            x_size, y_size = self._mat.shape[1], self._mat.shape[0]
 
         dummy_x = cp.empty(x_size, dtype=cp.float64)
         dummy_y = cp.empty(y_size, dtype=cp.float64)
@@ -238,63 +183,214 @@ class SparseMatVecProduct:
         )
         self._buffer = cp.empty(max(buf_size, 1), dtype=cp.uint8)
 
-        # Keep mat alive so its device buffers aren't freed.
-        self._mat_ref = mat
 
-    def _init_batched(self, mats, transa):
-        B = self._batch_size
-        template = mats[0]
-        rows, cols = template.shape
-        nnz = template.nnz
+    @staticmethod
+    def _create_mat_desc(mat: spmatrix, compute_type: int) -> int:
+        """Create a cuSPARSE sparse-matrix descriptor for *mat*.
 
-        # -- pack matrix data contiguously: [data_0 | data_1 | ... ] ----
-        # Check whether data is already packed (e.g. by SparseData).
-        if self._is_data_packed(mats, nnz):
-            # Reuse existing contiguous buffer
-            self._packed_data = cp.ndarray(
-                B * nnz, dtype=cp.float64,
-                memptr=cp.cuda.MemoryPointer(mats[0].data.data.mem, mats[0].data.data.ptr - mats[0].data.data.mem.ptr),
+        Supports CSR, CSC, and COO formats.  The descriptor reuses the matrix's
+        existing device memory; no copy is made.
+        """
+        rows, cols = mat.shape
+        if isinstance(mat, csr_matrix):
+            return cusparse.createCsr(
+                rows, cols, mat.nnz,
+                mat.indptr.data.ptr,
+                mat.indices.data.ptr,
+                mat.data.data.ptr,
+                _idx_type(mat.indptr),
+                _idx_type(mat.indices),
+                cusparse.CUSPARSE_INDEX_BASE_ZERO,
+                compute_type,
+            )
+        elif isinstance(mat, csc_matrix):
+            return cusparse.createCsc(
+                rows, cols, mat.nnz,
+                mat.indptr.data.ptr,
+                mat.indices.data.ptr,
+                mat.data.data.ptr,
+                _idx_type(mat.indptr),
+                _idx_type(mat.indices),
+                cusparse.CUSPARSE_INDEX_BASE_ZERO,
+                compute_type,
+            )
+        elif isinstance(mat, coo_matrix):
+            return cusparse.createCoo(
+                rows, cols, mat.nnz,
+                mat.row.data.ptr,
+                mat.col.data.ptr,
+                mat.data.data.ptr,
+                _idx_type(mat.row),
+                cusparse.CUSPARSE_INDEX_BASE_ZERO,
+                compute_type,
             )
         else:
-            self._packed_data = cp.empty(B * nnz, dtype=cp.float64)
-            for b in range(B):
-                view = self._packed_data[b * nnz : (b + 1) * nnz]
-                view[:] = mats[b].data
-                mats[b].data = view
+            raise TypeError(
+                f"Unsupported sparse matrix type: {type(mat).__name__}. "
+                "Expected csr_matrix, csc_matrix, or coo_matrix."
+            )
 
-        # -- build block-diagonal structure via bmat --------------------
-        # bmat gives us correct indptr/indices; we replace .data with our
-        # packed buffer so in-place modifications stay visible.
-        from cupyx.scipy.sparse import bmat as sp_bmat
-        blocks = [[None] * B for _ in range(B)]
-        for b in range(B):
-            blocks[b][b] = mats[b]
-        self._block_diag = sp_bmat(blocks, format='csr', dtype=cp.float64)
-        # Wire the packed data into the block-diagonal CSR
-        self._block_diag.data = self._packed_data
+    def __call__(
+        self,
+        x: cp.ndarray,  # shape (n,)
+        y: cp.ndarray,  # shape (m,)
+        alpha: float = 1.0,
+        beta: float = 0.0,
+        stream_ptr: int = None,
+    ) -> None:
+        """Execute ``y = alpha * op(A) * x + beta * y``. """
+        if stream_ptr is None:
+            stream_ptr = cp.cuda.get_current_stream().ptr
+        _cusparse_lib.cusparseSetStream(self._cusparse_handle, stream_ptr)
 
-        # -- cuSPARSE setup ---------------------------------------------
+        _alpha = ctypes.c_double(alpha)
+        _beta = ctypes.c_double(beta)
+        _cusparse_lib.cusparseDnVecSetValues(self._x_desc, x.data.ptr)
+        _cusparse_lib.cusparseDnVecSetValues(self._y_desc, y.data.ptr)
+        
+        status = _cusparse_lib.cusparseSpMV(
+            self._cusparse_handle,
+            self._op,
+            ctypes.addressof(_alpha),
+            self._mat_desc,
+            self._x_desc,
+            ctypes.addressof(_beta),
+            self._y_desc,
+            self._compute_type,
+            self._alg,
+            self._buffer.data.ptr,
+        )
+        if status != 0:
+            raise RuntimeError(f"cusparseSpMV failed with status {status}")
+
+    def __del__(self):
+        try:
+            cusparse.destroyDnVec(self._x_desc)
+        except Exception:
+            pass
+        try:
+            cusparse.destroyDnVec(self._y_desc)
+        except Exception:
+            pass
+        try:
+            cusparse.destroySpMat(self._mat_desc)
+        except Exception:
+            pass
+
+        handle = getattr(self, "_cusparse_handle", None)
+        if handle is not None:
+            try:
+                _destroy_cusparse_handle(handle)
+            except Exception:
+                pass
+
+
+
+class BatchedSparseMatVecProduct:
+    """Graph-capture-safe batched sparse matrix-vector product.
+
+    Computes ``y[b] = alpha * op(A[b]) @ x[b] + beta * y[b]`` for every
+    ``b`` in ``range(B)`` with a *single* ``cusparseSpMV`` call on an
+    internally constructed block-diagonal CSR::
+
+        [ A_0                  ]   [ x_0   ]   [ y_0   ]
+        [     A_1              ] @ [ x_1   ] = [ y_1   ]
+        [           ...        ]   [  ...  ]   [  ...  ]
+        [               A_B-1  ]   [ x_B-1 ]   [ y_B-1 ]
+
+    The stacked operator is ``(B*m, B*n)`` with ``B*nnz`` nonzeros. Because
+    all batches share the same sparsity pattern, the block-diagonal's
+    ``indptr`` and ``indices`` are built via vectorized cupy broadcasting —
+    no Python loop over batches — and the block-diagonal's values buffer is
+    a zero-copy ``reshape`` of ``mats.data``. Any in-place update to
+    ``mats`` (``mats[b] = ...``, ``mats.data *= scale``, etc.) is therefore
+    visible on the next call without rebuilding anything.
+
+    Graph safety mirrors ``SingleSparseMatVecProduct``: every cuSPARSE
+    descriptor and the workspace buffer are allocated once in ``__init__``;
+    ``__call__`` only rebinds dense-vector pointers and dispatches
+    ``cusparseSpMV`` via a direct ctypes call.
+
+    Parameters
+    ----------
+    mats : BatchedCsrMatrix
+        The batched sparse matrices. All batches share the sparsity
+        pattern; ``mats.data`` is a packed ``(B, nnz)`` float64 buffer.
+    transa : bool, default False
+        If ``True``, compute ``A[b]^T @ x[b]`` instead of ``A[b] @ x[b]``.
+
+    Call signature
+    --------------
+    ``op(x, y, alpha=1.0, beta=0.0, stream_ptr=None)``
+        ``x`` / ``y`` are float64 arrays of shape ``(B, k_x)`` / ``(B, k_y)``.
+        C-contiguous arrays are passed to cuSPARSE zero-copy. Non-contiguous
+        arrays (e.g. column slices of a wider ``(B, K)`` buffer) are staged
+        through pre-allocated internal buffers via ``cudaMemcpy2DAsync``;
+        when ``beta != 0`` the current ``y`` values are also staged in
+        before the call so cuSPARSE reads them correctly.
+    """
+
+    def __init__(
+        self,
+        mats: BatchedCsrMatrix,
+        transa: bool = False,
+    ):
+        self._batch_size = mats.batch_size
+        self._mats = mats
+        self._transa = transa
+
+        self._setup_big_diag_matrix()
+        self._setup_cusparse()
+
+    def _setup_big_diag_matrix(self):
+        B, rows, cols, nnz = self._mats.batch_size, self._mats.rows, self._mats.cols, self._mats.nnz
+        indptr = self._mats.indptr       # (rows+1,)
+        indices = self._mats.indices     # (nnz,)
+
+        # ---- block-diagonal indptr ((B*rows + 1,)): big[b*rows+r] = b*nnz + indptr[r]
+        batch_nnz = cp.arange(B, dtype=indptr.dtype) * nnz
+        big_mat_indptr = cp.empty(B * rows + 1, dtype=indptr.dtype)
+        big_mat_indptr[:B * rows].reshape(B, rows)[:] = (
+            indptr[:-1][None, :] + batch_nnz[:, None]
+        )
+        big_mat_indptr[-1] = B * nnz
+
+        # ---- block-diagonal indices ((B*nnz,)): big[b*nnz+k] = indices[k] + b*cols
+        batch_col = cp.arange(B, dtype=indices.dtype) * cols
+        big_mat_indices = (indices[None, :] + batch_col[:, None]).reshape(-1)
+
+        # ---- block-diagonal values: a zero-copy view into mats.data
+        big_mat_data = self._mats.data.reshape(-1)
+
+        self._block_diag_mat = csr_matrix(
+            (big_mat_data, big_mat_indices, big_mat_indptr),
+            shape=(B * rows, B * cols),
+        )
+
+    def _setup_cusparse(self):
+        B, rows, cols, nnz = self._mats.batch_size, self._mats.rows, self._mats.cols, self._mats.nnz
+
+        # ---- cuSPARSE setup ------------------------------------------
         self._cusparse_handle = _create_cusparse_handle()
         self._compute_type = rt.CUDA_R_64F
         self._op = (
             cusparse.CUSPARSE_OPERATION_TRANSPOSE
-            if transa
+            if self._transa
             else cusparse.CUSPARSE_OPERATION_NON_TRANSPOSE
         )
         self._alg = cusparse.CUSPARSE_MV_ALG_DEFAULT
+        self._mat_desc = SingleSparseMatVecProduct._create_mat_desc(
+            self._block_diag_mat, self._compute_type,
+        )
 
-        self._mat_desc = _create_mat_desc(self._block_diag, self._compute_type)
-
-        # Per-problem vector lengths (before stacking)
-        if transa:
+        # Per-problem vector lengths (before stacking).
+        if self._transa:
             self._x_vec_len, self._y_vec_len = rows, cols
         else:
             self._x_vec_len, self._y_vec_len = cols, rows
 
-        # Persistent contiguous buffers for cuSPARSE — callers may pass
-        # non-contiguous (B, k) views (e.g. column slices of Variables
-        # buffers). We always stage through these internal buffers using
-        # cudaMemcpy2DAsync (handles both contiguous and strided input).
+        # Persistent contiguous staging buffers. Used when the caller passes
+        # non-contiguous (B, k) views (e.g. column slices of a wider buffer).
         x_size = B * self._x_vec_len
         y_size = B * self._y_vec_len
         self._x_buf = cp.empty(x_size, dtype=cp.float64)
@@ -302,7 +398,7 @@ class SparseMatVecProduct:
         self._x_desc = cusparse.createDnVec(x_size, self._x_buf.data.ptr, self._compute_type)
         self._y_desc = cusparse.createDnVec(y_size, self._y_buf.data.ptr, self._compute_type)
 
-        # Workspace
+        # Workspace size is independent of the alpha/beta scalars.
         _alpha_placeholder = ctypes.c_double(1.0)
         _beta_placeholder = ctypes.c_double(0.0)
         buf_size = cusparse.spMV_bufferSize(
@@ -314,25 +410,10 @@ class SparseMatVecProduct:
             ctypes.addressof(_beta_placeholder),
             self._y_desc,
             self._compute_type,
-            self._alg,
+            cusparse.CUSPARSE_MV_ALG_DEFAULT,
         )
         self._buffer = cp.empty(max(buf_size, 1), dtype=cp.uint8)
 
-        # Keep refs alive
-        self._mat_ref = mats
-
-    @staticmethod
-    def _is_data_packed(mats, nnz):
-        """Return True if the matrices' data arrays already form a contiguous
-        packed buffer with stride ``nnz * 8`` bytes between consecutive blocks."""
-        if len(mats) < 2:
-            return True
-        stride = nnz * 8  # bytes
-        ptr0 = mats[0].data.data.ptr
-        for b in range(1, len(mats)):
-            if mats[b].data.data.ptr != ptr0 + b * stride:
-                return False
-        return True
 
     def __call__(
         self,
@@ -344,10 +425,11 @@ class SparseMatVecProduct:
     ) -> None:
         """Execute ``y = alpha * op(A) * x + beta * y``.
 
-        For B=1, *x* and *y* are ``(1, k)`` contiguous arrays.
-        For B>1, *x* and *y* may be non-contiguous ``(B, k)`` views
-        (e.g. column slices of a wider Variables buffer); the method
-        stages through pre-allocated internal buffers automatically.
+        ``x`` and ``y`` are ``(B, k)`` float64 arrays. C-contiguous arrays
+        are bound to cuSPARSE zero-copy. Non-contiguous arrays (e.g. column
+        slices of a wider buffer) are staged through pre-allocated internal
+        buffers via ``cudaMemcpy2DAsync``; when ``beta != 0`` the current y
+        values are also staged in before the call so cuSPARSE reads them.
         """
         if stream_ptr is None:
             stream_ptr = cp.cuda.get_current_stream().ptr
@@ -356,33 +438,48 @@ class SparseMatVecProduct:
         _alpha = ctypes.c_double(alpha)
         _beta = ctypes.c_double(beta)
 
-        if not self._is_batched:
-            # B=1: use caller's buffers directly (always contiguous)
+        B = self._batch_size
+        xk, yk = self._x_vec_len, self._y_vec_len
+        itemsize = 8  # float64
+        x_contig = x.flags['C_CONTIGUOUS']
+        y_contig = y.flags['C_CONTIGUOUS']
+
+        if x_contig:
             _cusparse_lib.cusparseDnVecSetValues(self._x_desc, x.data.ptr)
+        else:
+            # Copy x (non-contig) into the contiguous internal x_buf so the
+            # descriptor's expected layout matches memory. One D->D 2D copy.
+            rt.memcpy2DAsync(
+                self._x_buf.data.ptr,  # dst: start of internal packed buffer
+                xk * itemsize,         # dpitch: bytes between dst rows (tight)
+                x.data.ptr,            # src: caller's (possibly strided) buffer
+                x.strides[0],          # spitch: bytes between src rows (row stride)
+                xk * itemsize,         # width: bytes copied per row (xk float64s)
+                B,                     # height: number of rows (batches)
+                3,                     # kind: cudaMemcpyDeviceToDevice
+                stream_ptr,            # stream
+            )
+            _cusparse_lib.cusparseDnVecSetValues(self._x_desc, self._x_buf.data.ptr)
+
+        if y_contig:
             _cusparse_lib.cusparseDnVecSetValues(self._y_desc, y.data.ptr)
         else:
-            # B>1: if caller's buffers are C-contiguous, point cuSPARSE
-            # at them directly (zero-copy).  Otherwise stage through
-            # pre-allocated internal buffers via cudaMemcpy2DAsync.
-            B = self._batch_size
-            xk, yk = self._x_vec_len, self._y_vec_len
-            x_contig = x.flags['C_CONTIGUOUS']
-            y_contig = y.flags['C_CONTIGUOUS']
-
-            if x_contig:
-                _cusparse_lib.cusparseDnVecSetValues(self._x_desc, x.data.ptr)
-            else:
+            if beta != 0.0:
+                # cuSPARSE reads y before writing when beta != 0, so we must
+                # stage the caller's current y values into y_buf first;
+                # otherwise the read would see stale contents left over from
+                # a previous call.
                 rt.memcpy2DAsync(
-                    self._x_buf.data.ptr, xk * 8,
-                    x.data.ptr,           x.strides[0],
-                    xk * 8, B, 3, stream_ptr,
+                    self._y_buf.data.ptr,  # dst: internal packed y buffer
+                    yk * itemsize,         # dpitch: tight yk*8 bytes per row
+                    y.data.ptr,            # src: caller's y buffer
+                    y.strides[0],          # spitch: caller's row stride
+                    yk * itemsize,         # width: bytes copied per row
+                    B,                     # height: number of batches
+                    3,                     # kind: cudaMemcpyDeviceToDevice
+                    stream_ptr,            # stream
                 )
-                _cusparse_lib.cusparseDnVecSetValues(self._x_desc, self._x_buf.data.ptr)
-
-            if y_contig:
-                _cusparse_lib.cusparseDnVecSetValues(self._y_desc, y.data.ptr)
-            else:
-                _cusparse_lib.cusparseDnVecSetValues(self._y_desc, self._y_buf.data.ptr)
+            _cusparse_lib.cusparseDnVecSetValues(self._y_desc, self._y_buf.data.ptr)
 
         status = _cusparse_lib.cusparseSpMV(
             self._cusparse_handle,
@@ -399,11 +496,18 @@ class SparseMatVecProduct:
         if status != 0:
             raise RuntimeError(f"cusparseSpMV failed with status {status}")
 
-        if self._is_batched and not y_contig:
+        if not y_contig:
+            # Copy the SpMV result back out: internal packed y_buf -> caller's
+            # strided y. Same shape as the input stage, direction reversed.
             rt.memcpy2DAsync(
-                y.data.ptr,             y.strides[0],
-                self._y_buf.data.ptr,   yk * 8,
-                yk * 8, B, 3, stream_ptr,
+                y.data.ptr,            # dst: caller's (strided) y buffer
+                y.strides[0],          # dpitch: caller's row stride in bytes
+                self._y_buf.data.ptr,  # src: internal packed y buffer
+                yk * itemsize,         # spitch: tight yk*8 bytes per row
+                yk * itemsize,         # width: bytes copied per row
+                B,                     # height: number of batches
+                3,                     # kind: cudaMemcpyDeviceToDevice
+                stream_ptr,            # stream
             )
 
     def __del__(self):

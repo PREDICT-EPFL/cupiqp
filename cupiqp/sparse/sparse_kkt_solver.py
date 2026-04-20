@@ -5,8 +5,9 @@ from cupyx.scipy.sparse import csr_matrix, diags, bmat
 import nvtx
 
 from ..kkt_solver import KKTSolverBase
+from .batched_csr import BatchedCsrMatrix
 from .sparse_data import SparseData
-from .sparse_matvec import SparseMatVecProduct
+from .sparse_matvec import SingleSparseMatVecProduct, BatchedSparseMatVecProduct
 from .sparse_direct_solver import CudssSparseDirectSolver
 
 
@@ -28,18 +29,18 @@ class SparseKKTSolver(KKTSolverBase):
         P0, A0, G0 = data.P[0], data.A[0], data.G[0]
         kkt_template = self._initialize_kkt_csr(P0, A0, G0)
 
-        # -- Pack all KKT matrices in the batch into contiguous (B, kkt_nnz) buffer ----
-        self._kkt_data = cp.empty((B, kkt_template.nnz), dtype=cp.float64)
-        self._kkt_mats = []
-        for b in range(B):
-            row = self._kkt_data[b]
-            row[:] = kkt_template.data
-            kkt = csr_matrix(
-                (row, kkt_template.indices.copy(), kkt_template.indptr.copy()),
-                shape=kkt_template.shape,
-                copy=False,
-            )
-            self._kkt_mats.append(kkt)
+        # -- Pack all KKT matrices in the batch into a BatchedCsrMatrix,
+        # which owns a contiguous (B, kkt_nnz) values buffer and shares a
+        # single indices/indptr pair across batches. The initial values are
+        # broadcast from the template.
+        init_data = cp.empty((B, kkt_template.nnz), dtype=cp.float64)
+        init_data[:] = kkt_template.data
+        self._kkt_mats = BatchedCsrMatrix(
+            batch_size=B,
+            indices=kkt_template.indices,
+            indptr=kkt_template.indptr,
+            data=init_data,
+        )
 
         # -- Diagonal indices (shared — same structure) -----------------
         single_kkt_diag_idx = self._find_csr_diag_indices(self._kkt_mats[0])
@@ -77,20 +78,36 @@ class SparseKKTSolver(KKTSolverBase):
         # -- Scatter initial P, A, G values (vectorized) ---------------
         self._scatter_data(data, update_P=True, update_A=(p > 0), update_G=(m > 0))
 
-        # -- SpMV operators (block-diagonal for B>1, single for B=1) ----
-        self._spmv_P = SparseMatVecProduct(data.P, transa=False)
-        self._spmv_A = SparseMatVecProduct(data.A, transa=False)
-        self._spmv_AT = SparseMatVecProduct(data.A, transa=True)
-        self._spmv_G = SparseMatVecProduct(data.G, transa=False)
-        self._spmv_GT = SparseMatVecProduct(data.G, transa=True)
+        # -- SpMV operators: single-matrix path for B=1 (no block-diagonal
+        # overhead), batched block-diagonal path for B>1. data.P/A/G are
+        # already BatchedCsrMatrix instances (SparseData normalizes every
+        # accepted input form to BatchedCsrMatrix). --------------------
+        if B == 1:
+            self._spmv_P = SingleSparseMatVecProduct(data.P[0], transa=False)
+            if p > 0:
+                self._spmv_A = SingleSparseMatVecProduct(data.A[0], transa=False)
+                self._spmv_AT = SingleSparseMatVecProduct(data.A[0], transa=True)
+            if m > 0:
+                self._spmv_G = SingleSparseMatVecProduct(data.G[0], transa=False)
+                self._spmv_GT = SingleSparseMatVecProduct(data.G[0], transa=True)
+        else:
+            self._spmv_P = BatchedSparseMatVecProduct(data.P, transa=False)
+            if p > 0:
+                self._spmv_A = BatchedSparseMatVecProduct(data.A, transa=False)
+                self._spmv_AT = BatchedSparseMatVecProduct(data.A, transa=True)
+            if m > 0:
+                self._spmv_G = BatchedSparseMatVecProduct(data.G, transa=False)
+                self._spmv_GT = BatchedSparseMatVecProduct(data.G, transa=True)
 
-        # -- Direct solver (nvmath explicit batching for B>1) -----------
-        kkt_input = self._kkt_mats if B > 1 else self._kkt_mats[0]
-        self._lin_sys_solver = CudssSparseDirectSolver(kkt_input, use_deterministic_mode=use_deterministic_mode)
+        # Direct solver (CudssSparseDirectSolver handles B==1 and B>1
+        # internally via the BatchedCsrMatrix)
+        self._lin_sys_solver = CudssSparseDirectSolver(
+            self._kkt_mats, use_deterministic_mode=use_deterministic_mode,
+        )
         if not self._lin_sys_solver.plan(cuda_stream=cp.cuda.get_current_stream().ptr):
             raise RuntimeError("Sparse direct solver planning failed.")
 
-        # -- Workspace for P diagonal extraction ------------------------
+        # Workspace for P diagonal extraction
         self._P_diag = cp.empty((B, n), dtype=cp.float64)
 
     def __del__(self):
@@ -177,6 +194,15 @@ class SparseKKTSolver(KKTSolverBase):
         # Sparse diagonal placeholders (avoid cp.diag / cp.eye which create dense matrices)
         # Do P+In make sure the diagonal entries are non-zero
         # P is p.s.d so P's diagonal are all non-negative, adding I will not change non-zeros entries to zero
+        #
+        # NOTE: cupyx's CSR addition sorts the operand's indices/data buffers
+        # *in place* as a side effect (csrgeam pre-condition). ``data.P[0]``
+        # is a view that shares its ``indices`` array with the backing
+        # BatchedCsrMatrix, so we must operate on copies here to avoid
+        # corrupting the shared structure.
+        P = P.copy()
+        A = A.copy() if p else A
+        G = G.copy() if m else G
         In = diags(cp.ones(n, dtype=cp.float64), 0, shape=(n, n), format="csr")
         Ip = diags(cp.ones(p, dtype=cp.float64), 0, shape=(p, p), format="csr") if p else None
         Im = diags(cp.ones(m, dtype=cp.float64), 0, shape=(m, m), format="csr") if m else None
@@ -207,31 +233,16 @@ class SparseKKTSolver(KKTSolverBase):
                     break
         return diag_idx
 
-    # ------------------------------------------------------------------
-    # Data update (vectorized over batch)
-    # ------------------------------------------------------------------
-
-    def _get_packed_2d(self, data: SparseData, attr: str, mat_list_attr: str) -> cp.ndarray:
-        """Return a (B, nnz) view of packed data, or build it on the fly for B=1."""
-        if hasattr(data, attr):
-            return getattr(data, attr).reshape(self._batch_size, -1)
-        # B = 1 fallback
-        mat_list = getattr(data, mat_list_attr)
-        return mat_list[0].data.reshape(1, -1)
-
     def _scatter_data(self, data: SparseData, update_P: bool, update_A: bool, update_G: bool) -> None:
         """Vectorized scatter of P / A / G values into the (B, kkt_nnz) buffer."""
         if update_P:
-            P_2d = self._get_packed_2d(data, '_P_packed', '_P')
-            self._kkt_data[:, self._P_indices] = P_2d
+            self._kkt_mats.data[:, self._P_indices] = data._P.data
         if update_A:
-            A_2d = self._get_packed_2d(data, '_A_packed', '_A')
-            self._kkt_data[:, self._A_indices] = A_2d
-            self._kkt_data[:, self._AT_indices] = A_2d
+            self._kkt_mats.data[:, self._A_indices] = data._A.data
+            self._kkt_mats.data[:, self._AT_indices] = data._A.data
         if update_G:
-            G_2d = self._get_packed_2d(data, '_G_packed', '_G')
-            self._kkt_data[:, self._G_indices] = G_2d
-            self._kkt_data[:, self._GT_indices] = G_2d
+            self._kkt_mats.data[:, self._G_indices] = data._G.data
+            self._kkt_mats.data[:, self._GT_indices] = data._G.data
 
     def update_data(self, data: SparseData, update_P: bool, update_A: bool, update_G: bool) -> None:
         """Update the sparse KKT matrices when P, A, or G values change.
@@ -241,26 +252,21 @@ class SparseKKTSolver(KKTSolverBase):
         """
         self._scatter_data(data, update_P, update_A, update_G)
 
-    # ------------------------------------------------------------------
-    # KKT update / factor / solve
-    # ------------------------------------------------------------------
-
     @nvtx.annotate("SparseKKTSolver::update_kkt")
     def update_kkt(self, data: SparseData, delta: cp.ndarray, x_reg: cp.ndarray, z_reg: cp.ndarray) -> None:
         """Update diagonal blocks of all B KKT matrices (vectorized).
 
         Parameters: delta (B,), x_reg (B, n), z_reg (B, m).
         """
-        # Extract P diagonals: (B, n) — vectorized via packed P data
+        # Extract P diagonals: (B, n) — vectorized via packed P data.
         # Only read entries that actually exist in the CSR; missing diagonals stay 0.
-        P_2d = self._get_packed_2d(data, '_P_packed', '_P')
         self._P_diag[:] = 0.0
-        self._P_diag[:, self._P_diag_var_idx] = P_2d[:, self._P_diag_csr_idx]
+        self._P_diag[:, self._P_diag_var_idx] = data._P.data[:, self._P_diag_csr_idx]
 
         # Scatter into (B, kkt_nnz): 3 kernel launches total
-        self._kkt_data[:, self._diag_x_indices] = self._P_diag + x_reg
-        self._kkt_data[:, self._diag_y_indices] = -delta[:, None]
-        self._kkt_data[:, self._diag_z_indices] = -z_reg
+        self._kkt_mats.data[:, self._diag_x_indices] = self._P_diag + x_reg
+        self._kkt_mats.data[:, self._diag_y_indices] = -delta[:, None]
+        self._kkt_mats.data[:, self._diag_z_indices] = -z_reg
 
     @nvtx.annotate("SparseKKTSolver::factor")
     def factor(self) -> bool:
@@ -315,10 +321,6 @@ class SparseKKTSolver(KKTSolverBase):
                 delta_z.data.ptr, delta_z.strides[0],
                 sol_ptr + (n + p) * 8, dim * 8,
                 m * 8, B, 3, stream_ptr)
-
-    # ------------------------------------------------------------------
-    # Sparse matrix-vector products (single kernel for all B)
-    # ------------------------------------------------------------------
 
     @nvtx.annotate("SparseKKTSolver::eval_P_x")
     def eval_P_x(self, data: SparseData, alpha: float, x: cp.ndarray, z: cp.ndarray):
