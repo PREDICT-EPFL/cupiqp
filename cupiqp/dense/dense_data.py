@@ -1,9 +1,17 @@
-from typing import Optional
+from typing import Any, Optional
 
 import cupy as cp
 
 from ..data import Data
 from ..typedef import PIQP_INF
+
+
+# Type alias for every dense-input form the constructor accepts. ``cp.asarray``
+# normalizes all of these: cupy arrays are returned as-is; CUDA torch tensors
+# and JAX GPU arrays are adopted zero-copy via the ``__cuda_array_interface__``
+# / DLPack protocols; CPU torch tensors, JAX CPU arrays, and numpy arrays are
+# copied onto the current CUDA device.
+DenseInput = Any
 
 
 def _ensure_3d(array: cp.ndarray) -> cp.ndarray:
@@ -21,17 +29,23 @@ def _ensure_2d(array: cp.ndarray) -> cp.ndarray:
 
 
 class DenseData(Data):
-    """Dense data for one or more QPs with identical dimensions and bound structure."""
+    """Dense data for one or more QPs with identical dimensions and bound structure.
+
+    Every matrix/vector argument may be a cupy ndarray, a CUDA torch tensor,
+    a JAX GPU array, a numpy array, or anything ``cupy.asarray`` understands.
+    Inputs are normalized via ``_to_cupy`` — see its docstring for the zero-
+    copy paths and the CPU-tensor error behavior.
+    """
     def __init__(self,
-                 P: cp.ndarray,
-                 c: cp.ndarray,
-                 A: Optional[cp.ndarray] = None,
-                 b: Optional[cp.ndarray] = None,
-                 G: Optional[cp.ndarray] = None,
-                 h_u: Optional[cp.ndarray] = None,
-                 h_l: Optional[cp.ndarray] = None,
-                 x_u: Optional[cp.ndarray] = None,
-                 x_l: Optional[cp.ndarray] = None):
+                 P: DenseInput,
+                 c: DenseInput,
+                 A: Optional[DenseInput] = None,
+                 b: Optional[DenseInput] = None,
+                 G: Optional[DenseInput] = None,
+                 h_u: Optional[DenseInput] = None,
+                 h_l: Optional[DenseInput] = None,
+                 x_u: Optional[DenseInput] = None,
+                 x_l: Optional[DenseInput] = None):
 
         # --- validate and store P, c ---
         P = _ensure_3d(cp.asarray(P))
