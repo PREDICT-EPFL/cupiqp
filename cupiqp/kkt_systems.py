@@ -393,7 +393,7 @@ class KKTSystem:
         # Initial error computed on first iteration; subsequent iterations
         # reuse ref_err from candidate evaluation at end of previous iteration.
         refine_error = math.inf
-        VERBOSE_IR = True
+        VERBOSE_IR = False
         tol = settings.iterative_refinement_eps_abs + settings.iterative_refinement_eps_rel * rhs_norm
 
         for i in range(settings.iterative_refinement_max_iter):
