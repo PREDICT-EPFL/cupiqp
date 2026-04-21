@@ -115,7 +115,7 @@ class CudssSparseDirectSolver(SparseDirectSolver):
         # setup cuDSS solver
         opts = DirectSolverOptions(
             sparse_system_type=DirectSolverMatrixType.SYMMETRIC,
-            sparse_system_view=DirectSolverMatrixViewType.FULL,
+            sparse_system_view=DirectSolverMatrixViewType.LOWER,  # NOTE: only take the lower triangular part of the matrix
             multithreading_lib=self._find_cudss_mt_lib()
         )
         exe = ExecutionCUDA()  # Optional: ExecutionCUDA(). NOTE: hybrid mode seems more numerically stable
