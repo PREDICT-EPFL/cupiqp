@@ -1,5 +1,4 @@
 from typing import Optional
-import numpy as np
 import cupy as cp
 from cupyx.scipy.sparse import csr_matrix, diags, bmat
 import nvtx
@@ -9,6 +8,7 @@ from .batched_csr import BatchedCsrMatrix
 from .sparse_data import SparseData
 from .sparse_matvec import SingleSparseMatVecProduct, BatchedSparseMatVecProduct
 from .sparse_direct_solver import CudssSparseDirectSolver
+from .csr_helpers import csr_diag_indices, csr_row_indices, csr_subblock_indices
 
 
 class SparseKKTSolver(KKTSolverBase):
@@ -43,37 +43,42 @@ class SparseKKTSolver(KKTSolverBase):
         )
 
         # -- Diagonal indices (shared — same structure) -----------------
-        single_kkt_diag_idx = self._find_csr_diag_indices(self._kkt_mats[0])
+        single_kkt_diag_idx = csr_diag_indices(self._kkt_mats[0])
         self._diag_x_indices = single_kkt_diag_idx[:n]
         self._diag_y_indices = single_kkt_diag_idx[n:n+p]
         self._diag_z_indices = single_kkt_diag_idx[n+p:n+p+m]
 
         # -- P-diagonal CSR indices (for vectorized P diag extraction) --
         # P may have zero diagonal entries that are not stored in the CSR.
-        # We precompute integer index arrays for the existing entries so that
-        # update_kkt can gather without boolean masks (CUDA-graph safe).
-        P0_indptr = P0.indptr.get()
-        P0_indices = P0.indices.get()
-        P_diag_csr_idx = []   # CSR data-array positions of existing diagonals
-        P_diag_var_idx = []   # variable indices (0..n-1) that have a diagonal entry
-        for i in range(n):
-            for k in range(P0_indptr[i], P0_indptr[i + 1]):
-                if P0_indices[k] == i:
-                    P_diag_csr_idx.append(k)
-                    P_diag_var_idx.append(i)
-                    break
-        self._P_diag_csr_idx = cp.asarray(P_diag_csr_idx, dtype=cp.int32)
-        self._P_diag_var_idx = cp.asarray(P_diag_var_idx, dtype=cp.int32)
+        # An entry at position k is on the diagonal iff its row == its col;
+        # we keep only those positions so update_kkt can gather without any
+        # boolean-mask step (CUDA-graph safe).
+
+        # For example, 
+        # P = 
+        # [5  0  8
+        #  0  0  2
+        #  0  1  4]
+        # P.indices = [0 2 2 1 2]  (col indices)
+        # P.indptr = [0 2 3 5]
+        # P.data = [5 8 2 1 4]
+        # We can compute P's row indices: [0 0 1 2 2]
+        # (row_indices == col_indices) is [True False False False True], 
+        # leading to self._indices_of_Pdata_containing_nonzero_diag_entry = [0, 4], meaning the 0th and 4th entries in P.data are diagonal elements,
+        # and their row/col indices are P.indice[self._indices_of_Pdata_containing_nonzero_diag_entry] = [0 2], meaning these 2 diagonal elements are on the 0th and 2nd rows/cols
+        P0_rows, P0_cols = csr_row_indices(P0), P0.indices
+        self._indices_of_Pdata_containing_nonzero_diag_entry = cp.where(P0_rows == P0_cols)[0]
+        self._cols_of_P_containing_nonzero_diag_entry = P0.indices[self._indices_of_Pdata_containing_nonzero_diag_entry]
 
         # -- Block-to-KKT index maps (shared) --------------------------
         kkt0 = self._kkt_mats[0]
-        self._P_indices = self._build_block_index_map(P0, kkt0, 0, 0)
+        self._P_indices = csr_subblock_indices(P0, kkt0, 0, 0)
         if p > 0:
-            self._A_indices = self._build_block_index_map(A0, kkt0, n, 0)
-            self._AT_indices = self._build_transpose_index_map(A0, kkt0, 0, n)
+            self._A_indices  = csr_subblock_indices(A0, kkt0, n, 0)
+            self._AT_indices = csr_subblock_indices(A0, kkt0, 0, n, transa=True)
         if m > 0:
-            self._G_indices = self._build_block_index_map(G0, kkt0, n + p, 0)
-            self._GT_indices = self._build_transpose_index_map(G0, kkt0, 0, n + p)
+            self._G_indices  = csr_subblock_indices(G0, kkt0, n + p, 0)
+            self._GT_indices = csr_subblock_indices(G0, kkt0, 0, n + p, transa=True)
 
         # -- Scatter initial P, A, G values (vectorized) ---------------
         self._scatter_data(data, update_P=True, update_A=(p > 0), update_G=(m > 0))
@@ -115,67 +120,6 @@ class SparseKKTSolver(KKTSolverBase):
         if solver is not None:
             solver.__del__()
 
-    # ------------------------------------------------------------------
-    # Static helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _build_block_index_map(block: csr_matrix, kkt: csr_matrix,
-                               row_offset: int, col_offset: int) -> cp.ndarray:
-        """Map each non-zero of *block* to its position in *kkt*.data.
-
-        ``block[i, j]`` sits at ``kkt[row_offset + i, col_offset + j]``.
-        Returns a cupy int32 array of length ``block.nnz``.
-        """
-        b_indptr = block.indptr.get()
-        b_indices = block.indices.get()
-        k_indptr = kkt.indptr.get()
-        k_indices = kkt.indices.get()
-
-        idx_map = np.empty(block.nnz, dtype=np.int32)
-
-        for i in range(block.shape[0]):
-            kkt_row = row_offset + i
-            kkt_start = k_indptr[kkt_row]
-            kkt_end = k_indptr[kkt_row + 1]
-            kkt_cols = k_indices[kkt_start:kkt_end]
-
-            for k in range(b_indptr[i], b_indptr[i + 1]):
-                target_col = col_offset + b_indices[k]
-                local_pos = np.searchsorted(kkt_cols, target_col)
-                idx_map[k] = kkt_start + local_pos
-
-        return cp.asarray(idx_map)
-
-    @staticmethod
-    def _build_transpose_index_map(block: csr_matrix, kkt: csr_matrix,
-                                   row_offset: int, col_offset: int) -> cp.ndarray:
-        """Map each non-zero of *block* to the transposed position in *kkt*.data.
-
-        ``block[i, j]`` (value ``block.data[k]``) corresponds to
-        ``kkt[row_offset + j, col_offset + i]``  (the A^T / G^T entry).
-        Returns a cupy int32 array of length ``block.nnz``.
-        """
-        b_indptr = block.indptr.get()
-        b_indices = block.indices.get()
-        k_indptr = kkt.indptr.get()
-        k_indices = kkt.indices.get()
-
-        idx_map = np.empty(block.nnz, dtype=np.int32)
-
-        for i in range(block.shape[0]):
-            for k in range(b_indptr[i], b_indptr[i + 1]):
-                j = b_indices[k]
-                # transposed: kkt[row_offset + j, col_offset + i]
-                kkt_row = row_offset + j
-                kkt_start = k_indptr[kkt_row]
-                kkt_end = k_indptr[kkt_row + 1]
-                kkt_cols = k_indices[kkt_start:kkt_end]
-                local_pos = np.searchsorted(kkt_cols, col_offset + i)
-                idx_map[k] = kkt_start + local_pos
-
-        return cp.asarray(idx_map)
-
     @staticmethod
     def _initialize_kkt_csr(P: csr_matrix, A: Optional[csr_matrix] = None, G: Optional[csr_matrix] = None) -> csr_matrix:
         """
@@ -214,25 +158,6 @@ class SparseKKTSolver(KKTSolverBase):
             )
         return kkt
 
-    @staticmethod
-    def _find_csr_diag_indices(mat: csr_matrix) -> cp.ndarray:
-        """Find positions of diagonal entries within a CSR matrix's data array.
-
-        Returns a cupy int32 array of length ``min(rows, cols)``.
-        """
-        assert isinstance(mat, csr_matrix)
-        assert mat.shape[0] == mat.shape[1], "The provided csr_matrix is not square. Got shape: {mat.shape}"
-        indptr = mat.indptr.get()
-        indices = mat.indices.get()
-        n = mat.shape[0]
-        diag_idx = cp.empty(n, dtype=cp.int32)
-        for i in range(n):
-            for k in range(indptr[i], indptr[i + 1]):
-                if indices[k] == i:
-                    diag_idx[i] = k
-                    break
-        return diag_idx
-
     def _scatter_data(self, data: SparseData, update_P: bool, update_A: bool, update_G: bool) -> None:
         """Vectorized scatter of P / A / G values into the (B, kkt_nnz) buffer."""
         if update_P:
@@ -261,7 +186,7 @@ class SparseKKTSolver(KKTSolverBase):
         # Extract P diagonals: (B, n) — vectorized via packed P data.
         # Only read entries that actually exist in the CSR; missing diagonals stay 0.
         self._P_diag[:] = 0.0
-        self._P_diag[:, self._P_diag_var_idx] = data._P.data[:, self._P_diag_csr_idx]
+        self._P_diag[:, self._cols_of_P_containing_nonzero_diag_entry] = data._P.data[:, self._indices_of_Pdata_containing_nonzero_diag_entry]
 
         # Scatter into (B, kkt_nnz): 3 kernel launches total
         self._kkt_mats.data[:, self._diag_x_indices] = self._P_diag + x_reg
