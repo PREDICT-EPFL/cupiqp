@@ -117,9 +117,11 @@ class KKTSystem:
         self._update_regulerization_step_1_kernel = create_update_regularizations_step_1_kernel()
         self._update_regulerization_step_2_kernel = create_update_regularizations_step_2_kernel(n, m)
         self._eliminate_slacks_kernel = create_eliminate_slacks_kernel()
+        self._eliminate_slacks_transposed_kernel = create_eliminate_slacks_transposed_kernel()
         self._eliminate_duals_kernel = create_eliminate_duals_kernel(n, m)
         self._recover_duals_kernel = create_recover_duals_kernel(data.num_hu, data.num_hl, data.num_xu, data.num_xl)
         self._recover_slacks_kernel = create_recover_slacks_kernel()
+        self._recover_slacks_transposed_kernel = create_recover_slacks_transposed_kernel()
 
         # Precompute inverse index maps for gather-pattern kernels.
         # inv_idx_xu[j] = i such that idx_xu[i] == j, or -1 if variable j has no upper bound.
@@ -233,29 +235,81 @@ class KKTSystem:
         self._kkt_solver.update_kkt(data, delta, self._x_reg, self._z_reg)
     
     @nvtx.annotate("KKTSystem::solve")
-    def solve(self, data: Data, settings: Settings, rhs: Variables, lhs: Variables) -> None:
-        self._prepare_rhs(data, rhs)
+    def solve(self, data: Data, settings: Settings, rhs: Variables, lhs: Variables,
+              transpose: bool = False) -> None:
+        """Solve either ``K v = rhs`` (default) or ``K^T λ = rhs`` (``transpose=True``).
+
+        The condensed K_c factor built during the last ``update_scalings_and_factor``
+        is reused in both directions: K_c is symmetric, so its cuDSS factor inverts
+        K_c and K_c^T identically. Only the slack-side Schur elimination and back-
+        substitution differ between forward and transposed — handled by swapping
+        ``_eliminate_slacks_kernel`` / ``_recover_slacks_kernel`` for their
+        ``_transposed`` counterparts.
+
+        When ``transpose=True`` the system being solved (for implicit-diff / VJP) is::
+
+            [ P+rho*I   A^T   G^T  -G^T   I_n  -I_n                              ]
+            [ A        -d*I                                                      ]
+            [ G                -d*I              S_hu                            ]
+            [ -G                    -d*I              S_hl                       ]
+            [ I_n                        -d*I               S_xu                 ]
+            [ -I_n                             -d*I              S_xl            ]
+            [                    I_m                        Z_hu                 ]
+            [                          I_m                        Z_hl           ]
+            [                               I_n                         Z_xu     ]
+            [                                    I_n                        Z_xl ]
+
+        which has ``updated_rhs_z = rhs.z - (S/Z) * rhs.s`` (vs forward's
+        ``rhs.z - (1/Z) * rhs.s``) and slack recovery ``lhs.s = (rhs.s - lhs.z) / Z``
+        (vs forward's ``(rhs.s - S * lhs.z) / Z``).
+        """
+        self._prepare_rhs(data, rhs, transpose=transpose)
         self._kkt_solver.solve(data, self._rhs_x_bar, rhs.y, self._rhs_z_bar, lhs.x, lhs.y, self._work_z)  # ! the second _work_z is used to hold delta_z, but useless anyway. Can be further optimized.
-        if self._use_iterative_refinement and settings.iterative_refinement_max_iter > 0:
+        # Iterative refinement applies to the forward condensed solve only (K_c
+        # is symmetric so it *could* run for transpose too, but that path is for
+        # implicit-differentiation gradients where the minor regularization-floor
+        # error is accepted).
+        # TODO: currently only do IR in the QP solve procedure, no IR in the implicit differentiation.
+        if not transpose and self._use_iterative_refinement and settings.iterative_refinement_max_iter > 0:
             self.iterative_refinement(
                 data, settings,
                 self._rhs_x_bar, rhs.y, self._rhs_z_bar,
                 lhs.x, lhs.y, self._work_z)
-        self._recover_lhs(data, rhs, lhs)
+        self._recover_lhs(data, rhs, lhs, transpose=transpose)
 
     @nvtx.annotate("KKTSystem::_prepare_rhs")
-    @cuda_graph_capture(key=lambda self, data, rhs: (rhs.buffer_ptr,), enable=lambda self: self._settings.enable_cuda_graph)
-    def _prepare_rhs(self, data: Data, rhs: Variables):
-        """Prepare the rhs for the condensed KKT system after eliminating slacks and duals."""
+    @cuda_graph_capture(key=lambda self, data, rhs, transpose=False: (rhs.buffer_ptr, bool(transpose)), enable=lambda self: self._settings.enable_cuda_graph)
+    def _prepare_rhs(self, data: Data, rhs: Variables, transpose: bool = False):
+        """Build the condensed KKT rhs by eliminating slacks and duals.
+
+        The dual elimination (bound → x, inequality → z) is direction-agnostic —
+        the reduced system for (x, y, z_cond) has the same LHS in both K and K^T.
+        Only the preceding slack elimination differs: ``_eliminate_slacks_kernel``
+        for forward, ``_eliminate_slacks_transposed_kernel`` for transposed.
+        """
         B = self._batch_size
         wp_stream = wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr)
-        wp.launch(
-            kernel=self._eliminate_slacks_kernel,
-            dim=(B, data.num_ineq),
-            inputs=[rhs.z_all, rhs.s_all, self._m_z_inv_all, self._updated_rhs_z_all],
-            device="cuda",
-            stream=wp_stream,
-        )
+
+        if transpose:
+            # K^T slack row:  I lhs_z + Z lhs_s = rhs.s → S/Z scaling on rhs_s.
+            wp.launch(
+                kernel=self._eliminate_slacks_transposed_kernel,
+                dim=(B, data.num_ineq),
+                inputs=[rhs.z_all, rhs.s_all, self._m_s_all, self._m_z_inv_all,
+                        self._updated_rhs_z_all],
+                device="cuda",
+                stream=wp_stream,
+            )
+        else:
+            # K slack row:  S lhs_z + Z lhs_s = rhs.s → 1/Z scaling on rhs_s.
+            wp.launch(
+                kernel=self._eliminate_slacks_kernel,
+                dim=(B, data.num_ineq),
+                inputs=[rhs.z_all, rhs.s_all, self._m_z_inv_all, self._updated_rhs_z_all],
+                device="cuda",
+                stream=wp_stream,
+            )
+
         wp.launch(
             kernel=self._eliminate_duals_kernel,
             dim=(B, data.n + data.m),
@@ -277,11 +331,16 @@ class KKTSystem:
         )
 
         # # ---- ALTERNATIVE: pure CuPy implementation ----
-        # # Eliminate slacks: updated_rhs_z = rhs_z - inv(Z) * rhs_s
-        # cp.multiply(self._m_z_inv_all, rhs.s_all, out=self._updated_rhs_z_all)
+        # # Eliminate slacks: forward has updated_rhs_z = rhs_z - inv(Z) * rhs_s,
+        # #                   transpose has updated_rhs_z = rhs_z - (S/Z) * rhs_s.
+        # if transpose:
+        #     cp.multiply(self._m_s_all, self._m_z_inv_all, out=self._updated_rhs_z_all)
+        #     cp.multiply(self._updated_rhs_z_all, rhs.s_all, out=self._updated_rhs_z_all)
+        # else:
+        #     cp.multiply(self._m_z_inv_all, rhs.s_all, out=self._updated_rhs_z_all)
         # cp.subtract(rhs.z_all, self._updated_rhs_z_all, out=self._updated_rhs_z_all)
         #
-        # # Eliminate duals → rhs_x_bar, rhs_z_bar
+        # # Eliminate duals → rhs_x_bar, rhs_z_bar  (direction-agnostic)
         # self._rhs_x_bar[:] = rhs.x
         # if data.num_xu > 0:
         #     xbs_xu = data.x_b_scaling[:, data.idx_xu]
@@ -299,9 +358,16 @@ class KKTSystem:
         #     self._rhs_z_bar *= self._z_reg
 
     @nvtx.annotate("KKTSystem::_recover_lhs")
-    @cuda_graph_capture(key=lambda self, data, rhs, lhs: (rhs.buffer_ptr, lhs.buffer_ptr), enable=lambda self: self._settings.enable_cuda_graph)
-    def _recover_lhs(self, data: Data, rhs: Variables, lhs: Variables):
-        """Recover the full KKT solution from the condensed KKT solution."""
+    @cuda_graph_capture(key=lambda self, data, rhs, lhs, transpose=False: (rhs.buffer_ptr, lhs.buffer_ptr, bool(transpose)), enable=lambda self: self._settings.enable_cuda_graph)
+    def _recover_lhs(self, data: Data, rhs: Variables, lhs: Variables, transpose: bool = False):
+        """Back-substitute lhs.z_* and lhs.s_* from the condensed (lhs.x, lhs.y).
+
+        The dual back-sub (z_u, z_l, z_bu, z_bl) is direction-agnostic — the row
+        equations for those blocks have the same structure in K and K^T once the
+        slack has been eliminated. Only the final slack recovery differs:
+        forward uses ``lhs.s = (rhs.s - S lhs.z) / Z``, transpose drops the S
+        factor.
+        """
         B = self._batch_size
         wp_stream = wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr)
 
@@ -322,16 +388,27 @@ class KKTSystem:
                 device="cuda",
                 stream=wp_stream,
             )
-            wp.launch(
-                kernel=self._recover_slacks_kernel,
-                dim=(B, data.num_ineq),
-                inputs=[rhs.s_all, lhs.z_all, self._m_s_all, self._m_z_inv_all, lhs.s_all],
-                device="cuda",
-                stream=wp_stream,
-            )
+            if transpose:
+                # lhs.s = (rhs.s - lhs.z) / Z   (no factor of S)
+                wp.launch(
+                    kernel=self._recover_slacks_transposed_kernel,
+                    dim=(B, data.num_ineq),
+                    inputs=[rhs.s_all, lhs.z_all, self._m_z_inv_all, lhs.s_all],
+                    device="cuda",
+                    stream=wp_stream,
+                )
+            else:
+                # lhs.s = (rhs.s - S lhs.z) / Z
+                wp.launch(
+                    kernel=self._recover_slacks_kernel,
+                    dim=(B, data.num_ineq),
+                    inputs=[rhs.s_all, lhs.z_all, self._m_s_all, self._m_z_inv_all, lhs.s_all],
+                    device="cuda",
+                    stream=wp_stream,
+                )
 
         # # ---- ALTERNATIVE: pure CuPy implementation ----
-        # # Recover duals
+        # # Recover duals (direction-agnostic)
         # if data.num_hu > 0:
         #     lhs.z_u[:] = self._work_z[:, data.idx_hu]
         #     lhs.z_u -= self._updated_rhs_z_u
@@ -357,11 +434,15 @@ class KKTSystem:
         #     lhs.z_bl -= rhs.z_bl
         #     lhs.z_bl *= self._w_bl_delta_inv
         #
-        # # Recover slacks: lhs_s = inv(Z) * (rhs_s - S * lhs_z)
+        # # Recover slacks
         # if data.num_ineq > 0:
-        #     cp.multiply(self._m_s_all, lhs.z_all, out=lhs.s_all)
-        #     cp.subtract(rhs.s_all, lhs.s_all, out=lhs.s_all)
-        #     cp.multiply(self._m_z_inv_all, lhs.s_all, out=lhs.s_all)
+        #     if transpose:
+        #         cp.subtract(rhs.s_all, lhs.z_all, out=lhs.s_all)
+        #         cp.multiply(lhs.s_all, self._m_z_inv_all, out=lhs.s_all)
+        #     else:
+        #         cp.multiply(self._m_s_all, lhs.z_all, out=lhs.s_all)
+        #         cp.subtract(rhs.s_all, lhs.s_all, out=lhs.s_all)
+        #         cp.multiply(self._m_z_inv_all, lhs.s_all, out=lhs.s_all)
 
     @nvtx.annotate("KKTSystem::iterative_refinement")
     def iterative_refinement(self, data: Data, settings: Settings,
@@ -765,6 +846,27 @@ def create_eliminate_slacks_kernel():
     return eliminate_slacks_kernel
 
 
+def create_eliminate_slacks_transposed_kernel():
+    """Transposed (K^T) variant of eliminate_slacks. Scales rhs_s by W = S/Z instead
+    of 1/Z, because row 7..10 of K^T have S in the off-diagonal (vs. I in K).
+
+        updated_rhs_z_all[b, i] = rhs_z_all[b, i] - m_s_all[b, i] * m_z_inv_all[b, i] * rhs_s_all[b, i]
+    """
+    @wp.kernel
+    def eliminate_slacks_transposed_kernel(
+        rhs_z_all: wp.array2d(dtype=wp.float64),          # type: ignore
+        rhs_s_all: wp.array2d(dtype=wp.float64),          # type: ignore
+        m_s_all: wp.array2d(dtype=wp.float64),            # type: ignore
+        m_z_inv_all: wp.array2d(dtype=wp.float64),        # type: ignore
+        updated_rhs_z_all: wp.array2d(dtype=wp.float64),  # type: ignore
+    ):
+        b, i = wp.tid()
+        w = m_s_all[b, i] * m_z_inv_all[b, i]  # W = S / Z
+        updated_rhs_z_all[b, i] = -w * rhs_s_all[b, i] + rhs_z_all[b, i]
+
+    return eliminate_slacks_transposed_kernel
+
+
 def create_recover_duals_kernel(num_hu: int, num_hl: int, num_xu: int, num_xl: int):
     """Create kernel specialized for recovering duals. Performs the operation:
 
@@ -832,7 +934,7 @@ def create_recover_duals_kernel(num_hu: int, num_hl: int, num_xu: int, num_xl: i
 
 def create_recover_slacks_kernel():
     """Create kernel specialized for eliminating slacks. Performs the operation:
-    
+
         updated_lhs_z_u = inv(Z_u) (r_s_u - S_u lhs_z_u)
         updated_lhs_s_l = inv(Z_l) (r_s_l - S_l lhs_z_l)
         updated_lhs_s_bu = inv(Z_bu) (r_s_bu - S_bu lhs_z_bu)
@@ -855,3 +957,22 @@ def create_recover_slacks_kernel():
         lhs_s_all[b, i] = m_z_inv_all[b, i] * ((-m_s_all[b, i]) * lhs_z_all[b, i] + rhs_s_all[b, i])
 
     return recover_slacks_kernel
+
+
+def create_recover_slacks_transposed_kernel():
+    """Transposed (K^T) variant of recover_slacks. The slack rows in K^T read
+    ``I lhs_z + Z lhs_s = rhs_s``, so ``lhs_s = inv(Z) (rhs_s - lhs_z)``.
+
+        lhs_s_all[b, i] = m_z_inv_all[b, i] * (-lhs_z_all[b, i] + rhs_s_all[b, i])
+    """
+    @wp.kernel
+    def recover_slacks_transposed_kernel(
+        rhs_s_all: wp.array2d(dtype=wp.float64),    # type: ignore
+        lhs_z_all: wp.array2d(dtype=wp.float64),    # type: ignore
+        m_z_inv_all: wp.array2d(dtype=wp.float64),  # type: ignore
+        lhs_s_all: wp.array2d(dtype=wp.float64),    # type: ignore
+    ):
+        b, i = wp.tid()
+        lhs_s_all[b, i] = m_z_inv_all[b, i] * (-lhs_z_all[b, i] + rhs_s_all[b, i])
+
+    return recover_slacks_transposed_kernel
