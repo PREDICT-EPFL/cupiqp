@@ -120,8 +120,8 @@ class SolverBase:
         self._work_dual_res_norm = cp.empty(B, dtype=cp.float64)    # running max of dual residual norm terms
         self._work_norm_temp = cp.empty(B, dtype=cp.float64)        # temp (B,) for individual norm results
 
-        self._mu_prev = cp.empty((data.batch_size, 1))
-        self._mu_rate = cp.empty((data.batch_size, 1))
+        self._mu_prev = cp.empty(data.batch_size, dtype=cp.float64)
+        self._mu_rate = cp.empty(data.batch_size, dtype=cp.float64)
 
         self._enable_iterative_refinement = self.settings.iterative_refinement_always_enabled
 
@@ -573,7 +573,7 @@ class SolverBase:
         self._calculate_step()
         self._update_vars_after_corrector_step()
         self._calculate_mu()
-        cp.subtract(self._mu_prev, self._result.info.mu[:, None], out=self._mu_rate)
+        cp.subtract(self._mu_prev, self._result.info.mu, out=self._mu_rate)
         cp.divide(self._mu_rate, self._mu_prev, out=self._mu_rate)
         cp.maximum(self._mu_rate, 0., out=self._mu_rate)
 
@@ -583,7 +583,7 @@ class SolverBase:
         self._result.primals_all += self._result.info.primal_step[:, None] * self._step.primals_all
         self._result.duals_all += self._result.info.dual_step[:, None] * self._step.duals_all
         # ------------------ update mu and mu_rate for adaptive regularization ------------------
-        self._mu_prev[:] = self._result.info.mu[:, None]
+        self._mu_prev[:] = self._result.info.mu
 
     @nvtx.annotate("Solver::_calculate_step")
     @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
@@ -1024,7 +1024,7 @@ class SolverBase:
         """Update rho/delta based on residual progress — branchless via cp.where."""
         info = self._result.info
         settings = self.settings
-        mu_rate = self._mu_rate.ravel()  # (B,)
+        mu_rate = self._mu_rate
 
         # --- Rho update ---
         dual_improved = (
