@@ -108,6 +108,8 @@ class SolverBase:
         self._update_residuals_r_kernel = create_update_residual_r_kernel(
             self._data.n, self._data.p, self._data.num_hl+self._data.num_hu+self._data.num_xl+self._data.num_xu  # only n is used by the kernel; others kept for API compatibility
         )
+        self._calculate_sigma_kernel = create_calculate_sigma_kernel(self._data.num_ineq)
+        
         # Pre-allocated (B,) buffers for CUDA-graph-safe norm computations in _update_residuals_nr / _update_residuals_r
         self._work_primal_rel_norm = cp.empty(B, dtype=cp.float64)  # running max of primal relative norm terms
         self._work_dual_res_norm = cp.empty(B, dtype=cp.float64)    # running max of dual residual norm terms
@@ -601,18 +603,36 @@ class SolverBase:
     @nvtx.annotate("Solver::_calculate_sigma")
     @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
     def _calculate_sigma(self) -> None:
-        # s_trial = s + alpha_s * ds,  z_trial = z + alpha_z * dz
-        cp.multiply(self._result.info.primal_step[:, None], self._step.s_all, out=self._work_s) # s_trial in _work_s
-        self._work_s += self._result.s_all
-        cp.multiply(self._result.info.dual_step[:, None], self._step.z_all, out=self._work_z)  # z_trial in _work_z
-        self._work_z += self._result.z_all
-        cp.multiply(self._work_s, self._work_z, out=self._work_s)  # reuse _work_s to hold s_trial * z_trial
-        cp.sum(self._work_s, axis=1, out=self._result.info.sigma)
+        USE_WARP_IMPLEMENTATION = True
+        SIGMA_BLOCK_DIM = 256
+        if USE_WARP_IMPLEMENTATION:
+            wp.launch_tiled(
+                kernel=self._calculate_sigma_kernel,
+                dim=[self._data.batch_size],
+                inputs=[
+                    self._result.s_all, self._result.z_all,
+                    self._step.s_all, self._step.z_all,
+                    self._result.info.primal_step, self._result.info.dual_step,
+                    self._result.info.mu,
+                    self._result.info.sigma,
+                ],
+                block_dim=SIGMA_BLOCK_DIM,
+                device="cuda",
+                stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+            )
+        else:
+            # s_trial = s + alpha_s * ds,  z_trial = z + alpha_z * dz
+            cp.multiply(self._result.info.primal_step[:, None], self._step.s_all, out=self._work_s) # s_trial in _work_s
+            self._work_s += self._result.s_all
+            cp.multiply(self._result.info.dual_step[:, None], self._step.z_all, out=self._work_z)  # z_trial in _work_z
+            self._work_z += self._result.z_all
+            cp.multiply(self._work_s, self._work_z, out=self._work_s)  # reuse _work_s to hold s_trial * z_trial
+            cp.sum(self._work_s, axis=1, out=self._result.info.sigma)
 
-        cp.divide(self._result.info.sigma, self._result.info.mu, out=self._result.info.sigma)
-        self._result.info.sigma /= self._data.num_ineq
-        cp.clip(self._result.info.sigma, 0., 1., out=self._result.info.sigma)
-        cp.power(self._result.info.sigma, 3., out=self._result.info.sigma)
+            cp.divide(self._result.info.sigma, self._result.info.mu, out=self._result.info.sigma)
+            self._result.info.sigma /= self._data.num_ineq
+            cp.clip(self._result.info.sigma, 0., 1., out=self._result.info.sigma)
+            cp.power(self._result.info.sigma, 3., out=self._result.info.sigma)
 
     @nvtx.annotate("Solver::_update_residuals_nr")
     @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
@@ -1069,3 +1089,56 @@ def create_update_residual_r_kernel(n: int, p: int, num_ineq: int):
             res_r_dual[b, idx] = delta[b] * (result_dual[b, idx] - prox_dual[b, idx]) + res_nr_dual[b, idx]
 
     return update_residual_r_kernel
+
+
+def create_calculate_sigma_kernel(num_ineq: int):
+    """Fused block-reduction kernel for the centering parameter sigma.
+
+    For each batch ``b``, computes:
+
+        s_trial[i] = s[b, i] + alpha_s[b] * ds[b, i]
+        z_trial[i] = z[b, i] + alpha_z[b] * dz[b, i]
+        acc        = sum_i( s_trial[i] * z_trial[i] )
+        sigma[b]   = clip( acc / (mu[b] * num_ineq), 0, 1 ) ** 3
+
+    Dispatch with ``wp.launch_tiled(..., dim=[B], block_dim=block_dim)``:
+    one CUDA block per batch, ``block_dim`` threads cooperating to reduce the
+    ``num_ineq``-long row via Warp's tile API (shared-memory block reduction).
+    Thread 0 performs the scalar ``/mu``, ``clamp``, and ``^3`` finalization.
+    """
+    @wp.kernel
+    def calculate_sigma_kernel(
+        s_all: wp.array2d(dtype=wp.float64),        # (B, num_ineq)  # type: ignore
+        z_all: wp.array2d(dtype=wp.float64),        # (B, num_ineq)  # type: ignore
+        step_s_all: wp.array2d(dtype=wp.float64),   # (B, num_ineq)  # type: ignore
+        step_z_all: wp.array2d(dtype=wp.float64),   # (B, num_ineq)  # type: ignore
+        primal_step: wp.array(dtype=wp.float64),    # (B,) alpha_s   # type: ignore
+        dual_step: wp.array(dtype=wp.float64),      # (B,) alpha_z   # type: ignore
+        mu: wp.array(dtype=wp.float64),             # (B,)           # type: ignore
+        sigma: wp.array(dtype=wp.float64),          # (B,) output    # type: ignore
+    ):
+        # launch_tiled gives us (batch_idx, thread_in_block).
+        b, tid = wp.tid()
+        alpha_s = primal_step[b]
+        alpha_z = dual_step[b]
+        denom = mu[b] * wp.float64(num_ineq)
+
+        # Block-wide tile loads + elementwise fuse + reduction. All intermediates
+        # stay in registers / shared memory (no DRAM round-trip).
+        s_tile = wp.tile_load(s_all[b], shape=num_ineq)
+        z_tile = wp.tile_load(z_all[b], shape=num_ineq)
+        ds_tile = wp.tile_load(step_s_all[b], shape=num_ineq)
+        dz_tile = wp.tile_load(step_z_all[b], shape=num_ineq)
+        prod = (s_tile + alpha_s * ds_tile) * (z_tile + alpha_z * dz_tile)
+        sum_tile = wp.tile_sum(prod)  # (1,)-tile, in shared memory
+
+        # Write raw sum; tile_store is a block-synchronous collective op, so the
+        # subsequent thread-0 read sees the final value. Thread 0 then overwrites
+        # in place with the finalized sigma.
+        wp.tile_store(sigma, sum_tile, offset=b)
+        if tid == 0:
+            val = sigma[b] / denom
+            val = wp.clamp(val, wp.float64(0.0), wp.float64(1.0))
+            sigma[b] = val * val * val
+
+    return calculate_sigma_kernel
