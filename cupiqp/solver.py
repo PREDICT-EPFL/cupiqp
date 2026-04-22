@@ -109,7 +109,12 @@ class SolverBase:
             self._data.n, self._data.p, self._data.num_hl+self._data.num_hu+self._data.num_xl+self._data.num_xu  # only n is used by the kernel; others kept for API compatibility
         )
         self._calculate_sigma_kernel = create_calculate_sigma_kernel(self._data.num_ineq)
-        
+        self._calculate_step_kernel = create_calculate_step_kernel(self._data.num_ineq)
+
+        self._tau_device = cp.empty(1, dtype=cp.float64)
+        self._tau_device[0] = self.settings.tau  # device copy used by warp kernels
+        self._tau_host = float(self.settings.tau)  # host cache -- only H2D when tau actually changes
+
         # Pre-allocated (B,) buffers for CUDA-graph-safe norm computations in _update_residuals_nr / _update_residuals_r
         self._work_primal_rel_norm = cp.empty(B, dtype=cp.float64)  # running max of primal relative norm terms
         self._work_dual_res_norm = cp.empty(B, dtype=cp.float64)    # running max of dual residual norm terms
@@ -261,6 +266,10 @@ class SolverBase:
         self._result.info._status_value[:] = Status.PIQP_UNSOLVED.value
         self._result.info.iter[:] = 0
         self._result.info.reg_limit[:] = self.settings.reg_lower_limit
+        # Refresh tau only if the user changed settings.tau between solves because it requires H2D memcpy
+        if self._tau_host != self.settings.tau:
+            self._tau_device[0] = self.settings.tau
+            self._tau_host = float(self.settings.tau)
         self._result.info.factor_retires[:] = 0
         self._result.info.no_primal_update[:] = 0
         self._result.info.no_dual_update[:] = 0
@@ -583,15 +592,32 @@ class SolverBase:
         Compute the step length of the slack variables and dual variables. Make sure they remain non-negative.
         Vectorized implementation to minimize GPU kernel launches and synchronization.
         """
-        # alpha_s: step length for slacks
-        self._work_s[:] = cp.where(self._step.s_all < 0, -self._result.s_all / self._step.s_all, 1.)
-        self._result.info.primal_step[:] = cp.min(self._work_s, axis=1)  # alpha_s
-        self._result.info.primal_step *= self.settings.tau  # avoid getting too close to the boundary
+        USE_WARP_IMPLEMENTATION = True
+        STEP_BLOCK_DIM = 256
+        if USE_WARP_IMPLEMENTATION:
+            wp.launch_tiled(
+                kernel=self._calculate_step_kernel,
+                dim=[self._data.batch_size],
+                inputs=[
+                    self._result.s_all, self._result.z_all,
+                    self._step.s_all, self._step.z_all,
+                    self._tau_device,
+                    self._result.info.primal_step, self._result.info.dual_step,
+                ],
+                block_dim=STEP_BLOCK_DIM,
+                device="cuda",
+                stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+            )
+        else:
+            # alpha_s: step length for slacks
+            self._work_s[:] = cp.where(self._step.s_all < 0, -self._result.s_all / self._step.s_all, 1.)
+            self._result.info.primal_step[:] = cp.min(self._work_s, axis=1)  # alpha_s
+            self._result.info.primal_step *= self.settings.tau  # avoid getting too close to the boundary
 
-        # alpha_z: step length for duals
-        self._work_z[:] = cp.where(self._step.z_all < 0, -self._result.z_all / self._step.z_all, 1.)
-        self._result.info.dual_step[:] = cp.min(self._work_z, axis=1)  # alpha_z
-        self._result.info.dual_step *= self.settings.tau  # avoid getting too close to the boundary
+            # alpha_z: step length for duals
+            self._work_z[:] = cp.where(self._step.z_all < 0, -self._result.z_all / self._step.z_all, 1.)
+            self._result.info.dual_step[:] = cp.min(self._work_z, axis=1)  # alpha_z
+            self._result.info.dual_step *= self.settings.tau  # avoid getting too close to the boundary
 
     @nvtx.annotate("Solver::_calculate_mu")
     @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
@@ -1089,6 +1115,60 @@ def create_update_residual_r_kernel(n: int, p: int, num_ineq: int):
             res_r_dual[b, idx] = delta[b] * (result_dual[b, idx] - prox_dual[b, idx]) + res_nr_dual[b, idx]
 
     return update_residual_r_kernel
+
+
+def create_calculate_step_kernel(num_ineq: int):
+    """Fused block-reduction kernel for step lengths (primal and dual).
+
+    For each batch ``b``, computes:
+
+        alpha_s[b] = tau * min_i( ds[b,i] < 0 ? -s[b,i]/ds[b,i] : 1.0 )
+        alpha_z[b] = tau * min_i( dz[b,i] < 0 ? -z[b,i]/dz[b,i] : 1.0 )
+
+    Dispatch with ``wp.launch_tiled(..., dim=[B], block_dim=block_dim)``:
+    one CUDA block per batch, threads cooperating to reduce ``num_ineq``-long
+    rows via ``wp.tile_min``. The primal (s) and dual (z) paths share one
+    block -- tiles from the s-pipeline go out of scope before the z-pipeline's
+    loads, so shared memory is recycled between the two reductions. Thread 0
+    finalizes both outputs by multiplying by ``tau``.
+    """
+    @wp.func
+    def step_candidate(a: wp.float64, b: wp.float64) -> wp.float64:
+        return wp.where(a < wp.float64(0.0), -b / a, wp.float64(1.0))
+
+    @wp.kernel
+    def calculate_step_kernel(
+        s_all: wp.array2d(dtype=wp.float64),        # (B, num_ineq)  # type: ignore
+        z_all: wp.array2d(dtype=wp.float64),        # (B, num_ineq)  # type: ignore
+        step_s_all: wp.array2d(dtype=wp.float64),   # (B, num_ineq)  # type: ignore
+        step_z_all: wp.array2d(dtype=wp.float64),   # (B, num_ineq)  # type: ignore
+        tau: wp.array(dtype=wp.float64),            # (1,)           # type: ignore
+        alpha_s: wp.array(dtype=wp.float64),        # (B,) output    # type: ignore
+        alpha_z: wp.array(dtype=wp.float64),        # (B,) output    # type: ignore
+    ):
+        b, i = wp.tid()
+
+        # Primal-step pipeline: alpha_s[b] = tau * min_i(cand_s[i])
+        s_tile = wp.tile_load(s_all[b], shape=num_ineq)
+        ds_tile = wp.tile_load(step_s_all[b], shape=num_ineq)
+        cand_s = wp.tile_map(step_candidate, ds_tile, s_tile)
+        min_s = wp.tile_min(cand_s)
+        wp.tile_store(alpha_s, min_s, offset=b)  # store min_s into the corresponding batch of alpha_s
+
+        # Dual-step pipeline: alpha_z[b] = tau * min_i(cand_z[i])
+        z_tile = wp.tile_load(z_all[b], shape=num_ineq)
+        dz_tile = wp.tile_load(step_z_all[b], shape=num_ineq)
+        cand_z = wp.tile_map(step_candidate, dz_tile, z_tile)
+        min_z = wp.tile_min(cand_z)
+        wp.tile_store(alpha_z, min_z, offset=b)  # store min_z into the corresponding batch of alpha_z
+
+        # Scalar tau multiply via thread 0 (tile_store is block-collective, so
+        # the read-back is safe).
+        if i == 0:
+            alpha_s[b] = alpha_s[b] * tau[0]
+            alpha_z[b] = alpha_z[b] * tau[0]
+
+    return calculate_step_kernel
 
 
 def create_calculate_sigma_kernel(num_ineq: int):
