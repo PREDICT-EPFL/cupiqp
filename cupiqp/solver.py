@@ -532,10 +532,15 @@ class SolverBase:
         # Drop the quadratic term Δs ∘ Δz (first‑order Newton linearization) to get the linear system S Δz + Z Δs = - s ∘ z.
         # Thus the predictor RHS for the slack/dual complementarity equations is - s ∘ z (elementwise product), which is exactly what the four lines set for the different constraint groups.
         # In words: those lines build the complementarity residual r_s = - s .* z so the KKT solve computes Δs, Δz satisfying S Δz + Z Δs = r_s (the linearized complementarity equation) for the predictor (affine) direction. The .array() calls implement the elementwise product s .* z.
-        with nvtx.annotate("Solver::prepare_predictor_step"):
-            cp.multiply(self._result.s_all, self._result.z_all, out=self._res.s_all)
-            self._res.s_all *= -1.
-            
+        
+        # one fused kernel: res.s_all[b, i] = -s_all[b, i] * z_all[b, i].
+        wp.launch(
+            kernel=self._prepare_predictor_step_kernel,
+            dim=(self._data.batch_size, self._data.num_ineq),
+            inputs=[self._result.s_all, self._result.z_all, self._res.s_all],
+            device="cuda",
+            stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+        )
 
         if self.settings.debug:
             print("predictor step rhs is: res= ", self._res)
@@ -552,15 +557,21 @@ class SolverBase:
         self._calculate_sigma()
 
         # ------------------ corrector step ------------------
-        with nvtx.annotate("Solver::prepare_corrector_step"):
-            # self._res.s_l += -self._step.s_l * self._step.z_l + self._result.info.sigma * self._result.info.mu
-            # self._res.s_u += -self._step.s_u * self._step.z_u + self._result.info.sigma * self._result.info.mu
-            # self._res.s_bl += -self._step.s_bl * self._step.z_bl + self._result.info.sigma * self._result.info.mu
-            # self._res.s_bu += -self._step.s_bu * self._step.z_bu + self._result.info.sigma * self._result.info.mu
-            tmp_sigma_mu = self._result.info.sigma * self._result.info.mu
-            cp.multiply(self._step.s_all, self._step.z_all, out=self._work_s)
-            self._res.s_all -= self._work_s
-            self._res.s_all += tmp_sigma_mu[:, None]
+        # self._res.s_l += -self._step.s_l * self._step.z_l + self._result.info.sigma * self._result.info.mu
+        # self._res.s_u += -self._step.s_u * self._step.z_u + self._result.info.sigma * self._result.info.mu
+        # self._res.s_bl += -self._step.s_bl * self._step.z_bl + self._result.info.sigma * self._result.info.mu
+        # self._res.s_bu += -self._step.s_bu * self._step.z_bu + self._result.info.sigma * self._result.info.mu
+        wp.launch(
+            kernel=self._prepare_corrector_step_kernel,
+            dim=(self._data.batch_size, self._data.num_ineq),
+            inputs=[
+                self._step.s_all, self._step.z_all,
+                self._result.info.sigma, self._result.info.mu,
+                self._res.s_all,
+            ],
+            device="cuda",
+            stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+        )
 
         if self.settings.debug:
             print("corrector step rhs is: res= ", self._res)
@@ -1115,6 +1126,47 @@ def create_update_residual_r_kernel(n: int, p: int, num_ineq: int):
             res_r_dual[b, idx] = delta[b] * (result_dual[b, idx] - prox_dual[b, idx]) + res_nr_dual[b, idx]
 
     return update_residual_r_kernel
+
+
+def create_prepare_predictor_step_kernel():
+    """Fused kernel for the predictor-step RHS assembly:
+
+        res.s_all[b, i] = -s_all[b, i] * z_all[b, i]
+    """
+    @wp.kernel
+    def prepare_predictor_step_kernel(
+        s_all:     wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_ineq)
+        z_all:     wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_ineq)
+        res_s_all: wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_ineq) output
+    ):
+        b, i = wp.tid()
+        res_s_all[b, i] = -s_all[b, i] * z_all[b, i]
+
+    return prepare_predictor_step_kernel
+
+
+def create_prepare_corrector_step_kernel():
+    """Fused kernel for the corrector-step RHS update:
+
+        res.s_all[b, i] = res.s_all[b, i] - step.s_all[b, i] * step.z_all[b, i] + sigma[b] * mu[b]
+
+        ``res.s_all`` already holds `-s*z` from the predictor step on entry;
+        the corrector adds the second-order correction `-ds*dz` plus the
+        centering term `sigma*mu` (broadcast scalar per batch).
+    """
+    @wp.kernel
+    def prepare_corrector_step_kernel(
+        step_s_all: wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_ineq)
+        step_z_all: wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_ineq)
+        sigma:      wp.array(dtype=wp.float64),    # type: ignore  (B,)
+        mu:         wp.array(dtype=wp.float64),    # type: ignore  (B,)
+        res_s_all:  wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_ineq) in-out
+    ):
+        b, i = wp.tid()
+        sigma_mu = sigma[b] * mu[b]  # cheap redundant per-thread compute; no sync
+        res_s_all[b, i] = res_s_all[b, i] - step_s_all[b, i] * step_z_all[b, i] + sigma_mu
+
+    return prepare_corrector_step_kernel
 
 
 def create_calculate_step_kernel(num_ineq: int):
