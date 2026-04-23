@@ -32,7 +32,7 @@ class RuizEquilibration(ABC):
         4. Update box scaling: x_b_scaling *= d_b * d_x
         5. Accumulate: delta *= d,  delta_b *= d_b
         6. (Optional) Cost scaling: gamma = 1/max(mean(||P_cols||), ||c||),
-           then P *= gamma, c *= gamma, c_scaling *= gamma
+           then P *= gamma, c *= gamma, cost_scaling *= gamma
         7. Converge when max(||1 - d||_inf, ||1 - d_b||_inf) < 1e-3
 
     After convergence, bounds are scaled: b *= d_y, h *= d_z, x_l/x_u *= delta_b.
@@ -89,15 +89,15 @@ class RuizEquilibration(ABC):
         self._work_n = cp.empty((B, n), dtype=cp.float64)
 
     @property
-    def c_scaling(self) -> cp.ndarray:
+    def cost_scaling(self) -> cp.ndarray:
         return self._cost_scaling
 
-    @c_scaling.setter
-    def c_scaling(self, value):
+    @cost_scaling.setter
+    def cost_scaling(self, value):
         self._cost_scaling[:] = value
 
     @property
-    def c_scaling_inv(self) -> cp.ndarray:
+    def cost_scaling_inv(self) -> cp.ndarray:
         return self._cost_scaling_inv
 
     @property

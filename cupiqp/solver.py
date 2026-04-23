@@ -139,8 +139,8 @@ class SolverBase:
         n, p, m = self._data.n, self._data.p, self._data.m
         pc = self._preconditioner
         if pc is not None:
-            self._c_scaling_inv = pc.c_scaling_inv                          # (B,)
-            self._unscale_dual_res_factor = pc.c_scaling_inv[:, None] * pc.delta_inv[:, :n]  # (B, n)
+            self._cost_scaling_inv = pc.cost_scaling_inv                          # (B,)
+            self._unscale_dual_res_factor = pc.cost_scaling_inv[:, None] * pc.delta_inv[:, :n]  # (B, n)
             self._unscale_primal_res_eq_factor = pc.delta_inv[:, n:n + p] if p > 0 else cp.empty((B, 0))  # (B, p)
             self._unscale_primal_res_ineq_hu = pc.delta_inv[:, n + p + self._data.idx_hu] if self._data.num_hu > 0 else cp.empty((B, 0))  # (B, num_hu)
             self._unscale_primal_res_ineq_hl = pc.delta_inv[:, n + p + self._data.idx_hl] if self._data.num_hl > 0 else cp.empty((B, 0))  # (B, num_hl)
@@ -169,7 +169,7 @@ class SolverBase:
                            cp.max(cp.abs(pc.unscale_primal_res_b(self._data.x_l[:, self._data.idx_xl], self._data.idx_xl)), axis=1),
                            out=self._constraints_rhs_inf_norm_unscaled)
         else:
-            self._c_scaling_inv = cp.ones(B, dtype=cp.float64)                                                                               # (B,)
+            self._cost_scaling_inv = cp.ones(B, dtype=cp.float64)                                                                               # (B,)
             self._unscale_dual_res_factor = cp.ones((B, n), dtype=cp.float64)                                                                # (B, n)
             self._unscale_primal_res_eq_factor = cp.ones((B, p), dtype=cp.float64) if p > 0 else cp.empty((B, 0))                            # (B, p)
             self._unscale_primal_res_ineq_hu = cp.ones((B, self._data.num_hu), dtype=cp.float64) if self._data.num_hu > 0 else cp.empty((B, 0))  # (B, num_hu)
@@ -774,13 +774,13 @@ class SolverBase:
         cp.subtract(self._result.info.primal_obj, self._result.info.dual_obj, out=self._result.info.duality_gap)
 
         # Unscale objectives and duality gap from scaled to original space
-        self._result.info.primal_obj *= self._c_scaling_inv
-        self._result.info.dual_obj *= self._c_scaling_inv
-        self._result.info.duality_gap *= self._c_scaling_inv
+        self._result.info.primal_obj *= self._cost_scaling_inv
+        self._result.info.dual_obj *= self._cost_scaling_inv
+        self._result.info.duality_gap *= self._cost_scaling_inv
 
         # duality_gap_rel_norm = max(abs(unscaled terms))
         # Unscale the work_reduce terms before computing duality_gap_rel
-        self._work_reduce *= self._c_scaling_inv[:, None]
+        self._work_reduce *= self._cost_scaling_inv[:, None]
         cp.abs(self._work_reduce, out=self._work_reduce)
         cp.max(self._work_reduce[:, 0:8], axis=1, out=self._result.info.duality_gap_rel)
         cp.abs(self._result.info.duality_gap, out=self._result.info.duality_gap)
