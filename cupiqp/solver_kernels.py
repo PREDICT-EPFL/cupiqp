@@ -42,6 +42,51 @@ def create_prepare_corrector_step_kernel():
     return prepare_corrector_step_kernel
 
 
+def create_run_full_newton_step_kernel(n: int, p: int):
+    """Fused post-solve variable update for the equality-only (no-inequality)
+    path ``_run_full_newton_step``.
+
+    After the KKT Newton solve, computes:
+
+        result.x[b, :] += step.x[b, :]                  (alpha_primal = 1)
+        result.y[b, :] += step.y[b, :]                  (alpha_dual   = 1)
+        primal_step[b]  = 1.0
+        dual_step[b]    = 1.0
+
+    (A full Newton step since there are no inequality constraints to limit
+    the step length.) Thread 0 of each batch writes the scalar step-length
+    fields; the other threads apply the elementwise add on ``x`` or ``y``.
+
+    Dispatch: ``wp.launch(kernel, dim=(B, n+p))``. ``n`` and ``p`` are
+    compile-time constants so the per-thread branch fully specializes.
+    """
+    @wp.kernel
+    def run_full_newton_step_kernel(
+        step_x:      wp.array2d(dtype=wp.float64),  # (B, n)   # type: ignore
+        step_y:      wp.array2d(dtype=wp.float64),  # (B, p)   # type: ignore
+        result_x:    wp.array2d(dtype=wp.float64),  # (B, n)   # type: ignore
+        result_y:    wp.array2d(dtype=wp.float64),  # (B, p)   # type: ignore
+        primal_step: wp.array(dtype=wp.float64),    # (B,)     # type: ignore
+        dual_step:   wp.array(dtype=wp.float64),    # (B,)     # type: ignore
+    ):
+        b, t = wp.tid()
+        n_static = wp.static(n)
+        p_static = wp.static(p)
+
+        if t < n_static:
+            result_x[b, t] = result_x[b, t] + step_x[b, t]
+        elif t < n_static + p_static:
+            idx = t - n_static
+            result_y[b, idx] = result_y[b, idx] + step_y[b, idx]
+
+        # Thread 0 of each batch sets the scalar step-length outputs.
+        if t == 0:
+            primal_step[b] = wp.float64(1.0)
+            dual_step[b] = wp.float64(1.0)
+
+    return run_full_newton_step_kernel
+
+
 def create_calculate_step_kernel(num_ineq: int):
     """Fused block-reduction kernel for step lengths (primal and dual).
 
@@ -94,6 +139,42 @@ def create_calculate_step_kernel(num_ineq: int):
             alpha_z[b] = alpha_z[b] * tau[0]
 
     return calculate_step_kernel
+
+
+def create_calculate_mu_kernel(num_ineq: int):
+    """Fused block-reduction kernel for the duality measure mu.
+
+    For each batch ``b``, computes:
+
+        mu[b] = sum_i( s[b, i] * z[b, i] ) / num_ineq
+
+    Dispatch with ``wp.launch_tiled(..., dim=[B], block_dim=block_dim)``:
+    one CUDA block per batch, threads cooperating on the ``num_ineq``-long
+    reduction via ``wp.tile_sum``. Thread 0 performs the scalar
+    ``/ num_ineq`` finalization after the block-collective ``tile_store``
+    (which acts as a block-wide write fence).
+    """
+    @wp.kernel
+    def calculate_mu_kernel(
+        s_all: wp.array2d(dtype=wp.float64),  # (B, num_ineq)  # type: ignore
+        z_all: wp.array2d(dtype=wp.float64),  # (B, num_ineq)  # type: ignore
+        mu:    wp.array(dtype=wp.float64),    # (B,) output    # type: ignore
+    ):
+        b, tid = wp.tid()
+
+        # Per-batch row loads, cooperatively filled by block threads.
+        s_tile = wp.tile_load(s_all[b], shape=num_ineq)
+        z_tile = wp.tile_load(z_all[b], shape=num_ineq)
+
+        # Block-wide reduction: sum_i(s*z). Result is a (1,)-tile in shared mem.
+        sum_tile = wp.tile_sum(s_tile * z_tile)
+        wp.tile_store(mu, sum_tile, offset=b)
+
+        # Scalar finalize by thread 0; safe because tile_store is block-collective.
+        if tid == 0:
+            mu[b] = mu[b] / wp.float64(num_ineq)
+
+    return calculate_mu_kernel
 
 
 def create_calculate_sigma_kernel(num_ineq: int):

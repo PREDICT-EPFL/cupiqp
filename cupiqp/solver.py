@@ -13,8 +13,10 @@ from .utils import cuda_graph_capture
 from .solver_kernels import (
     create_prepare_predictor_step_kernel,
     create_prepare_corrector_step_kernel,
+    create_run_full_newton_step_kernel,
     create_calculate_step_kernel,
     create_calculate_sigma_kernel,
+    create_calculate_mu_kernel,
     create_update_residual_r_kernel,
 )
 
@@ -117,6 +119,10 @@ class SolverBase:
         )
         self._calculate_sigma_kernel = create_calculate_sigma_kernel(self._data.num_ineq)
         self._calculate_step_kernel = create_calculate_step_kernel(self._data.num_ineq)
+        self._calculate_mu_kernel = create_calculate_mu_kernel(self._data.num_ineq)
+        self._prepare_predictor_step_kernel = create_prepare_predictor_step_kernel()
+        self._prepare_corrector_step_kernel = create_prepare_corrector_step_kernel()
+        self._run_full_newton_step_kernel = create_run_full_newton_step_kernel(self._data.n, self._data.p)
 
         self._tau_device = cp.empty(1, dtype=cp.float64)
         self._tau_device[0] = self.settings.tau  # device copy used by warp kernels
@@ -519,10 +525,25 @@ class SolverBase:
     @nvtx.annotate("Solver::_run_full_newton_step")
     def _run_full_newton_step(self):
         self._kkt_system.solve(self._data, self.settings, self._res, self._step)
-        self._result.info.primal_step[:] = 1.0
-        self._result.info.dual_step[:] = 1.0
-        self._result.x += self._result.info.primal_step[:, None] * self._step.x
-        self._result.y += self._result.info.dual_step[:, None] * self._step.y
+
+        USE_WARP_IMPLEMENTATION = True
+        if USE_WARP_IMPLEMENTATION:
+            wp.launch(
+                kernel=self._run_full_newton_step_kernel,
+                dim=(self._data.batch_size, self._data.n + self._data.p),
+                inputs=[
+                    self._step.x, self._step.y,
+                    self._result.x, self._result.y,
+                    self._result.info.primal_step, self._result.info.dual_step,
+                ],
+                device="cuda",
+                stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+            )
+        else:
+            self._result.info.primal_step[:] = 1.0
+            self._result.info.dual_step[:] = 1.0
+            self._result.x += self._result.info.primal_step[:, None] * self._step.x
+            self._result.y += self._result.info.dual_step[:, None] * self._step.y
 
     @nvtx.annotate("Solver::_run_predictor_corrector")
     def _run_predictor_corrector(self):
@@ -640,9 +661,24 @@ class SolverBase:
     @nvtx.annotate("Solver::_calculate_mu")
     @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
     def _calculate_mu(self) -> None:
-        cp.multiply(self._result.s_all, self._result.z_all, out=self._work_s)
-        cp.sum(self._work_s, axis=1, out=self._result.info.mu)
-        self._result.info.mu /= self._data.num_ineq
+        USE_WARP_IMPLEMENTATION = True
+        MU_BLOCK_DIM = 256
+        if USE_WARP_IMPLEMENTATION:
+            wp.launch_tiled(
+                kernel=self._calculate_mu_kernel,
+                dim=[self._data.batch_size],
+                inputs=[
+                    self._result.s_all, self._result.z_all,
+                    self._result.info.mu,
+                ],
+                block_dim=MU_BLOCK_DIM,
+                device="cuda",
+                stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+            )
+        else:
+            cp.multiply(self._result.s_all, self._result.z_all, out=self._work_s)
+            cp.sum(self._work_s, axis=1, out=self._result.info.mu)
+            self._result.info.mu /= self._data.num_ineq
 
     @nvtx.annotate("Solver::_calculate_sigma")
     @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
