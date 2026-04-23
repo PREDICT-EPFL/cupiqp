@@ -1,5 +1,6 @@
 import os, importlib.util
 from abc import ABC, abstractmethod
+from typing import Union
 import numpy as np
 import cupy as cp
 from cupyx.scipy.sparse import csr_matrix
@@ -15,35 +16,69 @@ from nvmath.sparse.advanced import (
 )
 from nvmath.bindings import cudss as cudss_bindings
 
-from .sparse_matvec import SparseMatVecProduct
+from .batched_csr import BatchedCsrMatrix
 
 
 class SparseDirectSolver(ABC):
-    def __init__(self, matrix: csr_matrix):
-        if not isinstance(matrix, csr_matrix):
-            raise ValueError("Input matrix must be a csr_matrix.")
-        if matrix.shape[0] != matrix.shape[1]:
-            raise ValueError("Input matrix must be square.")
-        self._mat = matrix  # NOTE: should make sure memory of this matrix always exists and is not re-allocated, since the direct solver holds a pointer to the matrix memory for in-place factorization and solves. We can update the values of the matrix for each iteration, but should not re-allocate a new matrix.
-        self._dim = matrix.shape[0]
-        self._rhs = cp.empty(self._dim, dtype=cp.float64)
-        self._sol = cp.empty(self._dim, dtype=cp.float64)
-    
+    """Abstract base for sparse direct solvers — natively supports batching.
+
+    ``matrix`` is either
+
+    * a ``cupyx.scipy.sparse.csr_matrix`` (B = 1) — dispatched to nvmath's
+      non-batched ``DirectSolver``; or
+    * a ``BatchedCsrMatrix`` (B ≥ 1) — dispatched to nvmath's explicit-
+      batching ``DirectSolver`` by materializing per-batch ``csr_matrix``
+      views on top of the batched values buffer.
+    """
+
+    def __init__(self, matrix: Union[csr_matrix, BatchedCsrMatrix]):
+        if isinstance(matrix, csr_matrix):
+            if matrix.shape[0] != matrix.shape[1]:
+                raise ValueError("Matrix must be square.")
+            self._batch_size = 1
+            self._dim = matrix.shape[0]
+            self._mat = matrix
+            self._mat_list = None
+        elif isinstance(matrix, BatchedCsrMatrix):
+            if matrix.rows != matrix.cols:
+                raise ValueError("All matrices must be square.")
+            self._batch_size = matrix.batch_size
+            self._dim = matrix.rows
+            self._mat = matrix
+            # Per-batch csr_matrix views required by nvmath's batched API.
+            # Each view shares indices/indptr with the BatchedCsrMatrix and
+            # its .data points into the shared (B, nnz) values buffer, so
+            # in-place updates via matrix.data[:, k] = ... are visible to
+            # the solver automatically.
+            self._mat_list = [matrix[b] for b in range(self._batch_size)]
+        else:
+            raise TypeError(
+                "matrix must be a csr_matrix or BatchedCsrMatrix; got "
+                f"{type(matrix).__name__}."
+            )
+
+        # NOTE: the direct solver holds pointers into the matrix buffers
+        # for in-place factorization and solves. Callers may update the
+        # values in place between solves but must not reallocate the
+        # underlying buffer (e.g. swap BatchedCsrMatrix.data for a new array).
+        self._rhs = cp.empty((self._batch_size, self._dim), dtype=cp.float64)
+        self._sol = cp.empty((self._batch_size, self._dim), dtype=cp.float64)
+
     @nvtx.annotate("SparseDirectSolver::plan")
     @abstractmethod
-    def plan(self) -> bool:
+    def plan(self, cuda_stream: int) -> bool:
         """Precompute reordering and symbolic factorization"""
         pass
 
     @nvtx.annotate("SparseDirectSolver::factor")
     @abstractmethod
-    def factor(self) -> bool:
+    def factor(self, cuda_stream: int) -> bool:
         """Numerical factorization of the matrix. Should be called after plan() and before solve()."""
         pass
 
     @nvtx.annotate("SparseDirectSolver::solve")
     @abstractmethod
-    def solve(self):
+    def solve(self, cuda_stream: int):
         """Solve the linear system for the given right-hand side."""
         pass
 
@@ -52,39 +87,60 @@ class SparseDirectSolver(ABC):
         pass
 
     @property
-    def mat(self):
-        """Expose the matrix for in-place updates before calling factor()."""
-        return self._mat
-    
-    @property
-    def rhs(self):
-        """Expose the right-hand side vector for in-place updates before calling solve()."""
-        return self._rhs
-    
-    @property
-    def sol(self):
-        """Expose the solution vector after calling solve()."""
-        return self._sol
+    def batch_size(self) -> int:
+        return self._batch_size
 
+    @property
+    def dim(self) -> int:
+        return self._dim
+
+    @property
+    def rhs(self) -> cp.ndarray:
+        """Expose the (first) right-hand side vector for in-place updates before calling solve()."""
+        return self._rhs
+
+    @property
+    def sol(self) -> cp.ndarray:
+        """Expose the (first) solution vector after calling solve()."""
+        return self._sol
+    
 
 class CudssSparseDirectSolver(SparseDirectSolver):
-    def __init__(self, matrix: csr_matrix, use_deterministic_mode: bool = False, **cudss_kwargs):
+    def __init__(self, matrix: Union[csr_matrix, BatchedCsrMatrix], use_deterministic_mode: bool = False, **cudss_kwargs):
         super().__init__(matrix)
+        batch_size = self._batch_size
+        self._rhs_list = [self._rhs[i] for i in range(self._rhs.shape[0])]  # list of views
+        self._sol_list = [self._sol[i] for i in range(self._sol.shape[0])]  # list of views
 
         # setup cuDSS solver
         opts = DirectSolverOptions(
             sparse_system_type=DirectSolverMatrixType.SYMMETRIC,
-            sparse_system_view=DirectSolverMatrixViewType.FULL,
+            sparse_system_view=DirectSolverMatrixViewType.LOWER,  # NOTE: only take the lower triangular part of the matrix
             multithreading_lib=self._find_cudss_mt_lib()
         )
         exe = ExecutionCUDA()  # Optional: ExecutionCUDA(). NOTE: hybrid mode seems more numerically stable
 
-        self._cudss_solver = DirectSolver(
-            a=self._mat,
-            b=self._rhs,
-            options=opts,
-            execution=exe,
-            stream=cp.cuda.get_current_stream().ptr,
+        if batch_size == 1:
+            # Non-batched nvmath DirectSolver. ``self._mat`` is the raw
+            # csr_matrix when the user passed one directly, or None +
+            # self._mat_list[0] when a BatchedCsrMatrix with B=1 was passed.
+            a_single = self._mat if self._mat_list is None else self._mat_list[0]
+            self._cudss_solver = DirectSolver(
+                a=a_single,
+                b=self._rhs[0],
+                options=opts,
+                execution=exe,
+                stream=cp.cuda.get_current_stream().ptr,
+            )
+        else:
+            # Explicit-batching nvmath DirectSolver. ``self._mat_list`` is a
+            # list of csr_matrix views on top of the BatchedCsrMatrix.
+            self._cudss_solver = DirectSolver(
+                a=self._mat_list,
+                b=self._rhs_list,
+                options=opts,
+                execution=exe,
+                stream=cp.cuda.get_current_stream().ptr,
             )
         self._cudss_solver.plan_config.reordering_algorithm = DirectSolverAlgType.ALG_DEFAULT
         self._cudss_solver.solution_config.ir_num_steps = 0  # NOTE: iterative refinement steps, to be tuned
@@ -105,10 +161,25 @@ class CudssSparseDirectSolver(SparseDirectSolver):
                 _det_flag.dtype.itemsize,
             )
 
-        self._mat_vec_prod = SparseMatVecProduct(self._mat, transa=False)
-        self._res = cp.empty_like(self._rhs)
-        self._rhs_saved = cp.empty_like(self._rhs)
-        self._sol_ir = cp.empty_like(self._sol)
+        # Use raw cuDSS handles for direct execute() calls in solve(),
+        # bypassing nvmath's _allocate_batched_result overhead.
+        self._cudss_handle = self._cudss_solver.handle
+        self._cudss_config = self._cudss_solver.config_ptr
+        self._cudss_data   = self._cudss_solver.data_ptr
+        self._cudss_a      = self._cudss_solver.a_ptr
+        self._cudss_x      = self._cudss_solver.x_ptr
+        self._cudss_b      = self._cudss_solver.b_ptr
+
+        # Point x-descriptor at our pre-allocated _sol buffer (done once).
+        if batch_size == 1:
+            cudss_bindings.matrix_set_values(self._cudss_x, self._sol.data.ptr)
+        else:
+            row_bytes = self._dim * 8
+            ptrs = np.array([self._sol.data.ptr + i * row_bytes
+                             for i in range(batch_size)], dtype=np.uint64)
+            self._sol_ptrs_dev = cp.array(ptrs)  # prevent GC — descriptor holds this pointer
+            cudss_bindings.matrix_set_batch_values(
+                self._cudss_x, self._sol_ptrs_dev.data.ptr)
 
     def __del__(self):
         cudss_solver = getattr(self, "_cudss_solver", None)
@@ -119,21 +190,28 @@ class CudssSparseDirectSolver(SparseDirectSolver):
                 pass
             self._cudss_solver = None
 
-    def plan(self) -> bool:
+    @nvtx.annotate("CudssSparseDirectSolver::plan")
+    def plan(self, cuda_stream: int) -> bool:
         try:
-            plan_info = self._cudss_solver.plan(stream=cp.cuda.get_current_stream().ptr)
-            cp.cuda.get_current_stream().synchronize()
+            plan_info = self._cudss_solver.plan(stream=cuda_stream)
+            # cp.cuda.get_current_stream().synchronize()
         except Exception as e:
             print(f"Planning failed: {e}")
             return False
-        
+
         return True
 
-    def factor(self) -> bool:
+    @nvtx.annotate("CudssSparseDirectSolver::factor")
+    def factor(self, cuda_stream: int) -> bool:
         try:
-            cp.cuda.Device().synchronize()
-            fac_info = self._cudss_solver.factorize(stream=cp.cuda.get_current_stream().ptr)
-            cp.cuda.Device().synchronize()
+            fac_info = self._cudss_solver.factorize(stream=cuda_stream)
+            # cp.cuda.get_current_stream().synchronize()
+
+            if self._batch_size > 1:
+                # explicit batching returns a tuple of FactorizationInfo
+                if isinstance(fac_info, tuple):
+                    return all(fi.info == 0 for fi in fac_info)
+                return fac_info.info == 0
 
             # NOTE: this causes a D2H synchronization, which can be inefficient. More importantly, this prevents us from capturing cuda graphs.
             if fac_info.info != 0:
@@ -156,85 +234,27 @@ class CudssSparseDirectSolver(SparseDirectSolver):
 
         return True
 
-    def solve(self, 
-              iterative_refinement: bool = False, 
-              ir_abs_tol: float = 1e-12, 
+    @nvtx.annotate("CudssSparseDirectSolver::solve")
+    def solve(self,
+              cuda_stream: int,
+              iterative_refinement: bool = False,
+              ir_abs_tol: float = 1e-12,
               ir_rel_tol: float = 1e-12,
-              ir_max_iter: int = 10, 
+              ir_max_iter: int = 10,
               ir_min_improvement_rate: float = 5.0
               ) -> None:
-        # initial solve
-        self._sol[:] = self._cudss_solver.solve(stream=cp.cuda.get_current_stream().ptr)
-        cp.cuda.Device().synchronize()
+        # Bypass nvmath's solve() which allocates B fresh arrays every call.
+        # x_ptr already points at self._sol (set once in __init__), so cuDSS
+        # writes directly into our buffer — zero allocation, zero copy.
+        cudss_bindings.set_stream(self._cudss_handle, cuda_stream)
+        cudss_bindings.execute(
+            self._cudss_handle, cudss_bindings.Phase.SOLVE,
+            self._cudss_config, self._cudss_data,
+            self._cudss_a, self._cudss_x, self._cudss_b,
+        )
 
         if iterative_refinement:
-            self.iterative_refinement(ir_abs_tol, ir_rel_tol, ir_max_iter, ir_min_improvement_rate)
-
-    @nvtx.annotate("SparseDirectSolver::iterative_refinement")
-    def iterative_refinement(self, abs_tol: float, rel_tol: float, max_iter: int, min_improvement_rate: float) -> None:
-        VERBOSE = False
-        USE_RHS_NORM = False  # True: tol = atol + rtol * ||b||,  False: tol = atol + rtol * ||r_0||
-        # TODO: the iterative refinement here and the one in KKTSystem are actually the same thing. Should find a cleaner way to organize the code to avoid this confusion.
-
-        self._rhs_saved[:] = self._rhs
-
-        prev_res_norm = float('inf')
-
-        if USE_RHS_NORM:
-            rel_tol = 1e-16
-            rhs_norm = float(cp.max(cp.abs(self._rhs_saved)))
-            tol = abs_tol + rel_tol * rhs_norm
-            if VERBOSE:
-                print(f"      IR: ||b||={rhs_norm:.4e}, "
-                      f"tol={tol:.4e} (atol={abs_tol:.1e} + rtol={rel_tol:.1e} * ||b||)")
-
-        for itr in range(max_iter):
-            # residual: res = b - A*x
-            self._mat_vec_prod(x=self._sol, y=self._res)
-            cp.subtract(self._rhs_saved, self._res, out=self._res)
-
-            res_norm = float(cp.max(cp.abs(self._res)))
-
-            if not USE_RHS_NORM and itr == 0:
-                tol = abs_tol + rel_tol * res_norm
-                if VERBOSE:
-                    print(f"      IR: ||r_0||={res_norm:.4e}, "
-                          f"tol={tol:.4e} (atol={abs_tol:.1e} + rtol={rel_tol:.1e} * ||r_0||)")
-
-            improvement = prev_res_norm / max(res_norm, 1e-300)
-
-            if VERBOSE:
-                print(f"      IR iter {itr}: ||r||={res_norm:.4e}  improvement={improvement:.1f}x")
-
-            # Check convergence
-            if res_norm < tol:
-                if VERBOSE:
-                    print(f"      IR converged after {itr} iteration(s).")
-                break
-
-            # Check improvement rate — stop if not converging fast enough
-            if itr > 0 and improvement < min_improvement_rate:
-                if VERBOSE:
-                    print(f"      IR stalled after {itr} iteration(s) "
-                          f"(improvement {improvement:.1f}x < {min_improvement_rate:.1f}x threshold).")
-                break
-
-            prev_res_norm = res_norm
-
-            # Solve for correction: A*dx = res
-            self._rhs[:] = self._res
-            self._sol_ir[:] = self._cudss_solver.solve(stream=cp.cuda.get_current_stream().ptr)
-            cp.cuda.Device().synchronize()
-
-            self._sol += self._sol_ir
-
-        else:
-            if VERBOSE:
-                print(f"      IR reached max iterations ({max_iter}) "
-                  f"without convergence. Final ||r||={res_norm:.4e}, tol={tol:.4e}.")
-
-        # Restore original RHS
-        self._rhs[:] = self._rhs_saved
+            raise NotImplementedError("Iterative refinement in CudssSparseDirectSolver is not implemented yet.")
 
     @staticmethod
     def _find_cudss_mt_lib():
@@ -256,6 +276,3 @@ class CudssSparseDirectSolver(SparseDirectSolver):
                     if os.path.isfile(lib):
                         return lib
         return None
-    
-
-        

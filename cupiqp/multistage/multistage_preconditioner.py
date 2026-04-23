@@ -126,26 +126,26 @@ class MultistageRuizEquilibration(RuizEquilibration):
         P_D *= gamma
         P_E *= gamma
         data._c *= gamma
-        self.c_scaling *= gamma
+        self.cost_scaling *= gamma
 
     def _unscale_matrices(self, data: Data,
                           d_x_inv: cp.ndarray, d_y_inv: cp.ndarray, d_z_inv: cp.ndarray):
-        c_inv = float(self._c_scaling_inv)
+        cost_inv = float(self._cost_scaling_inv)
         N = data.num_blocks
         bs = data.block_size
         d_x_inv_2d = d_x_inv.reshape(N, bs)
 
         P_D = cp.from_dlpack(wp.to_dlpack(data._P.diag_blocks.data))
         P_E = cp.from_dlpack(wp.to_dlpack(data._P.off_diag_blocks_lower.data))
-        P_D *= c_inv
+        P_D *= cost_inv
         P_D *= d_x_inv_2d[:, None, :]
         P_D *= d_x_inv_2d[:, :, None]
         if N > 1:
-            P_E *= c_inv
+            P_E *= cost_inv
             P_E *= d_x_inv_2d[:N-1, None, :]
             P_E *= d_x_inv_2d[1:N, :, None]
 
-        data._c *= c_inv * d_x_inv
+        data._c *= cost_inv * d_x_inv
 
         if self.p > 0:
             r_a = data._A.rows_of_blocks
@@ -169,7 +169,7 @@ class MultistageRuizEquilibration(RuizEquilibration):
 
     def _apply_stored_scaling(self, data: Data,
                               d_x: cp.ndarray, d_y: cp.ndarray, d_z: cp.ndarray):
-        c = float(self.c_scaling)
+        c = float(self.cost_scaling)
         N = data.num_blocks
         bs = data.block_size
         d_x_2d = d_x.reshape(N, bs)

@@ -7,10 +7,18 @@ import nvtx
 from .results import Variables
 from .data import Data
 from .settings import Settings
-from .sparse.sparse_kkt_solver import SparseKKTSolver
-from .dense.dense_kkt_solver import DenseKKTSolver
-from .multistage.multistage_kkt_solver import MultistageKKTSolver
 from .utils import cuda_graph_capture
+from .kkt_systems_kernels import (
+    create_build_inverse_index_kernel,
+    create_eliminate_slacks_kernel,
+    create_eliminate_slacks_transposed_kernel,
+    create_eliminate_duals_kernel,
+    create_recover_slacks_kernel,
+    create_recover_slacks_transposed_kernel,
+    create_recover_duals_kernel,
+    create_update_regularizations_step_1_kernel,
+    create_update_regularizations_step_2_kernel,
+)
 
 class KKTSystem:
     """
@@ -41,77 +49,98 @@ class KKTSystem:
     """
     def __init__(self):
         return
-    
+
     def init(self, data: Data, settings: Settings):
         self._settings = settings
+        self._backend = settings.kkt_solver
         self._use_iterative_refinement = False
+        self._batch_size = data.batch_size
+        B = self._batch_size
+        n, p, m = data.n, data.p, data.m
 
-        self._rho = cp.empty(1)
-        self._delta = cp.empty(1)
-        self._x_reg = cp.empty(data.n)
-        self._z_reg = cp.empty(data.m)
-        self._P_diag = cp.empty(data.n)
+        # Per-problem regularization
+        self._rho = cp.empty(B, dtype=cp.float64)
+        self._delta = cp.empty(B, dtype=cp.float64)
+        self._x_reg = cp.empty((B, n), dtype=cp.float64)
+        self._z_reg = cp.empty((B, m), dtype=cp.float64)
 
-        # used to store the rhs of the condensed KKT system
+        # used to store the rhs of the condensed KKT system (per problem)
         # K_condensed * [dx; dy; dz] = [rhs_x_bar; rhs_y_bar; rhs_z_bar], 
         # where K_condensed is the condensed KKT matrix after eliminating duals of inequalities and box constraints and all slacks.
         # Since eliminating slacks and duals does not change rhs_y, we only need to store rhs_x_bar and rhs_z_bar.
-        self._rhs_x_bar = cp.empty(data.n)
-        self._rhs_z_bar = cp.empty(data.m)
 
-        self._work_x = cp.nan * cp.zeros(data.n)
-        self._work_z = cp.nan * cp.zeros(data.m)
+        self._rhs_x_bar = cp.empty((B, n), dtype=cp.float64)
+        self._rhs_z_bar = cp.empty((B, m), dtype=cp.float64) if m > 0 else cp.empty((B, 0), dtype=cp.float64)
 
-        if settings.kkt_solver == "sparse_ldlt":
-            self._kkt_solver = SparseKKTSolver(data, use_deterministic_mode=settings.use_deterministic_mode_for_cudss)
-        elif settings.kkt_solver == "dense_cholesky":
+        # Work buffers
+        self._work_x = cp.empty((B, n), dtype=cp.float64)
+        self._work_z = cp.empty((B, m), dtype=cp.float64) if m > 0 else cp.empty((B, 0), dtype=cp.float64)
+
+        # KKT solver backend
+        if settings.kkt_solver == "dense_cholesky":
+            from .dense.dense_kkt_solver import DenseKKTSolver
             self._kkt_solver = DenseKKTSolver(data)
+        elif settings.kkt_solver == "sparse_ldlt":
+            from .sparse.sparse_kkt_solver import SparseKKTSolver
+            self._kkt_solver = SparseKKTSolver(data, use_deterministic_mode=settings.use_deterministic_mode_for_cudss)
         elif settings.kkt_solver == "multistage_block_cholesky":
+            from .multistage.multistage_kkt_solver import MultistageKKTSolver
             self._kkt_solver = MultistageKKTSolver(data)
         else:
             raise ValueError(f"Unsupported kkt_solver: {settings.kkt_solver}")
 
-        # store the value of slack and dual variables value at this iteration, will be used in recovering the slack step: S*delta_z + Z*delta_s = r_s
-        self._m_s_u = cp.zeros(data.num_hu)
-        self._m_s_l = cp.zeros(data.num_hl)
-        self._m_z_u_inv = cp.zeros(data.num_hu)
-        self._m_z_l_inv = cp.zeros(data.num_hl)
-        self._m_s_bu = cp.zeros(data.num_xu)
-        self._m_s_bl = cp.zeros(data.num_xl)
-        self._m_z_bu_inv = cp.zeros(data.num_xu)
-        self._m_z_bl_inv = cp.zeros(data.num_xl)
+        # Contiguous internal buffers with layout [hl | hu | xl | xu] matching s_all/z_all.
+        num_ineq = data.num_hl + data.num_hu + data.num_xl + data.num_xu
+        hl, hu, xl, xu = data.num_hl, data.num_hu, data.num_xl, data.num_xu
+        # Store slack values at current iteration
+        self._m_s_all = cp.zeros((B, num_ineq), dtype=cp.float64)
+        self._m_s_l = self._m_s_all[:, :hl]
+        self._m_s_u = self._m_s_all[:, hl:hl+hu]
+        self._m_s_bl = self._m_s_all[:, hl+hu:hl+hu+xl]
+        self._m_s_bu = self._m_s_all[:, hl+hu+xl:hl+hu+xl+xu]
 
-        # pre-allocate memory for some variables used in factor and solve
-        self._w_u_delta_inv = cp.zeros(data.num_hu)   # store 1./(s_u / z_u + delta)
-        self._w_l_delta_inv = cp.zeros(data.num_hl)   # store 1./(s_l / z_l + delta)
-        self._w_bu_delta_inv = cp.zeros(data.num_xu)  # store 1./(s_bu / z_bu + delta)
-        self._w_bl_delta_inv = cp.zeros(data.num_xl)  # store 1./(s_bl / z_bl + delta)
+        # Store 1/z values at current iteration
+        self._m_z_inv_all = cp.zeros((B, num_ineq), dtype=cp.float64)
+        self._m_z_l_inv = self._m_z_inv_all[:, :hl]
+        self._m_z_u_inv = self._m_z_inv_all[:, hl:hl+hu]
+        self._m_z_bl_inv = self._m_z_inv_all[:, hl+hu:hl+hu+xl]
+        self._m_z_bu_inv = self._m_z_inv_all[:, hl+hu+xl:hl+hu+xl+xu]
 
-        # pre-allocate memory for some variables used to store updated rhs in solve
-        self._updated_rhs_z_u = cp.zeros(data.num_hu)
-        self._updated_rhs_z_l = cp.zeros(data.num_hl)
-        self._updated_rhs_z_bu = cp.zeros(data.num_xu)
-        self._updated_rhs_z_bl = cp.zeros(data.num_xl)
+        # Store 1/(s/z + delta) used in factor and solve
+        self._w_delta_inv_all = cp.zeros((B, num_ineq), dtype=cp.float64)
+        self._w_l_delta_inv = self._w_delta_inv_all[:, :hl]
+        self._w_u_delta_inv = self._w_delta_inv_all[:, hl:hl+hu]
+        self._w_bl_delta_inv = self._w_delta_inv_all[:, hl+hu:hl+hu+xl]
+        self._w_bu_delta_inv = self._w_delta_inv_all[:, hl+hu+xl:hl+hu+xl+xu]
 
-        # pre-allocate memory for condensed KKT iterative refinement (operates on x, y, z blocks only)
-        self._iter_refine_error_xyz = cp.zeros(data.n + data.p + data.m)
-        self._iter_refine_delta_xyz = cp.zeros(data.n+data.p+data.m)
+        # Updated rhs after eliminating slacks
+        self._updated_rhs_z_all = cp.zeros((B, num_ineq), dtype=cp.float64)
+        self._updated_rhs_z_l = self._updated_rhs_z_all[:, :hl]
+        self._updated_rhs_z_u = self._updated_rhs_z_all[:, hl:hl+hu]
+        self._updated_rhs_z_bl = self._updated_rhs_z_all[:, hl+hu:hl+hu+xl]
+        self._updated_rhs_z_bu = self._updated_rhs_z_all[:, hl+hu+xl:hl+hu+xl+xu]
 
-        # create kernels
-        self._update_regulerization_step_1_kernel = create_update_regularizations_step_1_kernel(data.num_hu, data.num_hl, data.num_xu, data.num_xl)
-        self._update_regulerization_step_2_kernel = create_update_regularizations_step_2_kernel(data.n, data.m)
-        self._eliminate_slacks_kernel = create_eliminate_slacks_kernel(data.num_hu, data.num_hl, data.num_xu, data.num_xl)
-        self._eliminate_duals_kernel = create_eliminate_duals_kernel(data.n, data.m)
+        # Pre-allocated buffers for condensed KKT iterative refinement
+        self._iter_refine_error_xyz = cp.zeros((B, n + p + m), dtype=cp.float64)
+        self._iter_refine_delta_xyz = cp.zeros((B, n + p + m), dtype=cp.float64)
+
+        # Create Warp kernels
+        self._update_regulerization_step_1_kernel = create_update_regularizations_step_1_kernel()
+        self._update_regulerization_step_2_kernel = create_update_regularizations_step_2_kernel(n, m)
+        self._eliminate_slacks_kernel = create_eliminate_slacks_kernel()
+        self._eliminate_slacks_transposed_kernel = create_eliminate_slacks_transposed_kernel()
+        self._eliminate_duals_kernel = create_eliminate_duals_kernel(n, m)
         self._recover_duals_kernel = create_recover_duals_kernel(data.num_hu, data.num_hl, data.num_xu, data.num_xl)
-        self._recover_slacks_kernel = create_recover_slacks_kernel(data.num_hu, data.num_hl, data.num_xu, data.num_xl)
+        self._recover_slacks_kernel = create_recover_slacks_kernel()
+        self._recover_slacks_transposed_kernel = create_recover_slacks_transposed_kernel()
 
         # Precompute inverse index maps for gather-pattern kernels.
         # inv_idx_xu[j] = i such that idx_xu[i] == j, or -1 if variable j has no upper bound.
         _build_inv_idx_kernel = create_build_inverse_index_kernel()
-        self._inv_idx_xu = wp.full(data.n, value=-1, dtype=wp.int32, device="cuda")
-        self._inv_idx_xl = wp.full(data.n, value=-1, dtype=wp.int32, device="cuda")
-        self._inv_idx_hu = wp.full(data.m, value=-1, dtype=wp.int32, device="cuda") if data.m > 0 else wp.zeros(0, dtype=wp.int32, device="cuda")
-        self._inv_idx_hl = wp.full(data.m, value=-1, dtype=wp.int32, device="cuda") if data.m > 0 else wp.zeros(0, dtype=wp.int32, device="cuda")
+        self._inv_idx_xu = wp.full(n, value=-1, dtype=wp.int32, device="cuda")
+        self._inv_idx_xl = wp.full(n, value=-1, dtype=wp.int32, device="cuda")
+        self._inv_idx_hu = wp.full(m, value=-1, dtype=wp.int32, device="cuda") if m > 0 else wp.zeros(0, dtype=wp.int32, device="cuda")
+        self._inv_idx_hl = wp.full(m, value=-1, dtype=wp.int32, device="cuda") if m > 0 else wp.zeros(0, dtype=wp.int32, device="cuda")
         if data.num_xu > 0:
             wp.launch(_build_inv_idx_kernel, dim=data.num_xu,
                       inputs=[data.idx_xu, self._inv_idx_xu], device="cuda")
@@ -124,51 +153,52 @@ class KKTSystem:
         if data.num_hl > 0:
             wp.launch(_build_inv_idx_kernel, dim=data.num_hl,
                       inputs=[data.idx_hl, self._inv_idx_hl], device="cuda")
- 
+
+    @property
+    def batch_size(self) -> int:
+        return self._batch_size
+
     @nvtx.annotate("KKTSystem::update_data")
     def update_data(self, data: Data, update_P: bool = False, update_A: bool = False, update_G: bool = False):
         self._kkt_solver.update_data(data, update_P, update_A, update_G)
 
     @nvtx.annotate("KKTSystem::update_scalings_and_factor")
     def update_scalings_and_factor(self, data: Data, settings: Settings, iterative_refinement: bool, rho: cp.ndarray, delta: cp.ndarray, vars: Variables) -> bool:
-        """
-        Update the scaling factors and refactor the KKT matrix.
+        """Update regularization terms and factor the KKT matrix.
 
         TODO: When iterative_refinement (IR) is True, adds static regularization to improve factorization stability. The solve() method will then run IR.
 
         The variable vars is the current primal/dual variable values at this iteration, i.e., values of x, y, z_u, z_l, s_u, s_l, z_bu, z_bl, s_bu, s_bl at the current iteration.
         """
         self._update_reg_and_kkt(data, delta, rho, vars)
-        
         self._use_iterative_refinement = iterative_refinement
         factor_success = self._kkt_solver.factor() # ! this is implicitly assuming idx_hu and idx_hl cover all indices of inequalities 0:m
         return factor_success
-    
-    @nvtx.annotate("KKTSystem::update_reg_and_kkt")
-    @cuda_graph_capture(key=lambda self, data, delta, rho, vars: (vars.buffer_ptr, delta.data.ptr, rho.data.ptr))
+
+    @nvtx.annotate("KKTSystem::_update_reg_and_kkt")
+    @cuda_graph_capture(key=lambda self, data, delta, rho, vars: (vars.buffer_ptr, delta.data.ptr, rho.data.ptr), enable=lambda self: self._settings.enable_cuda_graph)
     def _update_reg_and_kkt(self, data: Data, delta: cp.ndarray, rho: cp.ndarray, vars: Variables):
         """Update the regularization terms x_reg and z_reg for the condensed KKT system after eliminating slacks and duals of inequalities and box constraints. 
         Also update the condensed KKT matrix with the new regularization terms."""
         self._rho[:] = rho
         self._delta[:] = delta
 
-        USE_WARP_IMPLEMENTATION = True  # set to False to use pure cupy implementation for updating regularization, which is easier to debug but slower.
+        USE_WARP_IMPLEMENTATION = True
+        B = self._batch_size
         if USE_WARP_IMPLEMENTATION:
+            wp_stream = wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr)
             wp.launch(
                 kernel=self._update_regulerization_step_1_kernel,
-                dim=data.num_hu + data.num_hl + data.num_xu + data.num_xl,
-                inputs=[vars.s_u, vars.s_l, vars.s_bu, vars.s_bl,
-                        vars.z_u, vars.z_l, vars.z_bu, vars.z_bl,
-                        self._m_s_u, self._m_s_l, self._m_s_bu, self._m_s_bl,
-                        self._m_z_u_inv, self._m_z_l_inv, self._m_z_bu_inv, self._m_z_bl_inv,
-                        self._w_u_delta_inv, self._w_l_delta_inv, self._w_bu_delta_inv, self._w_bl_delta_inv,
+                dim=(B, data.num_ineq),
+                inputs=[vars.s_all, vars.z_all,
+                        self._m_s_all, self._m_z_inv_all, self._w_delta_inv_all,
                         delta],
                 device="cuda",
-                stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+                stream=wp_stream,
             )
             wp.launch(
                 kernel=self._update_regulerization_step_2_kernel,
-                dim=data.n + data.m,
+                dim=(B, data.n + data.m),
                 inputs=[
                     self._inv_idx_xu,
                     self._inv_idx_xl,
@@ -184,78 +214,116 @@ class KKTSystem:
                     self._z_reg,
                 ],
                 device="cuda",
-                stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+                stream=wp_stream,
             )
-
         else:
-            # store the current slack and dual variable values at this iteration
-            self._m_s_u[:] = vars.s_u
-            self._m_s_l[:] = vars.s_l
-            self._m_s_bu[:] = vars.s_bu
-            self._m_s_bl[:] = vars.s_bl
-            cp.reciprocal(vars.z_u, out=self._m_z_u_inv)  # better than self._m_z_u_inv[:] = 1. / vars.z_u since it avoids temporary allocation
-            cp.reciprocal(vars.z_l, out=self._m_z_l_inv)
-            cp.reciprocal(vars.z_bu, out=self._m_z_bu_inv)
-            cp.reciprocal(vars.z_bl, out=self._m_z_bl_inv)
+            # cache s, 1/z and w = 1/(s/z + delta)
+            self._m_s_all[:] = vars.s_all
+            cp.reciprocal(vars.z_all, out=self._m_z_inv_all)
+            cp.multiply(self._m_s_all, self._m_z_inv_all, out=self._w_delta_inv_all)
+            cp.add(self._w_delta_inv_all, delta[:, None], out=self._w_delta_inv_all)
+            cp.reciprocal(self._w_delta_inv_all, out=self._w_delta_inv_all)
 
-            # eliminate the box constraints by adding their contribution to x_reg and z_reg
-            # self._w_bu_delta_inv[:] = 1. / (self._m_s_bu * self._m_z_bu_inv + delta)
-            cp.multiply(self._m_s_bu, self._m_z_bu_inv, out=self._w_bu_delta_inv)
-            cp.add(self._w_bu_delta_inv, delta, out=self._w_bu_delta_inv)
-            cp.reciprocal(self._w_bu_delta_inv, out=self._w_bu_delta_inv)
-            # self._w_bl_delta_inv[:] = 1. / (self._m_s_bl * self._m_z_bl_inv + delta)
-            cp.multiply(self._m_s_bl, self._m_z_bl_inv, out=self._w_bl_delta_inv)
-            cp.add(self._w_bl_delta_inv, delta, out=self._w_bl_delta_inv)
-            cp.reciprocal(self._w_bl_delta_inv, out=self._w_bl_delta_inv)
-            # self._w_u_delta_inv[:] = 1. / (vars.s_u / vars.z_u + delta)
-            cp.multiply(self._m_s_u, self._m_z_u_inv, out=self._w_u_delta_inv)
-            cp.add(self._w_u_delta_inv, delta, out=self._w_u_delta_inv)
-            cp.reciprocal(self._w_u_delta_inv, out=self._w_u_delta_inv)
-            # self._w_l_delta_inv[:] = 1. / (vars.s_l / vars.z_l + delta)
-            cp.multiply(self._m_s_l, self._m_z_l_inv, out=self._w_l_delta_inv)
-            cp.add(self._w_l_delta_inv, delta, out=self._w_l_delta_inv)
-            cp.reciprocal(self._w_l_delta_inv, out=self._w_l_delta_inv)
+            # compute x_reg (B, n) and z_reg (B, m)
+            self._x_reg[:] = rho[:, None]
+            xbs = data.x_b_scaling  # (B, n)
+            if data.num_xu > 0:
+                xbs_xu = xbs[:, data.idx_xu]  # (B, num_xu)
+                self._x_reg[:, data.idx_xu] += xbs_xu * xbs_xu * self._w_bu_delta_inv
+            if data.num_xl > 0:
+                xbs_xl = xbs[:, data.idx_xl]  # (B, num_xl)
+                self._x_reg[:, data.idx_xl] += xbs_xl * xbs_xl * self._w_bl_delta_inv
 
-            self._x_reg[:] = rho[0]
-            xbs_xu = data.x_b_scaling[data.idx_xu]
-            xbs_xl = data.x_b_scaling[data.idx_xl]
-            self._x_reg[data.idx_xu] += xbs_xu * xbs_xu * self._w_bu_delta_inv
-            self._x_reg[data.idx_xl] += xbs_xl * xbs_xl * self._w_bl_delta_inv
-            self._z_reg.fill(0.)
-            self._z_reg[data.idx_hu] += self._w_u_delta_inv
-            self._z_reg[data.idx_hl] += self._w_l_delta_inv
-            cp.reciprocal(self._z_reg, out=self._z_reg)
+            if data.m > 0:
+                self._z_reg[:] = 0.0
+                if data.num_hu > 0:
+                    self._z_reg[:, data.idx_hu] += self._w_u_delta_inv
+                if data.num_hl > 0:
+                    self._z_reg[:, data.idx_hl] += self._w_l_delta_inv
+                cp.reciprocal(self._z_reg, out=self._z_reg)
 
+        # Update KKT matrix
         self._kkt_solver.update_kkt(data, delta, self._x_reg, self._z_reg)
     
     @nvtx.annotate("KKTSystem::solve")
-    def solve(self, data: Data, settings: Settings, rhs: Variables, lhs: Variables) -> None:
-        self._prepare_rhs(data, rhs)
+    def solve(self, data: Data, settings: Settings, rhs: Variables, lhs: Variables,
+              transpose: bool = False) -> None:
+        """Solve either ``K v = rhs`` (default) or ``K^T λ = rhs`` (``transpose=True``).
+
+        The condensed K_c factor built during the last ``update_scalings_and_factor``
+        is reused in both directions: K_c is symmetric, so its cuDSS factor inverts
+        K_c and K_c^T identically. Only the slack-side Schur elimination and back-
+        substitution differ between forward and transposed — handled by swapping
+        ``_eliminate_slacks_kernel`` / ``_recover_slacks_kernel`` for their
+        ``_transposed`` counterparts.
+
+        When ``transpose=True`` the system being solved (for implicit-diff / VJP) is::
+
+            [ P+rho*I   A^T   G^T  -G^T   I_n  -I_n                              ]
+            [ A        -d*I                                                      ]
+            [ G                -d*I              S_hu                            ]
+            [ -G                    -d*I              S_hl                       ]
+            [ I_n                        -d*I               S_xu                 ]
+            [ -I_n                             -d*I              S_xl            ]
+            [                    I_m                        Z_hu                 ]
+            [                          I_m                        Z_hl           ]
+            [                               I_n                         Z_xu     ]
+            [                                    I_n                        Z_xl ]
+
+        which has ``updated_rhs_z = rhs.z - (S/Z) * rhs.s`` (vs forward's
+        ``rhs.z - (1/Z) * rhs.s``) and slack recovery ``lhs.s = (rhs.s - lhs.z) / Z``
+        (vs forward's ``(rhs.s - S * lhs.z) / Z``).
+        """
+        self._prepare_rhs(data, rhs, transpose=transpose)
         self._kkt_solver.solve(data, self._rhs_x_bar, rhs.y, self._rhs_z_bar, lhs.x, lhs.y, self._work_z)  # ! the second _work_z is used to hold delta_z, but useless anyway. Can be further optimized.
-        if self._use_iterative_refinement and settings.iterative_refinement_max_iter > 0:
+        # Iterative refinement applies to the forward condensed solve only (K_c
+        # is symmetric so it *could* run for transpose too, but that path is for
+        # implicit-differentiation gradients where the minor regularization-floor
+        # error is accepted).
+        # TODO: currently only do IR in the QP solve procedure, no IR in the implicit differentiation.
+        if not transpose and self._use_iterative_refinement and settings.iterative_refinement_max_iter > 0:
             self.iterative_refinement(
                 data, settings,
                 self._rhs_x_bar, rhs.y, self._rhs_z_bar,
                 lhs.x, lhs.y, self._work_z)
-        self._recover_lhs(data, rhs, lhs)
+        self._recover_lhs(data, rhs, lhs, transpose=transpose)
 
-    @nvtx.annotate("KKTSystem::solve::_prepare_rhs")
-    @cuda_graph_capture(key=lambda self, data, rhs: (rhs.buffer_ptr,))
-    def _prepare_rhs(self, data: Data, rhs: Variables):
-        """Prepare the rhs for the condensed KKT system after eliminating slacks and duals of inequalities and box constraints."""
-        wp.launch(
-            kernel=self._eliminate_slacks_kernel,
-            dim=data.num_hu+data.num_hl+data.num_xu+data.num_xl,
-            inputs=[rhs.z_u, rhs.s_u, self._m_z_u_inv, self._updated_rhs_z_u,
-                    rhs.z_l, rhs.s_l, self._m_z_l_inv, self._updated_rhs_z_l,
-                    rhs.z_bu, rhs.s_bu, self._m_z_bu_inv, self._updated_rhs_z_bu,
-                    rhs.z_bl, rhs.s_bl, self._m_z_bl_inv, self._updated_rhs_z_bl],
-            device="cuda",
-            stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
-        )
+    @nvtx.annotate("KKTSystem::_prepare_rhs")
+    @cuda_graph_capture(key=lambda self, data, rhs, transpose=False: (rhs.buffer_ptr, bool(transpose)), enable=lambda self: self._settings.enable_cuda_graph)
+    def _prepare_rhs(self, data: Data, rhs: Variables, transpose: bool = False):
+        """Build the condensed KKT rhs by eliminating slacks and duals.
+
+        The dual elimination (bound → x, inequality → z) is direction-agnostic —
+        the reduced system for (x, y, z_cond) has the same LHS in both K and K^T.
+        Only the preceding slack elimination differs: ``_eliminate_slacks_kernel``
+        for forward, ``_eliminate_slacks_transposed_kernel`` for transposed.
+        """
+        B = self._batch_size
+        wp_stream = wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr)
+
+        if transpose:
+            # K^T slack row:  I lhs_z + Z lhs_s = rhs.s → S/Z scaling on rhs_s.
+            wp.launch(
+                kernel=self._eliminate_slacks_transposed_kernel,
+                dim=(B, data.num_ineq),
+                inputs=[rhs.z_all, rhs.s_all, self._m_s_all, self._m_z_inv_all,
+                        self._updated_rhs_z_all],
+                device="cuda",
+                stream=wp_stream,
+            )
+        else:
+            # K slack row:  S lhs_z + Z lhs_s = rhs.s → 1/Z scaling on rhs_s.
+            wp.launch(
+                kernel=self._eliminate_slacks_kernel,
+                dim=(B, data.num_ineq),
+                inputs=[rhs.z_all, rhs.s_all, self._m_z_inv_all, self._updated_rhs_z_all],
+                device="cuda",
+                stream=wp_stream,
+            )
+
         wp.launch(
             kernel=self._eliminate_duals_kernel,
-            dim=data.n + data.m,
+            dim=(B, data.n + data.m),
             inputs=[
                 self._inv_idx_xu, self._inv_idx_xl,
                 self._inv_idx_hu, self._inv_idx_hl,
@@ -270,132 +338,122 @@ class KKTSystem:
                 self._rhs_z_bar,
             ],
             device="cuda",
-            stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+            stream=wp_stream,
         )
 
-        # # ! ALTERNATIVE IMPLEMENTATION (pure cupy operations)
-        # ------ elliminate slack variables from rhs
-        # # rhs_z_u - inv(Z_u) * r_s_u
-        # cp.multiply(self._m_z_u_inv, rhs.s_u, out=self._updated_rhs_z_u)
-        # cp.subtract(rhs.z_u, self._updated_rhs_z_u, out=self._updated_rhs_z_u)
-        # # rhs_z_l - inv(Z_l) * r_s_l
-        # cp.multiply(self._m_z_l_inv, rhs.s_l, out=self._updated_rhs_z_l)
-        # cp.subtract(rhs.z_l, self._updated_rhs_z_l, out=self._updated_rhs_z_l)
-        # # rhs_z_bu - inv(Z_bu) * r_s_bu
-        # cp.multiply(self._m_z_bu_inv, rhs.s_bu, out=self._updated_rhs_z_bu)
-        # cp.subtract(rhs.z_bu, self._updated_rhs_z_bu, out=self._updated_rhs_z_bu)
-        # # rhs_z_bl - inv(Z_bl) * r_s_bl
-        # cp.multiply(self._m_z_bl_inv, rhs.s_bl, out=self._updated_rhs_z_bl)
-        # cp.subtract(rhs.z_bl, self._updated_rhs_z_bl, out=self._updated_rhs_z_bl)
-
-        # ------ elliminate dual variables from rhs to yield one single rhs_z passing to kkt solver
-        # To avoid avoid extra allocation, we use:
-        # self._work_x to hold modified rhs_x (to be passed to KKTSolver), self._work_z to hold modified rhs_z (to be passed to KKTSolver)
-        # use lhs.z_* to hold temporary value self._w_u_delta_inv * self._updated_rhs_z_u, and so on
-
-        # The below code is equivalent to:
-        # self._work_x[:] = rhs.x
-        # self._work_x[data.idx_xu] += self._w_bu_delta_inv * self._updated_rhs_z_bu
-        # self._work_x[data.idx_xl] -= self._w_bl_delta_inv * self._updated_rhs_z_bl
-        # self._work_z[:] = 0.
-        # self._work_z[data.idx_hu] += self._w_u_delta_inv * self._updated_rhs_z_u
-        # self._work_z[data.idx_hl] -= self._w_l_delta_inv * self._updated_rhs_z_l
-        # self._work_z[:] *= self._z_reg
-        
-        # self._work_x[:] = rhs.x
-        # cp.multiply(self._w_bu_delta_inv, self._updated_rhs_z_bu, out=lhs.z_bu)
-        # cp.add.at(self._work_x, data.idx_xu, lhs.z_bu)
-        # cp.multiply(self._w_bl_delta_inv, self._updated_rhs_z_bl, out=lhs.z_bl)
-        # cp.negative(lhs.z_bl, out=lhs.z_bl)
-        # cp.add.at(self._work_x, data.idx_xl, lhs.z_bl)
-        # self._work_z.fill(0)  # faster than cp.zeros assignment
-        # cp.multiply(self._w_u_delta_inv, self._updated_rhs_z_u, out=lhs.z_u) # use lhs.z_u as temporary storage
-        # cp.add.at(self._work_z, data.idx_hu, lhs.z_u)
-        # cp.multiply(self._w_l_delta_inv, self._updated_rhs_z_l, out=lhs.z_l)
-        # cp.negative(lhs.z_l, out=lhs.z_l)
-        # cp.add.at(self._work_z, data.idx_hl, lhs.z_l)
-        # self._work_z[:] *= self._z_reg
+        # # ---- ALTERNATIVE: pure CuPy implementation ----
+        # # Eliminate slacks: forward has updated_rhs_z = rhs_z - inv(Z) * rhs_s,
+        # #                   transpose has updated_rhs_z = rhs_z - (S/Z) * rhs_s.
+        # if transpose:
+        #     cp.multiply(self._m_s_all, self._m_z_inv_all, out=self._updated_rhs_z_all)
+        #     cp.multiply(self._updated_rhs_z_all, rhs.s_all, out=self._updated_rhs_z_all)
+        # else:
+        #     cp.multiply(self._m_z_inv_all, rhs.s_all, out=self._updated_rhs_z_all)
+        # cp.subtract(rhs.z_all, self._updated_rhs_z_all, out=self._updated_rhs_z_all)
+        #
+        # # Eliminate duals → rhs_x_bar, rhs_z_bar  (direction-agnostic)
+        # self._rhs_x_bar[:] = rhs.x
+        # if data.num_xu > 0:
+        #     xbs_xu = data.x_b_scaling[:, data.idx_xu]
+        #     self._rhs_x_bar[:, data.idx_xu] += xbs_xu * self._w_bu_delta_inv * self._updated_rhs_z_bu
+        # if data.num_xl > 0:
+        #     xbs_xl = data.x_b_scaling[:, data.idx_xl]
+        #     self._rhs_x_bar[:, data.idx_xl] -= xbs_xl * self._w_bl_delta_inv * self._updated_rhs_z_bl
+        #
+        # if data.m > 0:
+        #     self._rhs_z_bar[:] = 0.0
+        #     if data.num_hu > 0:
+        #         self._rhs_z_bar[:, data.idx_hu] += self._w_u_delta_inv * self._updated_rhs_z_u
+        #     if data.num_hl > 0:
+        #         self._rhs_z_bar[:, data.idx_hl] -= self._w_l_delta_inv * self._updated_rhs_z_l
+        #     self._rhs_z_bar *= self._z_reg
 
     @nvtx.annotate("KKTSystem::_recover_lhs")
-    @cuda_graph_capture(key=lambda self, data, rhs, lhs: (rhs.buffer_ptr, lhs.buffer_ptr))
-    def _recover_lhs(self, data: Data, rhs: Variables, lhs: Variables):
-        """Recover the full KKT solution from the condense KKT solution."""
-        # TODO: find a cleaner and more flexible to pass stream to eval_G_xn() and so on
-        self.eval_G_xn(data, 1., lhs.x, self._work_z)  # G * delta_x, where delta_x is stored in lhs.x
-        wp.launch(
-            kernel=self._recover_duals_kernel,
-            dim=data.num_hu+data.num_hl+data.num_xu+data.num_xl,
-            inputs=[
-                self._work_z, lhs.x,
-                data.idx_hu, self._w_u_delta_inv, self._updated_rhs_z_u, lhs.z_u,
-                data.idx_hl, self._w_l_delta_inv, self._updated_rhs_z_l, lhs.z_l,
-                data.idx_xu, self._w_bu_delta_inv, self._m_z_bu_inv, rhs.z_bu, rhs.s_bu, lhs.z_bu,
-                data.idx_xl, self._w_bl_delta_inv, self._m_z_bl_inv, rhs.z_bl, rhs.s_bl, lhs.z_bl,
-                data.x_b_scaling],
-            device="cuda",
-            stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
-        )
-        wp.launch(
-            kernel=self._recover_slacks_kernel,
-            dim=data.num_hu+data.num_hl+data.num_xu+data.num_xl,
-            inputs=[rhs.s_u, lhs.z_u, self._m_s_u, self._m_z_u_inv, lhs.s_u,
-                    rhs.s_l, lhs.z_l, self._m_s_l, self._m_z_l_inv, lhs.s_l,
-                    rhs.s_bu, lhs.z_bu, self._m_s_bu, self._m_z_bu_inv, lhs.s_bu,
-                    rhs.s_bl, lhs.z_bl, self._m_s_bl, self._m_z_bl_inv, lhs.s_bl],
-            device="cuda",
-            stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
-        )
+    @cuda_graph_capture(key=lambda self, data, rhs, lhs, transpose=False: (rhs.buffer_ptr, lhs.buffer_ptr, bool(transpose)), enable=lambda self: self._settings.enable_cuda_graph)
+    def _recover_lhs(self, data: Data, rhs: Variables, lhs: Variables, transpose: bool = False):
+        """Back-substitute lhs.z_* and lhs.s_* from the condensed (lhs.x, lhs.y).
 
-        # # ! ALTERNATIVE IMPLEMENTATION (pure cupy operations)
+        The dual back-sub (z_u, z_l, z_bu, z_bl) is direction-agnostic — the row
+        equations for those blocks have the same structure in K and K^T once the
+        slack has been eliminated. Only the final slack recovery differs:
+        forward uses ``lhs.s = (rhs.s - S lhs.z) / Z``, transpose drops the S
+        factor.
+        """
+        B = self._batch_size
+        wp_stream = wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr)
 
-        # ----- recover dual variables on lhs
-        # The below code is equivalent to:
-        # lhs.z_u[:] = self._w_u_delta_inv * (G_dx[data.idx_hu] - self._updated_rhs_z_u)   # delta_z_u
-        # lhs.z_l[:] = self._w_l_delta_inv * (-G_dx[data.idx_hl] - self._updated_rhs_z_l)  # delta_z_l
-        # lhs.z_bu[:] = self._w_bu_delta_inv * (lhs.x[data.idx_xu] - rhs.z_bu + self._m_z_bu_inv * rhs.s_bu)  # delta_z_bu
-        # lhs.z_bl[:] = -self._w_bl_delta_inv * (lhs.x[data.idx_xl] + rhs.z_bl - self._m_z_bl_inv * rhs.s_bl)  # delta_z_bl
-        
-        # lhs.z_u[:] = self._work_z[data.idx_hu]
-        # lhs.z_u -= self._updated_rhs_z_u
-        # lhs.z_u *= self._w_u_delta_inv
+        if data.m > 0:
+            self.eval_G_xn(data, 1., lhs.x, self._work_z)
 
-        # lhs.z_l[:] = self._work_z[data.idx_hl]
-        # lhs.z_l *= -1.
-        # lhs.z_l -= self._updated_rhs_z_l
-        # lhs.z_l *= self._w_l_delta_inv
+        if data.num_ineq > 0:
+            wp.launch(
+                kernel=self._recover_duals_kernel,
+                dim=(B, data.num_ineq),
+                inputs=[
+                    self._work_z, lhs.x,
+                    data.idx_hu, self._w_u_delta_inv, self._updated_rhs_z_u, lhs.z_u,
+                    data.idx_hl, self._w_l_delta_inv, self._updated_rhs_z_l, lhs.z_l,
+                    data.idx_xu, self._w_bu_delta_inv, self._m_z_bu_inv, rhs.z_bu, rhs.s_bu, lhs.z_bu,
+                    data.idx_xl, self._w_bl_delta_inv, self._m_z_bl_inv, rhs.z_bl, rhs.s_bl, lhs.z_bl,
+                    data.x_b_scaling],
+                device="cuda",
+                stream=wp_stream,
+            )
+            if transpose:
+                # lhs.s = (rhs.s - lhs.z) / Z   (no factor of S)
+                wp.launch(
+                    kernel=self._recover_slacks_transposed_kernel,
+                    dim=(B, data.num_ineq),
+                    inputs=[rhs.s_all, lhs.z_all, self._m_z_inv_all, lhs.s_all],
+                    device="cuda",
+                    stream=wp_stream,
+                )
+            else:
+                # lhs.s = (rhs.s - S lhs.z) / Z
+                wp.launch(
+                    kernel=self._recover_slacks_kernel,
+                    dim=(B, data.num_ineq),
+                    inputs=[rhs.s_all, lhs.z_all, self._m_s_all, self._m_z_inv_all, lhs.s_all],
+                    device="cuda",
+                    stream=wp_stream,
+                )
 
-        # cp.multiply(self._m_z_bu_inv, rhs.s_bu, out=lhs.z_bu)
-        # lhs.z_bu += lhs.x[data.idx_xu]
-        # lhs.z_bu -= rhs.z_bu
-        # lhs.z_bu *= self._w_bu_delta_inv
-
-        # cp.multiply(self._m_z_bl_inv, rhs.s_bl, out=lhs.z_bl)
-        # lhs.z_bl -= lhs.x[data.idx_xl]
-        # lhs.z_bl -= rhs.z_bl
-        # lhs.z_bl *= self._w_bl_delta_inv
-        
-        # ----- recover slack variable on lhs
-        # The below code is equivalent to:
-        # lhs.s_u[:] = self._m_z_u_inv * (rhs.s_u - self._m_s_u * lhs.z_u)  # delta_s_u = inv(Z_u) (r_s_u - S_u delta_z_u)
-        # lhs.s_l[:] = self._m_z_l_inv * (rhs.s_l - self._m_s_l * lhs.z_l)  # delta_s_l = inv(Z_l) (r_s_l - S_l delta_z_l)
-        # lhs.s_bu[:] = self._m_z_bu_inv * (rhs.s_bu - self._m_s_bu * lhs.z_bu)  # delta_s_bu = inv(Z_bu) (r_s_bu - S_bu delta_z_bu)
-        # lhs.s_bl[:] = self._m_z_bl_inv * (rhs.s_bl - self._m_s_bl * lhs.z_bl)  # delta_s_bl = inv(Z_bl) (r_s_bl - S_bl delta_z_bl)
-
-        # cp.multiply(self._m_s_u, lhs.z_u, out=lhs.s_u)
-        # cp.subtract(rhs.s_u, lhs.s_u, out=lhs.s_u)
-        # cp.multiply(self._m_z_u_inv, lhs.s_u, out=lhs.s_u)
-
-        # cp.multiply(self._m_s_l, lhs.z_l, out=lhs.s_l)
-        # cp.subtract(rhs.s_l, lhs.s_l, out=lhs.s_l)
-        # cp.multiply(self._m_z_l_inv, lhs.s_l, out=lhs.s_l)
-
-        # cp.multiply(self._m_s_bu, lhs.z_bu, out=lhs.s_bu)
-        # cp.subtract(rhs.s_bu, lhs.s_bu, out=lhs.s_bu)
-        # cp.multiply(self._m_z_bu_inv, lhs.s_bu, out=lhs.s_bu)
-
-        # cp.multiply(self._m_s_bl, lhs.z_bl, out=lhs.s_bl)
-        # cp.subtract(rhs.s_bl, lhs.s_bl, out=lhs.s_bl)
-        # cp.multiply(self._m_z_bl_inv, lhs.s_bl, out=lhs.s_bl)
+        # # ---- ALTERNATIVE: pure CuPy implementation ----
+        # # Recover duals (direction-agnostic)
+        # if data.num_hu > 0:
+        #     lhs.z_u[:] = self._work_z[:, data.idx_hu]
+        #     lhs.z_u -= self._updated_rhs_z_u
+        #     lhs.z_u *= self._w_u_delta_inv
+        #
+        # if data.num_hl > 0:
+        #     lhs.z_l[:] = self._work_z[:, data.idx_hl]
+        #     lhs.z_l *= -1.0
+        #     lhs.z_l -= self._updated_rhs_z_l
+        #     lhs.z_l *= self._w_l_delta_inv
+        #
+        # if data.num_xu > 0:
+        #     xbs_xu = data.x_b_scaling[:, data.idx_xu]
+        #     cp.multiply(self._m_z_bu_inv, rhs.s_bu, out=lhs.z_bu)
+        #     lhs.z_bu += xbs_xu * lhs.x[:, data.idx_xu]
+        #     lhs.z_bu -= rhs.z_bu
+        #     lhs.z_bu *= self._w_bu_delta_inv
+        #
+        # if data.num_xl > 0:
+        #     xbs_xl = data.x_b_scaling[:, data.idx_xl]
+        #     cp.multiply(self._m_z_bl_inv, rhs.s_bl, out=lhs.z_bl)
+        #     lhs.z_bl -= xbs_xl * lhs.x[:, data.idx_xl]
+        #     lhs.z_bl -= rhs.z_bl
+        #     lhs.z_bl *= self._w_bl_delta_inv
+        #
+        # # Recover slacks
+        # if data.num_ineq > 0:
+        #     if transpose:
+        #         cp.subtract(rhs.s_all, lhs.z_all, out=lhs.s_all)
+        #         cp.multiply(lhs.s_all, self._m_z_inv_all, out=lhs.s_all)
+        #     else:
+        #         cp.multiply(self._m_s_all, lhs.z_all, out=lhs.s_all)
+        #         cp.subtract(rhs.s_all, lhs.s_all, out=lhs.s_all)
+        #         cp.multiply(self._m_z_inv_all, lhs.s_all, out=lhs.s_all)
 
     @nvtx.annotate("KKTSystem::iterative_refinement")
     def iterative_refinement(self, data: Data, settings: Settings,
@@ -406,15 +464,17 @@ class KKTSystem:
         Refines (lhs_x, lhs_y, lhs_z) in-place so that
             K_condensed * [lhs_x; lhs_y; lhs_z] ≈ [rhs_x; rhs_y; rhs_z].
 
+        All arrays are (B, k) shaped.
         Matches PIQP's solve() IR loop (kkt_system.tpp lines 294-339).
         Returns False if a non-finite residual is encountered.
         """
-        ref_err_x = self._iter_refine_error_xyz[:data.n]
-        ref_err_y = self._iter_refine_error_xyz[data.n:data.n+data.p]
-        ref_err_z = self._iter_refine_error_xyz[data.n+data.p:]
-        ref_lhs_x = self._iter_refine_delta_xyz[:data.n]
-        ref_lhs_y = self._iter_refine_delta_xyz[data.n:data.n+data.p]
-        ref_lhs_z = self._iter_refine_delta_xyz[data.n+data.p:]
+        n, p, m = data.n, data.p, data.m
+        ref_err_x = self._iter_refine_error_xyz[:, :n]
+        ref_err_y = self._iter_refine_error_xyz[:, n:n+p]
+        ref_err_z = self._iter_refine_error_xyz[:, n+p:]
+        ref_lhs_x = self._iter_refine_delta_xyz[:, :n]
+        ref_lhs_y = self._iter_refine_delta_xyz[:, n:n+p]
+        ref_lhs_z = self._iter_refine_delta_xyz[:, n+p:]
 
         rhs_norm = float(cp.max(cp.abs(rhs_x)))
         if data.p > 0:
@@ -425,7 +485,7 @@ class KKTSystem:
         # Initial error computed on first iteration; subsequent iterations
         # reuse ref_err from candidate evaluation at end of previous iteration.
         refine_error = math.inf
-        VERBOSE_IR = True
+        VERBOSE_IR = False
         tol = settings.iterative_refinement_eps_abs + settings.iterative_refinement_eps_rel * rhs_norm
 
         for i in range(settings.iterative_refinement_max_iter):
@@ -440,7 +500,7 @@ class KKTSystem:
                     ref_err_x, ref_err_y, ref_err_z)
 
             prev_refine_error = refine_error
-            refine_error = float(cp.linalg.norm(self._iter_refine_error_xyz[:data.n + data.p + data.m], ord=cp.inf))
+            refine_error = float(cp.linalg.norm(self._iter_refine_error_xyz[:, :n+p+m].reshape(-1), ord=cp.inf))
 
             if VERBOSE_IR:
                 if i == 0:
@@ -517,7 +577,7 @@ class KKTSystem:
             self.eval_A_xn(data, 1., lhs_x, rhs_y)
             self.eval_AT_xt(data, 1., lhs_y, self._work_x)
             rhs_x += self._work_x
-            rhs_y -= self._delta[0] * lhs_y
+            rhs_y -= self._delta[:, None] * lhs_y
 
         # G block: rhs_z = G*lhs_x, rhs_x += G^T*lhs_z
         if data.m > 0:
@@ -596,399 +656,3 @@ class KKTSystem:
         """
         self._kkt_solver.eval_GT_xt(data, alpha_t, xt, zt)
 
-def create_build_inverse_index_kernel():
-    """Create a kernel that builds an inverse index map: inv_idx[idx[t]] = t."""
-    @wp.kernel
-    def build_inverse_index_kernel(
-        idx: wp.array(dtype=wp.int32),      # pyright: ignore[reportInvalidTypeForm]
-        inv_idx: wp.array(dtype=wp.int32),   # pyright: ignore[reportInvalidTypeForm]
-    ):
-        t = wp.tid()
-        inv_idx[idx[t]] = t
-    return build_inverse_index_kernel
-
-
-def create_update_regularizations_step_1_kernel(num_hu: int, num_hl: int, num_xu: int, num_xl: int):
-    """Create kernel specialized for ..., which will be used in factor and solve. Performs the operation:
-
-        self._m_s_u[:] = vars.s_u
-        self._m_s_l[:] = vars.s_l
-        self._m_s_bu[:] = vars.s_bu
-        self._m_s_bl[:] = vars.s_bl
-
-        self._m_z_u_inv[:] = 1. / vars.z_u
-        self._m_z_l_inv[:] = 1. / vars.z_l
-        self._m_z_bu_inv[:] = 1. / vars.z_bu
-        self._m_z_bl_inv[:] = 1. / vars.z_bl
-
-        self._w_bu_delta_inv[:] = 1. / (self._m_s_bu * self._m_z_bu_inv + delta)
-        self._w_bl_delta_inv[:] = 1. / (self._m_s_bl * self._m_z_bl_inv + delta)
-        self._w_u_delta_inv[:] = 1. / (self._m_s_u * self._m_z_u_inv + delta)
-        self._w_l_delta_inv[:] = 1. / (self._m_s_l * self._m_z_l_inv + delta)
-    """
-    @wp.kernel
-    def update_regularizations_step_1_kernel(
-        vars_s_u: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        vars_s_l: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        vars_s_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        vars_s_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        vars_z_u: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        vars_z_l: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        vars_z_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        vars_z_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        m_s_u: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        m_s_l: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        m_s_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        m_s_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        m_z_u_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        m_z_l_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        m_z_bu_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        m_z_bl_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        w_u_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        w_l_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        w_bu_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        w_bl_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        delta: wp.array(dtype=wp.float64)  # pyright: ignore[reportInvalidTypeForm]
-    ):
-        t = wp.tid()
-        num_hu_static = wp.static(num_hu)
-        num_hl_static = wp.static(num_hl)
-        num_xu_static = wp.static(num_xu)
-        num_xl_static = wp.static(num_xl)
-
-        if t < num_hu_static:
-            m_s_u[t] = vars_s_u[t]
-            m_z_u_inv[t] = wp.float64(1.0) / vars_z_u[t]
-            w_u_delta_inv[t] = wp.float64(1.0) / (m_s_u[t] * m_z_u_inv[t] + delta[0])
-        elif t < num_hu_static + num_hl_static:
-            t_hl = t - num_hu_static
-            m_s_l[t_hl] = vars_s_l[t_hl]
-            m_z_l_inv[t_hl] = wp.float64(1.0) / vars_z_l[t_hl]
-            w_l_delta_inv[t_hl] = wp.float64(1.0) / (m_s_l[t_hl] * m_z_l_inv[t_hl] + delta[0])
-        elif t < num_hu_static + num_hl_static + num_xu_static:
-            t_xu = t - num_hu_static - num_hl_static
-            m_s_bu[t_xu] = vars_s_bu[t_xu]
-            m_z_bu_inv[t_xu] = wp.float64(1.0) / vars_z_bu[t_xu]
-            w_bu_delta_inv[t_xu] = wp.float64(1.0) / (m_s_bu[t_xu] * m_z_bu_inv[t_xu] + delta[0])
-        elif t < num_hu_static + num_hl_static + num_xu_static + num_xl_static:
-            t_xl = t - num_hu_static - num_hl_static - num_xu_static
-            m_s_bl[t_xl] = vars_s_bl[t_xl]
-            m_z_bl_inv[t_xl] = wp.float64(1.0) / vars_z_bl[t_xl]
-            w_bl_delta_inv[t_xl] = wp.float64(1.0) / (m_s_bl[t_xl] * m_z_bl_inv[t_xl] + delta[0])
-        else:
-            return
-    return update_regularizations_step_1_kernel
-
-
-def create_update_regularizations_step_2_kernel(nx: int, nz: int):
-    """Create kernel specialized for computing the regularization terms for x and z
-    using a gather pattern.
-
-    Equivalent to:
-        x_reg[:] = rho
-        x_reg[idx_xu] += w_bu_delta_inv
-        x_reg[idx_xl] += w_bl_delta_inv
-
-        z_reg[:] = 0.
-        z_reg[idx_hu] += w_u_delta_inv
-        z_reg[idx_hl] += w_l_delta_inv
-        z_reg[:] = 1. / z_reg
-
-    Each thread writes only to its own unique slot (x_reg[t] or z_reg[tz]),
-    using inverse index maps to gather contributions.
-    """
-    @wp.kernel
-    def update_regularizations_step_2_kernel(
-        inv_idx_xu: wp.array(dtype=wp.int32),  # pyright: ignore[reportInvalidTypeForm]
-        inv_idx_xl: wp.array(dtype=wp.int32),  # pyright: ignore[reportInvalidTypeForm]
-        inv_idx_hu: wp.array(dtype=wp.int32),  # pyright: ignore[reportInvalidTypeForm]
-        inv_idx_hl: wp.array(dtype=wp.int32),  # pyright: ignore[reportInvalidTypeForm]
-        w_bu_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        w_bl_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        x_b_scaling: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        rho: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        x_reg: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        w_u_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        w_l_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        z_reg: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-    ):
-        t = wp.tid()
-        nx_static = wp.static(nx)
-        nz_static = wp.static(nz)
-
-        if t < nx_static:
-            val = rho[0]
-            xb_scaling = x_b_scaling[t]
-            xb_scaling_squared = xb_scaling * xb_scaling
-            ixu = inv_idx_xu[t]
-            ixl = inv_idx_xl[t]
-            if ixu >= 0:
-                val = val + xb_scaling_squared * w_bu_delta_inv[ixu]
-            if ixl >= 0:
-                val = val + xb_scaling_squared * w_bl_delta_inv[ixl]
-            x_reg[t] = val
-        elif t < nx_static + nz_static:
-            tz = t - nx_static
-            val = wp.float64(0.)
-            ihu = inv_idx_hu[tz]
-            ihl = inv_idx_hl[tz]
-            if ihu >= 0:
-                val = val + w_u_delta_inv[ihu]
-            if ihl >= 0:
-                val = val + w_l_delta_inv[ihl]
-            z_reg[tz] = wp.float64(1.0) / val
-
-    return update_regularizations_step_2_kernel
-
-
-def create_eliminate_duals_kernel(nx: int, nz: int):
-    """Create kernel specialized for eliminating duals using a gather pattern.
-
-    Equivalent to:
-        rhs_x_updated[:] = rhs_x
-        rhs_x_updated[idx_xu] += w_bu_delta_inv * rhs_z_bu
-        rhs_x_updated[idx_xl] -= w_bl_delta_inv * rhs_z_bl
-
-        rhs_z_updated[:] = 0.
-        rhs_z_updated[idx_hu] += w_u_delta_inv * rhs_z_u
-        rhs_z_updated[idx_hl] -= w_l_delta_inv * rhs_z_l
-        rhs_z_updated[:] *= z_reg
-
-    Each thread writes only to its own unique slot (rhs_x_updated[t] or
-    rhs_z_updated[tz]), using inverse index maps to gather contributions.
-    """
-    @wp.kernel
-    def eliminate_duals_kernel(
-        # inverse index maps (gather lookups)
-        inv_idx_xu: wp.array(dtype=wp.int32),  # pyright: ignore[reportInvalidTypeForm]
-        inv_idx_xl: wp.array(dtype=wp.int32),  # pyright: ignore[reportInvalidTypeForm]
-        inv_idx_hu: wp.array(dtype=wp.int32),  # pyright: ignore[reportInvalidTypeForm]
-        inv_idx_hl: wp.array(dtype=wp.int32),  # pyright: ignore[reportInvalidTypeForm]
-        # prepare new rhs_x
-        rhs_x: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        w_bu_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        w_bl_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        x_b_scaling: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        rhs_z_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        rhs_z_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        rhs_x_updated: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        # prepare new rhs_z
-        w_u_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        w_l_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        rhs_z_u: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        rhs_z_l: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        z_reg: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        rhs_z_updated: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-    ):
-        t = wp.tid()
-        nx_static = wp.static(nx)
-        nz_static = wp.static(nz)
-
-        if t < nx_static:
-            val = rhs_x[t]
-            xb_scaling = x_b_scaling[t]
-            ixu = inv_idx_xu[t]
-            ixl = inv_idx_xl[t]
-            if ixu >= 0:
-                val = val + xb_scaling * w_bu_delta_inv[ixu] * rhs_z_bu[ixu]
-            if ixl >= 0:
-                val = val - xb_scaling * w_bl_delta_inv[ixl] * rhs_z_bl[ixl]
-            rhs_x_updated[t] = val
-
-        elif t < nx_static + nz_static:
-            tz = t - nx_static
-            val = wp.float64(0.)
-            ihu = inv_idx_hu[tz]
-            ihl = inv_idx_hl[tz]
-            if ihu >= 0:
-                val = val + w_u_delta_inv[ihu] * rhs_z_u[ihu]
-            if ihl >= 0:
-                val = val - w_l_delta_inv[ihl] * rhs_z_l[ihl]
-            rhs_z_updated[tz] = val * z_reg[tz]
-
-    return eliminate_duals_kernel
-
-
-def create_eliminate_slacks_kernel(num_hu: int, num_hl: int, num_xu: int, num_xl: int):
-    """Create kernel specialized for eliminating slacks. Performs the operation:
-    
-        updated_rhs_z_u = rhs_z_u - inv(Z_u) * r_s_u
-        updated_rhs_z_l = rhs_z_l - inv(Z_l) * r_s_l
-        updated_rhs_z_bu = rhs_z_bu - inv(Z_bu) * r_s_bu
-        updated_rhs_z_bl = rhs_z_bl - inv(Z_bl) * r_s_bl
-    """
-    @wp.kernel
-    def eliminate_slacks_kernel(
-        # h_u
-        rhs_z_u: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        rhs_s_u: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        result_z_u_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        updated_rhs_z_u: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        # h_l
-        rhs_z_l: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        rhs_s_l: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        result_z_l_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        updated_rhs_z_l: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        # x_u
-        rhs_z_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        rhs_s_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        result_z_bu_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        updated_rhs_z_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        # x_l
-        rhs_z_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        rhs_s_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        result_z_bl_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        updated_rhs_z_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-    ):
-        t = wp.tid()
-        num_hu_static = wp.static(num_hu)
-        num_hl_static = wp.static(num_hl)
-        num_xu_static = wp.static(num_xu)
-        num_xl_static = wp.static(num_xl)
-
-        if t < num_hu_static:
-            updated_rhs_z_u[t] = -result_z_u_inv[t] * rhs_s_u[t] + rhs_z_u[t]
-        elif t < num_hu_static + num_hl_static:
-            offset = num_hu_static
-            updated_rhs_z_l[t - offset] = -result_z_l_inv[t - offset] * rhs_s_l[t - offset] + rhs_z_l[t - offset]
-        elif t < num_hu_static + num_hl_static + num_xu_static:
-            offset = num_hu_static + num_hl_static
-            updated_rhs_z_bu[t - offset] = -result_z_bu_inv[t - offset] * rhs_s_bu[t - offset] + rhs_z_bu[t - offset]
-        elif t < num_hu_static + num_hl_static + num_xu_static + num_xl_static:
-            offset = num_hu_static + num_hl_static + num_xu_static
-            updated_rhs_z_bl[t - offset] = -result_z_bl_inv[t - offset] * rhs_s_bl[t - offset] + rhs_z_bl[t - offset]
-        else:
-            return
-
-    return eliminate_slacks_kernel
-
-
-def create_recover_duals_kernel(num_hu: int, num_hl: int, num_xu: int, num_xl: int):
-    """Create kernel specialized for recovering duals. Performs the operation:
-
-        lhs.z_u[:] = self._w_u_delta_inv * (G_dx[data.idx_hu] - self._updated_rhs_z_u)
-        lhs.z_l[:] = self._w_l_delta_inv * (-G_dx[data.idx_hl] - self._updated_rhs_z_l)
-        lhs.z_bu[:] = self._w_bu_delta_inv * (lhs.x[data.idx_xu] - rhs.z_bu + self._m_z_bu_inv * rhs.s_bu)
-        lhs.z_bl[:] = -self._w_bl_delta_inv * (lhs.x[data.idx_xl] + rhs.z_bl - self._m_z_bl_inv * rhs.s_bl)
-    """
-    @wp.kernel
-    def recover_duals_kernel(
-        G_dx: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        lhs_x: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        # h_u
-        idx_hu: wp.array(dtype=wp.int32),  # pyright: ignore[reportInvalidTypeForm]
-        w_u_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        rhs_z_u: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        lhs_z_u: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        # h_l
-        idx_hl: wp.array(dtype=wp.int32),  # pyright: ignore[reportInvalidTypeForm]
-        w_l_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        rhs_z_l: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        lhs_z_l: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        # x_u
-        idx_xu: wp.array(dtype=wp.int32),  # pyright: ignore[reportInvalidTypeForm]
-        w_bu_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        m_z_bu_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        rhs_z_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        rhs_s_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        lhs_z_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        # x_l
-        idx_xl: wp.array(dtype=wp.int32),  # pyright: ignore[reportInvalidTypeForm]
-        w_bl_delta_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        m_z_bl_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        rhs_z_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        rhs_s_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        lhs_z_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        # x_b_scaling
-        x_b_scaling: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-    ):
-        t = wp.tid()
-        num_hu_static = wp.static(num_hu)
-        num_hl_static = wp.static(num_hl)
-        num_xu_static = wp.static(num_xu)
-        num_xl_static = wp.static(num_xl)
-
-        # lhs.z_u[:] = self._w_u_delta_inv * (G_dx[data.idx_hu] - self._updated_rhs_z_u)
-        if t < num_hu_static:
-            lhs_z_u[t] = G_dx[idx_hu[t]] - rhs_z_u[t]
-            lhs_z_u[t] *= w_u_delta_inv[t]
-        # lhs.z_l[:] = self._w_l_delta_inv * (-G_dx[data.idx_hl] - self._updated_rhs_z_l)
-        elif t < num_hu_static + num_hl_static:
-            offset = num_hu_static
-            lhs_z_l[t - offset] = -G_dx[idx_hl[t - offset]] - rhs_z_l[t - offset]
-            lhs_z_l[t - offset] *= w_l_delta_inv[t - offset]
-        # lhs.z_bu[:] = w_bu_delta_inv * (x_b_scaling[idx] * lhs.x[idx] - rhs.z_bu + z_bu_inv * rhs.s_bu)
-        elif t < num_hu_static + num_hl_static + num_xu_static:
-            offset = num_hu_static + num_hl_static
-            idx = idx_xu[t - offset]
-            lhs_z_bu[t - offset] = x_b_scaling[idx] * lhs_x[idx] - rhs_z_bu[t - offset] + m_z_bu_inv[t - offset] * rhs_s_bu[t - offset]
-            lhs_z_bu[t - offset] *= w_bu_delta_inv[t - offset]
-        # lhs.z_bl[:] = -w_bl_delta_inv * (x_b_scaling[idx] * lhs.x[idx] + rhs.z_bl - z_bl_inv * rhs.s_bl)
-        elif t < num_hu_static + num_hl_static + num_xu_static + num_xl_static:
-            offset = num_hu_static + num_hl_static + num_xu_static
-            idx = idx_xl[t - offset]
-            lhs_z_bl[t - offset] = x_b_scaling[idx] * lhs_x[idx] + rhs_z_bl[t - offset] - m_z_bl_inv[t - offset] * rhs_s_bl[t - offset]
-            lhs_z_bl[t - offset] *= -w_bl_delta_inv[t - offset]
-        else:
-            return
-
-    return recover_duals_kernel
-
-
-def create_recover_slacks_kernel(num_hu: int, num_hl: int, num_xu: int, num_xl: int):
-    """Create kernel specialized for eliminating slacks. Performs the operation:
-    
-        updated_lhs_z_u = inv(Z_u) (r_s_u - S_u lhs_z_u)
-        updated_lhs_s_l = inv(Z_l) (r_s_l - S_l lhs_z_l)
-        updated_lhs_s_bu = inv(Z_bu) (r_s_bu - S_bu lhs_z_bu)
-        updated_lhs_s_bl = inv(Z_bl) (r_s_bl - S_bl lhs_z_bl)
-    """
-    @wp.kernel
-    def recover_slacks_kernel(
-        # h_u
-        rhs_s_u: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        lhs_z_u: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        result_s_u: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        result_z_u_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        updated_lhs_s_u: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        # h_l
-        rhs_s_l: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        lhs_z_l: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        result_s_l: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        result_z_l_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        updated_lhs_s_l: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        # x_u
-        rhs_s_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        lhs_z_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        result_s_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        result_z_bu_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        updated_lhs_s_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        # x_l
-        rhs_s_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        lhs_z_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        result_s_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        result_z_bl_inv: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        updated_lhs_s_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-    ):
-        t = wp.tid()
-        num_hu_static = wp.static(num_hu)
-        num_hl_static = wp.static(num_hl)
-        num_xu_static = wp.static(num_xu)
-        num_xl_static = wp.static(num_xl)
-
-        if t < num_hu_static:
-            # explicitly first do -result_s_u[t] * lhs_z_u[t], then add rhs_s_u[t], to trigger FMA, which is faster and more accurate
-            updated_lhs_s_u[t] = result_z_u_inv[t] * (-result_s_u[t] * lhs_z_u[t] + rhs_s_u[t])
-        elif t < num_hu_static + num_hl_static:
-            offset = num_hu_static
-            updated_lhs_s_l[t - offset] = result_z_l_inv[t - offset] * (-result_s_l[t - offset] * lhs_z_l[t - offset] + rhs_s_l[t - offset])
-        elif t < num_hu_static + num_hl_static + num_xu_static:
-            offset = num_hu_static + num_hl_static
-            updated_lhs_s_bu[t - offset] = result_z_bu_inv[t - offset] * (-result_s_bu[t - offset] * lhs_z_bu[t - offset] + rhs_s_bu[t - offset])
-        elif t < num_hu_static + num_hl_static + num_xu_static + num_xl_static:
-            offset = num_hu_static + num_hl_static + num_xu_static
-            updated_lhs_s_bl[t - offset] = result_z_bl_inv[t - offset] * (-result_s_bl[t - offset] * lhs_z_bl[t - offset] + rhs_s_bl[t - offset])
-        else:
-            return
-
-    return recover_slacks_kernel
