@@ -68,8 +68,8 @@ class RuizEquilibration(ABC):
         self._delta_b_inv = cp.ones((B, n), dtype=cp.float64)
 
         # Cost scaling: (B,)
-        self._c_scaling = cp.ones(B, dtype=cp.float64)
-        self._c_scaling_inv = cp.ones(B, dtype=cp.float64)
+        self._cost_scaling = cp.ones(B, dtype=cp.float64)
+        self._cost_scaling_inv = cp.ones(B, dtype=cp.float64)
 
         # x_b_scaling: (B, n) — 1 for bounded variables, 0 for unbounded.
         # Bound structure is shared across batch, so init is the same for all b.
@@ -90,15 +90,15 @@ class RuizEquilibration(ABC):
 
     @property
     def c_scaling(self) -> cp.ndarray:
-        return self._c_scaling
+        return self._cost_scaling
 
     @c_scaling.setter
     def c_scaling(self, value):
-        self._c_scaling[:] = value
+        self._cost_scaling[:] = value
 
     @property
     def c_scaling_inv(self) -> cp.ndarray:
-        return self._c_scaling_inv
+        return self._cost_scaling_inv
 
     @property
     def delta(self) -> cp.ndarray:
@@ -125,8 +125,8 @@ class RuizEquilibration(ABC):
         self._delta_inv.fill(1.0)
         self._delta_b.fill(1.0)
         self._delta_b_inv.fill(1.0)
-        self._c_scaling.fill(1.0)
-        self._c_scaling_inv.fill(1.0)
+        self._cost_scaling.fill(1.0)
+        self._cost_scaling_inv.fill(1.0)
         cp.copyto(self._x_b_scaling, self._x_b_scaling_init)
 
     @nvtx.annotate("RuizEquilibration::scale_data")
@@ -173,7 +173,7 @@ class RuizEquilibration(ABC):
         # Compute inverses
         cp.reciprocal(self._delta, out=self._delta_inv)
         cp.reciprocal(self._delta_b, out=self._delta_b_inv)
-        cp.reciprocal(self._c_scaling, out=self._c_scaling_inv)
+        cp.reciprocal(self._cost_scaling, out=self._cost_scaling_inv)
 
         # Write x_b_scaling to data for use by KKT system and solver
         cp.copyto(data._x_b_scaling, self._x_b_scaling)
@@ -244,19 +244,19 @@ class RuizEquilibration(ABC):
 
     def unscale_dual_eq(self, y: cp.ndarray) -> cp.ndarray:
         """y_orig = c_inv * delta_y * y_scaled"""
-        return y * self._c_scaling_inv[:, None] * self._delta[:, self.n:self.n + self.p]
+        return y * self._cost_scaling_inv[:, None] * self._delta[:, self.n:self.n + self.p]
 
     def scale_dual_eq(self, y: cp.ndarray) -> cp.ndarray:
         """y_scaled = c * delta_inv_y * y_orig"""
-        return y * self._c_scaling[:, None] * self._delta_inv[:, self.n:self.n + self.p]
+        return y * self._cost_scaling[:, None] * self._delta_inv[:, self.n:self.n + self.p]
 
     def unscale_dual_ineq(self, z: cp.ndarray, idx: cp.ndarray) -> cp.ndarray:
         """z_orig = c_inv * delta_z[idx] * z_scaled"""
-        return z * self._c_scaling_inv[:, None] * self._delta[:, self.n + self.p + idx]
+        return z * self._cost_scaling_inv[:, None] * self._delta[:, self.n + self.p + idx]
 
     def unscale_dual_b(self, z_b: cp.ndarray, idx: cp.ndarray) -> cp.ndarray:
         """z_b_orig = c_inv * delta_b[idx] * z_b_scaled"""
-        return z_b * self._c_scaling_inv[:, None] * self._delta_b[:, idx]
+        return z_b * self._cost_scaling_inv[:, None] * self._delta_b[:, idx]
 
     def unscale_slack_ineq(self, s: cp.ndarray, idx: cp.ndarray) -> cp.ndarray:
         """s_orig = delta_inv_z[idx] * s_scaled"""
@@ -272,7 +272,7 @@ class RuizEquilibration(ABC):
 
     def unscale_dual_res(self, v: cp.ndarray) -> cp.ndarray:
         """v_orig = c_inv * delta_inv_x * v_scaled"""
-        return v * self._c_scaling_inv[:, None] * self._delta_inv[:, :self.n]
+        return v * self._cost_scaling_inv[:, None] * self._delta_inv[:, :self.n]
 
     def unscale_primal_res_eq(self, v: cp.ndarray) -> cp.ndarray:
         """v_orig = delta_inv_y * v_scaled"""
@@ -292,7 +292,7 @@ class RuizEquilibration(ABC):
 
     def unscale_cost(self, cost: cp.ndarray) -> cp.ndarray:
         """cost_orig = c_inv * cost_scaled"""
-        return cost * self._c_scaling_inv
+        return cost * self._cost_scaling_inv
 
     def _compute_kkt_norms(self, data: Data, d: cp.ndarray, d_b: cp.ndarray):
         """Compute inf-norms of each KKT row/column into d — shape (B, n+p+m).

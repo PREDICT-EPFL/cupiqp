@@ -62,11 +62,11 @@ class DenseRuizEquilibration(RuizEquilibration):
 
     def _unscale_matrices(self, data,
                           d_x_inv: cp.ndarray, d_y_inv: cp.ndarray, d_z_inv: cp.ndarray):
-        c_inv = self._c_scaling_inv[:, None, None]  # (B, 1, 1) for P, reuse as needed
+        c_inv = self._cost_scaling_inv[:, None, None]  # (B, 1, 1) for P, reuse as needed
         data._P *= c_inv
         data._P *= d_x_inv[:, None, :]
         data._P *= d_x_inv[:, :, None]
-        data._c *= self._c_scaling_inv[:, None] * d_x_inv
+        data._c *= self._cost_scaling_inv[:, None] * d_x_inv
         if self.p > 0:
             data._A *= d_x_inv[:, None, :]
             data._A *= d_y_inv[:, :, None]

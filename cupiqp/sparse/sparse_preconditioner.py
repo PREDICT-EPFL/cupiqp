@@ -68,10 +68,10 @@ class SparseRuizEquilibration(RuizEquilibration):
 
     def _unscale_matrices(self, data: Data,
                           d_x_inv: cp.ndarray, d_y_inv: cp.ndarray, d_z_inv: cp.ndarray):
-        data._P.data *= self._c_scaling_inv[:, None]
+        data._P.data *= self._cost_scaling_inv[:, None]
         self._batched_row_scale(data._P, d_x_inv)
         self._batched_col_scale(data._P, d_x_inv)
-        data._c *= self._c_scaling_inv[:, None] * d_x_inv
+        data._c *= self._cost_scaling_inv[:, None] * d_x_inv
 
         if self.p > 0:
             self._batched_row_scale(data._A, d_y_inv)
