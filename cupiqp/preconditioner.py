@@ -6,11 +6,149 @@ from .data import Data
 from .results import Variables
 
 
-class RuizEquilibration(ABC):
+class PreconditionerBase(ABC):
+    """Abstract preconditioner interface for QP problems — batched.
+
+    Defines only the operations the solver depends on. Concrete preconditioners
+    (Ruiz equilibration, identity, block-Jacobi, ...) choose their own internal
+    representation (diagonal vectors, sparse factors, ...).
+
+    Contract with the solver:
+        * scale_data / unscale_data / apply_scaling — transform the problem data.
+        * scale_primal / unscale_primal, scale_dual_eq / unscale_dual_eq, ...
+          — map individual vectors between scaled and original coordinates.
+        * unscale_solution — convenience that unscales a full Variables struct.
+        * x_b_scaling, cost_scaling, cost_scaling_inv — state the KKT solver and
+          solver read directly.
+        * reset — restore to identity scaling.
+    """
+
+    # ------------------------------------------------------------------
+    # Data-level scaling
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    def scale_data(self, data: Data, *args, **kwargs):
+        """Compute scalings from data and apply them to the problem matrices/vectors."""
+        ...
+
+    @abstractmethod
+    def unscale_data(self, data: Data):
+        """Reverse all scaling transformations on the problem data."""
+        ...
+
+    @abstractmethod
+    def apply_scaling(self, data: Data):
+        """Re-apply stored scaling to fresh (unscaled) data."""
+        ...
+
+    @abstractmethod
+    def reset(self):
+        """Restore the preconditioner to identity (no) scaling."""
+        ...
+
+    # ------------------------------------------------------------------
+    # State exposed to the solver / KKT system
+    # ------------------------------------------------------------------
+
+    @property
+    @abstractmethod
+    def cost_scaling(self) -> cp.ndarray:
+        """(B,) scalar objective scaling."""
+        ...
+
+    @property
+    @abstractmethod
+    def cost_scaling_inv(self) -> cp.ndarray:
+        """(B,) inverse of cost_scaling."""
+        ...
+
+    @property
+    @abstractmethod
+    def x_b_scaling(self) -> cp.ndarray:
+        """(B, n) diagonal of the box block in the scaled KKT matrix.
+
+        Zero for unbounded variables, nonzero for bounded ones.
+        """
+        ...
+
+    # ------------------------------------------------------------------
+    # Full-solution unscaling — generic, dispatches to per-component methods
+    # ------------------------------------------------------------------
+
+    @nvtx.annotate("Preconditioner::unscale_solution")
+    def unscale_solution(self, result: Variables, data: Data):
+        """Transform scaled IPM solution back to original coordinates, in place."""
+        self.unscale_primal(result.x, out=result.x)
+
+        if data.p > 0:
+            self.unscale_dual_eq(result.y, out=result.y)
+
+        if data.num_hu > 0:
+            self.unscale_dual_ineq(result.z_u, data.idx_hu, out=result.z_u)
+            self.unscale_slack_ineq(result.s_u, data.idx_hu, out=result.s_u)
+        if data.num_hl > 0:
+            self.unscale_dual_ineq(result.z_l, data.idx_hl, out=result.z_l)
+            self.unscale_slack_ineq(result.s_l, data.idx_hl, out=result.s_l)
+        if data.num_xu > 0:
+            self.unscale_dual_b(result.z_bu, data.idx_xu, out=result.z_bu)
+            self.unscale_slack_b(result.s_bu, data.idx_xu, out=result.s_bu)
+        if data.num_xl > 0:
+            self.unscale_dual_b(result.z_bl, data.idx_xl, out=result.z_bl)
+            self.unscale_slack_b(result.s_bl, data.idx_xl, out=result.s_bl)
+
+    # ------------------------------------------------------------------
+    # Per-component scaling / unscaling (abstract).
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    def unscale_primal(self, x: cp.ndarray, out: cp.ndarray): ...
+
+    @abstractmethod
+    def scale_primal(self, x: cp.ndarray, out: cp.ndarray): ...
+
+    @abstractmethod
+    def unscale_dual_eq(self, y: cp.ndarray, out: cp.ndarray): ...
+
+    @abstractmethod
+    def scale_dual_eq(self, y: cp.ndarray, out: cp.ndarray): ...
+
+    @abstractmethod
+    def unscale_dual_ineq(self, z: cp.ndarray, idx: cp.ndarray, out: cp.ndarray): ...
+
+    @abstractmethod
+    def unscale_dual_b(self, z_b: cp.ndarray, idx: cp.ndarray, out: cp.ndarray): ...
+
+    @abstractmethod
+    def unscale_slack_ineq(self, s: cp.ndarray, idx: cp.ndarray, out: cp.ndarray): ...
+
+    @abstractmethod
+    def unscale_slack_b(self, s_b: cp.ndarray, idx: cp.ndarray, out: cp.ndarray): ...
+
+    @abstractmethod
+    def unscale_dual_res(self, v: cp.ndarray, out: cp.ndarray): ...
+
+    @abstractmethod
+    def unscale_primal_res_eq(self, v: cp.ndarray, out: cp.ndarray): ...
+
+    @abstractmethod
+    def unscale_primal_res_ineq(self, v: cp.ndarray, idx: cp.ndarray, out: cp.ndarray): ...
+
+    @abstractmethod
+    def unscale_primal_res_b(self, v: cp.ndarray, idx: cp.ndarray, out: cp.ndarray): ...
+
+    @abstractmethod
+    def unscale_cost(self, cost: cp.ndarray, out: cp.ndarray): ...
+
+
+class RuizEquilibration(PreconditionerBase):
     """Ruiz equilibration preconditioner for QP problems — batched.
 
-    All scaling vectors carry a leading batch dimension ``(B, ...)``.
-    For single problems, ``B = 1``.
+    Diagonal preconditioner: stores (delta, delta_b, cost_scaling) as vectors
+    and uses them multiplicatively in every scale/unscale operation.
+
+    All scaling vectors carry a leading batch dimension ``(B, ...)``. For
+    single problems, ``B = 1``.
 
     Iteratively scale the following matrix so that each row/column has inf-norm close to 1:
 
@@ -37,10 +175,12 @@ class RuizEquilibration(ABC):
 
     After convergence, bounds are scaled: b *= d_y, h *= d_z, x_l/x_u *= delta_b.
 
+    x_b_scaling = x_b_scaling_init * delta_b * delta_x
+
     Solution unscaling recovers original coordinates:
-        x_orig = delta_x * x_scaled
-        y_orig = c_inv * delta_y * y_scaled
-        z_orig = c_inv * delta_z * z_scaled
+        x_orig   = delta_x * x_scaled
+        y_orig   = c_inv * delta_y * y_scaled
+        z_orig   = c_inv * delta_z * z_scaled
         z_b_orig = c_inv * delta_b * z_b_scaled
     """
 
@@ -88,6 +228,10 @@ class RuizEquilibration(ABC):
 
         self._work_n = cp.empty((B, n), dtype=cp.float64)
 
+    # ------------------------------------------------------------------
+    # State accessors
+    # ------------------------------------------------------------------
+
     @property
     def cost_scaling(self) -> cp.ndarray:
         return self._cost_scaling
@@ -118,6 +262,10 @@ class RuizEquilibration(ABC):
 
     @property
     def x_b_scaling(self) -> cp.ndarray:
+        """x_b_scaling = x_b_scaling_init * delta_b * delta_x
+
+        where x_b_scaling_init is a mask of 0/1 indicating whether x[i] has a finite bound.
+        """
         return self._x_b_scaling
 
     def reset(self):
@@ -128,6 +276,10 @@ class RuizEquilibration(ABC):
         self._cost_scaling.fill(1.0)
         self._cost_scaling_inv.fill(1.0)
         cp.copyto(self._x_b_scaling, self._x_b_scaling_init)
+
+    # ------------------------------------------------------------------
+    # Data-level scaling
+    # ------------------------------------------------------------------
 
     @nvtx.annotate("RuizEquilibration::scale_data")
     def scale_data(self, data: Data, scale_cost: bool, max_iter: int):
@@ -175,9 +327,6 @@ class RuizEquilibration(ABC):
         cp.reciprocal(self._delta_b, out=self._delta_b_inv)
         cp.reciprocal(self._cost_scaling, out=self._cost_scaling_inv)
 
-        # Write x_b_scaling to data for use by KKT system and solver
-        cp.copyto(data._x_b_scaling, self._x_b_scaling)
-
         # Scale bounds
         self._scale_bounds(data)
 
@@ -191,7 +340,6 @@ class RuizEquilibration(ABC):
 
         self._unscale_matrices(data, d_x_inv, d_y_inv, d_z_inv)
         self._unscale_bounds(data)
-        data._x_b_scaling.fill(1.0)
         self._x_b_scaling *= self._delta_b_inv * d_x_inv
         self.reset()
 
@@ -204,95 +352,76 @@ class RuizEquilibration(ABC):
         d_z = self._delta[:, n + p:]
 
         self._apply_stored_scaling(data, d_x, d_y, d_z)
-
-        cp.copyto(data._x_b_scaling, self._x_b_scaling)
         self._scale_bounds(data)
-
-    @nvtx.annotate("RuizEquilibration::unscale_solution")
-    def unscale_solution(self, result: Variables, data: Data):
-        """Transform scaled IPM solution back to original coordinates.
-        Matches C++ PIQP SolverBase::unscale_results()."""
-        result.x[:] = self.unscale_primal(result.x)
-
-        if self.p > 0:
-            result.y[:] = self.unscale_dual_eq(result.y)
-
-        if data.num_hu > 0:
-            result.z_u[:] = self.unscale_dual_ineq(result.z_u, data.idx_hu)
-            result.s_u[:] = self.unscale_slack_ineq(result.s_u, data.idx_hu)
-        if data.num_hl > 0:
-            result.z_l[:] = self.unscale_dual_ineq(result.z_l, data.idx_hl)
-            result.s_l[:] = self.unscale_slack_ineq(result.s_l, data.idx_hl)
-        if data.num_xu > 0:
-            result.z_bu[:] = self.unscale_dual_b(result.z_bu, data.idx_xu)
-            result.s_bu[:] = self.unscale_slack_b(result.s_bu, data.idx_xu)
-        if data.num_xl > 0:
-            result.z_bl[:] = self.unscale_dual_b(result.z_bl, data.idx_xl)
-            result.s_bl[:] = self.unscale_slack_b(result.s_bl, data.idx_xl)
 
     # ------------------------------------------------------------------
     # Primal / dual / slack scaling and unscaling
     # ------------------------------------------------------------------
 
-    def unscale_primal(self, x: cp.ndarray) -> cp.ndarray:
-        """x_orig = delta_x * x_scaled"""
-        return x * self._delta[:, :self.n]
+    def unscale_primal(self, x: cp.ndarray, out: cp.ndarray):
+        """out = delta_x * x_scaled"""
+        cp.multiply(x, self._delta[:, :self.n], out=out)
 
-    def scale_primal(self, x: cp.ndarray) -> cp.ndarray:
-        """x_scaled = delta_inv_x * x_orig"""
-        return x * self._delta_inv[:, :self.n]
+    def scale_primal(self, x: cp.ndarray, out: cp.ndarray):
+        """out = delta_inv_x * x_orig"""
+        cp.multiply(x, self._delta_inv[:, :self.n], out=out)
 
-    def unscale_dual_eq(self, y: cp.ndarray) -> cp.ndarray:
-        """y_orig = c_inv * delta_y * y_scaled"""
-        return y * self._cost_scaling_inv[:, None] * self._delta[:, self.n:self.n + self.p]
+    def unscale_dual_eq(self, y: cp.ndarray, out: cp.ndarray):
+        """out = c_inv * delta_y * y_scaled"""
+        cp.multiply(y, self._delta[:, self.n:self.n + self.p], out=out)
+        out *= self._cost_scaling_inv[:, None]
 
-    def scale_dual_eq(self, y: cp.ndarray) -> cp.ndarray:
-        """y_scaled = c * delta_inv_y * y_orig"""
-        return y * self._cost_scaling[:, None] * self._delta_inv[:, self.n:self.n + self.p]
+    def scale_dual_eq(self, y: cp.ndarray, out: cp.ndarray):
+        """out = c * delta_inv_y * y_orig"""
+        cp.multiply(y, self._delta_inv[:, self.n:self.n + self.p], out=out)
+        out *= self._cost_scaling[:, None]
 
-    def unscale_dual_ineq(self, z: cp.ndarray, idx: cp.ndarray) -> cp.ndarray:
-        """z_orig = c_inv * delta_z[idx] * z_scaled"""
-        return z * self._cost_scaling_inv[:, None] * self._delta[:, self.n + self.p + idx]
+    def unscale_dual_ineq(self, z: cp.ndarray, idx: cp.ndarray, out: cp.ndarray):
+        """out = c_inv * delta_z[idx] * z_scaled"""
+        cp.multiply(z, self._delta[:, self.n + self.p + idx], out=out)
+        out *= self._cost_scaling_inv[:, None]
 
-    def unscale_dual_b(self, z_b: cp.ndarray, idx: cp.ndarray) -> cp.ndarray:
-        """z_b_orig = c_inv * delta_b[idx] * z_b_scaled"""
-        return z_b * self._cost_scaling_inv[:, None] * self._delta_b[:, idx]
+    def unscale_dual_b(self, z_b: cp.ndarray, idx: cp.ndarray, out: cp.ndarray):
+        """out = c_inv * delta_b[idx] * z_b_scaled"""
+        cp.multiply(z_b, self._delta_b[:, idx], out=out)
+        out *= self._cost_scaling_inv[:, None]
 
-    def unscale_slack_ineq(self, s: cp.ndarray, idx: cp.ndarray) -> cp.ndarray:
-        """s_orig = delta_inv_z[idx] * s_scaled"""
-        return s * self._delta_inv[:, self.n + self.p + idx]
+    def unscale_slack_ineq(self, s: cp.ndarray, idx: cp.ndarray, out: cp.ndarray):
+        """out = delta_inv_z[idx] * s_scaled"""
+        cp.multiply(s, self._delta_inv[:, self.n + self.p + idx], out=out)
 
-    def unscale_slack_b(self, s_b: cp.ndarray, idx: cp.ndarray) -> cp.ndarray:
-        """s_b_orig = delta_b_inv[idx] * s_b_scaled"""
-        return s_b * self._delta_b_inv[:, idx]
+    def unscale_slack_b(self, s_b: cp.ndarray, idx: cp.ndarray, out: cp.ndarray):
+        """out = delta_b_inv[idx] * s_b_scaled"""
+        cp.multiply(s_b, self._delta_b_inv[:, idx], out=out)
 
     # ------------------------------------------------------------------
     # Residual unscaling (used every iteration for convergence checks)
     # ------------------------------------------------------------------
 
-    def unscale_dual_res(self, v: cp.ndarray) -> cp.ndarray:
-        """v_orig = c_inv * delta_inv_x * v_scaled"""
-        return v * self._cost_scaling_inv[:, None] * self._delta_inv[:, :self.n]
+    def unscale_dual_res(self, v: cp.ndarray, out: cp.ndarray):
+        """out = c_inv * delta_inv_x * v_scaled"""
+        cp.multiply(v, self._delta_inv[:, :self.n], out=out)
+        out *= self._cost_scaling_inv[:, None]
 
-    def unscale_primal_res_eq(self, v: cp.ndarray) -> cp.ndarray:
-        """v_orig = delta_inv_y * v_scaled"""
-        return v * self._delta_inv[:, self.n:self.n + self.p]
+    def unscale_primal_res_eq(self, v: cp.ndarray, out: cp.ndarray):
+        """out = delta_inv_y * v_scaled"""
+        cp.multiply(v, self._delta_inv[:, self.n:self.n + self.p], out=out)
 
-    def unscale_primal_res_ineq(self, v: cp.ndarray, idx: cp.ndarray) -> cp.ndarray:
-        """v_orig = delta_inv_z[idx] * v_scaled"""
-        return v * self._delta_inv[:, self.n + self.p + idx]
+    def unscale_primal_res_ineq(self, v: cp.ndarray, idx: cp.ndarray, out: cp.ndarray):
+        """out = delta_inv_z[idx] * v_scaled"""
+        cp.multiply(v, self._delta_inv[:, self.n + self.p + idx], out=out)
 
-    def unscale_primal_res_b(self, v: cp.ndarray, idx: cp.ndarray) -> cp.ndarray:
-        """v_orig = delta_b_inv[idx] * v_scaled"""
-        return v * self._delta_b_inv[:, idx]
+    def unscale_primal_res_b(self, v: cp.ndarray, idx: cp.ndarray, out: cp.ndarray):
+        """out = delta_b_inv[idx] * v_scaled"""
+        cp.multiply(v, self._delta_b_inv[:, idx], out=out)
 
     # ------------------------------------------------------------------
     # Cost unscaling
     # ------------------------------------------------------------------
 
-    def unscale_cost(self, cost: cp.ndarray) -> cp.ndarray:
-        """cost_orig = c_inv * cost_scaled"""
-        return cost * self._cost_scaling_inv
+    def unscale_cost(self, cost: cp.ndarray, out: cp.ndarray):
+        """out = c_inv * cost_scaled"""
+        cp.multiply(cost, self._cost_scaling_inv, out=out)
 
     def _compute_kkt_norms(self, data: Data, d: cp.ndarray, d_b: cp.ndarray):
         """Compute inf-norms of each KKT row/column into d — shape (B, n+p+m).
@@ -312,6 +441,10 @@ class RuizEquilibration(ABC):
             self.eval_G_col_inf_norms(data.G, self._work_n)
             d[:, :n] = cp.maximum(d[:, :n], self._work_n)
             self.eval_G_row_inf_norms(data.G, d[:, n+p:n+p+m])
+
+    # ------------------------------------------------------------------
+    # Backend hooks — implemented by DenseRuiz / SparseRuiz / MultistageRuiz
+    # ------------------------------------------------------------------
 
     @abstractmethod
     def eval_P_row_inf_norms(self, P, out: cp.ndarray):

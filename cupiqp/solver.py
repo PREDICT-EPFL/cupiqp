@@ -155,24 +155,34 @@ class SolverBase:
             # Compute unscaled constraints RHS norm from original (pre-scaling) bounds — (B,)
             self._constraints_rhs_inf_norm_unscaled = cp.zeros(B, dtype=cp.float64)
             if p > 0:
+                tmp = cp.empty_like(self._data.b)
+                pc.unscale_primal_res_eq(self._data.b, out=tmp)
                 cp.maximum(self._constraints_rhs_inf_norm_unscaled,
-                           cp.max(cp.abs(pc.unscale_primal_res_eq(self._data.b)), axis=1),
+                           cp.max(cp.abs(tmp), axis=1),
                            out=self._constraints_rhs_inf_norm_unscaled)
             if self._data.num_hu > 0:
+                tmp = self._data.h_u[:, self._data.idx_hu]   # fancy indexing → fresh copy
+                pc.unscale_primal_res_ineq(tmp, self._data.idx_hu, out=tmp)
                 cp.maximum(self._constraints_rhs_inf_norm_unscaled,
-                           cp.max(cp.abs(pc.unscale_primal_res_ineq(self._data.h_u[:, self._data.idx_hu], self._data.idx_hu)), axis=1),
+                           cp.max(cp.abs(tmp), axis=1),
                            out=self._constraints_rhs_inf_norm_unscaled)
             if self._data.num_hl > 0:
+                tmp = self._data.h_l[:, self._data.idx_hl]
+                pc.unscale_primal_res_ineq(tmp, self._data.idx_hl, out=tmp)
                 cp.maximum(self._constraints_rhs_inf_norm_unscaled,
-                           cp.max(cp.abs(pc.unscale_primal_res_ineq(self._data.h_l[:, self._data.idx_hl], self._data.idx_hl)), axis=1),
+                           cp.max(cp.abs(tmp), axis=1),
                            out=self._constraints_rhs_inf_norm_unscaled)
             if self._data.num_xu > 0:
+                tmp = self._data.x_u[:, self._data.idx_xu]
+                pc.unscale_primal_res_b(tmp, self._data.idx_xu, out=tmp)
                 cp.maximum(self._constraints_rhs_inf_norm_unscaled,
-                           cp.max(cp.abs(pc.unscale_primal_res_b(self._data.x_u[:, self._data.idx_xu], self._data.idx_xu)), axis=1),
+                           cp.max(cp.abs(tmp), axis=1),
                            out=self._constraints_rhs_inf_norm_unscaled)
             if self._data.num_xl > 0:
+                tmp = self._data.x_l[:, self._data.idx_xl]
+                pc.unscale_primal_res_b(tmp, self._data.idx_xl, out=tmp)
                 cp.maximum(self._constraints_rhs_inf_norm_unscaled,
-                           cp.max(cp.abs(pc.unscale_primal_res_b(self._data.x_l[:, self._data.idx_xl], self._data.idx_xl)), axis=1),
+                           cp.max(cp.abs(tmp), axis=1),
                            out=self._constraints_rhs_inf_norm_unscaled)
         else:
             self._cost_scaling_inv = cp.ones(B, dtype=cp.float64)                                                                               # (B,)
@@ -424,6 +434,7 @@ class SolverBase:
 
         self._kkt_system.update_scalings_and_factor(
             self._data,
+            self._preconditioner,
             self.settings,
             self._enable_iterative_refinement,
             self._result.info.rho,
@@ -443,7 +454,7 @@ class SolverBase:
             self._res.z_bu[:] = self._data.x_u[:, self._data.idx_xu]
         self._res.s_all[:] = 0.
 
-        self._kkt_system.solve(self._data, self.settings, self._res, self._result)  # getting an initial point of _result
+        self._kkt_system.solve(self._data, self._preconditioner, self.settings, self._res, self._result)  # getting an initial point of _result
 
         if self.settings.debug:
             print("Initial point after solving KKT system:", self._result)
@@ -505,7 +516,7 @@ class SolverBase:
         retries = 0
         while retries < self.settings.max_factor_retires:
             factor_succeeded = self._kkt_system.update_scalings_and_factor(
-                self._data, self.settings, self._enable_iterative_refinement,
+                self._data, self._preconditioner, self.settings, self._enable_iterative_refinement,
                 self._result.info.rho, self._result.info.delta, self._result)
             if factor_succeeded:
                 break
@@ -524,7 +535,7 @@ class SolverBase:
 
     @nvtx.annotate("Solver::_run_full_newton_step")
     def _run_full_newton_step(self):
-        self._kkt_system.solve(self._data, self.settings, self._res, self._step)
+        self._kkt_system.solve(self._data, self._preconditioner, self.settings, self._res, self._step)
 
         USE_WARP_IMPLEMENTATION = True
         if USE_WARP_IMPLEMENTATION:
@@ -573,7 +584,7 @@ class SolverBase:
         if self.settings.debug:
             print("predictor step rhs is: res= ", self._res)
 
-        self._kkt_system.solve(self._data, self.settings, self._res, self._step)
+        self._kkt_system.solve(self._data, self._preconditioner, self.settings, self._res, self._step)
 
         if self.settings.debug:
             print("predictor step is:", self._step)
@@ -603,7 +614,7 @@ class SolverBase:
 
         if self.settings.debug:
             print("corrector step rhs is: res= ", self._res)
-        self._kkt_system.solve(self._data, self.settings, self._res, self._step)
+        self._kkt_system.solve(self._data, self._preconditioner, self.settings, self._res, self._step)
 
         if self.settings.debug:
             print("corrector step is:", self._step)
@@ -829,8 +840,8 @@ class SolverBase:
         self._res_nr.x -= self._data.c
         self._res_nr.x -= self._res.x  # self._res.x holds A^T*y
         self._res_nr.x -= GT_zu_minus_zl
-        self._res_nr.x[:, self._data.idx_xl] += self._data.x_b_scaling[:, self._data.idx_xl] * self._result.z_bl
-        self._res_nr.x[:, self._data.idx_xu] -= self._data.x_b_scaling[:, self._data.idx_xu] * self._result.z_bu
+        self._res_nr.x[:, self._data.idx_xl] += self._preconditioner.x_b_scaling[:, self._data.idx_xl] * self._result.z_bl
+        self._res_nr.x[:, self._data.idx_xu] -= self._preconditioner.x_b_scaling[:, self._data.idx_xu] * self._result.z_bu
 
         # res_nr.y = -(A*x - b)
         self._res_nr.y += self._data.b
@@ -847,13 +858,13 @@ class SolverBase:
 
         # res_nr.z_bl = x_b_scaling*x - s_bl - xl
         self._res_nr.z_bl[:] = self._result.x[:, self._data.idx_xl]
-        self._res_nr.z_bl *= self._data.x_b_scaling[:, self._data.idx_xl]
+        self._res_nr.z_bl *= self._preconditioner.x_b_scaling[:, self._data.idx_xl]
         cp.subtract(self._res_nr.z_bl, self._result.s_bl, out=self._res_nr.z_bl)
         cp.subtract(self._res_nr.z_bl, self._data.x_l[:, self._data.idx_xl], out=self._res_nr.z_bl)
 
         # res_nr.z_bu = -(x_b_scaling*x + s_bu - xu)
         self._res_nr.z_bu[:] = self._result.x[:, self._data.idx_xu]
-        self._res_nr.z_bu *= self._data.x_b_scaling[:, self._data.idx_xu]
+        self._res_nr.z_bu *= self._preconditioner.x_b_scaling[:, self._data.idx_xu]
         cp.add(self._res_nr.z_bu, self._result.s_bu, out=self._res_nr.z_bu)
         cp.subtract(self._res_nr.z_bu, self._data.x_u[:, self._data.idx_xu], out=self._res_nr.z_bu)
         cp.negative(self._res_nr.z_bu, out=self._res_nr.z_bu)
@@ -920,8 +931,8 @@ class SolverBase:
 
         # ||unscale_dual_res(A^T*y + G^T*(z_u - z_l) + x_b_scaling*(z_bu - z_bl))||_inf
         self._res.x += GT_zu_minus_zl
-        self._res.x[:, self._data.idx_xl] -= self._data.x_b_scaling[:, self._data.idx_xl] * self._result.z_bl
-        self._res.x[:, self._data.idx_xu] += self._data.x_b_scaling[:, self._data.idx_xu] * self._result.z_bu
+        self._res.x[:, self._data.idx_xl] -= self._preconditioner.x_b_scaling[:, self._data.idx_xl] * self._result.z_bl
+        self._res.x[:, self._data.idx_xu] += self._preconditioner.x_b_scaling[:, self._data.idx_xu] * self._result.z_bu
         cp.absolute(self._res.x, out=self._work_primals)
         self._work_primals *= self._unscale_dual_res_factor
         cp.max(self._work_primals, axis=1, out=self._work_norm_temp)

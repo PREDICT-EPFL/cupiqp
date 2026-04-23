@@ -65,7 +65,6 @@ class Data(ABC):
         ``_x_l``, ``_x_u`` have been populated.
         """
         self._preprocess()
-        self._x_b_scaling = cp.ones((self._batch_size, self._n), dtype=cp.float64)
         self._constraints_rhs_inf_norm = cp.empty(self._batch_size, dtype=cp.float64)
         self._compute_constraints_rhs_inf_norm()
 
@@ -226,10 +225,6 @@ class Data(ABC):
     @property
     def x_l(self):
         return self._x_l
-
-    @property
-    def x_b_scaling(self):
-        return self._x_b_scaling
 
     @property
     def num_hl(self) -> int:

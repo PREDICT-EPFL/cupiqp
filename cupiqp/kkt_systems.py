@@ -8,6 +8,7 @@ from .results import Variables
 from .data import Data
 from .settings import Settings
 from .utils import cuda_graph_capture
+from .preconditioner import PreconditionerBase
 from .kkt_systems_kernels import (
     create_build_inverse_index_kernel,
     create_eliminate_slacks_kernel,
@@ -46,6 +47,21 @@ class KKTSystem:
         - Z_hu, Z_hl     : diagonal dual variable matrices for inequality upper/lower bounds
         - Z_xu, Z_xl     : diagonal dual variable matrices for variable upper/lower bounds
         - n, p, m        : number of primal variables, equality constraints, inequality constraints
+
+    If preconditioner is applied, the box constraints change from x_l <= x <= x_u to D_b*x_l <= D_b*D_x*x_scaled <= D_b*x_u, 
+    where D_b and D_x are diagonal matrices. Then the left-hand-side matrix becomes:
+
+        [ P+rho*I   A^T      G^T      -G^T     D_b*D_x  -D_b*D_x                                     ]
+        [ A        -d*I_p                                                                            ]
+        [ G                 -d*I_m                                I_m                                ]
+        [ -G                         -d*I_m                               I_m                        ]
+        [ D_b*D_x                              -d*I_n                             I_n                ]
+        [ -D_b*D_x                                      -d*I_n                            I_n        ]
+        [                   S_hu                                  Z_hu                               ]
+        [                            S_hl                                  Z_hl                      ]
+        [                                      S_xu                                  Z_xu            ]
+        [                                               S_xl                                  Z_xl   ]
+
     """
     def __init__(self):
         return
@@ -163,21 +179,21 @@ class KKTSystem:
         self._kkt_solver.update_data(data, update_P, update_A, update_G)
 
     @nvtx.annotate("KKTSystem::update_scalings_and_factor")
-    def update_scalings_and_factor(self, data: Data, settings: Settings, iterative_refinement: bool, rho: cp.ndarray, delta: cp.ndarray, vars: Variables) -> bool:
+    def update_scalings_and_factor(self, data: Data, preconditioner: PreconditionerBase, settings: Settings, iterative_refinement: bool, rho: cp.ndarray, delta: cp.ndarray, vars: Variables) -> bool:
         """Update regularization terms and factor the KKT matrix.
 
         TODO: When iterative_refinement (IR) is True, adds static regularization to improve factorization stability. The solve() method will then run IR.
 
         The variable vars is the current primal/dual variable values at this iteration, i.e., values of x, y, z_u, z_l, s_u, s_l, z_bu, z_bl, s_bu, s_bl at the current iteration.
         """
-        self._update_reg_and_kkt(data, delta, rho, vars)
+        self._update_reg_and_kkt(data, preconditioner, delta, rho, vars)
         self._use_iterative_refinement = iterative_refinement
         factor_success = self._kkt_solver.factor() # ! this is implicitly assuming idx_hu and idx_hl cover all indices of inequalities 0:m
         return factor_success
 
     @nvtx.annotate("KKTSystem::_update_reg_and_kkt")
-    @cuda_graph_capture(key=lambda self, data, delta, rho, vars: (vars.buffer_ptr, delta.data.ptr, rho.data.ptr), enable=lambda self: self._settings.enable_cuda_graph)
-    def _update_reg_and_kkt(self, data: Data, delta: cp.ndarray, rho: cp.ndarray, vars: Variables):
+    @cuda_graph_capture(key=lambda self, data, preconditioner, delta, rho, vars: (vars.buffer_ptr, delta.data.ptr, rho.data.ptr), enable=lambda self: self._settings.enable_cuda_graph)
+    def _update_reg_and_kkt(self, data: Data, preconditioner: PreconditionerBase, delta: cp.ndarray, rho: cp.ndarray, vars: Variables):
         """Update the regularization terms x_reg and z_reg for the condensed KKT system after eliminating slacks and duals of inequalities and box constraints. 
         Also update the condensed KKT matrix with the new regularization terms."""
         self._rho[:] = rho
@@ -206,7 +222,7 @@ class KKTSystem:
                     self._inv_idx_hl,
                     self._w_bu_delta_inv,
                     self._w_bl_delta_inv,
-                    data.x_b_scaling,
+                    preconditioner.x_b_scaling,
                     rho,
                     self._x_reg,
                     self._w_u_delta_inv,
@@ -226,7 +242,7 @@ class KKTSystem:
 
             # compute x_reg (B, n) and z_reg (B, m)
             self._x_reg[:] = rho[:, None]
-            xbs = data.x_b_scaling  # (B, n)
+            xbs = preconditioner.x_b_scaling  # (B, n)
             if data.num_xu > 0:
                 xbs_xu = xbs[:, data.idx_xu]  # (B, num_xu)
                 self._x_reg[:, data.idx_xu] += xbs_xu * xbs_xu * self._w_bu_delta_inv
@@ -246,7 +262,7 @@ class KKTSystem:
         self._kkt_solver.update_kkt(data, delta, self._x_reg, self._z_reg)
     
     @nvtx.annotate("KKTSystem::solve")
-    def solve(self, data: Data, settings: Settings, rhs: Variables, lhs: Variables,
+    def solve(self, data: Data, preconditioner: PreconditionerBase, settings: Settings, rhs: Variables, lhs: Variables,
               transpose: bool = False) -> None:
         """Solve either ``K v = rhs`` (default) or ``K^T λ = rhs`` (``transpose=True``).
 
@@ -274,7 +290,7 @@ class KKTSystem:
         ``rhs.z - (1/Z) * rhs.s``) and slack recovery ``lhs.s = (rhs.s - lhs.z) / Z``
         (vs forward's ``(rhs.s - S * lhs.z) / Z``).
         """
-        self._prepare_rhs(data, rhs, transpose=transpose)
+        self._prepare_rhs(data, preconditioner, rhs, transpose=transpose)
         self._kkt_solver.solve(data, self._rhs_x_bar, rhs.y, self._rhs_z_bar, lhs.x, lhs.y, self._work_z)  # ! the second _work_z is used to hold delta_z, but useless anyway. Can be further optimized.
         # Iterative refinement applies to the forward condensed solve only (K_c
         # is symmetric so it *could* run for transpose too, but that path is for
@@ -286,11 +302,11 @@ class KKTSystem:
                 data, settings,
                 self._rhs_x_bar, rhs.y, self._rhs_z_bar,
                 lhs.x, lhs.y, self._work_z)
-        self._recover_lhs(data, rhs, lhs, transpose=transpose)
+        self._recover_lhs(data, preconditioner, rhs, lhs, transpose=transpose)
 
     @nvtx.annotate("KKTSystem::_prepare_rhs")
-    @cuda_graph_capture(key=lambda self, data, rhs, transpose=False: (rhs.buffer_ptr, bool(transpose)), enable=lambda self: self._settings.enable_cuda_graph)
-    def _prepare_rhs(self, data: Data, rhs: Variables, transpose: bool = False):
+    @cuda_graph_capture(key=lambda self, data, preconditioner, rhs, transpose=False: (rhs.buffer_ptr, bool(transpose)), enable=lambda self: self._settings.enable_cuda_graph)
+    def _prepare_rhs(self, data: Data, preconditioner: PreconditionerBase, rhs: Variables, transpose: bool = False):
         """Build the condensed KKT rhs by eliminating slacks and duals.
 
         The dual elimination (bound → x, inequality → z) is direction-agnostic —
@@ -329,7 +345,7 @@ class KKTSystem:
                 self._inv_idx_hu, self._inv_idx_hl,
                 rhs.x,
                 self._w_bu_delta_inv, self._w_bl_delta_inv,
-                data._x_b_scaling,
+                preconditioner.x_b_scaling,
                 self._updated_rhs_z_bu, self._updated_rhs_z_bl,
                 self._rhs_x_bar,
                 self._w_u_delta_inv, self._w_l_delta_inv,
@@ -369,8 +385,8 @@ class KKTSystem:
         #     self._rhs_z_bar *= self._z_reg
 
     @nvtx.annotate("KKTSystem::_recover_lhs")
-    @cuda_graph_capture(key=lambda self, data, rhs, lhs, transpose=False: (rhs.buffer_ptr, lhs.buffer_ptr, bool(transpose)), enable=lambda self: self._settings.enable_cuda_graph)
-    def _recover_lhs(self, data: Data, rhs: Variables, lhs: Variables, transpose: bool = False):
+    @cuda_graph_capture(key=lambda self, data, preconditioner, rhs, lhs, transpose=False: (rhs.buffer_ptr, lhs.buffer_ptr, bool(transpose)), enable=lambda self: self._settings.enable_cuda_graph)
+    def _recover_lhs(self, data: Data, preconditioner: PreconditionerBase, rhs: Variables, lhs: Variables, transpose: bool = False):
         """Back-substitute lhs.z_* and lhs.s_* from the condensed (lhs.x, lhs.y).
 
         The dual back-sub (z_u, z_l, z_bu, z_bl) is direction-agnostic — the row
@@ -395,7 +411,7 @@ class KKTSystem:
                     data.idx_hl, self._w_l_delta_inv, self._updated_rhs_z_l, lhs.z_l,
                     data.idx_xu, self._w_bu_delta_inv, self._m_z_bu_inv, rhs.z_bu, rhs.s_bu, lhs.z_bu,
                     data.idx_xl, self._w_bl_delta_inv, self._m_z_bl_inv, rhs.z_bl, rhs.s_bl, lhs.z_bl,
-                    data.x_b_scaling],
+                    preconditioner.x_b_scaling],
                 device="cuda",
                 stream=wp_stream,
             )
