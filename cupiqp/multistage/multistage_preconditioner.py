@@ -1,98 +1,80 @@
+from typing import Optional
+
 import cupy as cp
 import warp as wp
 
-from ..data import Data
+from .multistage_data import MultistageData
 from ..preconditioner import RuizEquilibration
 from .multistage_utils import BlockTridiagMat, BlockBidiagMat
 
+
 class MultistageRuizEquilibration(RuizEquilibration):
-    """Ruiz equilibration for multistage backend."""
+    """Ruiz equilibration for multistage backend (single problem, B = 1).
 
-    def eval_P_row_inf_norms(self, P: BlockTridiagMat, out: cp.ndarray):
-        self._tridiag_row_inf_norms(P, out)
-    
-    def eval_A_row_inf_norms(self, A: BlockBidiagMat, out: cp.ndarray):
-        self._bidiag_row_inf_norms(A, out)
+    P is block-tridiagonal (BlockTridiagMat); A, G are block lower-bidiagonal
+    (BlockBidiagMat). Norms and scaling operate on the dense per-block
+    storage via DLPack bridges to warp buffers.
+    """
 
-    def eval_A_col_inf_norms(self, A: BlockBidiagMat, out: cp.ndarray):
-        self._bidiag_col_inf_norms(A, out)
+    # ------------------------------------------------------------------
+    # 3-hook backend API
+    # ------------------------------------------------------------------
 
-    def eval_G_row_inf_norms(self, G: BlockBidiagMat, out: cp.ndarray):
-        self._bidiag_row_inf_norms(G, out)
+    def compute_kkt_norms(self, data: MultistageData,
+                          d_iter: cp.ndarray, d_b_iter: cp.ndarray):
+        n, p, m = self.n, self.p, self.m
 
-    def eval_G_col_inf_norms(self, G: BlockBidiagMat, out: cp.ndarray):
-        self._bidiag_col_inf_norms(G, out)
+        # d_iter[:, :n] — x-block: P row-norms (P symmetric, so row ≡ col).
+        self._tridiag_row_inf_norms(data.P, d_iter[0, :n])
+        if p > 0:
+            self._bidiag_col_inf_norms(data.A, self._work_n[0])
+            cp.maximum(d_iter[0, :n], self._work_n[0], out=d_iter[0, :n])
+            self._bidiag_row_inf_norms(data.A, d_iter[0, n:n+p])
+        if m > 0:
+            self._bidiag_col_inf_norms(data.G, self._work_n[0])
+            cp.maximum(d_iter[0, :n], self._work_n[0], out=d_iter[0, :n])
+            self._bidiag_row_inf_norms(data.G, d_iter[0, n+p:n+p+m])
+        cp.maximum(d_iter[:, :n], self._x_b_scaling, out=d_iter[:, :n])
 
-    @staticmethod
-    def _tridiag_row_inf_norms(P: BlockTridiagMat, out: cp.ndarray):
-        """Row inf-norms of a block-tridiagonal matrix."""
-        N, d = P.num_diag_blocks, P.block_size
-        P_D = cp.from_dlpack(wp.to_dlpack(P.diag_blocks.data))  # (N, d, d)
-        # NOTE: we assume P_D stores the full diagonal blocks, not just the upper-triangular part. 
-        out[:] = cp.linalg.norm(P_D.reshape(-1, d), ord=cp.inf, axis=1)
+        d_b_iter[:] = self._x_b_scaling
 
-        if N > 1:
-            P_E = cp.from_dlpack(wp.to_dlpack(P.off_diag_blocks_lower.data))  # (N-1, d, d)
-            # lower diagonal blocks
-            cp.maximum(out[d:], cp.linalg.norm(P_E.reshape(-1, d), ord=cp.inf, axis=1), out=out[d:])
-            # upper diagonal blocks (transpose)
-            cp.maximum(out[:-d], cp.linalg.norm(P_E.transpose(0, 2, 1).reshape(-1, d), ord=cp.inf, axis=1), out=out[:-d])
-
-    @staticmethod
-    def _bidiag_row_inf_norms(mat: BlockBidiagMat, out: cp.ndarray):
-        """Row inf-norms of a block lower-bidiagonal matrix."""
-        N = mat.N
-        r = mat.rows_of_blocks
-        c = mat.cols_of_blocks
-        D = cp.from_dlpack(wp.to_dlpack(mat.D))   # (N, r, c)
-        E = cp.from_dlpack(wp.to_dlpack(mat.E))   # (N, r, c)
-        row_D = cp.linalg.norm(D.reshape(-1, c), ord=cp.inf, axis=1).reshape(N, r)  # (N, r)
-        row_E = cp.linalg.norm(E.reshape(-1, c), ord=cp.inf, axis=1).reshape(N, r)  # (N, r)
-
-        out_2d = out.reshape(N + 1, r)
-        out_2d[0] = row_D[0]
-        if N > 1:
-            cp.maximum(row_D[1:], row_E[:N-1], out=out_2d[1:N])
-        out_2d[N] = row_E[N - 1]
-
-    def _bidiag_col_inf_norms(self, mat: BlockBidiagMat, out: cp.ndarray):
-        """Column inf-norms of a block lower-bidiagonal matrix."""
-        r = mat.rows_of_blocks
-        D = cp.from_dlpack(wp.to_dlpack(mat.D))   # (N, r, c)
-        E = cp.from_dlpack(wp.to_dlpack(mat.E))   # (N, r, c)
-        col_norms_D = cp.linalg.norm(D.reshape(r, -1), ord=cp.inf, axis=0)          # (N, c)
-        col_norms_E = cp.linalg.norm(E.reshape(r, -1), ord=cp.inf, axis=0)          # (N, c)
-        cp.maximum(col_norms_D, col_norms_E, out=out)
-
-    def _scale_matrices(self, data: Data,
-                        d_x: cp.ndarray, d_y: cp.ndarray, d_z: cp.ndarray):
+    def scale_matrices(self, data: MultistageData,
+                       d_x: cp.ndarray, d_y: cp.ndarray, d_z: cp.ndarray,
+                       cost_scaling_factor: Optional[cp.ndarray] = None):
         N = data.num_blocks
         bs = data.block_size
-        d_x_2d = d_x.reshape(N, bs)
+        d_x_2d = d_x[0].reshape(N, bs)           # (N, bs) — strip the B=1 dim
 
         P_D = cp.from_dlpack(wp.to_dlpack(data._P.diag_blocks.data))
         P_E = cp.from_dlpack(wp.to_dlpack(data._P.off_diag_blocks_lower.data))
-        P_D *= d_x_2d[:, None, :]   # scale columns
-        P_D *= d_x_2d[:, :, None]   # scale rows
+        P_D *= d_x_2d[:, None, :]                # scale columns
+        P_D *= d_x_2d[:, :, None]                # scale rows
         if N > 1:
-            P_E *= d_x_2d[:N-1, None, :]   # scale columns (block-col k)
-            P_E *= d_x_2d[1:N, :, None]    # scale rows (block-row k+1)
+            P_E *= d_x_2d[:N-1, None, :]         # col scale
+            P_E *= d_x_2d[1:N, :, None]          # row scale
 
         data._c *= d_x
 
+        if cost_scaling_factor is not None:
+            cf = float(cost_scaling_factor[0])
+            P_D *= cf
+            if N > 1:
+                P_E *= cf
+            data._c *= cf
+
         if self.p > 0:
             r_a = data._A.rows_of_blocks
-            d_y_2d = d_y.reshape(N + 1, r_a)
+            d_y_2d = d_y[0].reshape(N + 1, r_a)
             A_D = cp.from_dlpack(wp.to_dlpack(data._A.D))
             A_E = cp.from_dlpack(wp.to_dlpack(data._A.E))
-            A_D *= d_x_2d[:, None, :]      # scale columns
-            A_D *= d_y_2d[:N, :, None]     # scale rows
-            A_E *= d_x_2d[:, None, :]      # scale columns (block-col k)
-            A_E *= d_y_2d[1:N+1, :, None]  # scale rows (block-row k+1)
+            A_D *= d_x_2d[:, None, :]
+            A_D *= d_y_2d[:N, :, None]
+            A_E *= d_x_2d[:, None, :]
+            A_E *= d_y_2d[1:N+1, :, None]
 
         if self.m > 0:
             r_g = data._G.rows_of_blocks
-            d_z_2d = d_z.reshape(N + 1, r_g)
+            d_z_2d = d_z[0].reshape(N + 1, r_g)
             G_D = cp.from_dlpack(wp.to_dlpack(data._G.D))
             G_E = cp.from_dlpack(wp.to_dlpack(data._G.E))
             G_D *= d_x_2d[:, None, :]
@@ -100,7 +82,7 @@ class MultistageRuizEquilibration(RuizEquilibration):
             G_E *= d_x_2d[:, None, :]
             G_E *= d_z_2d[1:N+1, :, None]
 
-    def _apply_cost_scaling(self, data: Data):
+    def apply_cost_scaling(self, data: MultistageData):
         N = data.num_blocks
         P_D = cp.from_dlpack(wp.to_dlpack(data._P.diag_blocks.data))
         P_E = cp.from_dlpack(wp.to_dlpack(data._P.off_diag_blocks_lower.data))
@@ -126,82 +108,47 @@ class MultistageRuizEquilibration(RuizEquilibration):
         P_D *= gamma
         P_E *= gamma
         data._c *= gamma
-        self.cost_scaling *= gamma
+        self._cost_scaling *= gamma
 
-    def _unscale_matrices(self, data: Data,
-                          d_x_inv: cp.ndarray, d_y_inv: cp.ndarray, d_z_inv: cp.ndarray):
-        cost_inv = float(self._cost_scaling_inv)
-        N = data.num_blocks
-        bs = data.block_size
-        d_x_inv_2d = d_x_inv.reshape(N, bs)
+    # ------------------------------------------------------------------
+    # Block-matrix primitives (single-problem)
+    # ------------------------------------------------------------------
 
-        P_D = cp.from_dlpack(wp.to_dlpack(data._P.diag_blocks.data))
-        P_E = cp.from_dlpack(wp.to_dlpack(data._P.off_diag_blocks_lower.data))
-        P_D *= cost_inv
-        P_D *= d_x_inv_2d[:, None, :]
-        P_D *= d_x_inv_2d[:, :, None]
+    @staticmethod
+    def _tridiag_row_inf_norms(P: BlockTridiagMat, out: cp.ndarray):
+        """Row inf-norms of a block-tridiagonal matrix. out shape: (n,)."""
+        N, d = P.num_diag_blocks, P.block_size
+        P_D = cp.from_dlpack(wp.to_dlpack(P.diag_blocks.data))  # (N, d, d)
+        out[:] = cp.linalg.norm(P_D.reshape(-1, d), ord=cp.inf, axis=1)
+
         if N > 1:
-            P_E *= cost_inv
-            P_E *= d_x_inv_2d[:N-1, None, :]
-            P_E *= d_x_inv_2d[1:N, :, None]
+            P_E = cp.from_dlpack(wp.to_dlpack(P.off_diag_blocks_lower.data))  # (N-1, d, d)
+            cp.maximum(out[d:], cp.linalg.norm(P_E.reshape(-1, d), ord=cp.inf, axis=1), out=out[d:])
+            cp.maximum(out[:-d], cp.linalg.norm(P_E.transpose(0, 2, 1).reshape(-1, d), ord=cp.inf, axis=1), out=out[:-d])
 
-        data._c *= cost_inv * d_x_inv
+    @staticmethod
+    def _bidiag_row_inf_norms(mat: BlockBidiagMat, out: cp.ndarray):
+        """Row inf-norms of a block lower-bidiagonal matrix. out shape: ((N+1)*r,)."""
+        N = mat.N
+        r = mat.rows_of_blocks
+        c = mat.cols_of_blocks
+        D = cp.from_dlpack(wp.to_dlpack(mat.D))
+        E = cp.from_dlpack(wp.to_dlpack(mat.E))
+        row_D = cp.linalg.norm(D.reshape(-1, c), ord=cp.inf, axis=1).reshape(N, r)
+        row_E = cp.linalg.norm(E.reshape(-1, c), ord=cp.inf, axis=1).reshape(N, r)
 
-        if self.p > 0:
-            r_a = data._A.rows_of_blocks
-            d_y_inv_2d = d_y_inv.reshape(N + 1, r_a)
-            A_D = cp.from_dlpack(wp.to_dlpack(data._A.D))
-            A_E = cp.from_dlpack(wp.to_dlpack(data._A.E))
-            A_D *= d_x_inv_2d[:, None, :]
-            A_D *= d_y_inv_2d[:N, :, None]
-            A_E *= d_x_inv_2d[:, None, :]
-            A_E *= d_y_inv_2d[1:N+1, :, None]
-
-        if self.m > 0:
-            r_g = data._G.rows_of_blocks
-            d_z_inv_2d = d_z_inv.reshape(N + 1, r_g)
-            G_D = cp.from_dlpack(wp.to_dlpack(data._G.D))
-            G_E = cp.from_dlpack(wp.to_dlpack(data._G.E))
-            G_D *= d_x_inv_2d[:, None, :]
-            G_D *= d_z_inv_2d[:N, :, None]
-            G_E *= d_x_inv_2d[:, None, :]
-            G_E *= d_z_inv_2d[1:N+1, :, None]
-
-    def _apply_stored_scaling(self, data: Data,
-                              d_x: cp.ndarray, d_y: cp.ndarray, d_z: cp.ndarray):
-        c = float(self.cost_scaling)
-        N = data.num_blocks
-        bs = data.block_size
-        d_x_2d = d_x.reshape(N, bs)
-
-        P_D = cp.from_dlpack(wp.to_dlpack(data._P.diag_blocks.data))
-        P_E = cp.from_dlpack(wp.to_dlpack(data._P.off_diag_blocks_lower.data))
-        P_D *= c
-        P_D *= d_x_2d[:, None, :]
-        P_D *= d_x_2d[:, :, None]
+        out_2d = out.reshape(N + 1, r)
+        out_2d[0] = row_D[0]
         if N > 1:
-            P_E *= c
-            P_E *= d_x_2d[:N-1, None, :]
-            P_E *= d_x_2d[1:N, :, None]
+            cp.maximum(row_D[1:], row_E[:N-1], out=out_2d[1:N])
+        out_2d[N] = row_E[N - 1]
 
-        data._c *= c * d_x
-
-        if self.p > 0:
-            r_a = data._A.rows_of_blocks
-            d_y_2d = d_y.reshape(N + 1, r_a)
-            A_D = cp.from_dlpack(wp.to_dlpack(data._A.D))
-            A_E = cp.from_dlpack(wp.to_dlpack(data._A.E))
-            A_D *= d_x_2d[:, None, :]
-            A_D *= d_y_2d[:N, :, None]
-            A_E *= d_x_2d[:, None, :]
-            A_E *= d_y_2d[1:N+1, :, None]
-
-        if self.m > 0:
-            r_g = data._G.rows_of_blocks
-            d_z_2d = d_z.reshape(N + 1, r_g)
-            G_D = cp.from_dlpack(wp.to_dlpack(data._G.D))
-            G_E = cp.from_dlpack(wp.to_dlpack(data._G.E))
-            G_D *= d_x_2d[:, None, :]
-            G_D *= d_z_2d[:N, :, None]
-            G_E *= d_x_2d[:, None, :]
-            G_E *= d_z_2d[1:N+1, :, None]
+    @staticmethod
+    def _bidiag_col_inf_norms(mat: BlockBidiagMat, out: cp.ndarray):
+        """Column inf-norms of a block lower-bidiagonal matrix. out shape: (N*c,)."""
+        r = mat.rows_of_blocks
+        D = cp.from_dlpack(wp.to_dlpack(mat.D))
+        E = cp.from_dlpack(wp.to_dlpack(mat.E))
+        col_norms_D = cp.linalg.norm(D.reshape(r, -1), ord=cp.inf, axis=0)
+        col_norms_E = cp.linalg.norm(E.reshape(r, -1), ord=cp.inf, axis=0)
+        cp.maximum(col_norms_D, col_norms_E, out=out)

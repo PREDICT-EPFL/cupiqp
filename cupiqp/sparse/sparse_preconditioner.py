@@ -1,6 +1,8 @@
+from typing import Optional
+
 import cupy as cp
 
-from ..data import Data
+from .sparse_data import SparseData
 from ..preconditioner import RuizEquilibration
 from .batched_csr import BatchedCsrMatrix
 
@@ -19,33 +21,35 @@ class SparseRuizEquilibration(RuizEquilibration):
     """
 
     # ------------------------------------------------------------------
-    # Norm evaluation
+    # 3-hook backend API
     # ------------------------------------------------------------------
 
-    def eval_P_row_inf_norms(self, P: BatchedCsrMatrix, out: cp.ndarray):
-        self._batched_row_inf_norms(P, out)
+    def compute_kkt_norms(self, data: SparseData,
+                          d_iter: cp.ndarray, d_b_iter: cp.ndarray):
+        n, p, m = self.n, self.p, self.m
 
-    def eval_A_row_inf_norms(self, A: BatchedCsrMatrix, out: cp.ndarray):
-        self._batched_row_inf_norms(A, out)
+        self._batched_row_inf_norms(data.P, d_iter[:, :n])
+        if p > 0:
+            self._batched_col_inf_norms(data.A, self._work_n)
+            d_iter[:, :n] = cp.maximum(d_iter[:, :n], self._work_n)
+            self._batched_row_inf_norms(data.A, d_iter[:, n:n+p])
+        if m > 0:
+            self._batched_col_inf_norms(data.G, self._work_n)
+            d_iter[:, :n] = cp.maximum(d_iter[:, :n], self._work_n)
+            self._batched_row_inf_norms(data.G, d_iter[:, n+p:n+p+m])
+        cp.maximum(d_iter[:, :n], self._x_b_scaling, out=d_iter[:, :n])
 
-    def eval_A_col_inf_norms(self, A: BatchedCsrMatrix, out: cp.ndarray):
-        self._batched_col_inf_norms(A, out)
+        d_b_iter[:] = self._x_b_scaling
 
-    def eval_G_row_inf_norms(self, G: BatchedCsrMatrix, out: cp.ndarray):
-        self._batched_row_inf_norms(G, out)
-
-    def eval_G_col_inf_norms(self, G: BatchedCsrMatrix, out: cp.ndarray):
-        self._batched_col_inf_norms(G, out)
-
-    # ------------------------------------------------------------------
-    # Scaling — in-place updates to each matrix's .data buffer
-    # ------------------------------------------------------------------
-
-    def _scale_matrices(self, data: Data,
-                        d_x: cp.ndarray, d_y: cp.ndarray, d_z: cp.ndarray):
+    def scale_matrices(self, data: SparseData,
+                       d_x: cp.ndarray, d_y: cp.ndarray, d_z: cp.ndarray,
+                       cost_scaling_factor: Optional[cp.ndarray] = None):
         self._batched_row_scale(data._P, d_x)
         self._batched_col_scale(data._P, d_x)
         data._c *= d_x
+        if cost_scaling_factor is not None:
+            data._P.data *= cost_scaling_factor[:, None]
+            data._c *= cost_scaling_factor[:, None]
 
         if self.p > 0:
             self._batched_row_scale(data._A, d_y)
@@ -54,7 +58,7 @@ class SparseRuizEquilibration(RuizEquilibration):
             self._batched_row_scale(data._G, d_z)
             self._batched_col_scale(data._G, d_x)
 
-    def _apply_cost_scaling(self, data: Data):
+    def apply_cost_scaling(self, data: SparseData):
         P_norms = self._batched_utri_symmetric_col_inf_norms(data._P)  # (B, n)
         gamma = cp.mean(P_norms, axis=1)                                # (B,)
         gamma = cp.clip(gamma, self.min_scaling, self.max_scaling)
@@ -64,35 +68,7 @@ class SparseRuizEquilibration(RuizEquilibration):
         gamma = 1.0 / gamma                                             # (B,)
         data._P.data *= gamma[:, None]
         data._c *= gamma[:, None]
-        self._c_scaling *= gamma
-
-    def _unscale_matrices(self, data: Data,
-                          d_x_inv: cp.ndarray, d_y_inv: cp.ndarray, d_z_inv: cp.ndarray):
-        data._P.data *= self._cost_scaling_inv[:, None]
-        self._batched_row_scale(data._P, d_x_inv)
-        self._batched_col_scale(data._P, d_x_inv)
-        data._c *= self._cost_scaling_inv[:, None] * d_x_inv
-
-        if self.p > 0:
-            self._batched_row_scale(data._A, d_y_inv)
-            self._batched_col_scale(data._A, d_x_inv)
-        if self.m > 0:
-            self._batched_row_scale(data._G, d_z_inv)
-            self._batched_col_scale(data._G, d_x_inv)
-
-    def _apply_stored_scaling(self, data: Data,
-                              d_x: cp.ndarray, d_y: cp.ndarray, d_z: cp.ndarray):
-        data._P.data *= self._c_scaling[:, None]
-        self._batched_row_scale(data._P, d_x)
-        self._batched_col_scale(data._P, d_x)
-        data._c *= self._c_scaling[:, None] * d_x
-
-        if self.p > 0:
-            self._batched_row_scale(data._A, d_y)
-            self._batched_col_scale(data._A, d_x)
-        if self.m > 0:
-            self._batched_row_scale(data._G, d_z)
-            self._batched_col_scale(data._G, d_x)
+        self._cost_scaling *= gamma
 
     # ------------------------------------------------------------------
     # Batched CSR primitives — operate on a BatchedCsrMatrix's shared

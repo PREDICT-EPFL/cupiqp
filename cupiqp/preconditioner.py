@@ -1,9 +1,19 @@
 from abc import ABC, abstractmethod
 import nvtx
 import cupy as cp
+import warp as wp
 
 from .data import Data
 from .results import Variables
+from .preconditioner_kernels import (
+    create_clamp_and_rsqrt_kernel,
+    create_accumulate_deltas_kernel,
+    create_ruiz_conv_check_kernel,
+    create_calc_scaling_inv_and_scale_bounds_kernel,
+)
+
+
+USE_WARP = True
 
 
 class PreconditionerBase(ABC):
@@ -14,7 +24,7 @@ class PreconditionerBase(ABC):
     representation (diagonal vectors, sparse factors, ...).
 
     Contract with the solver:
-        * scale_data / unscale_data / apply_scaling — transform the problem data.
+        * scale_data / unscale_data / reuse_scaling — transform the problem data.
         * scale_primal / unscale_primal, scale_dual_eq / unscale_dual_eq, ...
           — map individual vectors between scaled and original coordinates.
         * unscale_solution — convenience that unscales a full Variables struct.
@@ -38,7 +48,7 @@ class PreconditionerBase(ABC):
         ...
 
     @abstractmethod
-    def apply_scaling(self, data: Data):
+    def reuse_scaling(self, data: Data):
         """Re-apply stored scaling to fresh (unscaled) data."""
         ...
 
@@ -228,6 +238,18 @@ class RuizEquilibration(PreconditionerBase):
 
         self._work_n = cp.empty((B, n), dtype=cp.float64)
 
+        # Precompile warp kernels (one specialization per (n, p, m,
+        # min_scaling, max_scaling) tuple).
+        self._clamp_and_rsqrt_kernel = create_clamp_and_rsqrt_kernel(
+            n, p, m, min_scaling, max_scaling,
+        )
+        self._accumulate_deltas_kernel = create_accumulate_deltas_kernel(n, p, m)
+        self._conv_check_kernel = create_ruiz_conv_check_kernel(n, p, m)
+        self._calc_scaling_inv_and_scale_bounds_kernel = create_calc_scaling_inv_and_scale_bounds_kernel(n, p, m)
+
+        # (2B,) buffer for per-batch (max_d, max_db) pairs — cp.max gives global.
+        self._conv_buf = cp.empty(2 * B, dtype=cp.float64)
+
     # ------------------------------------------------------------------
     # State accessors
     # ------------------------------------------------------------------
@@ -284,13 +306,76 @@ class RuizEquilibration(PreconditionerBase):
     @nvtx.annotate("RuizEquilibration::scale_data")
     def scale_data(self, data: Data, scale_cost: bool, max_iter: int):
         """Run Ruiz equilibration iterations to scale the problem data."""
+        if USE_WARP:
+            self._scale_data_warp(data, scale_cost, max_iter)
+        else:
+            self._scale_data_cupy(data, scale_cost, max_iter)
+
+    def _scale_data_warp(self, data: Data, scale_cost: bool, max_iter: int):
+        n, p, m = self.n, self.p, self.m
+        stream = wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr)
+
+        for _ in range(max_iter):
+            # backend specific
+            self.compute_kkt_norms(data, self._delta_iter, self._delta_b_iter)
+
+            wp.launch(
+                kernel=self._clamp_and_rsqrt_kernel,
+                dim=(self.B, n + p + m),
+                inputs=[self._delta_iter, self._delta_b_iter],
+                device="cuda", stream=stream,
+            )
+
+            # backend specific
+            self.scale_matrices(
+                data,
+                self._delta_iter[:, :n],
+                self._delta_iter[:, n:n+p],
+                self._delta_iter[:, n+p:n+p+m],
+                cost_scaling_factor=None
+                )
+
+            wp.launch(
+                kernel=self._accumulate_deltas_kernel,
+                dim=(self.B, n + p + m),
+                inputs=[
+                    self._delta, self._delta_b, self._x_b_scaling,
+                    self._delta_iter, self._delta_b_iter,
+                ],
+                device="cuda", stream=stream,
+            )
+
+            if scale_cost:
+                self.apply_cost_scaling(data)
+
+            _CONV_CHECK_BLOCK_DIM = 256
+            wp.launch_tiled(
+                kernel=self._conv_check_kernel,
+                dim=[self.B],
+                inputs=[self._delta_iter, self._delta_b_iter, self._conv_buf],
+                block_dim=_CONV_CHECK_BLOCK_DIM,
+                device="cuda", stream=stream,
+            )
+            if float(cp.max(self._conv_buf)) < self.convergence_tol:
+                break
+
+        wp.launch(
+            kernel=self._calc_scaling_inv_and_scale_bounds_kernel,
+            dim=(self.B, n + p + m + 1),
+            inputs=[
+                self._delta, self._delta_inv,
+                self._delta_b, self._delta_b_inv,
+                self._cost_scaling, self._cost_scaling_inv,
+                data._b, data._h_l, data._h_u, data._x_l, data._x_u,
+            ],
+            device="cuda", stream=stream,
+        )
+
+    def _scale_data_cupy(self, data: Data, scale_cost: bool, max_iter: int):
         n, p = self.n, self.p
 
         for _ in range(max_iter):
-            # Compute KKT row/column inf-norms → (B, n+p+m)
-            self._compute_kkt_norms(data, self._delta_iter, self._delta_b_iter)
-            cp.maximum(self._delta_iter[:, :n], self._x_b_scaling, out=self._delta_iter[:, :n])
-            self._delta_b_iter[:] = self._x_b_scaling
+            self.compute_kkt_norms(data, self._delta_iter, self._delta_b_iter)
 
             self._limit_scaling(self._delta_iter)
             self._limit_scaling(self._delta_b_iter)
@@ -299,35 +384,30 @@ class RuizEquilibration(PreconditionerBase):
             cp.sqrt(self._delta_b_iter, out=self._delta_b_iter)
             cp.reciprocal(self._delta_b_iter, out=self._delta_b_iter)
 
-            d_x = self._delta_iter[:, :n]        # (B, n)
-            d_y = self._delta_iter[:, n:n+p]     # (B, p)
-            d_z = self._delta_iter[:, n+p:]      # (B, m)
+            d_x = self._delta_iter[:, :n]
+            d_y = self._delta_iter[:, n:n+p]
+            d_z = self._delta_iter[:, n+p:]
 
-            # Apply scaling
-            self._scale_matrices(data, d_x, d_y, d_z)
+            self.scale_matrices(data, d_x, d_y, d_z, cost_scaling_factor=None)
+
             self._x_b_scaling *= self._delta_b_iter * d_x
-
-            # Accumulate
             self._delta *= self._delta_iter
             self._delta_b *= self._delta_b_iter
 
             if scale_cost:
-                self._apply_cost_scaling(data)
+                self.apply_cost_scaling(data)
 
-            # Check convergence (worst over batch)
             conv = max(
                 float(cp.max(cp.abs(1.0 - self._delta_iter))),
-                float(cp.max(cp.abs(1.0 - self._delta_b_iter)))
+                float(cp.max(cp.abs(1.0 - self._delta_b_iter))),
             )
             if conv < self.convergence_tol:
                 break
 
-        # Compute inverses
         cp.reciprocal(self._delta, out=self._delta_inv)
         cp.reciprocal(self._delta_b, out=self._delta_b_inv)
         cp.reciprocal(self._cost_scaling, out=self._cost_scaling_inv)
 
-        # Scale bounds
         self._scale_bounds(data)
 
     @nvtx.annotate("RuizEquilibration::unscale_data")
@@ -338,20 +418,24 @@ class RuizEquilibration(PreconditionerBase):
         d_y_inv = self._delta_inv[:, n:n+p]
         d_z_inv = self._delta_inv[:, n+p:]
 
-        self._unscale_matrices(data, d_x_inv, d_y_inv, d_z_inv)
+        # Applies D_x^-1 P D_x^-1, D_y^-1 A D_x^-1, D_z^-1 G D_x^-1, D_x^-1 c,
+        # plus cost_scaling_inv on P and c.
+        self.scale_matrices(data, d_x_inv, d_y_inv, d_z_inv,
+                            cost_scaling_factor=self._cost_scaling_inv)
         self._unscale_bounds(data)
         self._x_b_scaling *= self._delta_b_inv * d_x_inv
         self.reset()
 
-    @nvtx.annotate("RuizEquilibration::apply_scaling")
-    def apply_scaling(self, data: Data):
+    @nvtx.annotate("RuizEquilibration::reuse_scaling")
+    def reuse_scaling(self, data: Data):
         """Re-apply stored scaling to fresh (unscaled) data."""
         n, p = self.n, self.p
         d_x = self._delta[:, :n]
         d_y = self._delta[:, n:n + p]
         d_z = self._delta[:, n + p:]
 
-        self._apply_stored_scaling(data, d_x, d_y, d_z)
+        # Applies D_x P D_x, D_y A D_x, D_z G D_x, D_x c, plus cost_scaling on P, c.
+        self.scale_matrices(data, d_x, d_y, d_z, cost_scaling_factor=self._cost_scaling)
         self._scale_bounds(data)
 
     # ------------------------------------------------------------------
@@ -423,79 +507,49 @@ class RuizEquilibration(PreconditionerBase):
         """out = c_inv * cost_scaled"""
         cp.multiply(cost, self._cost_scaling_inv, out=out)
 
-    def _compute_kkt_norms(self, data: Data, d: cp.ndarray, d_b: cp.ndarray):
-        """Compute inf-norms of each KKT row/column into d — shape (B, n+p+m).
-
-        d[:, :n]     = max over P columns, A columns, G columns
-        d[:, n:n+p]  = A row norms
-        d[:, n+p:]   = G row norms
-        d_b is NOT set here (handled by caller).
-        """
-        n, p, m = self.n, self.p, self.m
-        self.eval_P_row_inf_norms(data.P, d[:, :n])
-        if p > 0:
-            self.eval_A_col_inf_norms(data.A, self._work_n)
-            d[:, :n] = cp.maximum(d[:, :n], self._work_n)
-            self.eval_A_row_inf_norms(data.A, d[:, n:n+p])
-        if m > 0:
-            self.eval_G_col_inf_norms(data.G, self._work_n)
-            d[:, :n] = cp.maximum(d[:, :n], self._work_n)
-            self.eval_G_row_inf_norms(data.G, d[:, n+p:n+p+m])
-
     # ------------------------------------------------------------------
     # Backend hooks — implemented by DenseRuiz / SparseRuiz / MultistageRuiz
     # ------------------------------------------------------------------
 
     @abstractmethod
-    def eval_P_row_inf_norms(self, P, out: cp.ndarray):
-        """Row inf-norms of P. P: (B, n, n), out: (B, n)."""
+    def compute_kkt_norms(self, data: Data,
+                          d_iter: cp.ndarray, d_b_iter: cp.ndarray):
+        """Fill the Ruiz row/col inf-norms.
+
+        d_iter  (B, n+p+m): row/col inf-norms of the Ruiz KKT matrix
+            [:, :n]      = max(max over P rows/cols, A cols, G cols, x_b_scaling)
+            [:, n:n+p]   = A row inf-norms
+            [:, n+p:]    = G row inf-norms
+        d_b_iter (B, n)  : copy of the current x_b_scaling.
+
+        Backends are expected to write both outputs in a single fused pass.
+        """
         ...
 
     @abstractmethod
-    def eval_A_row_inf_norms(self, A, out: cp.ndarray):
-        """Row inf-norms of A. A: (B, p, n), out: (B, p)."""
+    def scale_matrices(self, data: Data,
+                       d_x: cp.ndarray, d_y: cp.ndarray, d_z: cp.ndarray,
+                       cost_scaling_factor: cp.ndarray | None = None):
+        """Apply row/col scaling to P, A, G, c.
+
+        P <- D_x P D_x,   c <- D_x c,   A <- D_y A D_x,   G <- D_z G D_x
+
+        If ``cost_scaling_factor`` is provided (shape (B,)), additionally 
+        multiply P and c by it. Used by all three call sites:
+          - One Ruiz iter       : (d_iter_x,  d_iter_y,  d_iter_z,  None)
+          - Unscaling            : (d_x_inv,   d_y_inv,   d_z_inv,   cost_scaling_inv)
+          - Re-apply stored      : (delta_x,   delta_y,   delta_z,   cost_scaling)
+        """
         ...
 
     @abstractmethod
-    def eval_A_col_inf_norms(self, A, out: cp.ndarray):
-        """Column inf-norms of A. A: (B, p, n), out: (B, n)."""
-        ...
-
-    @abstractmethod
-    def eval_G_row_inf_norms(self, G, out: cp.ndarray):
-        """Row inf-norms of G. G: (B, m, n), out: (B, m)."""
-        ...
-
-    @abstractmethod
-    def eval_G_col_inf_norms(self, G, out: cp.ndarray):
-        """Column inf-norms of G. G: (B, m, n), out: (B, n)."""
-        ...
-
-    @abstractmethod
-    def _scale_matrices(self, data: Data,
-                        d_x: cp.ndarray, d_y: cp.ndarray, d_z: cp.ndarray):
-        """Apply one Ruiz iteration scaling. d_x: (B, n), d_y: (B, p), d_z: (B, m)."""
-        ...
-
-    @abstractmethod
-    def _apply_cost_scaling(self, data: Data):
-        """Compute gamma from P norms and ||c||, scale P and c by gamma."""
-        ...
-
-    @abstractmethod
-    def _unscale_matrices(self, data: Data,
-                          d_x_inv: cp.ndarray, d_y_inv: cp.ndarray, d_z_inv: cp.ndarray):
-        """Reverse all matrix scaling using stored inverses."""
-        ...
-
-    @abstractmethod
-    def _apply_stored_scaling(self, data: Data,
-                              d_x: cp.ndarray, d_y: cp.ndarray, d_z: cp.ndarray):
-        """Re-apply stored scaling to fresh data (reuse_prev_scaling path)."""
+    def apply_cost_scaling(self, data: Data):
+        """Compute gamma from |P| (triu) and |c|; multiply P and c by gamma;
+        multiply self._cost_scaling by gamma."""
         ...
 
     # ------------------------------------------------------------------
-    # Shared helpers
+    # Shared helpers (for cupy implementation)
     # ------------------------------------------------------------------
 
     def _limit_scaling(self, d: cp.ndarray):

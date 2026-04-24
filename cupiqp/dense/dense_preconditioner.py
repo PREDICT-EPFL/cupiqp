@@ -1,6 +1,19 @@
+from typing import Optional
 import cupy as cp
+import warp as wp
 
+from .dense_data import DenseData
 from ..preconditioner import RuizEquilibration
+from .dense_preconditioner_kernels import (
+    create_dense_compute_kkt_norms_kernel,
+    create_dense_scale_P_and_c_kernel,
+    create_dense_scale_A_or_G_kernel,
+    create_dense_compute_gamma_kernel,
+    create_dense_apply_gamma_kernel,
+)
+
+
+USE_WARP = True
 
 
 class DenseRuizEquilibration(RuizEquilibration):
@@ -9,33 +22,94 @@ class DenseRuizEquilibration(RuizEquilibration):
     All matrices are (B, rows, cols), all vectors are (B, k).
     """
 
-    def eval_P_row_inf_norms(self, P: cp.ndarray, out: cp.ndarray):
-        """P: (B, n, n), out: (B, n)."""
-        cp.max(cp.abs(P), axis=2, out=out)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._dense_compute_kkt_norms_kernel = create_dense_compute_kkt_norms_kernel(
+            self.n, self.p, self.m,
+        )
+        self._dense_scale_P_c_kernel = create_dense_scale_P_and_c_kernel(self.n)
+        if self.p > 0:
+            self._dense_scale_A_kernel = create_dense_scale_A_or_G_kernel(self.p, self.n)
+        if self.m > 0:
+            self._dense_scale_G_kernel = create_dense_scale_A_or_G_kernel(self.m, self.n)
+        # (B,)-ones buffer used when scale_matrices is called with cost_scaling_factor=None.
+        self._cost_factor_ones = cp.ones(self.B, dtype=cp.float64)
 
-    def eval_A_row_inf_norms(self, A: cp.ndarray, out: cp.ndarray):
-        """A: (B, p, n), out: (B, p)."""
-        cp.max(cp.abs(A), axis=2, out=out)
+        self._dense_compute_gamma_kernel = create_dense_compute_gamma_kernel(
+            self.n, self.min_scaling, self.max_scaling,
+        )
+        self._dense_apply_gamma_kernel = create_dense_apply_gamma_kernel(self.n)
+        self._gamma_buf = cp.empty(self.B, dtype=cp.float64)
 
-    def eval_A_col_inf_norms(self, A: cp.ndarray, out: cp.ndarray):
-        """A: (B, p, n), out: (B, n)."""
-        cp.max(cp.abs(A), axis=1, out=out)
+    # ------------------------------------------------------------------
+    # 3-hook backend API
+    # ------------------------------------------------------------------
 
-    def eval_G_row_inf_norms(self, G: cp.ndarray, out: cp.ndarray):
-        """G: (B, m, n), out: (B, m)."""
-        cp.max(cp.abs(G), axis=2, out=out)
+    def compute_kkt_norms(self, data: DenseData,
+                          d_iter: cp.ndarray, d_b_iter: cp.ndarray):
+        """Fill d_iter (B, n+p+m) with Ruiz row/col inf-norms; d_b_iter = x_b_scaling."""
+        n, p, m = self.n, self.p, self.m
 
-    def eval_G_col_inf_norms(self, G: cp.ndarray, out: cp.ndarray):
-        """G: (B, m, n), out: (B, n)."""
-        cp.max(cp.abs(G), axis=1, out=out)
+        if USE_WARP:
+            wp.launch(
+                kernel=self._dense_compute_kkt_norms_kernel,
+                dim=(self.B, n + p + m),
+                inputs=[data.P, data.A, data.G, self._x_b_scaling, d_iter, d_b_iter],
+                device="cuda",
+                stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+            )
+            return
 
-    def _scale_matrices(self, data,
-                        d_x: cp.ndarray, d_y: cp.ndarray, d_z: cp.ndarray):
-        """d_x: (B, n), d_y: (B, p), d_z: (B, m).  Data arrays are (B, *, *)."""
-        # P: (B, n, n) *= (B, 1, n) then *= (B, n, 1)
+        # --- cupy fallback (kept for A/B verification) ---
+        P, A, G = data.P, data.A, data.G
+        cp.max(cp.abs(P), axis=2, out=d_iter[:, :n])
+        if p > 0:
+            cp.max(cp.abs(A), axis=1, out=self._work_n)
+            d_iter[:, :n] = cp.maximum(d_iter[:, :n], self._work_n)
+            cp.max(cp.abs(A), axis=2, out=d_iter[:, n:n+p])
+        if m > 0:
+            cp.max(cp.abs(G), axis=1, out=self._work_n)
+            d_iter[:, :n] = cp.maximum(d_iter[:, :n], self._work_n)
+            cp.max(cp.abs(G), axis=2, out=d_iter[:, n+p:n+p+m])
+        cp.maximum(d_iter[:, :n], self._x_b_scaling, out=d_iter[:, :n])
+        d_b_iter[:] = self._x_b_scaling
+
+    def scale_matrices(self, data: DenseData,
+                       d_x: cp.ndarray, d_y: cp.ndarray, d_z: cp.ndarray,
+                       cost_scaling_factor: Optional[cp.ndarray] = None):
+        """Apply row/col scaling in-place to P, c, A, G."""
+        if USE_WARP:
+            stream = wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr)
+            cf = cost_scaling_factor if cost_scaling_factor is not None else self._cost_factor_ones
+            wp.launch(
+                kernel=self._dense_scale_P_c_kernel,
+                dim=(self.B, self.n, self.n),
+                inputs=[data._P, data._c, d_x, cf],
+                device="cuda", stream=stream,
+            )
+            if self.p > 0:
+                wp.launch(
+                    kernel=self._dense_scale_A_kernel,
+                    dim=(self.B, self.p, self.n),
+                    inputs=[data._A, d_y, d_x],
+                    device="cuda", stream=stream,
+                )
+            if self.m > 0:
+                wp.launch(
+                    kernel=self._dense_scale_G_kernel,
+                    dim=(self.B, self.m, self.n),
+                    inputs=[data._G, d_z, d_x],
+                    device="cuda", stream=stream,
+                )
+            return
+
+        # --- cupy fallback ---
         data._P *= d_x[:, None, :]
         data._P *= d_x[:, :, None]
         data._c *= d_x
+        if cost_scaling_factor is not None:
+            data._P *= cost_scaling_factor[:, None, None]
+            data._c *= cost_scaling_factor[:, None]
         if self.p > 0:
             data._A *= d_x[:, None, :]
             data._A *= d_y[:, :, None]
@@ -43,47 +117,39 @@ class DenseRuizEquilibration(RuizEquilibration):
             data._G *= d_x[:, None, :]
             data._G *= d_z[:, :, None]
 
-    def _apply_cost_scaling(self, data):
-        """Per-problem cost scaling gamma.  Stores (B,) in self.c_scaling."""
-        P_abs = cp.abs(data._P)                          # (B, n, n)
-        # triu per-batch: use einsum or just compute max along rows and cols
-        P_utri = cp.triu(P_abs.reshape(-1, self.n, self.n)).reshape(data._P.shape)
-        col_max = cp.max(P_utri, axis=1)                 # (B, n)
-        row_max = cp.max(P_utri, axis=2)                 # (B, n)
-        gamma = cp.mean(cp.maximum(col_max, row_max), axis=1)  # (B,)
+    def apply_cost_scaling(self, data: DenseData):
+        """Per-problem cost scaling gamma = 1/max(mean(||P_cols||), ||c||).
+
+        Scales P and c by gamma, accumulates gamma into self._cost_scaling.
+        """
+        if USE_WARP:
+            stream = wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr)
+            wp.launch(
+                kernel=self._dense_compute_gamma_kernel,
+                dim=(self.B,),
+                inputs=[data._P, data._c, self._gamma_buf],
+                device="cuda", stream=stream,
+            )
+            wp.launch(
+                kernel=self._dense_apply_gamma_kernel,
+                dim=(self.B, self.n, self.n),
+                inputs=[data._P, data._c, self._cost_scaling, self._gamma_buf],
+                device="cuda", stream=stream,
+            )
+            return
+
+        # --- cupy fallback ---
+        n = self.n
+        P_abs = cp.abs(data._P)                                       # (B, n, n)
+        P_utri = cp.triu(P_abs.reshape(-1, n, n)).reshape(data._P.shape)
+        col_max = cp.max(P_utri, axis=1)                              # (B, n)
+        row_max = cp.max(P_utri, axis=2)                              # (B, n)
+        gamma = cp.mean(cp.maximum(col_max, row_max), axis=1)         # (B,)
         gamma = cp.clip(gamma, self.min_scaling, self.max_scaling)
-        c_norm = cp.max(cp.abs(data._c), axis=1)         # (B,)
+        c_norm = cp.max(cp.abs(data._c), axis=1)                      # (B,)
         gamma = cp.maximum(gamma, c_norm)
         gamma = cp.clip(gamma, self.min_scaling, self.max_scaling)
-        gamma = 1.0 / gamma                              # (B,)
+        gamma = 1.0 / gamma                                           # (B,)
         data._P *= gamma[:, None, None]
         data._c *= gamma[:, None]
-        self._c_scaling *= gamma
-
-    def _unscale_matrices(self, data,
-                          d_x_inv: cp.ndarray, d_y_inv: cp.ndarray, d_z_inv: cp.ndarray):
-        c_inv = self._cost_scaling_inv[:, None, None]  # (B, 1, 1) for P, reuse as needed
-        data._P *= c_inv
-        data._P *= d_x_inv[:, None, :]
-        data._P *= d_x_inv[:, :, None]
-        data._c *= self._cost_scaling_inv[:, None] * d_x_inv
-        if self.p > 0:
-            data._A *= d_x_inv[:, None, :]
-            data._A *= d_y_inv[:, :, None]
-        if self.m > 0:
-            data._G *= d_x_inv[:, None, :]
-            data._G *= d_z_inv[:, :, None]
-
-    def _apply_stored_scaling(self, data,
-                              d_x: cp.ndarray, d_y: cp.ndarray, d_z: cp.ndarray):
-        c = self._c_scaling
-        data._P *= c[:, None, None]
-        data._P *= d_x[:, None, :]
-        data._P *= d_x[:, :, None]
-        data._c *= c[:, None] * d_x
-        if self.p > 0:
-            data._A *= d_x[:, None, :]
-            data._A *= d_y[:, :, None]
-        if self.m > 0:
-            data._G *= d_x[:, None, :]
-            data._G *= d_z[:, :, None]
+        self._cost_scaling *= gamma
