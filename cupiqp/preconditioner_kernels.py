@@ -42,7 +42,10 @@ def create_clamp_and_rsqrt_kernel(n: int, p: int, m: int,
     return clamp_rsqrt_kernel
 
 
-def create_calc_scaling_inv_and_scale_bounds_kernel(n: int, p: int, m: int):
+def create_calc_scaling_inv_and_scale_bounds_kernel(
+    n: int, p: int, m: int,
+    num_hl: int, num_hu: int, num_xl: int, num_xu: int,
+):
     """Fuse the kernel for storing the inverse of scaling factors and scaling the bounds.
 
     Replaces the cupy/warp chain
@@ -81,11 +84,23 @@ def create_calc_scaling_inv_and_scale_bounds_kernel(n: int, p: int, m: int):
         data_h_u:         wp.array2d(dtype=wp.float64),  # type: ignore  (B, m) — to be scaled in-place
         data_x_l:         wp.array2d(dtype=wp.float64),  # type: ignore  (B, n) — to be scaled in-place
         data_x_u:         wp.array2d(dtype=wp.float64),  # type: ignore  (B, n) — to be scaled in-place
+        idx_hl:                    wp.array(dtype=wp.int32),      # type: ignore  (num_hl,)
+        idx_hu:                    wp.array(dtype=wp.int32),      # type: ignore  (num_hu,)
+        idx_xl:                    wp.array(dtype=wp.int32),      # type: ignore  (num_xl,)
+        idx_xu:                    wp.array(dtype=wp.int32),      # type: ignore  (num_xu,)
+        dual_res_unscale_factor:   wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)          output
+        primal_res_unscale_factor: wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_duals)  output
     ):
         b, k = wp.tid()
         n_static = wp.static(n)
         np_static = wp.static(n + p)
         npm_static = wp.static(n + p + m)
+        tail_start = wp.static(n + p + m + 1)
+        off_zl_end  = wp.static(p)
+        off_zu_end  = wp.static(p + num_hl)
+        off_zbl_end = wp.static(p + num_hl + num_hu)
+        off_zbu_end = wp.static(p + num_hl + num_hu + num_xl)
+        num_duals   = wp.static(p + num_hl + num_hu + num_xl + num_xu)
 
         if k < n_static:
             delta_inv[b, k] = wp.float64(1.0) / delta[b, k]
@@ -93,6 +108,8 @@ def create_calc_scaling_inv_and_scale_bounds_kernel(n: int, p: int, m: int):
             # scale x_l and x_u inplace
             data_x_l[b, k] = data_x_l[b, k] * delta_b[b, k]
             data_x_u[b, k] = data_x_u[b, k] * delta_b[b, k]
+            # dual_res_unscale_factor = cost_scaling_inv * delta_inv on x-block
+            dual_res_unscale_factor[b, k] = wp.float64(1.0) / (cost_scaling[b] * delta[b, k])
         elif k < np_static:
             delta_inv[b, k] = wp.float64(1.0) / delta[b, k]
             # scale rhs of equality constraints inplace
@@ -106,6 +123,25 @@ def create_calc_scaling_inv_and_scale_bounds_kernel(n: int, p: int, m: int):
         elif k < npm_static + 1:
             # compute inverse of cost scaling
             cost_scaling_inv[b] = wp.float64(1.0) / cost_scaling[b]
+        elif k < tail_start + num_duals:
+            # primal_res_unscale_factor[b, j], packed in _dual_buffer order
+            # [y | z_l | z_u | z_bl | z_bu]. Read only inputs (delta, delta_b,
+            # idx_*) — no read-after-write hazard within this kernel.
+            j = k - tail_start
+            if j < off_zl_end:
+                primal_res_unscale_factor[b, j] = wp.float64(1.0) / delta[b, wp.static(n) + j]
+            elif j < off_zu_end:
+                idx = idx_hl[j - wp.static(p)]
+                primal_res_unscale_factor[b, j] = wp.float64(1.0) / delta[b, wp.static(n + p) + idx]
+            elif j < off_zbl_end:
+                idx = idx_hu[j - wp.static(p + num_hl)]
+                primal_res_unscale_factor[b, j] = wp.float64(1.0) / delta[b, wp.static(n + p) + idx]
+            elif j < off_zbu_end:
+                idx = idx_xl[j - wp.static(p + num_hl + num_hu)]
+                primal_res_unscale_factor[b, j] = wp.float64(1.0) / delta_b[b, idx]
+            else:
+                idx = idx_xu[j - wp.static(p + num_hl + num_hu + num_xl)]
+                primal_res_unscale_factor[b, j] = wp.float64(1.0) / delta_b[b, idx]
         else:
             return
 

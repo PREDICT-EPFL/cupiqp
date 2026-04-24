@@ -197,6 +197,8 @@ class RuizEquilibration(PreconditionerBase):
     def __init__(self, B: int, n: int, p: int, m: int,
                  idx_xl: cp.ndarray,
                  idx_xu: cp.ndarray,
+                 idx_hl: cp.ndarray,
+                 idx_hu: cp.ndarray,
                  min_scaling: float = 1e-4,
                  max_scaling: float = 1e4,
                  convergence_tol: float = 1e-3,
@@ -205,6 +207,12 @@ class RuizEquilibration(PreconditionerBase):
         self.n = n
         self.p = p
         self.m = m
+
+        self._idx_xl = idx_xl
+        self._idx_xu = idx_xu
+        self._idx_hl = idx_hl
+        self._idx_hu = idx_hu
+
         self.min_scaling = min_scaling
         self.max_scaling = max_scaling
         self.convergence_tol = convergence_tol
@@ -220,6 +228,31 @@ class RuizEquilibration(PreconditionerBase):
         # Cost scaling: (B,)
         self._cost_scaling = cp.ones(B, dtype=cp.float64)
         self._cost_scaling_inv = cp.ones(B, dtype=cp.float64)
+
+        # Pre-combined residual unscaling factors — materialized once per
+        # Ruiz update in _refresh_unscale_factors(). The solver's
+        # update_residuals_r_kernel reads these directly so its stage-2
+        # reductions stay pure tile_max(tile_map(_abs_mul, ...)) calls with
+        # no in-kernel gather / cost_scaling_inv multiply.
+        #
+        #   dual_res_unscale_factor[b, i]   = cost_scaling_inv[b] * delta_inv[b, i]
+        #                                     for i ∈ [0, n)
+        #       — multiplies res.x (the dual residual on the x-block)
+        #         element-wise to convert it back to original units.
+        #
+        #   primal_res_unscale_factor[b, j] = unscaling factor for res.duals_all
+        #       — shape (B, num_duals); packed in Variables._dual_buffer
+        #         order [y | z_l | z_u | z_bl | z_bu], with per-segment
+        #         content (see _refresh_unscale_factors for the exact slices):
+        #
+        #             [y]:    delta_inv[:, n : n+p]
+        #             [z_l]:  delta_inv[:, n + p + idx_hl]     (gather)
+        #             [z_u]:  delta_inv[:, n + p + idx_hu]     (gather)
+        #             [z_bl]: delta_b_inv[:, idx_xl]           (gather)
+        #             [z_bu]: delta_b_inv[:, idx_xu]           (gather)
+        num_duals = p + idx_hl.size + idx_hu.size + idx_xl.size + idx_xu.size
+        self._dual_res_unscale_factor = cp.ones((B, n), dtype=cp.float64)
+        self._primal_res_unscale_factor = cp.ones((B, num_duals), dtype=cp.float64)
 
         # x_b_scaling: (B, n) — 1 for bounded variables, 0 for unbounded.
         # Bound structure is shared across batch, so init is the same for all b.
@@ -245,7 +278,9 @@ class RuizEquilibration(PreconditionerBase):
         )
         self._accumulate_deltas_kernel = create_accumulate_deltas_kernel(n, p, m)
         self._conv_check_kernel = create_ruiz_conv_check_kernel(n, p, m)
-        self._calc_scaling_inv_and_scale_bounds_kernel = create_calc_scaling_inv_and_scale_bounds_kernel(n, p, m)
+        self._calc_scaling_inv_and_scale_bounds_kernel = create_calc_scaling_inv_and_scale_bounds_kernel(
+            n, p, m, idx_hl.size, idx_hu.size, idx_xl.size, idx_xu.size,
+        )
 
         # (2B,) buffer for per-batch (max_d, max_db) pairs — cp.max gives global.
         self._conv_buf = cp.empty(2 * B, dtype=cp.float64)
@@ -290,6 +325,110 @@ class RuizEquilibration(PreconditionerBase):
         """
         return self._x_b_scaling
 
+    @property
+    def dual_res_unscale_factor(self) -> cp.ndarray:
+        """(B, n). Per-element multiplier that converts the scaled dual
+        residual on the x-block back to original units::
+
+            unscaled_dual_res[b, i] = res.x[b, i] * dual_res_unscale_factor[b, i]
+
+        Computed from the preconditioner's inverse scalings as::
+
+            dual_res_unscale_factor[b, i] = cost_scaling_inv[b] * delta_inv[b, i]
+                                            for i ∈ [0, n)
+
+        where ``delta_inv[:, :n] = 1 / delta[:, :n]`` is the x-block of the
+        combined scaling vector and ``cost_scaling_inv = 1 / cost_scaling``.
+
+        Refreshed by ``_refresh_unscale_factors`` whenever ``delta`` or
+        ``cost_scaling`` changes (end of ``scale_data``, in ``reset``).
+        """
+        return self._dual_res_unscale_factor
+
+    @property
+    def primal_res_unscale_factor(self) -> cp.ndarray:
+        """(B, num_duals). Per-element multiplier that converts the scaled
+        primal residuals on the dual variables back to original units::
+
+            unscaled_primal_res[b, j] = res.duals_all[b, j]
+                                        * primal_res_unscale_factor[b, j]
+
+        Laid out in ``Variables._dual_buffer`` order
+        ``[y | z_l | z_u | z_bl | z_bu]``. Per-segment computation from
+        the preconditioner's inverse scalings (``delta_inv = 1 / delta``,
+        ``delta_b_inv = 1 / delta_b``):
+
+            offset range                                  content
+            -----------------------------------           ----------------------------
+            [0 : p]                                       delta_inv[:, n : n+p]
+            [p : p+num_hl]                                delta_inv[:, n + p + idx_hl]
+            [p+num_hl : p+num_hl+num_hu]                  delta_inv[:, n + p + idx_hu]
+            [p+num_hl+num_hu : p+num_hl+num_hu+num_xl]    delta_b_inv[:, idx_xl]
+            [p+num_hl+num_hu+num_xl : num_duals]          delta_b_inv[:, idx_xu]
+
+        Note there's no ``cost_scaling_inv`` factor on the primal side — only
+        the dual residual is scaled by the cost factor.
+
+        Refreshed by ``_refresh_unscale_factors`` whenever ``delta`` or
+        ``delta_b`` changes (end of ``scale_data``, in ``reset``).
+        """
+        return self._primal_res_unscale_factor
+
+    def _refresh_unscale_factors(self):
+        """Re-materialize dual_res_unscale_factor and primal_res_unscale_factor
+        from the current ``delta_inv`` / ``delta_b_inv`` / ``cost_scaling_inv``.
+
+        Call whenever any of those three arrays is updated (end of
+        ``_scale_data_warp`` / ``_scale_data_cupy``, and in ``reset``).
+        Not needed in ``reuse_scaling`` because it leaves delta/delta_b/
+        cost_scaling untouched.
+
+        Formulas:
+
+            dual_res_unscale_factor[b, i]    =  cost_scaling_inv[b]
+                                              * delta_inv[b, i]            i ∈ [0, n)
+
+            primal_res_unscale_factor[b, j]  =  see layout in the property
+                                                docstring — concatenated
+                                                slices of delta_inv and
+                                                delta_b_inv, in
+                                                _dual_buffer order.
+        """
+        n, p = self.n, self.p
+
+        # x-block for the dual residual:
+        #     dual_res_unscale_factor = cost_scaling_inv[:, None] * delta_inv[:, :n]
+        cp.multiply(self._cost_scaling_inv[:, None], self._delta_inv[:, :n],
+                    out=self._dual_res_unscale_factor)
+
+        # Duals-block for the primal residual, packed in Variables._dual_buffer
+        # order [y | z_l | z_u | z_bl | z_bu]. Offsets are computed from the
+        # compile-time-fixed segment sizes (p, num_hl, num_hu, num_xl, num_xu).
+        off = 0
+        if p > 0:
+            # [y]: delta_inv[:, n : n+p]
+            self._primal_res_unscale_factor[:, off:off + p] = self._delta_inv[:, n:n + p]
+            off += p
+        n_hl = self._idx_hl.size
+        if n_hl > 0:
+            # [z_l]: gather delta_inv[:, n + p + idx_hl]
+            self._primal_res_unscale_factor[:, off:off + n_hl] = self._delta_inv[:, n + p + self._idx_hl]
+            off += n_hl
+        n_hu = self._idx_hu.size
+        if n_hu > 0:
+            # [z_u]: gather delta_inv[:, n + p + idx_hu]
+            self._primal_res_unscale_factor[:, off:off + n_hu] = self._delta_inv[:, n + p + self._idx_hu]
+            off += n_hu
+        n_xl = self._idx_xl.size
+        if n_xl > 0:
+            # [z_bl]: gather delta_b_inv[:, idx_xl]
+            self._primal_res_unscale_factor[:, off:off + n_xl] = self._delta_b_inv[:, self._idx_xl]
+            off += n_xl
+        n_xu = self._idx_xu.size
+        if n_xu > 0:
+            # [z_bu]: gather delta_b_inv[:, idx_xu]
+            self._primal_res_unscale_factor[:, off:off + n_xu] = self._delta_b_inv[:, self._idx_xu]
+
     def reset(self):
         self._delta.fill(1.0)
         self._delta_inv.fill(1.0)
@@ -298,6 +437,8 @@ class RuizEquilibration(PreconditionerBase):
         self._cost_scaling.fill(1.0)
         self._cost_scaling_inv.fill(1.0)
         cp.copyto(self._x_b_scaling, self._x_b_scaling_init)
+        self._dual_res_unscale_factor.fill(1.0)
+        self._primal_res_unscale_factor.fill(1.0)
 
     # ------------------------------------------------------------------
     # Data-level scaling
@@ -359,14 +500,17 @@ class RuizEquilibration(PreconditionerBase):
             if float(cp.max(self._conv_buf)) < self.convergence_tol:
                 break
 
+        num_duals = self._primal_res_unscale_factor.shape[1]
         wp.launch(
             kernel=self._calc_scaling_inv_and_scale_bounds_kernel,
-            dim=(self.B, n + p + m + 1),
+            dim=(self.B, n + p + m + 1 + num_duals),
             inputs=[
                 self._delta, self._delta_inv,
                 self._delta_b, self._delta_b_inv,
                 self._cost_scaling, self._cost_scaling_inv,
                 data._b, data._h_l, data._h_u, data._x_l, data._x_u,
+                self._idx_hl, self._idx_hu, self._idx_xl, self._idx_xu,
+                self._dual_res_unscale_factor, self._primal_res_unscale_factor,
             ],
             device="cuda", stream=stream,
         )
@@ -409,6 +553,7 @@ class RuizEquilibration(PreconditionerBase):
         cp.reciprocal(self._cost_scaling, out=self._cost_scaling_inv)
 
         self._scale_bounds(data)
+        self._refresh_unscale_factors()
 
     @nvtx.annotate("RuizEquilibration::unscale_data")
     def unscale_data(self, data: Data):

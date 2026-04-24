@@ -230,32 +230,153 @@ def create_calculate_sigma_kernel(num_ineq: int):
     return calculate_sigma_kernel
 
 
-def create_update_residual_r_kernel(n: int, p: int, num_ineq: int):
-    """Performs the following operations using contiguous duals_all
+def create_update_residuals_r_kernel(
+    n: int, p: int, num_hu: int, num_hl: int, num_xu: int, num_xl: int,
+):
+    """Single fused kernel for the whole ``_update_residuals_r`` body.
+
+    Residual-unscaling factors are passed pre-combined as
+    ``dual_res_unscale_factor`` (B, n) and ``primal_res_unscale_factor``
+    (B, num_duals), materialized once per Ruiz update by the preconditioner
+    (see ``RuizEquilibration._refresh_unscale_factors``). The kernel needs
+    no preconditioner state or gather indices — every stage-2 reduction is
+    a contiguous tile_max.
+
+    Stage 1 -- build regularized residuals from non-regularized ones. The
+    ``delta`` / ``rho`` kernel args are the IPM proximal-step scalars; they
+    are *not* the preconditioner's ``delta`` / ``delta_inv``:
+
         res.x[b]         = res_nr.x[b]         - rho[b]   * (result.x[b]         - prox.x[b])
         res.duals_all[b] = res_nr.duals_all[b] + delta[b] * (result.duals_all[b] - prox.duals_all[b])
+
+    Stage 2 -- four reductions over the freshly computed residuals + the
+    primal/dual prox-infeasibility measures. The two ``*_unscale_factor``
+    inputs hold:
+
+        dual_res_unscale_factor[b, i]    = cost_scaling_inv[b] * delta_inv[b, i]
+                                           for i ∈ [0, n)
+
+        primal_res_unscale_factor[b, j]  = packed in Variables._dual_buffer
+                                           order [y | z_l | z_u | z_bl | z_bu]:
+                                             [y]:    delta_inv[b, n : n+p]
+                                             [z_l]:  delta_inv[b, n + p + idx_hl]
+                                             [z_u]:  delta_inv[b, n + p + idx_hu]
+                                             [z_bl]: delta_b_inv[b, idx_xl]
+                                             [z_bu]: delta_b_inv[b, idx_xu]
+
+        dual_res_reg[b]    = max_i ( |res.x[b, i]|                         * dual_res_unscale_factor[b, i] )
+        dual_prox_inf[b]   = rho[b]   * max_i ( |result.x[b, i]     - prox.x[b, i]| )
+        primal_prox_inf[b] = delta[b] * max_i ( |result.duals_all[b, i] - prox.duals_all[b, i]| )
+        primal_res_reg[b]  = max_j ( |res.duals_all[b, j]|                 * primal_res_unscale_factor[b, j] )
+
+    Stage 3 -- scalar finalize (thread 0 only). ``delta`` / ``rho`` here
+    are again the IPM proximal scalars, not preconditioner state:
+
+        dual_res_reg_rel[b]   = dual_res_reg[b]   * dual_res_rel[b]   / dual_res[b]   if dual_res_rel[b]   > 0 else dual_res_reg[b]
+        primal_res_reg_rel[b] = primal_res_reg[b] * primal_res_rel[b] / primal_res[b] if primal_res_rel[b] > 0 else primal_res_reg[b]
+
+    ``p`` / ``num_hu`` / ``num_hl`` / ``num_xu`` / ``num_xl`` are compile-time
+    constants. ``n`` is always > 0; ``num_duals == 0`` (no eq, no ineq, no
+    box) is handled by thread 0 writing zeros.
+
+    Tile reuse: stage 1's ``diff_x``, ``new_res_x``, ``diff_d``, ``new_res_d``
+    tiles are kept in registers and fed straight into stage 2's reductions —
+    no extra global loads.
+
+    Dispatch: ``wp.launch_tiled(..., dim=[B], block_dim=256)`` -- one block
+    per batch.
     """
+    num_duals = p + num_hu + num_hl + num_xu + num_xl
+
+    @wp.func
+    def _abs_mul(a: wp.float64, b: wp.float64) -> wp.float64:
+        return wp.abs(a) * b
+
     @wp.kernel
-    def update_residual_r_kernel(
-        rho: wp.array(dtype=wp.float64),             # (B,)         # type: ignore
-        delta: wp.array(dtype=wp.float64),           # (B,)         # type: ignore
-        res_nr_x: wp.array2d(dtype=wp.float64),      # (B, n)       # type: ignore
-        res_nr_dual: wp.array2d(dtype=wp.float64),   # (B, p+nineq) # type: ignore
-        result_x: wp.array2d(dtype=wp.float64),      # (B, n)       # type: ignore
-        result_dual: wp.array2d(dtype=wp.float64),   # (B, p+nineq) # type: ignore
-        prox_x: wp.array2d(dtype=wp.float64),        # (B, n)       # type: ignore
-        prox_dual: wp.array2d(dtype=wp.float64),     # (B, p+nineq) # type: ignore
-        res_r_x: wp.array2d(dtype=wp.float64),       # (B, n)       # type: ignore
-        res_r_dual: wp.array2d(dtype=wp.float64),    # (B, p+nineq) # type: ignore
+    def update_residuals_r_kernel(
+        # Stage 1 inputs
+        rho:           wp.array(dtype=wp.float64),    # type: ignore  (B,)
+        delta:         wp.array(dtype=wp.float64),    # type: ignore  (B,)
+        res_nr_x:      wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
+        res_nr_duals:   wp.array2d(dtype=wp.float64), # type: ignore  (B, num_duals)
+        result_x:      wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
+        result_duals:  wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_duals)
+        prox_x:        wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
+        prox_duals:    wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_duals)
+        # Stage 1 outputs
+        res_x:         wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
+        res_duals:     wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_duals)
+        # Pre-combined residual unscaling factors (from preconditioner)
+        dual_res_unscale_factor:   wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
+        primal_res_unscale_factor: wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_duals)
+        # Stage 3 scalar inputs
+        primal_res:     wp.array(dtype=wp.float64),  # type: ignore  (B,)
+        primal_res_rel: wp.array(dtype=wp.float64),  # type: ignore  (B,)
+        dual_res:       wp.array(dtype=wp.float64),  # type: ignore  (B,)
+        dual_res_rel:   wp.array(dtype=wp.float64),  # type: ignore  (B,)
+        # Outputs
+        primal_res_reg:     wp.array(dtype=wp.float64),  # type: ignore
+        primal_res_reg_rel: wp.array(dtype=wp.float64),  # type: ignore
+        dual_res_reg:       wp.array(dtype=wp.float64),  # type: ignore
+        dual_res_reg_rel:   wp.array(dtype=wp.float64),  # type: ignore
+        primal_prox_inf:    wp.array(dtype=wp.float64),  # type: ignore
+        dual_prox_inf:      wp.array(dtype=wp.float64),  # type: ignore
     ):
-        b, t = wp.tid()
-        n_static = wp.static(n)
-        num_duals_static = wp.static(p + num_ineq)
+        b, i = wp.tid()
 
-        if t < n_static:
-            res_r_x[b, t] = -rho[b] * (result_x[b, t] - prox_x[b, t]) + res_nr_x[b, t]
-        elif t < n_static + num_duals_static:
-            idx = t - n_static
-            res_r_dual[b, idx] = delta[b] * (result_dual[b, idx] - prox_dual[b, idx]) + res_nr_dual[b, idx]
+        # --- x-sized pipeline: stage 1 (build res.x) + stage 2 (dual_prox_inf, dual_res_reg) ---
+        res_nr_x_tile = wp.tile_load(res_nr_x[b],  shape=n)
+        result_x_tile = wp.tile_load(result_x[b],  shape=n)
+        prox_x_tile   = wp.tile_load(prox_x[b],    shape=n)
+        diff_x_tile   = result_x_tile - prox_x_tile
 
-    return update_residual_r_kernel
+        # Stage 1: res.x = res_nr.x - rho * (result.x - prox.x)
+        new_res_x_tile = res_nr_x_tile - rho[b] * diff_x_tile
+        wp.tile_store(res_x[b], new_res_x_tile)
+
+        # Stage 2: dual_prox_inf = rho[b] * max |diff_x|  (reusing the tile)
+        mt = wp.tile_max(wp.tile_map(wp.abs, diff_x_tile))
+        wp.tile_store(dual_prox_inf, mt * rho[b], offset=b)
+
+        # Stage 2: dual_res_reg = max |new_res_x * dual_res_unscale_factor|
+        scale_x_tile = wp.tile_load(dual_res_unscale_factor[b], shape=n)
+        mt = wp.tile_max(wp.tile_map(_abs_mul, new_res_x_tile, scale_x_tile))
+        wp.tile_store(dual_res_reg, mt, offset=b)
+
+        # --- duals-sized pipeline: stage 1 (build res.duals) + stage 2 (primal_prox_inf, primal_res_reg) ---
+        if wp.static(num_duals > 0):
+            nr_d_tile  = wp.tile_load(res_nr_duals[b],   shape=num_duals)
+            r_d_tile   = wp.tile_load(result_duals[b],  shape=num_duals)
+            p_d_tile   = wp.tile_load(prox_duals[b],    shape=num_duals)
+            diff_d_tile = r_d_tile - p_d_tile
+
+            # Stage 1: res.duals = res_nr.duals + delta * (result.duals - prox.duals)
+            new_res_d_tile = nr_d_tile + delta[b] * diff_d_tile
+            wp.tile_store(res_duals[b], new_res_d_tile)
+
+            # Stage 2: primal_prox_inf = delta[b] * max |diff_d|
+            mt = wp.tile_max(wp.tile_map(wp.abs, diff_d_tile))
+            wp.tile_store(primal_prox_inf, mt * delta[b], offset=b)
+
+            # Stage 2: primal_res_reg = max |new_res_d * primal_res_unscale_factor|
+            scale_d_tile = wp.tile_load(primal_res_unscale_factor[b], shape=num_duals)
+            mt = wp.tile_max(wp.tile_map(_abs_mul, new_res_d_tile, scale_d_tile))
+            wp.tile_store(primal_res_reg, mt, offset=b)
+        else:
+            if i == 0:
+                primal_prox_inf[b] = wp.float64(0.0)
+                primal_res_reg[b]  = wp.float64(0.0)
+
+        # --- Stage 3: scalar finalize --------------------------------------
+        if i == 0:
+            if primal_res_rel[b] > wp.float64(0.0):
+                primal_res_reg_rel[b] = primal_res_reg[b] * primal_res_rel[b] / primal_res[b]
+            else:
+                primal_res_reg_rel[b] = primal_res_reg[b]
+
+            if dual_res_rel[b] > wp.float64(0.0):
+                dual_res_reg_rel[b] = dual_res_reg[b] * dual_res_rel[b] / dual_res[b]
+            else:
+                dual_res_reg_rel[b] = dual_res_reg[b]
+
+    return update_residuals_r_kernel
