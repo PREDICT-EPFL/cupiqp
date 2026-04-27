@@ -380,3 +380,372 @@ def create_update_residuals_r_kernel(
                 dual_res_reg_rel[b] = dual_res_reg[b]
 
     return update_residuals_r_kernel
+
+
+def create_update_residual_nr_kernel(n: int, p: int, m: int, num_hl: int, num_hu: int, num_xl: int, num_xu: int):
+    r"""Fused kernel to update non-regularized residuals
+
+    - ``minus_Px``      = ``-P*x``                             from ``eval_P_x(alpha=-1)``  (also used as the in-place ``res_nr.x`` slot)
+    - ``A_x``           = ``+A*x``                             from ``eval_A_xn(alpha=+1)`` (note: NOT aliased with ``res_nr.y``; see solver wiring)
+    - ``AT_y``          = ``A^T * y``                          from ``eval_AT_xt``
+    - ``G_x``           = ``G*x``                              from ``eval_G_xn``
+    - ``GT_zh_assembled`` = ``G^T * (z_u - z_l)``              from ``eval_GT_xt`` (input to that matvec is built by the pre-matvec scatter into ``zu_minus_zl``)
+    - ``zb_assembled``  = ``x_b_scaling * (z_bu - z_bl)``      from the pre-matvec scatter (``prepare_zu_minus_zl_and_zbu_minus_zbl_kernel``)
+
+    Compute:
+
+        res_nr.x      = -(P*x + c + A^T*y + G^T*(z_u - z_l) + x_b_scaling*(z_bu - z_bl))
+        res_nr.y      = -A*x + b
+        res_nr.z_hl   =  G*x[idx_hl] - s_l - h_l[idx_hl]
+        res_nr.z_hu   = -G*x[idx_hu] - s_u + h_u[idx_hu]
+        res_nr.z_xl   =  x_b_scaling[idx_xl]*x[idx_xl] - s_bl - x_l[idx_xl]
+        res_nr.z_xu   = -(x_b_scaling[idx_xu]*x[idx_xu] + s_bu - x_u[idx_xu])
+
+        primal_obj    = (0.5 x^T P x + c^T x) * cost_scaling_inv
+        dual_obj      = -(0.5 x^T P x + b^T y + h_u^T z_u - h_l^T z_l + x_u^T z_bu - x_l^T z_bl) * cost_scaling_inv
+        duality_gap   = |primal_obj - dual_obj|
+        duality_gap_rel = duality_gap / max(1, max_k(cost_scaling_inv * |w_k|))   for w_k in the 7 unique obj-sum terms
+
+        primal_res    = max over the 5 segments of  ||delta_inv_seg * res_nr_seg||_inf  (unscaled)
+        primal_norm    = max(||A*x||, ||G*x[hu]||, ||G*x[hl]||,
+                            ||s_u||,  ||s_l||,  ||s_bu||, ||s_bl||,
+                            constraints_rhs_inf_norm[b])    -- all unscaled
+        primal_res_rel = primal_res / max(1, primal_norm)
+
+        dual_res      = ||delta_x_inv * res_nr.x||_inf * cost_scaling_inv
+        dual_norm     = max(||P*x||, ||c||, ||A^T*y + G^T*(z_u-z_l) + x_b_scaling*(z_bu-z_bl)||) * delta_x_inv * cost_scaling_inv
+        dual_res_rel  = dual_res / max(1, dual_norm)
+    """
+    @wp.kernel
+    def update_residual_nr_kernel(
+        minus_Px:                   wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
+        A_x:                        wp.array2d(dtype=wp.float64),  # type: ignore  (B, p)
+        AT_y:                       wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
+        G_x:                        wp.array2d(dtype=wp.float64),  # type: ignore  (B, m)
+        GT_zh_assembled:            wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
+        zb_assembled:               wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
+        # Data
+        data_c:                     wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
+        data_b:                     wp.array2d(dtype=wp.float64),  # type: ignore  (B, p)
+        data_h_l:                   wp.array2d(dtype=wp.float64),  # type: ignore  (B, m)
+        data_h_u:                   wp.array2d(dtype=wp.float64),  # type: ignore  (B, m)
+        data_x_l:                   wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
+        data_x_u:                   wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
+        # Variables at current iteration
+        result_x:                   wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
+        result_y:                   wp.array2d(dtype=wp.float64),  # type: ignore  (B, p)
+        result_z_hl:                wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_hl)
+        result_z_hu:                wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_hu)
+        result_z_xl:                wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_xl)
+        result_z_xu:                wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_xu)
+        result_s_hl:                wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_hl)
+        result_s_hu:                wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_hu)
+        result_s_xl:                wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_xl)
+        result_s_xu:                wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_xu)
+        # Preconditioner
+        x_b_scaling:                wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
+        cost_scaling_inv:           wp.array(dtype=wp.float64),    # type: ignore  (B,)
+        delta_inv:                  wp.array2d(dtype=wp.float64),  # type: ignore  (B, n+p+m)
+        delta_b_inv:                wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
+        constraints_rhs_inf_norm:   wp.array(dtype=wp.float64),    # type: ignore  (B,)
+        # Segment index maps
+        idx_hl:                     wp.array(dtype=wp.int32),      # type: ignore
+        idx_hu:                     wp.array(dtype=wp.int32),      # type: ignore
+        idx_xl:                     wp.array(dtype=wp.int32),      # type: ignore
+        idx_xu:                     wp.array(dtype=wp.int32),      # type: ignore
+        # Residuals
+        res_nr_x:                   wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
+        res_nr_y:                   wp.array2d(dtype=wp.float64),  # type: ignore  (B, p)
+        res_nr_z_hl:                wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_hl)
+        res_nr_z_hu:                wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_hu)
+        res_nr_z_xl:                wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_xl)
+        res_nr_z_xu:                wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_xu)
+        # Objectices and residuals
+        info_primal_obj:            wp.array(dtype=wp.float64),  # type: ignore  shape (B,)
+        info_dual_obj:              wp.array(dtype=wp.float64),  # type: ignore  shape (B,)
+        info_duality_gap:           wp.array(dtype=wp.float64),  # type: ignore  shape (B,)
+        info_duality_gap_rel:       wp.array(dtype=wp.float64),  # type: ignore  shape (B,)
+        info_primal_res:            wp.array(dtype=wp.float64),  # type: ignore  shape (B,)
+        info_primal_res_rel:        wp.array(dtype=wp.float64),  # type: ignore  shape (B,)
+        info_dual_res:              wp.array(dtype=wp.float64),  # type: ignore  shape (B,)
+        info_dual_res_rel:          wp.array(dtype=wp.float64),  # type: ignore  shape (B,)
+        info_prev_primal_res:       wp.array(dtype=wp.float64),  # type: ignore  shape (B,)
+        info_prev_dual_res:         wp.array(dtype=wp.float64),  # type: ignore  shape (B,)
+    ):
+        b, i = wp.tid()
+
+        if i == 0:
+            info_prev_primal_res[b] = info_primal_res[b]
+            info_prev_dual_res[b]   = info_dual_res[b]
+
+        minus_Px_tile        = wp.tile_load(minus_Px[b],        shape=n)
+        x_tile               = wp.tile_load(result_x[b],        shape=n)
+        c_tile               = wp.tile_load(data_c[b],          shape=n)
+        AT_y_tile            = wp.tile_load(AT_y[b],            shape=n)
+        GT_zh_assembled_tile = wp.tile_load(GT_zh_assembled[b], shape=n)
+        zb_assembled_tile    = wp.tile_load(zb_assembled[b],    shape=n)
+        delta_x_inv_tile     = wp.tile_load(delta_inv[b],       shape=n, offset=0)
+
+        # ---- res_nr.x = -P*x - c - AT*y - GT*(z_u-z_l) - x_b_scaling*(z_bu-z_bl) ----
+        res_nr_x_tile = minus_Px_tile - c_tile - AT_y_tile - GT_zh_assembled_tile - zb_assembled_tile
+        wp.tile_store(res_nr_x[b], res_nr_x_tile)
+
+        # ---- info.dual_res = cost_scaling_inv * ||delta_x_inv * res_nr.x||_inf ----
+        dual_res = wp.tile_extract(
+            wp.tile_max(wp.tile_map(wp.abs, delta_x_inv_tile * res_nr_x_tile)), 0,
+        ) * cost_scaling_inv[b]
+        if i == 0:
+            info_dual_res[b] = dual_res
+
+        half_xT_Px = wp.tile_extract(
+            wp.float64(-0.5) * wp.tile_sum(minus_Px_tile * x_tile), 0,
+        )
+        cT_x = wp.tile_extract(wp.tile_sum(c_tile * x_tile), 0)
+
+        # ---- segment obj-sum scalars (default 0; overridden inside guards) ----
+        bT_y    = wp.float64(0.0)
+        hl_zhl  = wp.float64(0.0)
+        hu_zhu  = wp.float64(0.0)
+        xl_zxl  = wp.float64(0.0)
+        xu_zxu  = wp.float64(0.0)
+
+        # ---- primal_res / primal_rel_norm running maxes (scalar) ----
+        primal_res  = wp.float64(0.0)
+        primal_res_rel_norm = wp.float64(0.0)
+
+        # ---- dual_res_rel: 3-term running max ----
+        Px_norm = wp.tile_extract(wp.tile_max(wp.tile_map(wp.abs, minus_Px_tile * delta_x_inv_tile)), 0)
+        c_norm = wp.tile_extract(wp.tile_max(wp.tile_map(wp.abs, c_tile * delta_x_inv_tile)), 0)
+        accum_x_tile = AT_y_tile + GT_zh_assembled_tile + zb_assembled_tile
+        accum_norm = wp.tile_extract(wp.tile_max(wp.tile_map(wp.abs, accum_x_tile * delta_x_inv_tile)), 0)
+        drn_max = wp.max(Px_norm, wp.max(c_norm, accum_norm))
+
+        # ===================== y-segment =====================
+        if wp.static(p > 0):
+            delta_y_inv_tile = wp.tile_load(delta_inv[b], shape=p, offset=n)
+
+            b_tile   = wp.tile_load(data_b[b], shape=p)
+            y_tile   = wp.tile_load(result_y[b], shape=p)
+            A_x_tile = wp.tile_load(A_x[b], shape=p)
+
+            # b^T y obj-sum
+            bT_y = wp.tile_extract(wp.tile_sum(b_tile * y_tile), 0)
+
+            # res_nr.y = -A*x + b
+            res_nr_y_tile = -A_x_tile + b_tile
+            wp.tile_store(res_nr_y[b], res_nr_y_tile)
+
+            # ||res_nr.y||_inf -> primal_res
+            res_nr_y_norm = wp.tile_extract(wp.tile_max(wp.tile_map(wp.abs, res_nr_y_tile * delta_y_inv_tile)), 0)
+            primal_res = wp.max(primal_res, res_nr_y_norm)
+
+            # ||A*x||_inf -> primal_rel_norm
+            A_x_norm = wp.tile_extract(wp.tile_max(wp.tile_map(wp.abs, A_x_tile * delta_y_inv_tile)), 0)
+            primal_res_rel_norm = wp.max(primal_res_rel_norm, A_x_norm)
+
+        # ===================== z_l (hl) segment =====================
+        if wp.static(num_hl > 0):
+            idx_hl_tile = wp.tile_load(idx_hl, shape=num_hl)
+            delta_z_hl_inv_tile = wp.tile_load_indexed(
+                delta_inv[b], indices=idx_hl_tile, shape=(num_hl,), offset=(n + p,), axis=0,
+            )
+
+            # h_l^T z_l obj-sum
+            hl_tile  = wp.tile_load_indexed(data_h_l[b], indices=idx_hl_tile, shape=(num_hl,), axis=0)
+            zhl_tile = wp.tile_load(result_z_hl[b], shape=num_hl)
+            hl_zhl = wp.tile_extract(wp.tile_sum(hl_tile * zhl_tile), 0)
+
+            # res_nr.z_l = G*x[idx_hl] - s_l - h_l[idx_hl]
+            Gx_idx_hl_tile = wp.tile_load_indexed(G_x[b], indices=idx_hl_tile, shape=(num_hl,), axis=0)
+            s_hl_tile = wp.tile_load(result_s_hl[b], shape=num_hl)
+            res_nr_z_hl_tile = Gx_idx_hl_tile - s_hl_tile - hl_tile
+            wp.tile_store(res_nr_z_hl[b], res_nr_z_hl_tile)
+
+            # primal_res
+            hl_res_norm = wp.tile_extract(
+                wp.tile_max(wp.tile_map(wp.abs, res_nr_z_hl_tile * delta_z_hl_inv_tile)), 0,
+            )
+            primal_res = wp.max(primal_res, hl_res_norm)
+
+            # primal_rel_norm: ||G*x[hl]||, ||s_l||
+            gx_hl_norm = wp.tile_extract(
+                wp.tile_max(wp.tile_map(wp.abs, Gx_idx_hl_tile * delta_z_hl_inv_tile)), 0,
+            )
+            s_hl_norm = wp.tile_extract(
+                wp.tile_max(wp.tile_map(wp.abs, s_hl_tile * delta_z_hl_inv_tile)), 0,
+            )
+            primal_res_rel_norm = wp.max(primal_res_rel_norm, wp.max(gx_hl_norm, s_hl_norm))
+
+        # ===================== z_u (hu) segment =====================
+        if wp.static(num_hu > 0):
+            idx_hu_tile = wp.tile_load(idx_hu, shape=num_hu)
+            delta_z_hu_inv_tile = wp.tile_load_indexed(
+                delta_inv[b], indices=idx_hu_tile, shape=(num_hu,), offset=(n + p,), axis=0,
+            )
+
+            hu_tile  = wp.tile_load_indexed(data_h_u[b], indices=idx_hu_tile, shape=(num_hu,), axis=0)
+            zhu_tile = wp.tile_load(result_z_hu[b], shape=num_hu)
+            hu_zhu = wp.tile_extract(wp.tile_sum(hu_tile * zhu_tile), 0)
+
+            # res_nr.z_u = -G*x[idx_hu] - s_u + h_u[idx_hu]
+            Gx_idx_hu_tile = wp.tile_load_indexed(G_x[b], indices=idx_hu_tile, shape=(num_hu,), axis=0)
+            s_hu_tile = wp.tile_load(result_s_hu[b], shape=num_hu)
+            res_nr_z_hu_tile = -Gx_idx_hu_tile - s_hu_tile + hu_tile
+            wp.tile_store(res_nr_z_hu[b], res_nr_z_hu_tile)
+
+            hu_res_norm = wp.tile_extract(
+                wp.tile_max(wp.tile_map(wp.abs, res_nr_z_hu_tile * delta_z_hu_inv_tile)), 0,
+            )
+            primal_res = wp.max(primal_res, hu_res_norm)
+
+            gx_hu_norm = wp.tile_extract(
+                wp.tile_max(wp.tile_map(wp.abs, Gx_idx_hu_tile * delta_z_hu_inv_tile)), 0,
+            )
+            s_hu_norm = wp.tile_extract(
+                wp.tile_max(wp.tile_map(wp.abs, s_hu_tile * delta_z_hu_inv_tile)), 0,
+            )
+            primal_res_rel_norm = wp.max(primal_res_rel_norm, wp.max(gx_hu_norm, s_hu_norm))
+
+        # ===================== z_bl (xl) segment =====================
+        if wp.static(num_xl > 0):
+            idx_xl_tile = wp.tile_load(idx_xl, shape=num_xl)
+            delta_b_xl_inv_tile = wp.tile_load_indexed(
+                delta_b_inv[b], indices=idx_xl_tile, shape=(num_xl,), axis=0,
+            )
+
+            xl_tile  = wp.tile_load_indexed(data_x_l[b], indices=idx_xl_tile, shape=(num_xl,), axis=0)
+            zxl_tile = wp.tile_load(result_z_xl[b], shape=num_xl)
+            xl_zxl = wp.tile_extract(wp.tile_sum(xl_tile * zxl_tile), 0)
+
+            # res_nr.z_bl = x_b_scaling[idx_xl]*x[idx_xl] - s_bl - x_l[idx_xl]
+            x_idx_xl_tile = wp.tile_load_indexed(result_x[b], indices=idx_xl_tile, shape=(num_xl,), axis=0)
+            x_b_scaling_idx_xl_tile = wp.tile_load_indexed(
+                x_b_scaling[b], indices=idx_xl_tile, shape=(num_xl,), axis=0,
+            )
+            s_xl_tile = wp.tile_load(result_s_xl[b], shape=num_xl)
+            res_nr_z_xl_tile = x_b_scaling_idx_xl_tile * x_idx_xl_tile - s_xl_tile - xl_tile
+            wp.tile_store(res_nr_z_xl[b], res_nr_z_xl_tile)
+
+            xl_res_norm = wp.tile_extract(
+                wp.tile_max(wp.tile_map(wp.abs, res_nr_z_xl_tile * delta_b_xl_inv_tile)), 0,
+            )
+            primal_res = wp.max(primal_res, xl_res_norm)
+
+            # primal_rel_norm: ||s_bl||
+            s_xl_norm = wp.tile_extract(
+                wp.tile_max(wp.tile_map(wp.abs, s_xl_tile * delta_b_xl_inv_tile)), 0,
+            )
+            primal_res_rel_norm = wp.max(primal_res_rel_norm, s_xl_norm)
+
+        # ===================== z_bu (xu) segment =====================
+        if wp.static(num_xu > 0):
+            idx_xu_tile = wp.tile_load(idx_xu, shape=num_xu)
+            delta_b_xu_inv_tile = wp.tile_load_indexed(
+                delta_b_inv[b], indices=idx_xu_tile, shape=(num_xu,), axis=0,
+            )
+
+            xu_tile  = wp.tile_load_indexed(data_x_u[b], indices=idx_xu_tile, shape=(num_xu,), axis=0)
+            zxu_tile = wp.tile_load(result_z_xu[b], shape=num_xu)
+            xu_zxu = wp.tile_extract(wp.tile_sum(xu_tile * zxu_tile), 0)
+
+            # res_nr.z_bu = -(x_b_scaling[idx_xu]*x[idx_xu] + s_bu - x_u[idx_xu])
+            x_idx_xu_tile = wp.tile_load_indexed(result_x[b], indices=idx_xu_tile, shape=(num_xu,), axis=0)
+            x_b_scaling_idx_xu_tile = wp.tile_load_indexed(
+                x_b_scaling[b], indices=idx_xu_tile, shape=(num_xu,), axis=0,
+            )
+            s_xu_tile = wp.tile_load(result_s_xu[b], shape=num_xu)
+            res_nr_z_xu_tile = -x_b_scaling_idx_xu_tile * x_idx_xu_tile - s_xu_tile + xu_tile
+            wp.tile_store(res_nr_z_xu[b], res_nr_z_xu_tile)
+
+            xu_res_norm = wp.tile_extract(
+                wp.tile_max(wp.tile_map(wp.abs, res_nr_z_xu_tile * delta_b_xu_inv_tile)), 0,
+            )
+            primal_res = wp.max(primal_res, xu_res_norm)
+
+            s_xu_norm = wp.tile_extract(
+                wp.tile_max(wp.tile_map(wp.abs, s_xu_tile * delta_b_xu_inv_tile)), 0,
+            )
+            primal_res_rel_norm = wp.max(primal_res_rel_norm, s_xu_norm)
+
+        # ===================== finalize info =====================
+        if i == 0:
+            # primal/dual obj + duality_gap
+            info_primal_obj[b] = cost_scaling_inv[b] * (half_xT_Px + cT_x)
+            info_dual_obj[b] = cost_scaling_inv[b] * (-half_xT_Px - bT_y - hu_zhu + hl_zhl - xu_zxu + xl_zxl)
+            info_duality_gap[b] = wp.abs(info_primal_obj[b] - info_dual_obj[b])
+
+            # duality_gap_rel: cost_scaling_inv * max(|0.5xPx|, |cTx|, |bTy|, |hl_zhl|, |hu_zhu|, |xl_zxl|, |xu_zxu|)
+            duality_gap_rel_norm = wp.abs(half_xT_Px)
+            duality_gap_rel_norm = wp.max(duality_gap_rel_norm, wp.abs(cT_x))
+            duality_gap_rel_norm = wp.max(duality_gap_rel_norm, wp.abs(bT_y))
+            duality_gap_rel_norm = wp.max(duality_gap_rel_norm, wp.abs(hl_zhl))
+            duality_gap_rel_norm = wp.max(duality_gap_rel_norm, wp.abs(hu_zhu))
+            duality_gap_rel_norm = wp.max(duality_gap_rel_norm, wp.abs(xl_zxl))
+            duality_gap_rel_norm = wp.max(duality_gap_rel_norm, wp.abs(xu_zxu))
+            duality_gap_rel_norm = wp.max(cost_scaling_inv[b] * duality_gap_rel_norm, wp.float64(1.0))
+            info_duality_gap_rel[b] = info_duality_gap[b] / duality_gap_rel_norm
+
+            # primal_res / primal_res_rel
+            info_primal_res[b] = primal_res
+            prn = wp.max(primal_res_rel_norm, constraints_rhs_inf_norm[b])
+            prn = wp.max(prn, wp.float64(1.0))
+            info_primal_res_rel[b] = primal_res / prn
+
+            # dual_res_rel  (info.dual_res already = dr_x)
+            dual_res_rel_norm = wp.max(drn_max * cost_scaling_inv[b], wp.float64(1.0))
+            info_dual_res_rel[b] = dual_res / dual_res_rel_norm
+
+    return update_residual_nr_kernel
+
+
+def create_prepare_zu_minus_zl_and_zbu_minus_zbl_kernel(m: int, n: int):
+    """Pre-matvec scatter-gather for _update_residuals_nr.
+
+          zhu_minus_zhl = 0
+          zhu_minus_zhl[:, idx_hu] += z_hu
+          zhu_minus_zhl[:, idx_hl] -= z_hl
+
+          zbu_minus_zbl = 0
+          zbu_minus_zbl[:, idx_xu] += z_xu
+          zbu_minus_zbl[:, idx_xl] -= z_xl
+          zbu_minus_zbl *=  x_b_scaling[b, i]
+    """
+
+    @wp.kernel
+    def prepare_zu_minus_zl_and_zbu_minus_zbl_kernel(
+        z_u:              wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_hu)
+        z_l:              wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_hl)
+        z_bl:             wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_xl)
+        z_bu:             wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_xu)
+        x_b_scaling:      wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
+        inv_idx_hu:       wp.array(dtype=wp.int32),      # type: ignore  (m,)
+        inv_idx_hl:       wp.array(dtype=wp.int32),      # type: ignore  (m,)
+        inv_idx_xu:       wp.array(dtype=wp.int32),      # type: ignore  (n,)
+        inv_idx_xl:       wp.array(dtype=wp.int32),      # type: ignore  (n,)
+        zu_minus_zl:      wp.array2d(dtype=wp.float64),  # type: ignore  (B, m) output
+        zbu_minus_zbl:    wp.array2d(dtype=wp.float64),  # type: ignore  (B, n) output
+    ):
+        m_static = wp.static(m)
+        b, i = wp.tid()
+
+        if i < m_static:
+            val = wp.float64(0.0)
+            k_hu = inv_idx_hu[i]
+            if k_hu >= 0:
+                val = val + z_u[b, k_hu]
+            k_hl = inv_idx_hl[i]
+            if k_hl >= 0:
+                val = val - z_l[b, k_hl]
+            zu_minus_zl[b, i] = val
+        else:
+            j = i - m_static
+            val = wp.float64(0.0)
+            k_xu = inv_idx_xu[j]
+            if k_xu >= 0:
+                val = val + z_bu[b, k_xu]
+            k_xl = inv_idx_xl[j]
+            if k_xl >= 0:
+                val = val - z_bl[b, k_xl]
+            zbu_minus_zbl[b, j] = x_b_scaling[b, j] * val
+
+    return prepare_zu_minus_zl_and_zbu_minus_zbl_kernel

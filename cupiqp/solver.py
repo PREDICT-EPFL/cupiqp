@@ -18,6 +18,8 @@ from .solver_kernels import (
     create_calculate_sigma_kernel,
     create_calculate_mu_kernel,
     create_update_residuals_r_kernel,
+    create_prepare_zu_minus_zl_and_zbu_minus_zbl_kernel,
+    create_update_residual_nr_kernel,
 )
 
 
@@ -117,6 +119,15 @@ class SolverBase:
             int(self._data.num_hu), int(self._data.num_hl),
             int(self._data.num_xu), int(self._data.num_xl),
         )
+        self._prepare_zu_minus_zl_and_zbu_minus_zbl_kernel = create_prepare_zu_minus_zl_and_zbu_minus_zbl_kernel(
+            self._data.m, self._data.n,
+        )
+        self._update_residual_nr_kernel = create_update_residual_nr_kernel(
+            self._data.n, self._data.p, self._data.m, 
+            self._data.num_hl, self._data.num_hu, self._data.num_xl, self._data.num_xu
+        )
+
+        self._work_x = cp.empty((B, self._data.n), dtype=cp.float64)
 
         if self._data.num_ineq > 0:
             self._calculate_sigma_kernel = create_calculate_sigma_kernel(self._data.num_ineq)
@@ -714,27 +725,171 @@ class SolverBase:
     @nvtx.annotate("Solver::_update_residuals_nr")
     @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
     def _update_residuals_nr(self):
+        r"""Compute non-regularized KKT residuals + objective values +
+        relative norms (used for convergence checks).
+
+        All variables (``x``, ``y``, ``z_l``, ``z_u``, ``z_bl``, ``z_bu``,
+        ``s_*``) and data (``P``, ``c``, ``A``, ``b``, ``G``, ``h_*``,
+        ``x_*``) are stored in the **scaled** problem space (Ruiz
+        preconditioner). The bound rows pick up an extra ``x_b_scaling``
+        factor because ``x_l <= x <= x_u`` becomes
+        ``x_l_scaled <= x_b_scaling * x_scaled <= x_u_scaled`` after
+        scaling. Convergence norms are reported in the **unscaled** problem
+        space — magnitudes are restored via ``delta_inv``, ``delta_b_inv``,
+        ``cost_scaling_inv`` from the preconditioner.
+
+        Residual formulas (scaled space):
+
+            res_nr.x    = -(P*x + c + A^T*y + G^T*(z_u - z_l)
+                            + x_b_scaling*(z_bu - z_bl))
+            res_nr.y    = -(A*x - b)
+            res_nr.z_l  =   G*x[idx_hl] - s_l - h_l[idx_hl]
+            res_nr.z_u  = -G*x[idx_hu] - s_u + h_u[idx_hu]
+            res_nr.z_bl =   x_b_scaling[idx_xl]*x[idx_xl] - s_bl - x_l[idx_xl]
+            res_nr.z_bu = -(x_b_scaling[idx_xu]*x[idx_xu] + s_bu - x_u[idx_xu])
+
+        Convergence norms (unscaled, infinity norm per batch):
+
+            primal_res     = max over the 5 dual segments of
+                                 ||u_p_seg .* res_nr_seg||_inf
+                             where u_p_seg is the per-segment primal
+                             unscale factor:
+                                 [y]:    delta_inv[:, n : n+p]
+                                 [z_l]:  delta_inv[:, n+p+idx_hl]
+                                 [z_u]:  delta_inv[:, n+p+idx_hu]
+                                 [z_bl]: delta_b_inv[:, idx_xl]
+                                 [z_bu]: delta_b_inv[:, idx_xu]
+
+            dual_res       = cost_scaling_inv * ||delta_inv[:, :n] .* res_nr.x||_inf
+
+        Relative-norm denominators (also unscaled, max over magnitudes
+        that go into the corresponding residual):
+
+            primal_rel     = max( ||u_p_y .* A*x||,
+                                  ||u_p_zl .* G*x[idx_hl]||,
+                                  ||u_p_zu .* G*x[idx_hu]||,
+                                  ||u_p_zl .* s_l||,  ||u_p_zu .* s_u||,
+                                  ||u_p_zbl .* s_bl||, ||u_p_zbu .* s_bu||,
+                                  constraints_rhs_inf_norm_unscaled )
+
+            dual_rel       = cost_scaling_inv * max(
+                                  ||delta_inv[:, :n] .* P*x||,
+                                  ||delta_inv[:, :n] .* c||,
+                                  ||delta_inv[:, :n] .* (A^T*y + G^T*(z_u-z_l)
+                                       + x_b_scaling*(z_bu-z_bl))|| )
+
+            primal_res_rel = primal_res / max(1, primal_rel)
+            dual_res_rel   = dual_res   / max(1, dual_rel)
+
+        Objectives and duality gap (unscaled to original problem space via
+        ``cost_scaling_inv``):
+
+            primal_obj   = ( 0.5 x^T P x + c^T x ) * cost_scaling_inv
+            dual_obj     = -( 0.5 x^T P x + b^T y + h_u^T z_u - h_l^T z_l
+                              + x_u^T z_bu - x_l^T z_bl ) * cost_scaling_inv
+            duality_gap  = |primal_obj - dual_obj|
+            duality_gap_rel
+                         = duality_gap / max(1, cost_scaling_inv *
+                              max_k |w_k|)
+                           where {w_k} is the set of seven obj sub-terms
+                           used above (0.5 x^T P x, c^T x, b^T y, h_u^T z_u,
+                           h_l^T z_l, x_u^T z_bu, x_l^T z_bl).
         """
-        Compute the non-regularized residuals, which reflects the residuals of the KKT conditions excluding the regularization terms in Schwan 2023 paper eq(6)
+        USE_WAPR_IMPLEMENTATION = True
+        if USE_WAPR_IMPLEMENTATION:
+            self._update_residuals_nr_warp()
+        else:
+            self._update_residuals_nr_cupy()
 
-            res_nr.x = -(P*x + c + A^T*y + G^T*(z_u - z_l) + z_bu - z_bl)  # residual of KKT stationarity
-            res_nr.y = -(A*x - b)                                          # residual of KKT primal feasibility: A*x = b
-            res_nr.z_l = G*x - s_l - hl                                    # residual of KKT primal feasibility: hl <= G*x
-            res_nr.z_u = -G*x - s_u + hu                                   # residual of KKT primal feasibility: G*x <= hu
-            res_nr.z_bu = -(x - s_bu - xu)                                 # residual of KKT primal feasibility: xl <= x
-            res_nr.z_bl = x - s_bl - xl                                    # residual of KKT primal feasibility: x <= xu
+    def _update_residuals_nr_warp(self):
+        """Fused-warp implementation: pre-matvec scatter + 5 sacred matvecs +
+        one combined obj_kernel that subsumes res_nr assembly, info.primal/dual
+        obj + duality_gap + duality_gap_rel, info.primal/dual_res +
+        primal/dual_res_rel, prev_*_res snapshots."""
+        pc      = self._preconditioner
+        data    = self._data
+        result  = self._result
+        res_nr  = self._res_nr
+        info    = result.info
+        wp_stream = wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr)
 
-        primal_residual = ||[A*x - b; G*x - s_l - hl; -G*x - s_u + hu; -x + s_bu + xu; x - s_bl - xl]||_inf
-        dual_residual = ||P*x + c + A^T*y + G^T*(z_u - z_l) + z_bu - z_bl||_inf
+        self._kkt_system.eval_P_x(data, -1., result.x, res_nr.x)
 
-        primal_residual_norm = ||A*x; b; G*x; h_u; s_u; h_l; s_l; x_l; s_bu; x_u; s_bl||_inf
-        dual_residual_norm = ||P*x; c; A^T*y; G^T*(z_u - z_l) + z_bu - z_bl||_inf
-        
+        if data.p > 0:
+            self._kkt_system.eval_A_xn(data, 1., result.x, self._res.y)
+            self._kkt_system.eval_AT_xt(data, 1., result.y, self._res.x)
+        else:
+            self._res.y.fill(0.)
+            self._res.x.fill(0.)
 
-        Also updates the primal and dual objectives and duality gap in self._result.info:
-            - primal_obj = 0.5 x^T P x + c^T x
-            - dual_obj = -0.5 x^T P x - b^T y - h_u^T z_u + h_l^T z_l - x_u^T z_bu + x_l^T z_bl
-        """
+        # build work_z_1 (G^T * (z_u_scatter - z_l_scatter))
+        # and self._work_x (x_b_scaling*(z_bu_scatter - z_bl_scattered))
+        wp.launch(
+            kernel=self._prepare_zu_minus_zl_and_zbu_minus_zbl_kernel,
+            dim=(data.batch_size, data.m + data.n),
+            inputs=[
+                result.z_u, result.z_l,
+                result.z_bl, result.z_bu,
+                pc.x_b_scaling,
+                self._kkt_system._inv_idx_hu, self._kkt_system._inv_idx_hl,
+                self._kkt_system._inv_idx_xu, self._kkt_system._inv_idx_xl,
+                self._work_z_1, self._work_x,
+            ],
+            stream=wp_stream,
+        )
+
+        G_x = self._work_z_2
+        GT_zu_minus_zl = self._step.x
+        if data.m > 0:
+            self._kkt_system.eval_G_xn(data, 1., result.x, G_x)
+            self._kkt_system.eval_GT_xt(data, 1., self._work_z_1, GT_zu_minus_zl)
+        else:
+            G_x.fill(0.)
+            GT_zu_minus_zl.fill(0.)
+
+        wp.launch_tiled(
+            kernel=self._update_residual_nr_kernel,
+            dim=[data.batch_size],
+            inputs=[
+                res_nr.x,            # minus_Px
+                self._res.y,         # A_x = A*x
+                self._res.x,         # AT_y
+                G_x,
+                GT_zu_minus_zl,      # GT_zh_assembled
+                self._work_x,        # zb_assembled = x_b_scaling*(z_bu - z_bl)
+                # Data
+                data.c, data.b, data.h_l, data.h_u, data.x_l, data.x_u,
+                # Result variables
+                result.x, result.y,
+                result.z_l, result.z_u, result.z_bl, result.z_bu,
+                result.s_l, result.s_u, result.s_bl, result.s_bu,
+                # Preconditioner
+                pc.x_b_scaling, pc.cost_scaling_inv,
+                pc.delta_inv, pc.delta_b_inv,
+                self._constraints_rhs_inf_norm_unscaled,
+                # Index maps
+                data.idx_hl, data.idx_hu, data.idx_xl, data.idx_xu,
+                # Residual outputs
+                res_nr.x, res_nr.y,
+                res_nr.z_l, res_nr.z_u, res_nr.z_bl, res_nr.z_bu,
+                # Info outputs
+                info.primal_obj,
+                info.dual_obj,
+                info.duality_gap,
+                info.duality_gap_rel,
+                info.primal_res,
+                info.primal_res_rel,
+                info.dual_res,
+                info.dual_res_rel,
+                info.prev_primal_res,
+                info.prev_dual_res,
+            ],
+            block_dim=256,
+            stream=wp_stream,
+        )
+
+    def _update_residuals_nr_cupy(self):
+        """Pure cupy implementation"""
         pc = self._preconditioner
         n, p = self._data.n, self._data.p
         # cuSPARSE/cuBLAS operations
@@ -857,7 +1012,6 @@ class SolverBase:
         cp.add(self._res_nr.z_bu, self._result.s_bu, out=self._res_nr.z_bu)
         cp.subtract(self._res_nr.z_bu, self._data.x_u[:, self._data.idx_xu], out=self._res_nr.z_bu)
         cp.negative(self._res_nr.z_bu, out=self._res_nr.z_bu)
-
 
         # ------------ update primal and dual residuals ------------
         self._result.info.prev_primal_res[:] = self._result.info.primal_res
