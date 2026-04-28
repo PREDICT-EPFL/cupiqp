@@ -253,8 +253,11 @@ class Info:
         self._status_value = np.full(batch_size, Status.PIQP_UNSOLVED.value, dtype=np.int32)
         self.iter = np.zeros(batch_size, dtype=np.int32)
         self.factor_retires = np.zeros(batch_size, dtype=np.int32)
-        self.no_primal_update = np.zeros(batch_size, dtype=np.int32)
-        self.no_dual_update = np.zeros(batch_size, dtype=np.int32)
+        # Per-batch "no update" counters live on device (int32). Source of truth;
+        # the rho/delta kernels reset on improved, increment on stagnated.
+        # to_host() syncs them into the InfoHost mirror once per IPM iteration.
+        self.no_primal_update = cp.zeros(batch_size, dtype=cp.int32)
+        self.no_dual_update = cp.zeros(batch_size, dtype=cp.int32)
 
     def init(self):
         self._buffer = cp.zeros((self._batch_size, len(InfoIdx)), dtype=cp.float64)
@@ -267,6 +270,8 @@ class Info:
     @nvtx.annotate("Info:to_host")
     def to_host(self, info_host: 'InfoHost'):
         cp.asnumpy(self._buffer, out=info_host._buffer)
+        cp.asnumpy(self.no_primal_update, out=info_host.no_primal_update)
+        cp.asnumpy(self.no_dual_update,   out=info_host.no_dual_update)
 
     @property
     def batch_size(self) -> int:
@@ -279,7 +284,7 @@ class InfoHost:
 
     Each property returns a ``(B,)`` NumPy array.
     """
-    __slots__ = ('_buffer', '_batch_size')
+    __slots__ = ('_buffer', '_batch_size', 'no_primal_update', 'no_dual_update')
 
     for _idx in InfoIdx:
         locals()[_idx.name] = property(lambda self, i=_idx: self._buffer[:, i])
@@ -288,6 +293,8 @@ class InfoHost:
     def __init__(self, batch_size: int = 1):
         self._batch_size = batch_size
         self._buffer = np.empty((batch_size, len(InfoIdx)), dtype=np.float64)
+        self.no_primal_update = np.zeros(batch_size, dtype=np.int32)
+        self.no_dual_update = np.zeros(batch_size, dtype=np.int32)
 
 
 

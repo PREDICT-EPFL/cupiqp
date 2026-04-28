@@ -20,6 +20,8 @@ from .solver_kernels import (
     create_update_residuals_r_kernel,
     create_prepare_zu_minus_zl_and_zbu_minus_zbl_kernel,
     create_update_residual_nr_kernel,
+    create_update_rho_delta_with_ineq_kernel,
+    create_update_rho_delta_without_ineq_kernel,
 )
 
 
@@ -135,9 +137,15 @@ class SolverBase:
             self._calculate_mu_kernel = create_calculate_mu_kernel(self._data.num_ineq)
             self._prepare_predictor_step_kernel = create_prepare_predictor_step_kernel()
             self._prepare_corrector_step_kernel = create_prepare_corrector_step_kernel()
+            self._update_rho_delta_with_ineq_kernel = create_update_rho_delta_with_ineq_kernel(
+                self._data.n, self._data.p + self._data.num_ineq,
+            )
 
         else:
             self._run_full_newton_step_kernel = create_run_full_newton_step_kernel(self._data.n, self._data.p)
+            self._update_rho_delta_without_ineq_kernel = create_update_rho_delta_without_ineq_kernel(
+                self._data.n, self._data.p,
+            )
 
         self._tau_device = cp.empty(1, dtype=cp.float64)
         self._tau_device[0] = self.settings.tau  # device copy used by warp kernels
@@ -147,9 +155,6 @@ class SolverBase:
         self._work_primal_rel_norm = cp.empty(B, dtype=cp.float64)  # running max of primal relative norm terms
         self._work_dual_res_norm = cp.empty(B, dtype=cp.float64)    # running max of dual residual norm terms
         self._work_norm_temp = cp.empty(B, dtype=cp.float64)        # temp (B,) for individual norm results
-
-        self._mu_prev = cp.empty(data.batch_size, dtype=cp.float64)
-        self._mu_rate = cp.empty(data.batch_size, dtype=cp.float64)
 
         self._enable_iterative_refinement = self.settings.iterative_refinement_always_enabled
 
@@ -342,7 +347,7 @@ class SolverBase:
 
                 # primal infeasibility check
                 primal_infeasible = (
-                    (self._result.info.no_dual_update > min(5, settings.reg_finetune_dual_update_threshold)) &
+                    (info_host.no_dual_update > min(5, settings.reg_finetune_dual_update_threshold)) &
                     (info_host.primal_prox_inf > settings.infeasibility_threshold) &
                     ((info_host.primal_res_reg < settings.eps_abs) | (info_host.primal_res_reg_rel < settings.eps_rel))
                 )
@@ -350,7 +355,7 @@ class SolverBase:
 
                 # dual infeasibility check
                 dual_infeasible = (
-                    (self._result.info.no_primal_update > min(5, settings.reg_finetune_primal_update_threshold)) &
+                    (info_host.no_primal_update > min(5, settings.reg_finetune_primal_update_threshold)) &
                     (info_host.dual_prox_inf > settings.infeasibility_threshold) &
                     ((info_host.dual_res_reg < settings.eps_abs) | (info_host.dual_res_reg_rel < settings.eps_rel))
                 )
@@ -381,18 +386,19 @@ class SolverBase:
                 
                 # avoid possibility of converging to a local minimum -> decrease the minimum regularization value (vectorized)
                 finetune_mask = (
-                    ((self._result.info.no_primal_update > self.settings.reg_finetune_primal_update_threshold) &
+                    ((info_host.no_primal_update > self.settings.reg_finetune_primal_update_threshold) &
                      (info_host.rho == info_host.reg_limit) &
                      (info_host.reg_limit != self.settings.reg_finetune_lower_limit)) |
-                    ((self._result.info.no_dual_update > self.settings.reg_finetune_dual_update_threshold) &
+                    ((info_host.no_dual_update > self.settings.reg_finetune_dual_update_threshold) &
                      (info_host.delta == info_host.reg_limit) &
                      (info_host.reg_limit != self.settings.reg_finetune_lower_limit))
                 )
                 finetune_mask &= (info_host.dual_prox_inf < self.settings.infeasibility_threshold) & (info_host.primal_prox_inf < self.settings.infeasibility_threshold)
                 if np.any(finetune_mask):
                     self._result.info.reg_limit[finetune_mask] = self.settings.reg_finetune_lower_limit
-                    self._result.info.no_primal_update[finetune_mask] = 0
-                    self._result.info.no_dual_update[finetune_mask] = 0
+                    finetune_mask_dev = cp.asarray(finetune_mask)
+                    self._result.info.no_primal_update[finetune_mask_dev] = 0
+                    self._result.info.no_dual_update[finetune_mask_dev] = 0
 
                 if self.settings.verbose:
                     self._print_iteration_info()
@@ -620,17 +626,12 @@ class SolverBase:
         self._calculate_step()
         self._update_vars_after_corrector_step()
         self._calculate_mu()
-        cp.subtract(self._mu_prev, self._result.info.mu, out=self._mu_rate)
-        cp.divide(self._mu_rate, self._mu_prev, out=self._mu_rate)
-        cp.maximum(self._mu_rate, 0., out=self._mu_rate)
 
     @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
     def _update_vars_after_corrector_step(self):
         # ------------------ update variables ------------------
         self._result.primals_all += self._result.info.primal_step[:, None] * self._step.primals_all
         self._result.duals_all += self._result.info.dual_step[:, None] * self._step.duals_all
-        # ------------------ update mu and mu_rate for adaptive regularization ------------------
-        self._mu_prev[:] = self._result.info.mu
 
     @nvtx.annotate("Solver::_calculate_step")
     @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
@@ -802,10 +803,6 @@ class SolverBase:
             self._update_residuals_nr_cupy()
 
     def _update_residuals_nr_warp(self):
-        """Fused-warp implementation: pre-matvec scatter + 5 sacred matvecs +
-        one combined obj_kernel that subsumes res_nr assembly, info.primal/dual
-        obj + duality_gap + duality_gap_rel, info.primal/dual_res +
-        primal/dual_res_rel, prev_*_res snapshots."""
         pc      = self._preconditioner
         data    = self._data
         result  = self._result
@@ -1252,39 +1249,90 @@ class SolverBase:
         """Update rho/delta based on residual progress — branchless via cp.where."""
         info = self._result.info
         settings = self.settings
-        mu_rate = self._mu_rate
 
-        # --- Rho update ---
-        dual_improved = (
-            (info.dual_res < 0.95 * info.prev_dual_res) |
-            (info.dual_res < settings.eps_abs) | (info.dual_res_rel < settings.eps_rel) |
-            ((info.rho == settings.reg_finetune_lower_limit) & (info.dual_prox_inf < settings.infeasibility_threshold))
-        )
-        rho_fast = cp.maximum(info.reg_limit, (1. - mu_rate) * info.rho)
-        rho_slow = cp.maximum(info.reg_limit, (1. - 0.666 * mu_rate) * info.rho)
-        rho_slow_decay_ok = (~dual_improved) & ((info.iter[0] < 5) | (info.dual_prox_inf < settings.infeasibility_threshold))
-        info.rho[:] = cp.where(dual_improved, rho_fast, cp.where(rho_slow_decay_ok, rho_slow, info.rho))
-        self._prox_vars.x[:] = cp.where(dual_improved[:, None], self._result.x, self._prox_vars.x)
-        self._result.info.no_primal_update += cp.asnumpy((~dual_improved).astype(cp.int32))
+        USE_WARP_IMPLEMENTATION = True
+        if USE_WARP_IMPLEMENTATION:
+            n = self._data.n
+            num_duals = self._data.p + self._data.num_ineq
+            wp.launch(
+                kernel=self._update_rho_delta_with_ineq_kernel,
+                dim=(self._data.batch_size, n + num_duals),
+                inputs=[
+                    info.dual_res, info.prev_dual_res, info.dual_res_rel, info.dual_prox_inf,
+                    info.primal_res, info.prev_primal_res, info.primal_res_rel, info.primal_prox_inf,
+                    info.reg_limit,
+                    info.rho, info.delta,
+                    info.no_primal_update, info.no_dual_update,
+                    self._result.x, self._prox_vars.x,
+                    self._result.duals_all, self._prox_vars.duals_all,
+                    settings.eps_abs,
+                    settings.eps_rel,
+                    settings.reg_finetune_lower_limit,
+                    settings.infeasibility_threshold,
+                    info.iter[0],
+                ],
+                device="cuda",
+                stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+            )
+        else:
+            # --- Rho update ---
+            dual_improved = (
+                (info.dual_res < 0.95 * info.prev_dual_res) |
+                (info.dual_res < settings.eps_abs) | (info.dual_res_rel < settings.eps_rel) |
+                ((info.rho == settings.reg_finetune_lower_limit) & (info.dual_prox_inf < settings.infeasibility_threshold))
+            )
+            rho_fast = cp.maximum(info.reg_limit, 0.1 * info.rho)
+            rho_slow = cp.maximum(info.reg_limit, 0.5 * info.rho)
+            rho_slow_decay_ok = (~dual_improved) & ((info.iter[0] < 5) | (info.dual_prox_inf < settings.infeasibility_threshold))
+            info.rho[:] = cp.where(dual_improved, rho_fast, cp.where(rho_slow_decay_ok, rho_slow, info.rho))
+            self._prox_vars.x[:] = cp.where(dual_improved[:, None], self._result.x, self._prox_vars.x)
+            info.no_primal_update += 1
+            info.no_primal_update[dual_improved] = 0
 
-        # --- Delta update ---
-        primal_improved = (
-            (info.primal_res < 0.95 * info.prev_primal_res) |
-            (info.primal_res < settings.eps_abs) | (info.primal_res_rel < settings.eps_rel) |
-            ((info.delta == settings.reg_finetune_lower_limit) & (info.primal_prox_inf < settings.infeasibility_threshold))
-        )
-        delta_fast = cp.maximum(info.reg_limit, (1. - mu_rate) * info.delta)
-        delta_slow = cp.maximum(info.reg_limit, (1. - 0.666 * mu_rate) * info.delta)
-        delta_slow_decay_ok = (~primal_improved) & ((info.iter[0] < 5) | (info.primal_prox_inf < settings.infeasibility_threshold))
-        info.delta[:] = cp.where(primal_improved, delta_fast, cp.where(delta_slow_decay_ok, delta_slow, info.delta))
-        self._prox_vars.duals_all[:] = cp.where(primal_improved[:, None], self._result.duals_all, self._prox_vars.duals_all)
-        self._result.info.no_dual_update += cp.asnumpy((~primal_improved).astype(cp.int32))
+            # --- Delta update ---
+            primal_improved = (
+                (info.primal_res < 0.95 * info.prev_primal_res) |
+                (info.primal_res < settings.eps_abs) | (info.primal_res_rel < settings.eps_rel) |
+                ((info.delta == settings.reg_finetune_lower_limit) & (info.primal_prox_inf < settings.infeasibility_threshold))
+            )
+            delta_fast = cp.maximum(info.reg_limit, 0.1 * info.delta)
+            delta_slow = cp.maximum(info.reg_limit, 0.5 * info.delta)
+            delta_slow_decay_ok = (~primal_improved) & ((info.iter[0] < 5) | (info.primal_prox_inf < settings.infeasibility_threshold))
+            info.delta[:] = cp.where(primal_improved, delta_fast, cp.where(delta_slow_decay_ok, delta_slow, info.delta))
+            self._prox_vars.duals_all[:] = cp.where(primal_improved[:, None], self._result.duals_all, self._prox_vars.duals_all)
+            info.no_dual_update += 1
+            info.no_dual_update[primal_improved] = 0
 
     @nvtx.annotate("Solver::_update_rho_delta_without_ineq")
     def _update_rho_delta_without_ineq(self) -> None:
         """Update rho/delta based on residual progress — branchless via cp.where."""
         info = self._result.info
         settings = self.settings
+
+        USE_WARP_IMPLEMENTATION = True
+        if USE_WARP_IMPLEMENTATION:
+            n = self._data.n
+            p = self._data.p
+            wp.launch(
+                kernel=self._update_rho_delta_without_ineq_kernel,
+                dim=(self._data.batch_size, n + p),
+                inputs=[
+                    info.dual_res, info.prev_dual_res, info.dual_res_rel, info.dual_prox_inf,
+                    info.primal_res, info.prev_primal_res, info.primal_res_rel, info.primal_prox_inf,
+                    info.reg_limit,
+                    info.rho, info.delta,
+                    info.no_primal_update, info.no_dual_update,
+                    self._result.x, self._prox_vars.x,
+                    self._result.y, self._prox_vars.y,
+                    settings.eps_abs,
+                    settings.eps_rel,
+                    settings.infeasibility_threshold,
+                    info.iter[0],
+                ],
+                device="cuda",
+                stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+            )
+            return
 
         # --- Rho update ---
         dual_improved = (
@@ -1297,7 +1345,8 @@ class SolverBase:
         rho_slow_decay_ok = (~dual_improved) & ((info.iter[0] < 5) | (info.dual_prox_inf < settings.infeasibility_threshold))
         info.rho[:] = cp.where(dual_improved, rho_fast, cp.where(rho_slow_decay_ok, rho_slow, info.rho))
         self._prox_vars.x[:] = cp.where(dual_improved[:, None], self._result.x, self._prox_vars.x)
-        self._result.info.no_primal_update += cp.asnumpy((~dual_improved).astype(cp.int32))
+        info.no_primal_update += 1
+        info.no_primal_update[dual_improved] = 0
 
         # --- Delta update ---
         primal_improved = (
@@ -1310,6 +1359,5 @@ class SolverBase:
         delta_slow_decay_ok = (~primal_improved) & ((info.iter[0] < 5) | (info.primal_prox_inf < settings.infeasibility_threshold))
         info.delta[:] = cp.where(primal_improved, delta_fast, cp.where(delta_slow_decay_ok, delta_slow, info.delta))
         self._prox_vars.y[:] = cp.where(primal_improved[:, None], self._result.y, self._prox_vars.y)
-        self._result.info.no_dual_update += cp.asnumpy((~primal_improved).astype(cp.int32))
-
-
+        info.no_dual_update += 1
+        info.no_dual_update[primal_improved] = 0
