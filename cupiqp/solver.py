@@ -22,6 +22,7 @@ from .solver_kernels import (
     create_update_residual_nr_kernel,
     create_update_rho_delta_with_ineq_kernel,
     create_update_rho_delta_without_ineq_kernel,
+    create_boundary_shift_kernel,
 )
 
 
@@ -139,6 +140,10 @@ class SolverBase:
             self._prepare_corrector_step_kernel = create_prepare_corrector_step_kernel()
             self._update_rho_delta_with_ineq_kernel = create_update_rho_delta_with_ineq_kernel(
                 self._data.n, self._data.p + self._data.num_ineq,
+            )
+            self._boundary_shift_kernel = create_boundary_shift_kernel(
+                self._data.num_hl, self._data.num_hu,
+                self._data.num_xl, self._data.num_xu,
             )
 
         else:
@@ -366,22 +371,19 @@ class SolverBase:
                     break
                 
                 # avoid getting too close to boundary which can result in a division by zero
-                epsilon = float(cp.finfo(cp.float64).eps)
-                boundary_shifted = False
-                if self._data.num_hl > 0 and bool(cp.any(self._result.z_l < epsilon)):
-                    self._result.z_l += (self._result.z_l < epsilon) * epsilon
-                    boundary_shifted = True
-                if self._data.num_hu > 0 and bool(cp.any(self._result.z_u < epsilon)):
-                    self._result.z_u += (self._result.z_u < epsilon) * epsilon
-                    boundary_shifted = True
-                if self._data.num_xl > 0 and bool(cp.min(self._result.z_bl) < epsilon):
-                    self._result.z_bl += epsilon
-                    boundary_shifted = True
-                if self._data.num_xu > 0 and bool(cp.min(self._result.z_bu) < epsilon):
-                    self._result.z_bu += epsilon
-                    boundary_shifted = True
-                if boundary_shifted:
-                    # print("Boundary shifted to avoid division by zero")
+                if self._data.num_ineq > 0:
+                    wp.launch(
+                        kernel=self._boundary_shift_kernel,
+                        dim=(self._data.batch_size,
+                             self._data.num_hl + self._data.num_hu
+                             + self._data.num_xl + self._data.num_xu),
+                        inputs=[
+                            self._result.z_l, self._result.z_u,
+                            self._result.z_bl, self._result.z_bu,
+                        ],
+                        device="cuda",
+                        stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+                    )
                     self._calculate_mu()
                 
                 # avoid possibility of converging to a local minimum -> decrease the minimum regularization value (vectorized)

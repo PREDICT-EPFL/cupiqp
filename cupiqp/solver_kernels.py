@@ -929,3 +929,48 @@ def create_update_rho_delta_without_ineq_kernel(n: int, p: int):
             prox_y[b, t] = wp.where(primal_improved, result_y[b, t], prox_y[b, t])
 
     return update_rho_delta_without_ineq_kernel
+
+
+def create_boundary_shift_kernel(num_hl: int, num_hu: int, num_xl: int, num_xu: int):
+    """Per-element ``z`` boundary shift to avoid division-by-zero in the IPM.
+
+        if z_hl[b, k] < eps: z_hl[b, k] += eps    (k in [0, num_hl))
+        if z_hu[b, k] < eps: z_hu[b, k] += eps    (k in [0, num_hu))
+        if z_bl[b, k] < eps: z_bl[b, k] += eps    (k in [0, num_xl))
+        if z_bu[b, k] < eps: z_bu[b, k] += eps    (k in [0, num_xu))
+    """
+    # IEEE 754 float64 machine epsilon (== np.finfo(np.float64).eps)
+    EPS_F64 = wp.constant(wp.float64(2.220446049250313e-16))
+    
+    @wp.kernel
+    def boundary_shift_kernel(
+        z_hl:  wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_hl)
+        z_hu:  wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_hu)
+        z_bl: wp.array2d(dtype=wp.float64),   # type: ignore  (B, num_xl)
+        z_bu: wp.array2d(dtype=wp.float64),   # type: ignore  (B, num_xu)
+    ):
+        b, t = wp.tid()
+        n_hl = wp.static(num_hl)
+        n_hu = wp.static(num_hu)
+        n_xl = wp.static(num_xl)
+        n_xu = wp.static(num_xu)
+
+        if t < n_hl:
+            if z_hl[b, t] < EPS_F64:
+                z_hl[b, t] = z_hl[b, t] + EPS_F64
+        elif t < n_hl + n_hu:
+            i = t - n_hl
+            if z_hu[b, i] < EPS_F64:
+                z_hu[b, i] = z_hu[b, i] + EPS_F64
+        elif t < n_hl + n_hu + n_xl:
+            i = t - n_hl - n_hu
+            if z_bl[b, i] < EPS_F64:
+                z_bl[b, i] = z_bl[b, i] + EPS_F64
+        elif t < n_hl + n_hu + n_xl + n_xu:
+            i = t - n_hl - n_hu - n_xl
+            if z_bu[b, i] < EPS_F64:
+                z_bu[b, i] = z_bu[b, i] + EPS_F64
+        else:
+            return
+
+    return boundary_shift_kernel
