@@ -25,18 +25,19 @@ from batched_solver_interface import (
 )
 
 
-def make_constr_least_square_data(B, n, m_F, p, seed=42):
+def make_constr_least_square_data(B, n, rows_F, rows_A, seed=42):
     rng = np.random.default_rng(seed)
-    F = rng.standard_normal((m_F, n))
-    A_eq = rng.standard_normal((p, n))
+    F = rng.standard_normal((rows_F, n))
+    A_eq = rng.standard_normal((rows_A, n))
     Fs = np.tile(F[None], (B, 1, 1))
-    gs = rng.standard_normal((B, m_F))
+    gs = rng.standard_normal((B, rows_F))
     As = np.tile(A_eq[None], (B, 1, 1))
-    bs = (As @ np.ones((B, n, 1))).squeeze(-1) + 0.1 * rng.standard_normal((B, p))
+    bs = (As @ np.ones((B, n, 1))).squeeze(-1) + 0.1 * rng.standard_normal((B, rows_A))
     Ps = 2 * np.einsum('bji,bjk->bik', Fs, Fs)
     Ps = (Ps + Ps.transpose(0, 2, 1)) / 2
     cs = -2 * np.einsum('bji,bj->bi', Fs, gs)
-    return BatchedQPData(P=Ps, c=cs, A=As, b=bs, x_l=np.zeros((B, n)))
+    xls = rng.standard_normal((B, n))
+    return BatchedQPData(P=Ps, c=cs, A=As, b=bs, x_l=xls)
 
 
 SOLVERS = [
@@ -69,16 +70,16 @@ def fmt_result(r, B):
     return f"{r.setup_time_ms:10.2f}  {r.solve_time_ms:10.2f}  {n_iter}  {fail:5d}/{B:<5d}"
 
 
-def run_benchmark(n=20, m_F=40, p=5, batch_sizes=None, tol=1e-8,
+def run_benchmark(n=20, row_F=40, row_A=5, batch_sizes=None, tol=1e-8,
                   max_iter=300, n_repeats=10):
     if batch_sizes is None:
-        batch_sizes = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, int(8192*2)]
+        # batch_sizes = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, int(8192*2), int(8192*4), int(8192*8)]
         # batch_sizes = [2048, 4096, 8192, int(8192*2), int(8192*4), int(8192*8)]
-        # batch_sizes = [8192]
+        batch_sizes = [8, 16, 32]
 
     solver_names = [name for name, _ in SOLVERS]
-    print(f"Constrained Least Squares: n={n}, m_F={m_F}, p={p}")
-    print(f"  min ||Fx - g||^2  s.t.  Ax = b,  x >= 0")
+    print(f"Constrained Least Squares: n={n}, row(F)={row_F}, row(A)={row_A}")
+    print(f"  min ||Fx - g||^2  s.t.  Ax = b,  x >= x_l")
     print(f"  tol={tol}, max_iter={max_iter}, n_repeats={n_repeats}")
     print()
     print_header(solver_names)
@@ -88,7 +89,7 @@ def run_benchmark(n=20, m_F=40, p=5, batch_sizes=None, tol=1e-8,
                for name in solver_names}
 
     for B in batch_sizes:
-        data = make_constr_least_square_data(B, n, m_F, p)
+        data = make_constr_least_square_data(B, n, row_F, row_A, seed=10)
         per_solver = {}
         for name, cls in SOLVERS:
             try:
@@ -114,7 +115,7 @@ def run_benchmark(n=20, m_F=40, p=5, batch_sizes=None, tol=1e-8,
         print(f"{B:6d}" + _SEP + _SEP.join(fmt_result(per_solver[name], B) for name in solver_names),
               flush=True)
 
-    params = dict(n=n, m_F=m_F, p=p, tol=tol, max_iter=max_iter)
+    params = dict(n=n, rows_F=row_F, p=row_A, tol=tol, max_iter=max_iter)
     return results, batch_sizes, params
 
 
@@ -139,8 +140,8 @@ def plot_results(results, batch_sizes, params):
     fig, axes = plt.subplots(1, 2, figsize=(10, 3.8))
     fig.suptitle(
         r"Batched Constrained Least Squares: "
-        rf"$n\!=\!{params['n']}$, $m_F\!=\!{params['m_F']}$, "
-        rf"$p\!=\!{params['p']}$, tol$\!=\!10^{{{int(np.log10(params['tol']))}}}$",
+        rf"$n\!=\!{params['n']}$, $\mathrm{{rows}}(F)\!=\!{params['rows_F']}$, "
+        rf"$\mathrm{{rows}}(A)\!=\!{params['p']}$, $\epsilon\!=\!10^{{{int(np.log10(params['tol']))}}}$",
         fontsize=13,
     )
 
@@ -178,8 +179,10 @@ def plot_results(results, batch_sizes, params):
     ax.set_ylabel(r"Throughput (QP/s)")
     ax.set_title(r"Solve Throughput")
     ax.set_xscale("log")
+    ax.set_yscale("log")
     ax.legend(framealpha=0.9)
-    ax.grid(True, alpha=0.3)
+    ax.grid(True, which="major", alpha=0.5)
+    ax.grid(True, which="minor", alpha=0.2)
 
     plt.tight_layout()
     out_pdf = Path(__file__).resolve().parent / "benchmark_cls.pdf"
@@ -217,12 +220,25 @@ if __name__ == "__main__":
                    help=f"Save results to this JSON file (default: {default_json}).")
     p.add_argument("--no-plot", action="store_true", help="Skip plotting.")
     p.add_argument("--tol", type=float, default=1e-8)
+    p.add_argument("--n", type=int, default=20, help="Number of decision variables.")
+    p.add_argument("--row-F", dest="row_F", type=int, default=40,
+                   help="Number of rows of F (residual length in ||Fx - g||^2).")
+    p.add_argument("--row-A", dest="row_A", type=int, default=5,
+                   help="Number of equality constraints (rows of A).")
+    p.add_argument("--batch-sizes", dest="batch_sizes", type=int, nargs="+", default=None,
+                   help="Space-separated list of batch sizes (e.g. --batch-sizes 8 16 32).")
+    p.add_argument("--max-iter", dest="max_iter", type=int, default=300)
+    p.add_argument("--n-repeats", dest="n_repeats", type=int, default=10)
     args = p.parse_args()
 
     if args.load is not None:
         results, batch_sizes, params = load_json(args.load)
     else:
-        results, batch_sizes, params = run_benchmark(tol=args.tol)
+        results, batch_sizes, params = run_benchmark(
+            n=args.n, row_F=args.row_F, row_A=args.row_A,
+            batch_sizes=args.batch_sizes, tol=args.tol,
+            max_iter=args.max_iter, n_repeats=args.n_repeats,
+        )
         save_json(results, batch_sizes, params, args.save)
 
     if not args.no_plot:
