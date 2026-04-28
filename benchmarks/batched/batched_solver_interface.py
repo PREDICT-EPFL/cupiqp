@@ -35,6 +35,17 @@ import jax.numpy as jnp
 from jax import jit, vmap
 
 
+SOLVER_COLORS = {
+    "cupiqp": "blue",
+    "qpax":   "green",
+    "qpth":   "red",
+    "moreau": "yellow",
+    "jaxopt": "magenta",
+}
+
+
+
+
 @dataclass
 class BatchedQPData:
     """Batched QP data in numpy arrays."""
@@ -195,7 +206,7 @@ class CupiqpBatchedSolverBase(BatchedQPSolver):
         self._data = data
         self._setup_kwargs = self._to_native(data)
 
-    @nvtx.annotate("cuPIQP::setup")
+    @nvtx.annotate("cupiqp::setup", color=SOLVER_COLORS["cupiqp"])
     def setup(self) -> None:
         self._solver = SolverBase()
         self._solver.settings.kkt_solver = self._kkt_solver
@@ -205,7 +216,7 @@ class CupiqpBatchedSolverBase(BatchedQPSolver):
         self._solver.settings.verbose = False
         self._solver.setup(**self._setup_kwargs)
 
-    @nvtx.annotate("cuPIQP::solve")
+    @nvtx.annotate("cupiqp::solve", color=SOLVER_COLORS["cupiqp"])
     def solve(self) -> BatchedQPResult:
         self._solver.solve()
         cp.cuda.Device(0).synchronize()
@@ -334,12 +345,12 @@ class QpaxBatchedSolver(BatchedQPSolver):
             self._Gs = jnp.zeros((B, 0, n))
             self._hs = jnp.zeros((B, 0))
 
-    @nvtx.annotate("qpax::setup")
+    @nvtx.annotate("qpax::setup", color=SOLVER_COLORS["qpax"])
     def setup(self) -> None:
         solve_fn = partial(qpax.solve_qp, solver_tol=self.tol_abs, max_iter=self.max_iter)
         self._batch_solve = jit(vmap(solve_fn, in_axes=(0, 0, 0, 0, 0, 0)))
 
-    @nvtx.annotate("qpax::solve")
+    @nvtx.annotate("qpax::solve", color=SOLVER_COLORS["qpax"])
     def solve(self) -> BatchedQPResult:
         xs, _, _, _, converged, pdip_iter = self._batch_solve(
             self._Ps, self._cs, self._As, self._bs, self._Gs, self._hs)
@@ -415,11 +426,11 @@ class QpthBatchedSolver(BatchedQPSolver):
             self._G = torch.empty(B, 0, n, dtype=torch.float64, device='cuda')
             self._h = torch.empty(B, 0, dtype=torch.float64, device='cuda')
 
-    @nvtx.annotate("qpth::setup")
+    @nvtx.annotate("qpth::setup", color=SOLVER_COLORS["qpth"])
     def setup(self) -> None:
         self._qp_fn = QPFunction(verbose=0, maxIter=self.max_iter, eps=self.tol_abs, check_Q_spd=False)
 
-    @nvtx.annotate("qpth::solve")
+    @nvtx.annotate("qpth::solve", color=SOLVER_COLORS["qpth"])
     def solve(self) -> BatchedQPResult:
         with torch.no_grad():
             x = self._qp_fn(self._Q, self._p, self._G, self._h, self._A, self._b)
@@ -534,20 +545,21 @@ class MoreauBatchedSolver(BatchedQPSolver):
         else:
             self._b = torch.zeros(B, 0, dtype=torch.float64)
 
-    @nvtx.annotate("moreau::setup")
+    @nvtx.annotate("moreau::setup", color=SOLVER_COLORS["moreau"])
     def setup(self) -> None:
         B, n = self._data.B, self._data.n
 
         cones = moreau.Cones(num_zero_cones=self._num_zero, num_nonneg_cones=self._num_nonneg)
-        ipm = moreau.IPMSettings(
+        ipm_settings = moreau.IPMSettings(
             direct_solve_method="cudss",  # NOTE: if not set it to cudss, maybe it switches to CPU when batch size is small?
             tol_feas=self.tol_abs,
+            cudss_ir_steps=0,  # NOTE: the default IR step is 2
             )
         settings = moreau.Settings(
             batch_size=B,  # NOTE: passing the batch_size seems to enhance the Moreau's perform a lot!
             max_iter=self.max_iter,
             enable_grad=False,
-            ipm_settings=ipm,
+            ipm_settings=ipm_settings,
             device="cuda",
         )
 
@@ -561,7 +573,7 @@ class MoreauBatchedSolver(BatchedQPSolver):
             settings=settings,
         )
 
-    @nvtx.annotate("moreau::solve")
+    @nvtx.annotate("moreau::solve", color=SOLVER_COLORS["moreau"])
     def solve(self) -> BatchedQPResult:
         with torch.no_grad():
             sol = self._solver.solve(self._P_vals, self._A_vals, self._q, self._b)
@@ -643,7 +655,7 @@ class JaxoptBatchedSolver(BatchedQPSolver):
         self._l_full = jnp.concatenate(l_full_parts, axis=1)
         self._u_full = jnp.concatenate(u_full_parts, axis=1)
 
-    @nvtx.annotate("jaxopt::setup")
+    @nvtx.annotate("jaxopt::setup", color=SOLVER_COLORS["jaxopt"])
     def setup(self) -> None:
         osqp = BoxOSQP(
             maxiter=self.max_iter,
@@ -661,7 +673,7 @@ class JaxoptBatchedSolver(BatchedQPSolver):
 
         self._batch_solve = jit(vmap(solve_one, in_axes=(0, 0, 0, 0, 0)))
 
-    @nvtx.annotate("jaxopt::solve")
+    @nvtx.annotate("jaxopt::solve", color=SOLVER_COLORS["jaxopt"])
     def solve(self) -> BatchedQPResult:
         t0 = time.perf_counter()
         xs = self._batch_solve(
