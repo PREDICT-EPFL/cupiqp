@@ -21,7 +21,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 from batched_solver_interface import (
     BatchedQPData, CupiqpDenseBatchedSolver, CupiqpSparseBatchedSolver,
-    QpaxBatchedSolver, QpthBatchedSolver, MoreauBatchedSolver,
+    QpaxBatchedSolver, QpthBatchedSolver,
+    MoreauTorchBatchedSolver, MoreauTorchHackedBatchedSolver,
+    MoreauJaxBatchedSolver,
 )
 
 
@@ -45,7 +47,9 @@ SOLVERS = [
     ("cupiqp-sparse", CupiqpSparseBatchedSolver),
     ("qpax", QpaxBatchedSolver),
     ("qpth", QpthBatchedSolver),
-    ("moreau", MoreauBatchedSolver),
+    ("moreau-torch", MoreauTorchBatchedSolver),
+    ("moreau-torch-hacked", MoreauTorchHackedBatchedSolver),
+    ("moreau-jax", MoreauJaxBatchedSolver),
 ]
 
 
@@ -133,9 +137,13 @@ def plot_results(results, batch_sizes, params):
     })
 
     colors = {"cupiqp-dense": "#1f77b4", "cupiqp-sparse": "#9467bd",
-              "qpax": "#ff7f0e", "qpth": "#2ca02c", "moreau": "#d62728"}
+              "qpax": "#ff7f0e", "qpth": "#2ca02c",
+              "moreau-torch": "#d62728", "moreau-torch-hacked": "#e377c2",
+              "moreau-jax": "#8c564b"}
     markers = {"cupiqp-dense": "o", "cupiqp-sparse": "P",
-               "qpax": "s", "qpth": "^", "moreau": "D"}
+               "qpax": "s", "qpth": "^",
+               "moreau-torch": "D", "moreau-torch-hacked": "X",
+               "moreau-jax": "*"}
 
     fig, axes = plt.subplots(1, 2, figsize=(10, 3.8))
     fig.suptitle(

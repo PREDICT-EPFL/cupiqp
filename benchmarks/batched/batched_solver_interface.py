@@ -36,11 +36,13 @@ from jax import jit, vmap
 
 
 SOLVER_COLORS = {
-    "cupiqp": "blue",
-    "qpax":   "green",
-    "qpth":   "red",
-    "moreau": "yellow",
-    "jaxopt": "magenta",
+    "cupiqp":              "blue",
+    "qpax":                "green",
+    "qpth":                "red",
+    "moreau-torch":        "yellow",
+    "moreau-torch-hacked": "orange",
+    "moreau-jax":          "purple",
+    "jaxopt":              "magenta",
 }
 
 
@@ -139,8 +141,21 @@ class BatchedQPSolver(ABC):
         ...
 
     @abstractmethod
-    def solve(self) -> BatchedQPResult:
-        """Solve the QP(s) and return the result."""
+    def solve(self) -> None:
+        """Run the solver kernels and end with a stream sync.
+
+        Must NOT pull data to host or build a result object — those go in
+        ``_collect_result()`` so they don't inflate the timing.
+        """
+        ...
+
+    @abstractmethod
+    def _collect_result(self) -> BatchedQPResult:
+        """Pull the solution to host side and build the ``BatchedQPResult``.
+
+        Called once after the timing loop. May freely D2H whatever it needs
+        (primal x, status array, iter counter, etc.).
+        """
         ...
 
     def benchmark(self, data: BatchedQPData, n_repeats: int = 5) -> BatchedQPResult:
@@ -149,7 +164,8 @@ class BatchedQPSolver(ABC):
         ``_prepare_data`` runs once before timing. ``setup()`` runs once
         (timed — includes any first-call JIT / symbolic-analysis cost).
         The first solve is a warm-up and excluded; the remaining
-        ``n_repeats`` solves are timed.
+        ``n_repeats`` solves are timed. ``_collect_result`` runs once at
+        the end, outside the timed window.
         """
         self._prepare_data(data)
 
@@ -164,10 +180,11 @@ class BatchedQPSolver(ABC):
         solve_times = []
         for _ in range(n_repeats):
             t0 = time.perf_counter()
-            result = self.solve()
+            self.solve()
             t1 = time.perf_counter()
             solve_times.append((t1 - t0) * 1000)
 
+        result = self._collect_result()
         result.setup_time_ms = setup_time_ms
         result.solve_time_ms = float(np.median(solve_times))
         result.solve_times_all = solve_times
@@ -217,20 +234,22 @@ class CupiqpBatchedSolverBase(BatchedQPSolver):
         self._solver.setup(**self._setup_kwargs)
 
     @nvtx.annotate("cupiqp::solve", color=SOLVER_COLORS["cupiqp"])
-    def solve(self) -> BatchedQPResult:
+    def solve(self) -> None:
         self._solver.solve()
         cp.cuda.Device(0).synchronize()
 
+    def _collect_result(self) -> BatchedQPResult:
         valid_statuses = {
             CupiqpStatus.PIQP_SOLVED.value,
             CupiqpStatus.PIQP_PRIMAL_INFEASIBLE.value,
             CupiqpStatus.PIQP_DUAL_INFEASIBLE.value,
         }
-        idx_unsolved = [i for i, status_i in enumerate(self._solver.result.info._status_value) if status_i not in valid_statuses]
-        n_solved = len(self._solver.result.info._status_value) - len(idx_unsolved)
-        x = cp.asnumpy(self._solver.result.x)
+        status_np = cp.asnumpy(self._solver.result.info._status_value)
+        idx_unsolved = [i for i, s in enumerate(status_np) if s not in valid_statuses]
+        n_solved = len(status_np) - len(idx_unsolved)
         return BatchedQPResult(
-            x=x, setup_time_ms=0, solve_time_ms=0, solve_times_all=[],  # filled by benchmark()
+            x=cp.asnumpy(self._solver.result.x),
+            setup_time_ms=0, solve_time_ms=0, solve_times_all=[],  # filled by benchmark()
             n_solved=n_solved, total=self._data.B,
             solver_name=self.name,
             index_unsolved=idx_unsolved,
@@ -351,19 +370,23 @@ class QpaxBatchedSolver(BatchedQPSolver):
         self._batch_solve = jit(vmap(solve_fn, in_axes=(0, 0, 0, 0, 0, 0)))
 
     @nvtx.annotate("qpax::solve", color=SOLVER_COLORS["qpax"])
-    def solve(self) -> BatchedQPResult:
+    def solve(self) -> None:
         xs, _, _, _, converged, pdip_iter = self._batch_solve(
             self._Ps, self._cs, self._As, self._bs, self._Gs, self._hs)
         xs.block_until_ready()
+        self._last_xs        = xs
+        self._last_converged = converged
+        self._last_iters     = pdip_iter
 
-        n_solved = int(jnp.sum(converged))
-        idx_unsolved = [i for i, converged_i in enumerate(converged) if not converged_i]
+    def _collect_result(self) -> BatchedQPResult:
+        converged_np = np.asarray(self._last_converged)
         return BatchedQPResult(
-            x=np.array(xs), setup_time_ms=0, solve_time_ms=0, solve_times_all=[],
-            n_solved=n_solved, total=self._data.B,
+            x=np.asarray(self._last_xs),
+            setup_time_ms=0, solve_time_ms=0, solve_times_all=[],
+            n_solved=int(converged_np.sum()), total=self._data.B,
             solver_name=self.name,
-            index_unsolved=idx_unsolved,
-            n_iter_max=int(pdip_iter.max()),
+            index_unsolved=[i for i, c in enumerate(converged_np) if not c],
+            n_iter_max=int(self._last_iters.max()),
         )
 
 
@@ -431,18 +454,17 @@ class QpthBatchedSolver(BatchedQPSolver):
         self._qp_fn = QPFunction(verbose=0, maxIter=self.max_iter, eps=self.tol_abs, check_Q_spd=False)
 
     @nvtx.annotate("qpth::solve", color=SOLVER_COLORS["qpth"])
-    def solve(self) -> BatchedQPResult:
+    def solve(self) -> None:
         with torch.no_grad():
-            x = self._qp_fn(self._Q, self._p, self._G, self._h, self._A, self._b)
+            self._last_x = self._qp_fn(self._Q, self._p, self._G, self._h, self._A, self._b)
         torch.cuda.synchronize()
 
-        x_np = x.cpu().numpy()
-        # qpth doesn't report per-problem convergence; check for NaN
-        n_solved = -1  # NOTE: qpth does not return status
-
+    def _collect_result(self) -> BatchedQPResult:
+        # qpth doesn't expose per-problem convergence or iter count.
         return BatchedQPResult(
-            x=x_np, setup_time_ms=0, solve_time_ms=0, solve_times_all=[],
-            n_solved=n_solved, total=self._data.B,
+            x=self._last_x.cpu().numpy(),
+            setup_time_ms=0, solve_time_ms=0, solve_times_all=[],
+            n_solved=-1, total=self._data.B,
             solver_name=self.name,
             index_unsolved=[],
         )
@@ -459,8 +481,8 @@ try:
 except ImportError:
     _MOREAU_AVAILABLE = False
 
-class MoreauBatchedSolver(BatchedQPSolver):
-    """moreau batched conic solver (GPU, PyTorch).
+class MoreauTorchBatchedSolver(BatchedQPSolver):
+    """moreau batched conic solver via the PyTorch interface (GPU).
 
     Converts QP to conic form:
         min 0.5 x^T P x + q^T x
@@ -473,7 +495,7 @@ class MoreauBatchedSolver(BatchedQPSolver):
 
     @property
     def name(self) -> str:
-        return "moreau"
+        return "moreau-torch"
 
     def _prepare_data(self, data: BatchedQPData) -> None:
         if not _MOREAU_AVAILABLE:
@@ -524,28 +546,34 @@ class MoreauBatchedSolver(BatchedQPSolver):
         self._num_zero = num_zero
         self._num_nonneg = num_nonneg
 
-        # Batched values: (B, nnz_P) and (B, nnz_A)
+        # Batched values on CUDA — moreau's solver runs on cuda (device="cuda"
+        # in setup()), so leaving these on CPU forces a H2D copy of every
+        # input tensor on every solve() call, polluting the timed window.
         P_nnz = self._P_sp.nnz
-        self._P_vals = torch.zeros(B, P_nnz, dtype=torch.float64)
+        P_vals_np = np.zeros((B, P_nnz), dtype=np.float64)
         for i in range(B):
-            P_i = sparse.csr_matrix(data.P[i])
-            self._P_vals[i] = torch.tensor(P_i.data, dtype=torch.float64)
+            P_vals_np[i] = sparse.csr_matrix(data.P[i]).data
+        self._P_vals = torch.tensor(P_vals_np, dtype=torch.float64, device='cuda')
 
         # A_cone is the same structure for all problems, but values differ
         # for equality and inequality bounds
         self._A_vals = torch.tensor(
-            np.tile(self._A_sp.data[None, :], (B, 1)), dtype=torch.float64
+            np.tile(self._A_sp.data[None, :], (B, 1)),
+            dtype=torch.float64, device='cuda',
         )
 
-        self._q = torch.tensor(data.c, dtype=torch.float64)
+        self._q = torch.tensor(data.c, dtype=torch.float64, device='cuda')
 
         # b_cone: (B, total_constraints)
         if b_parts_np:
-            self._b = torch.tensor(np.concatenate(b_parts_np, axis=1), dtype=torch.float64)
+            self._b = torch.tensor(
+                np.concatenate(b_parts_np, axis=1),
+                dtype=torch.float64, device='cuda',
+            )
         else:
-            self._b = torch.zeros(B, 0, dtype=torch.float64)
+            self._b = torch.zeros(B, 0, dtype=torch.float64, device='cuda')
 
-    @nvtx.annotate("moreau::setup", color=SOLVER_COLORS["moreau"])
+    @nvtx.annotate("moreau-torch::setup", color=SOLVER_COLORS["moreau-torch"])
     def setup(self) -> None:
         B, n = self._data.B, self._data.n
 
@@ -573,12 +601,13 @@ class MoreauBatchedSolver(BatchedQPSolver):
             settings=settings,
         )
 
-    @nvtx.annotate("moreau::solve", color=SOLVER_COLORS["moreau"])
-    def solve(self) -> BatchedQPResult:
+    @nvtx.annotate("moreau-torch::solve", color=SOLVER_COLORS["moreau-torch"])
+    def solve(self) -> None:
         with torch.no_grad():
-            sol = self._solver.solve(self._P_vals, self._A_vals, self._q, self._b)
+            self._last_sol = self._solver.solve(self._P_vals, self._A_vals, self._q, self._b)
         torch.cuda.synchronize()
 
+    def _collect_result(self) -> BatchedQPResult:
         valid_statuses = {
             moreau.SolverStatus.Solved,
             moreau.SolverStatus.PrimalInfeasible,
@@ -587,16 +616,247 @@ class MoreauBatchedSolver(BatchedQPSolver):
             moreau.SolverStatus.AlmostPrimalInfeasible,
             moreau.SolverStatus.AlmostDualInfeasible,
         }
-        idx_unsolved = [i for i, status_i in enumerate(self._solver.info.status) if status_i not in valid_statuses]
-        n_solved = len(self._solver.info.status) - len(idx_unsolved)
-        x_np = sol.x.cpu().numpy()
-
+        status = self._solver.info.status  # already host-side
+        idx_unsolved = [i for i, s in enumerate(status) if s not in valid_statuses]
+        n_solved = len(status) - len(idx_unsolved)
         return BatchedQPResult(
-            x=x_np, setup_time_ms=0, solve_time_ms=0, solve_times_all=[],
+            x=self._last_sol.x.cpu().numpy(),
+            setup_time_ms=0, solve_time_ms=0, solve_times_all=[],
             n_solved=n_solved, total=self._data.B,
             solver_name=self.name,
             index_unsolved=idx_unsolved,
             n_iter_max=int(np.max(self._solver.info.iterations)),
+        )
+
+
+class MoreauTorchHackedBatchedSolver(MoreauTorchBatchedSolver):
+    """Same problem encoding as ``MoreauTorchBatchedSolver``, but bypasses
+    moreau's public ``Solver.solve()`` wrapper and calls the underlying
+    autograd ``_SolveFunction.apply`` directly.
+
+    Why: ``Solver.solve()`` does ``[_normalize_status(int(st)) for st in
+    cached['status']]`` (moreau/torch/__init__.py:752) on every call to
+    populate ``self._info.status``. With batch size B that's B element-wise
+    D2H syncs inside the timed window. Calling ``_SolveFunction.apply``
+    directly skips that loop; we read the device-resident status array
+    once in ``_collect_result()`` via a single bulk D2H.
+
+    Reaches into moreau's private API — may break across moreau versions.
+    """
+
+    @property
+    def name(self) -> str:
+        return "moreau-torch-hacked"
+
+    @nvtx.annotate("moreau-torch-hacked::setup", color=SOLVER_COLORS["moreau-torch-hacked"])
+    def setup(self) -> None:
+        super().setup()
+        # Run moreau's internal P/A setup once so ``_solver._P_values`` and
+        # ``_solver._A_values`` are populated for the bypass path. The
+        # public ``Solver.solve()`` calls this on every solve, but with
+        # unchanged P/A values it's a cached no-op after the first run.
+        self._solver.setup(self._P_vals, self._A_vals)
+
+    @nvtx.annotate("moreau-torch-hacked::solve", color=SOLVER_COLORS["moreau-torch-hacked"])
+    def solve(self) -> None:
+        from moreau.torch import _SolveFunction
+        with torch.no_grad():
+            x, _z, _s = _SolveFunction.apply(
+                self._solver, self._q, self._b,
+                self._solver._P_values, self._solver._A_values,
+            )
+        self._last_x = x
+        torch.cuda.synchronize()
+
+    def _collect_result(self) -> BatchedQPResult:
+        valid_statuses = {
+            moreau.SolverStatus.Solved,
+            moreau.SolverStatus.PrimalInfeasible,
+            moreau.SolverStatus.DualInfeasible,
+            moreau.SolverStatus.AlmostSolved,
+            moreau.SolverStatus.AlmostPrimalInfeasible,
+            moreau.SolverStatus.AlmostDualInfeasible,
+        }
+        from moreau.torch import _normalize_status
+        cached = self._solver._last_result
+        status_dev = cached['status']
+        status_np = status_dev.cpu().numpy() if hasattr(status_dev, 'cpu') \
+                    else np.asarray(status_dev)
+        statuses = [_normalize_status(int(s)) for s in status_np]
+        idx_unsolved = [i for i, s in enumerate(statuses) if s not in valid_statuses]
+        n_solved = len(statuses) - len(idx_unsolved)
+
+        iters = cached['iterations']
+        iters_np = iters.cpu().numpy() if hasattr(iters, 'cpu') else np.asarray(iters)
+
+        return BatchedQPResult(
+            x=self._last_x.cpu().numpy(),
+            setup_time_ms=0, solve_time_ms=0, solve_times_all=[],
+            n_solved=n_solved, total=self._data.B,
+            solver_name=self.name,
+            index_unsolved=idx_unsolved,
+            n_iter_max=int(iters_np.max()),
+        )
+
+
+# ======================================================================
+# moreau via JAX
+# ======================================================================
+
+try:
+    from moreau.jax import Solver as MoreauJaxSolver
+    _MOREAU_JAX_AVAILABLE = True
+except ImportError:
+    _MOREAU_JAX_AVAILABLE = False
+
+
+class MoreauJaxBatchedSolver(BatchedQPSolver):
+    """moreau batched conic solver via the JAX interface (GPU).
+
+    Same conic encoding as ``MoreauTorchBatchedSolver`` (the conic
+    constraint matrix and value layout are identical — only the tensor
+    framework differs). Unlike the Torch wrapper, moreau's JAX wrapper
+    does NOT iterate over the per-batch status tensor inside its
+    ``solve()``; status stays as a JAX array on device until the user
+    pulls it explicitly. So no ``Hacked`` bypass variant is needed.
+
+    NOTE: The Moreau solver uses Sparse linear algebra by default!
+    """
+
+    @property
+    def name(self) -> str:
+        return "moreau-jax"
+
+    def _prepare_data(self, data: BatchedQPData) -> None:
+        if not _MOREAU_JAX_AVAILABLE:
+            raise ImportError("moreau.jax is required for MoreauJaxBatchedSolver")
+        from scipy import sparse
+
+        self._data = data
+        B, n, p, m = data.B, data.n, data.p, data.m
+
+        # Build the conic constraint matrix A_cone and bounds b_cone, identical
+        # row blocks to the Torch path:
+        #   [A_eq; G (upper); -G (lower); I (x_upper); -I (x_lower)]
+        A_parts = []
+        b_parts_np = []
+        num_zero = 0
+        num_nonneg = 0
+
+        if p > 0:
+            A_parts.append(data.A[0])
+            b_parts_np.append(data.b)
+            num_zero = p
+        if data.G is not None and data.h_u is not None:
+            A_parts.append(data.G[0])
+            b_parts_np.append(data.h_u)
+            num_nonneg += m
+        if data.G is not None and data.h_l is not None:
+            A_parts.append(-data.G[0])
+            b_parts_np.append(-data.h_l)
+            num_nonneg += m
+        if data.x_u is not None:
+            A_parts.append(np.eye(n))
+            b_parts_np.append(data.x_u)
+            num_nonneg += n
+        if data.x_l is not None:
+            A_parts.append(-np.eye(n))
+            b_parts_np.append(-data.x_l)
+            num_nonneg += n
+
+        A_cone_np = np.vstack(A_parts) if A_parts else np.zeros((0, n))
+
+        P_np = data.P[0]
+        self._P_sp = sparse.csr_matrix(P_np)
+        self._A_sp = sparse.csr_matrix(A_cone_np)
+        self._num_zero = num_zero
+        self._num_nonneg = num_nonneg
+
+        # In this benchmark the QP layout shares P/A across the batch — only
+        # q and b vary. Match the moreau JAX docs example: store P/A as 1-D
+        # arrays (single problem) and only the per-problem q/b as 2-D batched
+        # arrays. Will be vmapped with ``in_axes=(None, None, 0, 0)``.
+        # https://docs.moreau.so/guide/jax-integration.html
+        self._P_vals = jnp.asarray(self._P_sp.data, dtype=jnp.float64)
+        self._A_vals = jnp.asarray(self._A_sp.data, dtype=jnp.float64)
+        self._q = jnp.asarray(data.c, dtype=jnp.float64)
+        if b_parts_np:
+            self._b = jnp.asarray(np.concatenate(b_parts_np, axis=1), dtype=jnp.float64)
+        else:
+            self._b = jnp.zeros((B, 0), dtype=jnp.float64)
+
+    @nvtx.annotate("moreau-jax::setup", color=SOLVER_COLORS["moreau-jax"])
+    def setup(self) -> None:
+        B, n = self._data.B, self._data.n
+
+        cones = moreau.Cones(num_zero_cones=self._num_zero, num_nonneg_cones=self._num_nonneg)
+        ipm_settings = moreau.IPMSettings(
+            direct_solve_method="cudss",
+            tol_feas=self.tol_abs,
+            cudss_ir_steps=0,
+        )
+        settings = moreau.Settings(
+            batch_size=B,
+            max_iter=self.max_iter,
+            enable_grad=False,
+            ipm_settings=ipm_settings,
+            device="cuda",
+        )
+
+        self._solver = MoreauJaxSolver(
+            n=n, m=self._A_sp.shape[0],
+            P_row_offsets=np.asarray(self._P_sp.indptr, dtype=np.int64),
+            P_col_indices=np.asarray(self._P_sp.indices, dtype=np.int64),
+            A_row_offsets=np.asarray(self._A_sp.indptr, dtype=np.int64),
+            A_col_indices=np.asarray(self._A_sp.indices, dtype=np.int64),
+            cones=cones,
+            settings=settings,
+        )
+        # Match the moreau JAX docs: vmap solver.solve with P/A shared
+        # across the batch, q/b batched. The custom_vmap rule on the
+        # underlying impl handles the batched dispatch; we use _solve_raw
+        # so the call returns ``(JaxSolution, JaxSolveInfo)`` and we can
+        # read per-batch status / iterations from ``info`` directly.
+        self._batch_solve = jax.jit(
+            jax.vmap(self._solver._solve_raw, in_axes=(None, None, 0, 0))
+        )
+
+    @nvtx.annotate("moreau-jax::solve", color=SOLVER_COLORS["moreau-jax"])
+    def solve(self) -> None:
+        sol, info = self._batch_solve(
+            self._P_vals, self._A_vals, self._q, self._b
+        )
+        self._last_sol = sol
+        self._last_info = info
+        # JAX is async — sync on the primal so the timed range covers
+        # actual solver work rather than just the dispatch.
+        sol.x.block_until_ready()
+
+    def _collect_result(self) -> BatchedQPResult:
+        valid_statuses = {
+            moreau.SolverStatus.Solved,
+            moreau.SolverStatus.PrimalInfeasible,
+            moreau.SolverStatus.DualInfeasible,
+            moreau.SolverStatus.AlmostSolved,
+            moreau.SolverStatus.AlmostPrimalInfeasible,
+            moreau.SolverStatus.AlmostDualInfeasible,
+        }
+        from moreau._types import normalize_status as _normalize_status
+        info = self._last_info
+        # Bulk D2H of the per-batch status / iterations arrays (one copy each).
+        status_np = np.asarray(info.status)
+        iters_np  = np.asarray(info.iterations)
+        statuses = [_normalize_status(int(s)) for s in status_np]
+        idx_unsolved = [i for i, s in enumerate(statuses) if s not in valid_statuses]
+        n_solved = len(statuses) - len(idx_unsolved)
+
+        return BatchedQPResult(
+            x=np.asarray(self._last_sol.x),
+            setup_time_ms=0, solve_time_ms=0, solve_times_all=[],
+            n_solved=n_solved, total=self._data.B,
+            solver_name=self.name,
+            index_unsolved=idx_unsolved,
+            n_iter_max=int(iters_np.max()),
         )
 
 
@@ -674,15 +934,16 @@ class JaxoptBatchedSolver(BatchedQPSolver):
         self._batch_solve = jit(vmap(solve_one, in_axes=(0, 0, 0, 0, 0)))
 
     @nvtx.annotate("jaxopt::solve", color=SOLVER_COLORS["jaxopt"])
-    def solve(self) -> BatchedQPResult:
-        t0 = time.perf_counter()
+    def solve(self) -> None:
         xs = self._batch_solve(
             self._Ps, self._cs, self._A_full, self._l_full, self._u_full)
         xs.block_until_ready()
-        elapsed = time.perf_counter() - t0
+        self._last_xs = xs
 
+    def _collect_result(self) -> BatchedQPResult:
         return BatchedQPResult(
-            x=np.array(xs), setup_time_ms=0, solve_time_ms=elapsed * 1000, solve_times_all=[],
+            x=np.asarray(self._last_xs),
+            setup_time_ms=0, solve_time_ms=0, solve_times_all=[],
             n_solved=-1,  # NOTE: BoxOSQP doesn't report per-problem convergence easily
             total=self._data.B,
             solver_name=self.name,
