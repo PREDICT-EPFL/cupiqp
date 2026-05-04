@@ -1,5 +1,6 @@
 from typing import Optional
 import cupy as cp
+import warp as wp
 from cupyx.scipy.sparse import csr_matrix, diags, bmat
 import nvtx
 
@@ -9,6 +10,7 @@ from .sparse_data import SparseData
 from .sparse_matvec import SingleSparseMatVecProduct, BatchedSparseMatVecProduct
 from .sparse_direct_solver import CudssSparseDirectSolver
 from .csr_helpers import csr_diag_indices, csr_row_indices, csr_subblock_indices
+from .sparse_kkt_solver_kernels import create_update_kkt_diag_kernel
 
 
 class SparseKKTSolver(KKTSolverBase):
@@ -47,6 +49,8 @@ class SparseKKTSolver(KKTSolverBase):
         self._diag_x_indices = single_kkt_diag_idx[:n]
         self._diag_y_indices = single_kkt_diag_idx[n:n+p]
         self._diag_z_indices = single_kkt_diag_idx[n+p:n+p+m]
+
+        self._update_kkt_diag_kernel = create_update_kkt_diag_kernel(n, p, m)
 
         # -- P-diagonal CSR indices (for vectorized P diag extraction) --
         # P may have zero diagonal entries that are not stored in the CSR.
@@ -182,14 +186,18 @@ class SparseKKTSolver(KKTSolverBase):
 
     @nvtx.annotate("SparseKKTSolver::update_kkt")
     def update_kkt(self, data: SparseData, delta: cp.ndarray, x_reg: cp.ndarray, z_reg: cp.ndarray) -> None:
-        """Update diagonal blocks of all B KKT matrices (vectorized).
-
-        Parameters: delta (B,), x_reg (B, n), z_reg (B, m).
-        """
-        # Scatter into (B, kkt_nnz): 3 kernel launches total
-        self._kkt_mats.data[:, self._diag_x_indices] = self._P_diag + x_reg
-        self._kkt_mats.data[:, self._diag_y_indices] = -delta[:, None]
-        self._kkt_mats.data[:, self._diag_z_indices] = -z_reg
+        """Update diagonal blocks of all batched KKT matrices."""
+        wp.launch(
+            kernel=self._update_kkt_diag_kernel,
+            dim=(self._batch_size, data.n + data.p + data.m),
+            inputs=[
+                self._P_diag, x_reg, delta, z_reg,
+                self._diag_x_indices, self._diag_y_indices, self._diag_z_indices,
+                self._kkt_mats.data,
+            ],
+            device="cuda",
+            stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+        )
 
     @nvtx.annotate("SparseKKTSolver::factor")
     def factor(self) -> bool:

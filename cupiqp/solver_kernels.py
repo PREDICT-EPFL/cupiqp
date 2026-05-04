@@ -42,6 +42,39 @@ def create_prepare_corrector_step_kernel():
     return prepare_corrector_step_kernel
 
 
+def create_update_vars_after_corrector_step_kernel(n_primal: int, n_dual: int):
+    """Fused scaled-add for ``_update_vars_after_corrector_step``::
+
+        result.primals_all[b, i] += primal_step[b] * step.primals_all[b, i]   (i in [0, n_primal))
+        result.duals_all  [b, j] += dual_step  [b] * step.duals_all  [b, j]   (j in [0, n_dual))
+
+    Note: here the slack variables are also counted into the primals and get updated.
+
+    Dispatch: ``wp.launch(kernel, dim=(B, n_primal + n_dual))``.
+    ``n_primal = n + num_ineq``, ``n_dual = p + num_ineq``.
+    """
+    @wp.kernel
+    def update_vars_after_corrector_step_kernel(
+        primal_step:      wp.array(dtype=wp.float64),    # type: ignore  (B,)
+        dual_step:        wp.array(dtype=wp.float64),    # type: ignore  (B,)
+        step_primals_all: wp.array2d(dtype=wp.float64),  # type: ignore  (B, n_primal)
+        step_duals_all:   wp.array2d(dtype=wp.float64),  # type: ignore  (B, n_dual)
+        primals_all:      wp.array2d(dtype=wp.float64),  # type: ignore  (B, n_primal) in-out
+        duals_all:        wp.array2d(dtype=wp.float64),  # type: ignore  (B, n_dual)   in-out
+    ):
+        b, t = wp.tid()
+        n_primal_static = wp.static(n_primal)
+        n_dual_static = wp.static(n_dual)
+
+        if t < n_primal_static:
+            primals_all[b, t] = primals_all[b, t] + primal_step[b] * step_primals_all[b, t]
+        elif t < n_primal_static + n_dual_static:
+            j = t - n_primal_static
+            duals_all[b, j] = duals_all[b, j] + dual_step[b] * step_duals_all[b, j]
+
+    return update_vars_after_corrector_step_kernel
+
+
 def create_run_full_newton_step_kernel(n: int, p: int):
     """Fused post-solve variable update for the equality-only (no-inequality)
     path ``_run_full_newton_step``.

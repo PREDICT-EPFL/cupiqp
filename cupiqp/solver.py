@@ -631,9 +631,24 @@ class SolverBase:
 
     @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
     def _update_vars_after_corrector_step(self):
-        # ------------------ update variables ------------------
-        self._result.primals_all += self._result.info.primal_step[:, None] * self._step.primals_all
-        self._result.duals_all += self._result.info.dual_step[:, None] * self._step.duals_all
+        # self._result.primals_all += self._result.info.primal_step[:, None] * self._step.primals_all
+        # self._result.duals_all += self._result.info.dual_step[:, None] * self._step.duals_all
+        n_primal = self._data.n + self._data.num_ineq
+        n_dual   = self._data.p + self._data.num_ineq
+        wp.launch(
+            kernel=self._update_vars_after_corrector_step_kernel,
+            dim=(self._data.batch_size, n_primal + n_dual),
+            inputs=[
+                self._result.info.primal_step,
+                self._result.info.dual_step,
+                self._step.primals_all,
+                self._step.duals_all,
+                self._result.primals_all,
+                self._result.duals_all,
+            ],
+            device="cuda",
+            stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+        )
 
     @nvtx.annotate("Solver::_calculate_step")
     @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)

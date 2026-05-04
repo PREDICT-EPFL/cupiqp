@@ -1,9 +1,11 @@
 import cupy as cp
 import nvtx
+import warp as wp
 
 from ..kkt_solver import KKTSolverBase
 from .dense_data import DenseData
 from .dense_cholesky import CholeskyInplaceSolver, BatchedCholeskyInplaceSolver
+from .dense_kkt_solver_kernels import create_update_kkt_kernel
 from .cublas_wrappers import (
     cublas_set_stream, cublas_create_handle, cublas_destroy_handle,
     dgemv, dsyrk, cublas_set_stream,
@@ -31,10 +33,11 @@ class DenseKKTSolver(KKTSolverBase):
         self._z_reg_inv = cp.empty((B, m), dtype=cp.float64) if m > 0 else cp.empty((B, 0), dtype=cp.float64)
         self._z_reg_inv_sqrt = cp.empty((B, m), dtype=cp.float64) if m > 0 else cp.empty((B, 0), dtype=cp.float64)
         self._kkt_mat = cp.empty((B, n, n), dtype=cp.float64)
-        self._P_diag_idx = cp.arange(n)
         self._AtA = cp.empty((B, n, n), dtype=cp.float64) if p > 0 else cp.zeros((B, 0, 0), dtype=cp.float64)
         self._G_scaled = cp.empty((B, m, n), dtype=cp.float64) if m > 0 else cp.zeros((B, 0, 0), dtype=cp.float64)
         self._work_n = cp.empty((B, n), dtype=cp.float64)
+
+        self._update_kkt_kernel, self._update_kkt_kernel_launch_dim = create_update_kkt_kernel(n, p, m)
 
         self._cublas_handle = cublas_create_handle()
 
@@ -77,28 +80,51 @@ class DenseKKTSolver(KKTSolverBase):
     def update_kkt(self, data: DenseData, delta: cp.ndarray, x_reg: cp.ndarray, z_reg: cp.ndarray) -> None:
         """Assemble KKT matrix using batched cuBLAS calls (CUDA graph safe)."""
         cublas_set_stream(self._cublas_handle, cp.cuda.get_current_stream().ptr)
-        n = data.n
 
-        # Store delta; compute 1/delta on device
-        self._delta[:] = delta.reshape(-1, 1)
-        cp.reciprocal(self._delta, out=self._delta_inv)
+        USE_WARP_IMPL = True
+        if USE_WARP_IMPL:
+            # compute kkt = P + diag(x_reg) + 1/delta*AtA, as well as delta_inv, G_scaled, z_reg_inv, z_reg_inv_sqrt
+            wp.launch(
+                kernel=self._update_kkt_kernel,
+                dim=(self._batch_size, self._update_kkt_kernel_launch_dim),
+                inputs=[
+                    data.P, self._AtA, data.G, delta, x_reg, z_reg,
+                    self._delta_inv, self._z_reg_inv, self._z_reg_inv_sqrt,
+                    self._kkt_mat, self._G_scaled,
+                ],
+                device="cuda",
+                stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+            )
+            if data.m > 0:
+                self._syrk(self._cublas_handle, self._G_scaled, self._kkt_mat, 1.0, 1.0)
+        
+        else:
+            # --- cupy fallback ---
+            n = data.n
 
-        # KKT = P
-        self._kkt_mat[:] = data.P
+            self._delta[:] = delta.reshape(-1, 1)
+            cp.reciprocal(self._delta, out=self._delta_inv)
 
-        # KKT_diag += x_reg
-        self._kkt_mat[:, self._P_diag_idx, self._P_diag_idx] += x_reg
+            self._kkt_mat[:] = data.P
+            # NOTE:
+            # Diagonal write via a stride-(n+1) view of the flattened (B, n*n)
+            # buffer, equivalent to ``self._kkt_mat[:, idx, idx] += x_reg`` but
+            # without ``cupy_prepare_array_indexing``. Fancy indexing here would
+            # allocate an internal index-scratch buffer from CuPy's mempool;
+            # captured into the _update_reg_and_kkt CUDA graph, that scratch
+            # pointer goes stale once the mempool is perturbed by other allocators
+            # (JAX/RMM, torch caching), and replay crashes with
+            # CUDA_ERROR_ILLEGAL_ADDRESS.
+            self._kkt_mat.reshape(self._batch_size, -1)[:, ::n + 1] += x_reg
 
-        # KKT += (1/delta) * AtA
-        if data.p > 0:
-            self._kkt_mat += self._delta_inv[:, :, None] * self._AtA
+            if data.p > 0:
+                self._kkt_mat += self._delta_inv[:, :, None] * self._AtA
 
-        # KKT += G_scaled^T @ G_scaled  where G_scaled = diag(z_reg_inv_sqrt) @ G
-        if data.m > 0:
-            cp.reciprocal(z_reg, out=self._z_reg_inv)
-            cp.sqrt(self._z_reg_inv, out=self._z_reg_inv_sqrt)
-            cp.multiply(self._z_reg_inv_sqrt[:, :, None], data.G, out=self._G_scaled)
-            self._syrk(self._cublas_handle, self._G_scaled, self._kkt_mat, 1.0, 1.0)
+            if data.m > 0:
+                cp.reciprocal(z_reg, out=self._z_reg_inv)
+                cp.sqrt(self._z_reg_inv, out=self._z_reg_inv_sqrt)
+                cp.multiply(self._z_reg_inv_sqrt[:, :, None], data.G, out=self._G_scaled)
+                self._syrk(self._cublas_handle, self._G_scaled, self._kkt_mat, 1.0, 1.0)
 
     @nvtx.annotate("DenseKKTSolver::factor")
     def factor(self) -> bool:
