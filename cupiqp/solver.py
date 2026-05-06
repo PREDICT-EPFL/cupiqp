@@ -67,22 +67,7 @@ class Solver:
         else:
             raise ValueError(f"Unknown kkt_solver type: {self.settings.kkt_solver}")
 
-        if self.settings.kkt_solver == "dense_cholesky":
-            from .dense.dense_preconditioner import DenseRuizEquilibration
-            PreconditionerClass = DenseRuizEquilibration
-        elif self.settings.kkt_solver == "sparse_ldlt":
-            from .sparse.sparse_preconditioner import SparseRuizEquilibration
-            PreconditionerClass = SparseRuizEquilibration
-        elif self.settings.kkt_solver == "multistage_block_cholesky":
-            from .multistage.multistage_preconditioner import MultistageRuizEquilibration
-            PreconditionerClass = MultistageRuizEquilibration
-        else:
-            raise ValueError(f"No preconditioner for kkt_solver type: {self.settings.kkt_solver}")
-        self._preconditioner = PreconditionerClass(
-            self._data.batch_size, self._data.n, self._data.p, self._data.m,
-            self._data.idx_xl, self._data.idx_xu,
-            self._data.idx_hl, self._data.idx_hu,
-        )
+        self._preconditioner = self._init_preconditioner()
         if self.settings.preconditioner_iter > 0:
             self._preconditioner.scale_data(
                 self._data,
@@ -506,6 +491,25 @@ class Solver:
             # Mark all still-unsolved problems as numerical issues
             still_unsolved = (self._result.info._status_value == Status.PIQP_UNSOLVED.value)
             self._result.info._status_value[still_unsolved] = Status.PIQP_NUMERICAL_ISSUES.value
+
+    def _init_preconditioner(self):
+        """Construct the Ruiz preconditioner for the configured KKT backend."""
+        if self.settings.kkt_solver == "dense_cholesky":
+            from .dense.dense_preconditioner import DenseRuizEquilibration
+            PreconditionerClass = DenseRuizEquilibration
+        elif self.settings.kkt_solver == "sparse_ldlt":
+            from .sparse.sparse_preconditioner import SparseRuizEquilibration
+            PreconditionerClass = SparseRuizEquilibration
+        elif self.settings.kkt_solver == "multistage_block_cholesky":
+            from .multistage.multistage_preconditioner import MultistageRuizEquilibration
+            PreconditionerClass = MultistageRuizEquilibration
+        else:
+            raise ValueError(f"No preconditioner for kkt_solver type: {self.settings.kkt_solver}")
+        return PreconditionerClass(
+            self._data.batch_size, self._data.n, self._data.p, self._data.m,
+            self._data.idx_xl, self._data.idx_xu,
+            self._data.idx_hl, self._data.idx_hu,
+        )
 
     def _init_warp_kernels(self) -> None:
         if self._data.num_ineq > 0:

@@ -33,6 +33,28 @@ class LargeProblemSolver(Solver):
     predictor-corrector kernels, residual queries) from ``Solver``.
     """
 
+    def _init_preconditioner(self):
+        """Construct the Ruiz preconditioner with ``use_warp_tile_kernels=False``
+        so the conv-check tile factory is never called and never compiled,
+        and the whole equilibration loop runs on the cupy path."""
+        if self.settings.kkt_solver == "dense_cholesky":
+            from .dense.dense_preconditioner import DenseRuizEquilibration
+            PreconditionerClass = DenseRuizEquilibration
+        elif self.settings.kkt_solver == "sparse_ldlt":
+            from .sparse.sparse_preconditioner import SparseRuizEquilibration
+            PreconditionerClass = SparseRuizEquilibration
+        elif self.settings.kkt_solver == "multistage_block_cholesky":
+            from .multistage.multistage_preconditioner import MultistageRuizEquilibration
+            PreconditionerClass = MultistageRuizEquilibration
+        else:
+            raise ValueError(f"No preconditioner for kkt_solver type: {self.settings.kkt_solver}")
+        return PreconditionerClass(
+            self._data.batch_size, self._data.n, self._data.p, self._data.m,
+            self._data.idx_xl, self._data.idx_xu,
+            self._data.idx_hl, self._data.idx_hu,
+            use_warp_tile_kernels=False,
+        )
+
     def _init_warp_kernels(self) -> None:
         if self._data.num_ineq > 0:
             self._boundary_shift_kernel = create_boundary_shift_kernel(

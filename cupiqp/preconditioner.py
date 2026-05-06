@@ -202,7 +202,9 @@ class RuizEquilibration(PreconditionerBase):
                  min_scaling: float = 1e-4,
                  max_scaling: float = 1e4,
                  convergence_tol: float = 1e-3,
+                 use_warp_tile_kernels: bool = True,
                  ):
+        self._use_warp_tile_kernels = use_warp_tile_kernels
         self.B = B
         self.n = n
         self.p = p
@@ -277,7 +279,14 @@ class RuizEquilibration(PreconditionerBase):
             n, p, m, min_scaling, max_scaling,
         )
         self._accumulate_deltas_kernel = create_accumulate_deltas_kernel(n, p, m)
-        self._conv_check_kernel = create_ruiz_conv_check_kernel(n, p, m)
+        # Gate the tile-factory call — calling it triggers shape-specialized
+        # warp tile codegen. ``LargeProblemSolver`` constructs this class
+        # with ``use_warp_kernels=False`` to skip the compile entirely; the
+        # cupy fallback at the launch site is used instead.
+        if use_warp_tile_kernels:
+            self._conv_check_kernel = create_ruiz_conv_check_kernel(n, p, m)
+        else:
+            self._conv_check_kernel = None
         self._calc_scaling_inv_and_scale_bounds_kernel = create_calc_scaling_inv_and_scale_bounds_kernel(
             n, p, m, idx_hl.size, idx_hu.size, idx_xl.size, idx_xu.size,
         )
@@ -447,7 +456,7 @@ class RuizEquilibration(PreconditionerBase):
     @nvtx.annotate("RuizEquilibration::scale_data")
     def scale_data(self, data: Data, scale_cost: bool, max_iter: int):
         """Run Ruiz equilibration iterations to scale the problem data."""
-        if USE_WARP:
+        if self._use_warp_tile_kernels:
             self._scale_data_warp(data, scale_cost, max_iter)
         else:
             self._scale_data_cupy(data, scale_cost, max_iter)
@@ -489,14 +498,20 @@ class RuizEquilibration(PreconditionerBase):
             if scale_cost:
                 self.apply_cost_scaling(data)
 
-            _CONV_CHECK_BLOCK_DIM = 256
-            wp.launch_tiled(
-                kernel=self._conv_check_kernel,
-                dim=[self.B],
-                inputs=[self._delta_iter, self._delta_b_iter, self._conv_buf],
-                block_dim=_CONV_CHECK_BLOCK_DIM,
-                device="cuda", stream=stream,
-            )
+            if self._use_warp_tile_kernels:
+                _CONV_CHECK_BLOCK_DIM = 256
+                wp.launch_tiled(
+                    kernel=self._conv_check_kernel,
+                    dim=[self.B],
+                    inputs=[self._delta_iter, self._delta_b_iter, self._conv_buf],
+                    block_dim=_CONV_CHECK_BLOCK_DIM,
+                    device="cuda", stream=stream,
+                )
+            else:
+                # _conv_buf shape (2B,) layout matching the warp kernel:
+                #   [d_max_b0, db_max_b0, d_max_b1, db_max_b1, ...]
+                cp.max(cp.abs(self._delta_iter   - 1.0), axis=1, out=self._conv_buf[0::2])
+                cp.max(cp.abs(self._delta_b_iter - 1.0), axis=1, out=self._conv_buf[1::2])
             if float(cp.max(self._conv_buf)) < self.convergence_tol:
                 break
 
