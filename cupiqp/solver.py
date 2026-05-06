@@ -8,12 +8,12 @@ from .settings import Settings
 from .data import Data
 from .results import Result, Status, Variables, InfoHost
 from .kkt_systems import KKTSystem
-from .preconditioner import RuizEquilibration
 from .utils import cuda_graph_capture
 from .solver_kernels import (
     create_prepare_predictor_step_kernel,
     create_prepare_corrector_step_kernel,
-    create_run_full_newton_step_kernel,
+    create_update_vars_after_corrector_step_kernel,
+    create_boundary_shift_kernel,
     create_calculate_step_kernel,
     create_calculate_sigma_kernel,
     create_calculate_mu_kernel,
@@ -22,7 +22,7 @@ from .solver_kernels import (
     create_update_residual_nr_kernel,
     create_update_rho_delta_with_ineq_kernel,
     create_update_rho_delta_without_ineq_kernel,
-    create_boundary_shift_kernel,
+    create_run_full_newton_step_kernel,
 )
 
 
@@ -31,7 +31,7 @@ wp.config.enable_backward = False  # disable backward mode, cut down kernel comp
 wp.init()
 
 
-class SolverBase:
+class Solver:
     def __init__(self):
 
         self.settings = Settings()
@@ -117,40 +117,9 @@ class SolverBase:
         self._work_residual = cp.empty((data.batch_size, ))
         self._work_reduce = cp.empty((data.batch_size, 8))  # used to hold the intermediate results of the reductions related to s_l, s_u, s_bl, s_bu and z_l, z_u, z_bl, z_bu
         
-        self._update_residuals_r_kernel = create_update_residuals_r_kernel(
-            self._data.n, self._data.p,
-            int(self._data.num_hu), int(self._data.num_hl),
-            int(self._data.num_xu), int(self._data.num_xl),
-        )
-        self._prepare_zu_minus_zl_and_zbu_minus_zbl_kernel = create_prepare_zu_minus_zl_and_zbu_minus_zbl_kernel(
-            self._data.m, self._data.n,
-        )
-        self._update_residual_nr_kernel = create_update_residual_nr_kernel(
-            self._data.n, self._data.p, self._data.m, 
-            self._data.num_hl, self._data.num_hu, self._data.num_xl, self._data.num_xu
-        )
+        self._init_warp_kernels()
 
         self._work_x = cp.empty((B, self._data.n), dtype=cp.float64)
-
-        if self._data.num_ineq > 0:
-            self._calculate_sigma_kernel = create_calculate_sigma_kernel(self._data.num_ineq)
-            self._calculate_step_kernel = create_calculate_step_kernel(self._data.num_ineq)
-            self._calculate_mu_kernel = create_calculate_mu_kernel(self._data.num_ineq)
-            self._prepare_predictor_step_kernel = create_prepare_predictor_step_kernel()
-            self._prepare_corrector_step_kernel = create_prepare_corrector_step_kernel()
-            self._update_rho_delta_with_ineq_kernel = create_update_rho_delta_with_ineq_kernel(
-                self._data.n, self._data.p + self._data.num_ineq,
-            )
-            self._boundary_shift_kernel = create_boundary_shift_kernel(
-                self._data.num_hl, self._data.num_hu,
-                self._data.num_xl, self._data.num_xu,
-            )
-
-        else:
-            self._run_full_newton_step_kernel = create_run_full_newton_step_kernel(self._data.n, self._data.p)
-            self._update_rho_delta_without_ineq_kernel = create_update_rho_delta_without_ineq_kernel(
-                self._data.n, self._data.p,
-            )
 
         self._tau_device = cp.empty(1, dtype=cp.float64)
         self._tau_device[0] = self.settings.tau  # device copy used by warp kernels
@@ -538,28 +507,58 @@ class SolverBase:
             still_unsolved = (self._result.info._status_value == Status.PIQP_UNSOLVED.value)
             self._result.info._status_value[still_unsolved] = Status.PIQP_NUMERICAL_ISSUES.value
 
+    def _init_warp_kernels(self) -> None:
+        if self._data.num_ineq > 0:
+            self._boundary_shift_kernel = create_boundary_shift_kernel(
+                self._data.num_hl, self._data.num_hu,
+                self._data.num_xl, self._data.num_xu,
+            )
+            self._prepare_predictor_step_kernel = create_prepare_predictor_step_kernel()
+            self._prepare_corrector_step_kernel = create_prepare_corrector_step_kernel()
+            self._update_vars_after_corrector_step_kernel = create_update_vars_after_corrector_step_kernel(
+                n_primal=self._data.n + self._data.num_ineq, n_dual=self._data.p + self._data.num_ineq,
+            )
+
+        # Tile-based kernels
+        self._update_residuals_r_kernel = create_update_residuals_r_kernel(
+            self._data.n, self._data.p,
+            int(self._data.num_hu), int(self._data.num_hl),
+            int(self._data.num_xu), int(self._data.num_xl),
+        )
+        self._prepare_zu_minus_zl_and_zbu_minus_zbl_kernel = create_prepare_zu_minus_zl_and_zbu_minus_zbl_kernel(
+            self._data.m, self._data.n,
+        )
+        self._update_residual_nr_kernel = create_update_residual_nr_kernel(
+            self._data.n, self._data.p, self._data.m,
+            self._data.num_hl, self._data.num_hu, self._data.num_xl, self._data.num_xu,
+        )
+        if self._data.num_ineq > 0:
+            self._calculate_sigma_kernel = create_calculate_sigma_kernel(self._data.num_ineq)
+            self._calculate_step_kernel = create_calculate_step_kernel(self._data.num_ineq)
+            self._calculate_mu_kernel = create_calculate_mu_kernel(self._data.num_ineq)
+            self._update_rho_delta_with_ineq_kernel = create_update_rho_delta_with_ineq_kernel(
+                self._data.n, self._data.p + self._data.num_ineq,
+            )
+        else:
+            self._run_full_newton_step_kernel = create_run_full_newton_step_kernel(self._data.n, self._data.p)
+            self._update_rho_delta_without_ineq_kernel = create_update_rho_delta_without_ineq_kernel(
+                self._data.n, self._data.p,
+            )
+
     @nvtx.annotate("Solver::_run_full_newton_step")
     def _run_full_newton_step(self):
         self._kkt_system.solve(self._data, self._preconditioner, self.settings, self._res, self._step)
-
-        USE_WARP_IMPLEMENTATION = True
-        if USE_WARP_IMPLEMENTATION:
-            wp.launch(
-                kernel=self._run_full_newton_step_kernel,
-                dim=(self._data.batch_size, self._data.n + self._data.p),
-                inputs=[
-                    self._step.x, self._step.y,
-                    self._result.x, self._result.y,
-                    self._result.info.primal_step, self._result.info.dual_step,
-                ],
-                device="cuda",
-                stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
-            )
-        else:
-            self._result.info.primal_step[:] = 1.0
-            self._result.info.dual_step[:] = 1.0
-            self._result.x += self._result.info.primal_step[:, None] * self._step.x
-            self._result.y += self._result.info.dual_step[:, None] * self._step.y
+        wp.launch(
+            kernel=self._run_full_newton_step_kernel,
+            dim=(self._data.batch_size, self._data.n + self._data.p),
+            inputs=[
+                self._step.x, self._step.y,
+                self._result.x, self._result.y,
+                self._result.info.primal_step, self._result.info.dual_step,
+            ],
+            device="cuda",
+            stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+        )
 
     @nvtx.annotate("Solver::_run_predictor_corrector")
     def _run_predictor_corrector(self):
@@ -653,92 +652,55 @@ class SolverBase:
     @nvtx.annotate("Solver::_calculate_step")
     @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
     def _calculate_step(self) -> None:
-        """
-        Compute the step length of the slack variables and dual variables. Make sure they remain non-negative.
-        Vectorized implementation to minimize GPU kernel launches and synchronization.
-        """
-        USE_WARP_IMPLEMENTATION = True
         STEP_BLOCK_DIM = 256
-        if USE_WARP_IMPLEMENTATION:
-            wp.launch_tiled(
-                kernel=self._calculate_step_kernel,
-                dim=[self._data.batch_size],
-                inputs=[
-                    self._result.s_all, self._result.z_all,
-                    self._step.s_all, self._step.z_all,
-                    self._tau_device,
-                    self._result.info.primal_step, self._result.info.dual_step,
-                ],
-                block_dim=STEP_BLOCK_DIM,
-                device="cuda",
-                stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
-            )
-        else:
-            # alpha_s: step length for slacks
-            self._work_s[:] = cp.where(self._step.s_all < 0, -self._result.s_all / self._step.s_all, 1.)
-            self._result.info.primal_step[:] = cp.min(self._work_s, axis=1)  # alpha_s
-            self._result.info.primal_step *= self.settings.tau  # avoid getting too close to the boundary
-
-            # alpha_z: step length for duals
-            self._work_z[:] = cp.where(self._step.z_all < 0, -self._result.z_all / self._step.z_all, 1.)
-            self._result.info.dual_step[:] = cp.min(self._work_z, axis=1)  # alpha_z
-            self._result.info.dual_step *= self.settings.tau  # avoid getting too close to the boundary
+        wp.launch_tiled(
+            kernel=self._calculate_step_kernel,
+            dim=[self._data.batch_size],
+            inputs=[
+                self._result.s_all, self._result.z_all,
+                self._step.s_all, self._step.z_all,
+                self._tau_device,
+                self._result.info.primal_step, self._result.info.dual_step,
+            ],
+            block_dim=STEP_BLOCK_DIM,
+            device="cuda",
+            stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+        )
 
     @nvtx.annotate("Solver::_calculate_mu")
     @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
     def _calculate_mu(self) -> None:
-        USE_WARP_IMPLEMENTATION = True
         MU_BLOCK_DIM = 256
-        if USE_WARP_IMPLEMENTATION:
-            wp.launch_tiled(
-                kernel=self._calculate_mu_kernel,
-                dim=[self._data.batch_size],
-                inputs=[
-                    self._result.s_all, self._result.z_all,
-                    self._result.info.mu,
-                ],
-                block_dim=MU_BLOCK_DIM,
-                device="cuda",
-                stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
-            )
-        else:
-            cp.multiply(self._result.s_all, self._result.z_all, out=self._work_s)
-            cp.sum(self._work_s, axis=1, out=self._result.info.mu)
-            self._result.info.mu /= self._data.num_ineq
+        wp.launch_tiled(
+            kernel=self._calculate_mu_kernel,
+            dim=[self._data.batch_size],
+            inputs=[
+                self._result.s_all, self._result.z_all,
+                self._result.info.mu,
+            ],
+            block_dim=MU_BLOCK_DIM,
+            device="cuda",
+            stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+        )
 
     @nvtx.annotate("Solver::_calculate_sigma")
     @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
     def _calculate_sigma(self) -> None:
-        USE_WARP_IMPLEMENTATION = True
         SIGMA_BLOCK_DIM = 256
-        if USE_WARP_IMPLEMENTATION:
-            wp.launch_tiled(
-                kernel=self._calculate_sigma_kernel,
-                dim=[self._data.batch_size],
-                inputs=[
-                    self._result.s_all, self._result.z_all,
-                    self._step.s_all, self._step.z_all,
-                    self._result.info.primal_step, self._result.info.dual_step,
-                    self._result.info.mu,
-                    self._result.info.sigma,
-                ],
-                block_dim=SIGMA_BLOCK_DIM,
-                device="cuda",
-                stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
-            )
-        else:
-            # s_trial = s + alpha_s * ds,  z_trial = z + alpha_z * dz
-            cp.multiply(self._result.info.primal_step[:, None], self._step.s_all, out=self._work_s) # s_trial in _work_s
-            self._work_s += self._result.s_all
-            cp.multiply(self._result.info.dual_step[:, None], self._step.z_all, out=self._work_z)  # z_trial in _work_z
-            self._work_z += self._result.z_all
-            cp.multiply(self._work_s, self._work_z, out=self._work_s)  # reuse _work_s to hold s_trial * z_trial
-            cp.sum(self._work_s, axis=1, out=self._result.info.sigma)
-
-            cp.divide(self._result.info.sigma, self._result.info.mu, out=self._result.info.sigma)
-            self._result.info.sigma /= self._data.num_ineq
-            cp.clip(self._result.info.sigma, 0., 1., out=self._result.info.sigma)
-            cp.power(self._result.info.sigma, 3., out=self._result.info.sigma)
+        wp.launch_tiled(
+            kernel=self._calculate_sigma_kernel,
+            dim=[self._data.batch_size],
+            inputs=[
+                self._result.s_all, self._result.z_all,
+                self._step.s_all, self._step.z_all,
+                self._result.info.primal_step, self._result.info.dual_step,
+                self._result.info.mu,
+                self._result.info.sigma,
+            ],
+            block_dim=SIGMA_BLOCK_DIM,
+            device="cuda",
+            stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+        )
 
     @nvtx.annotate("Solver::_update_residuals_nr")
     @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
@@ -813,13 +775,6 @@ class SolverBase:
                            used above (0.5 x^T P x, c^T x, b^T y, h_u^T z_u,
                            h_l^T z_l, x_u^T z_bu, x_l^T z_bl).
         """
-        USE_WAPR_IMPLEMENTATION = True
-        if USE_WAPR_IMPLEMENTATION:
-            self._update_residuals_nr_warp()
-        else:
-            self._update_residuals_nr_cupy()
-
-    def _update_residuals_nr_warp(self):
         pc      = self._preconditioner
         data    = self._data
         result  = self._result
@@ -902,205 +857,6 @@ class SolverBase:
             stream=wp_stream,
         )
 
-    def _update_residuals_nr_cupy(self):
-        """Pure cupy implementation"""
-        pc = self._preconditioner
-        n, p = self._data.n, self._data.p
-        # cuSPARSE/cuBLAS operations
-        self._kkt_system.eval_P_x(self._data, -1., self._result.x, self._res_nr.x)
-        # ||unscale_dual_res(P*x)||_inf -> _work_dual_res_norm (will be updated further inside graph)
-        cp.absolute(self._res_nr.x, out=self._work_primals)
-        self._work_primals *= pc.delta_inv[:, :n]
-        self._work_primals *= pc.cost_scaling_inv[:, None]
-        cp.max(self._work_primals, axis=1, out=self._work_dual_res_norm)
-
-        if self._data.p > 0:
-            self._kkt_system.eval_A_xn(self._data, -1., self._result.x, self._res_nr.y)  # store -A*x in res_nr.y
-            self._kkt_system.eval_AT_xt(self._data, 1., self._result.y, self._res.x)  # store A^T*y in res.x
-        else:
-            self._res.x.fill(0.)  # no equality constraints, A^T*y = 0
-        # ||unscale_primal_res_eq(A*x)||_inf -> _work_primal_rel_norm (will be updated further inside graph)
-        if self._data.p > 0:
-            cp.absolute(self._res_nr.y, out=self._work_duals[:, :self._data.p])
-            self._work_duals[:, :self._data.p] *= pc.delta_inv[:, n:n + p]
-            cp.max(self._work_duals[:, :self._data.p], axis=1, out=self._work_primal_rel_norm)
-        else:
-            self._work_primal_rel_norm.fill(0.)
-
-        self._work_z_1.fill(0.)
-        self._work_z_1[:, self._data.idx_hu] += self._result.z_u
-        self._work_z_1[:, self._data.idx_hl] -= self._result.z_l
-
-        G_x = self._work_z_2  # reuse self._work_z_2 to store G*x
-        GT_zu_minus_zl = self._step.x  # reuse self._step.x as temporary storage
-        # NOTE: cublasDgemmStridedBatched performs many memset if m=0, so better not call it when unnecessary
-        if self._data.m > 0:
-            self._kkt_system.eval_G_xn(self._data, 1., self._result.x, G_x)
-            self._kkt_system.eval_GT_xt(self._data, 1., self._work_z_1, GT_zu_minus_zl)
-        else:
-            G_x.fill(0.)
-            GT_zu_minus_zl.fill(0)
-
-        # ------------ update primal / dual objectives and duality gap ------------
-        # primal objective: 0.5 x^T P x + c^T x
-        # dual objective is: -0.5 x^T P x - b^T y - h_u^T z_u + h_l^T z_l - x_u^T z_bu + x_l^T z_bl
-
-        # use self._work_reduce to hold intermediate terms for primal and dual objectives:
-        # index |  content
-        #  0    |   0.5 * x^T P x
-        #  1    |   c^T x
-        #  2    |   0.5 * x^T P x (copy of idx 0 for easier reduction)
-        #  3    |   b^T y
-        #  4    |   -h_l^T z_l
-        #  5    |   h_u^T z_u
-        #  6    |   -x_l^T z_bl
-        #  7    |   x_u^T z_bu
-
-        # Per-problem dot products via sum of elementwise product along axis=1
-        # _work_reduce is (B, 8)
-        cp.sum(self._res_nr.x * self._result.x, axis=1, out=self._work_reduce[:, 0])
-        self._work_reduce[:, 0] *= -0.5  # hold 0.5 * x^T P x
-        cp.sum(self._data.c * self._result.x, axis=1, out=self._work_reduce[:, 1])  # hold c^T x
-
-        self._work_reduce[:, 2] = self._work_reduce[:, 0]  # hold 0.5 * x^T P x
-        cp.sum(self._data.b * self._result.y, axis=1, out=self._work_reduce[:, 3])  # hold b^T y
-        cp.sum(self._data.h_l[:, self._data.idx_hl] * self._result.z_l, axis=1, out=self._work_reduce[:, 4])
-        self._work_reduce[:, 4] *= -1.  # hold - h_l^T z_l
-        cp.sum(self._data.h_u[:, self._data.idx_hu] * self._result.z_u, axis=1, out=self._work_reduce[:, 5])  # hold h_u^T z_u
-        cp.sum(self._data.x_l[:, self._data.idx_xl] * self._result.z_bl, axis=1, out=self._work_reduce[:, 6])
-        self._work_reduce[:, 6] *= -1.  # hold - x_l^T z_bl
-        cp.sum(self._data.x_u[:, self._data.idx_xu] * self._result.z_bu, axis=1, out=self._work_reduce[:, 7])  # hold x_u^T z_bu
-
-        cp.sum(self._work_reduce[:, 0:2], axis=1, out=self._result.info.primal_obj)  # primal_obj = 0.5 * x^T P x + c^T x
-        cp.sum(self._work_reduce[:, 2:8], axis=1, out=self._result.info.dual_obj)
-        self._result.info.dual_obj *= -1.  # dual_obj = -b^T y - h_u^T z_u + h_l^T z_l - x_u^T z_bu + x_l^T z_bl
-
-        # duality_gap = abs(primal_obj - dual_obj) (in scaled space, then unscale all three)
-        cp.subtract(self._result.info.primal_obj, self._result.info.dual_obj, out=self._result.info.duality_gap)
-
-        # Unscale objectives and duality gap from scaled to original space
-        self._result.info.primal_obj *= pc.cost_scaling_inv
-        self._result.info.dual_obj *= pc.cost_scaling_inv
-        self._result.info.duality_gap *= pc.cost_scaling_inv
-
-        # duality_gap_rel_norm = max(abs(unscaled terms))
-        # Unscale the work_reduce terms before computing duality_gap_rel
-        self._work_reduce *= pc.cost_scaling_inv[:, None]
-        cp.abs(self._work_reduce, out=self._work_reduce)
-        cp.max(self._work_reduce[:, 0:8], axis=1, out=self._result.info.duality_gap_rel)
-        cp.abs(self._result.info.duality_gap, out=self._result.info.duality_gap)
-        cp.maximum(self._result.info.duality_gap_rel, 1., out=self._result.info.duality_gap_rel)
-        cp.divide(self._result.info.duality_gap, self._result.info.duality_gap_rel, out=self._result.info.duality_gap_rel)
-
-        # ------------ update non-regulerized residuals ------------
-        # res_nr.x = -(P*x + c + A^T*y + G^T*(z_u - z_l) + z_bu - z_bl)
-        # self._res_nr.x is computed as -P*x above
-        self._res_nr.x -= self._data.c
-        self._res_nr.x -= self._res.x  # self._res.x holds A^T*y
-        self._res_nr.x -= GT_zu_minus_zl
-        self._res_nr.x[:, self._data.idx_xl] += self._preconditioner.x_b_scaling[:, self._data.idx_xl] * self._result.z_bl
-        self._res_nr.x[:, self._data.idx_xu] -= self._preconditioner.x_b_scaling[:, self._data.idx_xu] * self._result.z_bu
-
-        # res_nr.y = -(A*x - b)
-        self._res_nr.y += self._data.b
-
-        # res_nr.z_l = G*x - s_l - hl
-        self._res_nr.z_l[:] = G_x[:, self._data.idx_hl]
-        cp.subtract(self._res_nr.z_l, self._result.s_l, out=self._res_nr.z_l)
-        cp.subtract(self._res_nr.z_l, self._data.h_l[:, self._data.idx_hl], out=self._res_nr.z_l)
-
-        # res_nr.z_u = -G*x - s_u + hu
-        self._res_nr.z_u[:] = -G_x[:, self._data.idx_hu]
-        cp.subtract(self._res_nr.z_u, self._result.s_u, out=self._res_nr.z_u)
-        cp.add(self._res_nr.z_u, self._data.h_u[:, self._data.idx_hu], out=self._res_nr.z_u)
-
-        # res_nr.z_bl = x_b_scaling*x - s_bl - xl
-        self._res_nr.z_bl[:] = self._result.x[:, self._data.idx_xl]
-        self._res_nr.z_bl *= self._preconditioner.x_b_scaling[:, self._data.idx_xl]
-        cp.subtract(self._res_nr.z_bl, self._result.s_bl, out=self._res_nr.z_bl)
-        cp.subtract(self._res_nr.z_bl, self._data.x_l[:, self._data.idx_xl], out=self._res_nr.z_bl)
-
-        # res_nr.z_bu = -(x_b_scaling*x + s_bu - xu)
-        self._res_nr.z_bu[:] = self._result.x[:, self._data.idx_xu]
-        self._res_nr.z_bu *= self._preconditioner.x_b_scaling[:, self._data.idx_xu]
-        cp.add(self._res_nr.z_bu, self._result.s_bu, out=self._res_nr.z_bu)
-        cp.subtract(self._res_nr.z_bu, self._data.x_u[:, self._data.idx_xu], out=self._res_nr.z_bu)
-        cp.negative(self._res_nr.z_bu, out=self._res_nr.z_bu)
-
-        # ------------ update primal and dual residuals ------------
-        self._result.info.prev_primal_res[:] = self._result.info.primal_res
-        self._result.info.prev_dual_res[:] = self._result.info.dual_res
-
-        self._result.info.primal_res[:] = self._primal_res_nr()
-
-        # primal_rel_norm: update running max (initialized outside graph with ||unscale(A*x)||_inf)
-        # All terms are unscaled before taking norms to match PIQP C++ convergence check.
-        # _work_z_1 is free at this point (only used before graph for cuSPARSE input)
-        if self._data.num_hu > 0:
-            self._work_z_1[:, :self._data.num_hu] = cp.abs(G_x[:, self._data.idx_hu])
-            self._work_z_1[:, :self._data.num_hu] *= pc.delta_inv[:, n + p + self._data.idx_hu]
-            cp.max(self._work_z_1[:, :self._data.num_hu], axis=1, out=self._work_norm_temp)
-            cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
-
-        if self._data.num_hl > 0:
-            self._work_z_1[:, :self._data.num_hl] = cp.abs(G_x[:, self._data.idx_hl])
-            self._work_z_1[:, :self._data.num_hl] *= pc.delta_inv[:, n + p + self._data.idx_hl]
-            cp.max(self._work_z_1[:, :self._data.num_hl], axis=1, out=self._work_norm_temp)
-            cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
-
-        if self._data.num_hu > 0:
-            cp.absolute(self._result.s_u, out=self._work_z_1[:, :self._data.num_hu])
-            self._work_z_1[:, :self._data.num_hu] *= pc.delta_inv[:, n + p + self._data.idx_hu]
-            cp.max(self._work_z_1[:, :self._data.num_hu], axis=1, out=self._work_norm_temp)
-            cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
-
-        if self._data.num_hl > 0:
-            cp.absolute(self._result.s_l, out=self._work_z_1[:, :self._data.num_hl])
-            self._work_z_1[:, :self._data.num_hl] *= pc.delta_inv[:, n + p + self._data.idx_hl]
-            cp.max(self._work_z_1[:, :self._data.num_hl], axis=1, out=self._work_norm_temp)
-            cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
-
-        if self._data.num_xu > 0:
-            cp.absolute(self._result.s_bu, out=self._work_z[:, :self._data.num_xu])
-            self._work_z[:, :self._data.num_xu] *= pc.delta_b_inv[:, self._data.idx_xu]
-            cp.max(self._work_z[:, :self._data.num_xu], axis=1, out=self._work_norm_temp)
-            cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
-
-        if self._data.num_xl > 0:
-            cp.absolute(self._result.s_bl, out=self._work_z[:, :self._data.num_xl])
-            self._work_z[:, :self._data.num_xl] *= pc.delta_b_inv[:, self._data.idx_xl]
-            cp.max(self._work_z[:, :self._data.num_xl], axis=1, out=self._work_norm_temp)
-            cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
-
-        cp.maximum(self._work_primal_rel_norm, self._constraints_rhs_inf_norm_unscaled, out=self._work_primal_rel_norm)
-        # Store max(1, primal_rel_norm) for use by _update_residuals_r
-        cp.maximum(self._work_primal_rel_norm, 1., out=self._work_primal_rel_norm)
-        cp.divide(self._result.info.primal_res, self._work_primal_rel_norm, out=self._result.info.primal_res_rel)
-
-        # dual_res_norm: update running max (initialized outside graph with ||unscale(P*x)||_inf)
-        self._result.info.dual_res[:] = self._dual_res_nr()
-
-        # ||unscale_dual_res(c)||_inf
-        cp.absolute(self._data.c, out=self._work_primals)
-        self._work_primals *= pc.delta_inv[:, :n]
-        self._work_primals *= pc.cost_scaling_inv[:, None]
-        cp.max(self._work_primals, axis=1, out=self._work_norm_temp)
-        cp.maximum(self._work_dual_res_norm, self._work_norm_temp, out=self._work_dual_res_norm)
-
-        # ||unscale_dual_res(A^T*y + G^T*(z_u - z_l) + x_b_scaling*(z_bu - z_bl))||_inf
-        self._res.x += GT_zu_minus_zl
-        self._res.x[:, self._data.idx_xl] -= self._preconditioner.x_b_scaling[:, self._data.idx_xl] * self._result.z_bl
-        self._res.x[:, self._data.idx_xu] += self._preconditioner.x_b_scaling[:, self._data.idx_xu] * self._result.z_bu
-        cp.absolute(self._res.x, out=self._work_primals)
-        self._work_primals *= pc.delta_inv[:, :n]
-        self._work_primals *= pc.cost_scaling_inv[:, None]
-        cp.max(self._work_primals, axis=1, out=self._work_norm_temp)
-        cp.maximum(self._work_dual_res_norm, self._work_norm_temp, out=self._work_dual_res_norm)
-
-        # store max(1, dual_res_norm) for use by _update_residuals_r
-        cp.maximum(self._work_dual_res_norm, 1., out=self._work_dual_res_norm)
-        cp.divide(self._result.info.dual_res, self._work_dual_res_norm, out=self._result.info.dual_res_rel)
-
     @nvtx.annotate("Solver::_update_residuals_r")
     @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
     def _update_residuals_r(self):
@@ -1115,59 +871,27 @@ class SolverBase:
         # self._res.z_u[:] = self._res_nr.z_u - self._result.info.delta * (self._prox_vars.z_u - self._result.z_u)
         # self._res.z_bl[:] = self._res_nr.z_bl - self._result.info.delta * (self._prox_vars.z_bl - self._result.z_bl)
         # self._res.z_bu[:] = self._res_nr.z_bu - self._result.info.delta * (self._prox_vars.z_bu - self._result.z_bu)
-        USE_WARP_IMPLEMENTATION = True
-        if USE_WARP_IMPLEMENTATION:
-            pc = self._preconditioner
-            wp.launch_tiled(
-                kernel=self._update_residuals_r_kernel,
-                dim=[self._data.batch_size],
-                inputs=[
-                    self._result.info.rho, self._result.info.delta,
-                    self._res_nr.x, self._res_nr.duals_all,
-                    self._result.x, self._result.duals_all,
-                    self._prox_vars.x, self._prox_vars.duals_all,
-                    self._res.x, self._res.duals_all,
-                    pc.dual_res_unscale_factor, pc.primal_res_unscale_factor,
-                    self._result.info.primal_res, self._result.info.primal_res_rel,
-                    self._result.info.dual_res, self._result.info.dual_res_rel,
-                    self._result.info.primal_res_reg, self._result.info.primal_res_reg_rel,
-                    self._result.info.dual_res_reg, self._result.info.dual_res_reg_rel,
-                    self._result.info.primal_prox_inf, self._result.info.dual_prox_inf,
-                ],
-                block_dim=256,
-                device="cuda",
-                stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
-            )
-        else:
-            cp.subtract(self._result.x, self._prox_vars.x, out=self._res.x)
-            self._res.x *= self._result.info.rho[:, None]
-            cp.subtract(self._res_nr.x, self._res.x, out=self._res.x)
-            cp.subtract(self._prox_vars.duals_all, self._result.duals_all, out=self._res.duals_all)
-            self._res.duals_all *= self._result.info.delta[:, None]
-            cp.subtract(self._res_nr.duals_all, self._res.duals_all, out=self._res.duals_all)
-
-            self._result.info.primal_res_reg[:] = self._primal_res_r()
-            # primal_rel_scaling = self._result.info.primal_res / self._result.info.primal_res_rel if self._result.info.primal_res_rel > 0 else 1.
-            # self._result.info.primal_res_reg_rel[:] = self._result.info.primal_res_reg / primal_rel_scaling
-            cp.divide(self._result.info.primal_res, self._result.info.primal_res_rel, out=self._result.info.primal_res_reg_rel)
-            self._result.info.primal_res_reg_rel[:] = cp.where(self._result.info.primal_res_rel > 0,
-                    self._result.info.primal_res_reg_rel, cp.asarray(1.0, dtype=self._result.info.primal_res_reg_rel.dtype))
-            cp.divide(self._result.info.primal_res_reg, self._result.info.primal_res_reg_rel, out=self._result.info.primal_res_reg_rel)
-
-            self._result.info.dual_res_reg[:] = self._dual_res_r()
-            # dual_rel_scaling = self._result.info.dual_res / self._result.info.dual_res_rel if self._result.info.dual_res_rel > 0 else 1.
-            # self._result.info.dual_res_reg_rel[:] = self._result.info.dual_res_reg / dual_rel_scaling
-            cp.divide(self._result.info.dual_res, self._result.info.dual_res_rel, out=self._result.info.dual_res_reg_rel)
-            self._result.info.dual_res_reg_rel[:] = cp.where(self._result.info.dual_res_rel > 0,
-                    self._result.info.dual_res_reg_rel, cp.asarray(1.0, dtype=self._result.info.dual_res_reg_rel.dtype))
-            cp.divide(self._result.info.dual_res_reg, self._result.info.dual_res_reg_rel, out=self._result.info.dual_res_reg_rel)
-
-            self._result.info.primal_prox_inf[:] = self._primal_prox_inf()
-            self._result.info.primal_prox_inf *= self._result.info.delta
-            self._result.info.dual_prox_inf[:] = self._dual_prox_inf()
-            self._result.info.dual_prox_inf *= self._result.info.rho
-        
-        
+        pc = self._preconditioner
+        wp.launch_tiled(
+            kernel=self._update_residuals_r_kernel,
+            dim=[self._data.batch_size],
+            inputs=[
+                self._result.info.rho, self._result.info.delta,
+                self._res_nr.x, self._res_nr.duals_all,
+                self._result.x, self._result.duals_all,
+                self._prox_vars.x, self._prox_vars.duals_all,
+                self._res.x, self._res.duals_all,
+                pc.dual_res_unscale_factor, pc.primal_res_unscale_factor,
+                self._result.info.primal_res, self._result.info.primal_res_rel,
+                self._result.info.dual_res, self._result.info.dual_res_rel,
+                self._result.info.primal_res_reg, self._result.info.primal_res_reg_rel,
+                self._result.info.dual_res_reg, self._result.info.dual_res_reg_rel,
+                self._result.info.primal_prox_inf, self._result.info.dual_prox_inf,
+            ],
+            block_dim=256,
+            device="cuda",
+            stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+        )
 
     @nvtx.annotate("Solver::_primal_res_nr")
     def _primal_res_nr(self):
@@ -1263,118 +987,57 @@ class SolverBase:
     
     @nvtx.annotate("Solver::_update_rho_delta_with_ineq")
     def _update_rho_delta_with_ineq(self) -> None:
-        """Update rho/delta based on residual progress — branchless via cp.where."""
         info = self._result.info
         settings = self.settings
-
-        USE_WARP_IMPLEMENTATION = True
-        if USE_WARP_IMPLEMENTATION:
-            n = self._data.n
-            num_duals = self._data.p + self._data.num_ineq
-            wp.launch(
-                kernel=self._update_rho_delta_with_ineq_kernel,
-                dim=(self._data.batch_size, n + num_duals),
-                inputs=[
-                    info.dual_res, info.prev_dual_res, info.dual_res_rel, info.dual_prox_inf,
-                    info.primal_res, info.prev_primal_res, info.primal_res_rel, info.primal_prox_inf,
-                    info.reg_limit,
-                    info.rho, info.delta,
-                    info.no_primal_update, info.no_dual_update,
-                    self._result.x, self._prox_vars.x,
-                    self._result.duals_all, self._prox_vars.duals_all,
-                    settings.eps_abs,
-                    settings.eps_rel,
-                    settings.reg_finetune_lower_limit,
-                    settings.infeasibility_threshold,
-                    info.iter[0],
-                ],
-                device="cuda",
-                stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
-            )
-        else:
-            # --- Rho update ---
-            dual_improved = (
-                (info.dual_res < 0.95 * info.prev_dual_res) |
-                (info.dual_res < settings.eps_abs) | (info.dual_res_rel < settings.eps_rel) |
-                ((info.rho == settings.reg_finetune_lower_limit) & (info.dual_prox_inf < settings.infeasibility_threshold))
-            )
-            rho_fast = cp.maximum(info.reg_limit, 0.1 * info.rho)
-            rho_slow = cp.maximum(info.reg_limit, 0.5 * info.rho)
-            rho_slow_decay_ok = (~dual_improved) & ((info.iter[0] < 5) | (info.dual_prox_inf < settings.infeasibility_threshold))
-            info.rho[:] = cp.where(dual_improved, rho_fast, cp.where(rho_slow_decay_ok, rho_slow, info.rho))
-            self._prox_vars.x[:] = cp.where(dual_improved[:, None], self._result.x, self._prox_vars.x)
-            info.no_primal_update += 1
-            info.no_primal_update[dual_improved] = 0
-
-            # --- Delta update ---
-            primal_improved = (
-                (info.primal_res < 0.95 * info.prev_primal_res) |
-                (info.primal_res < settings.eps_abs) | (info.primal_res_rel < settings.eps_rel) |
-                ((info.delta == settings.reg_finetune_lower_limit) & (info.primal_prox_inf < settings.infeasibility_threshold))
-            )
-            delta_fast = cp.maximum(info.reg_limit, 0.1 * info.delta)
-            delta_slow = cp.maximum(info.reg_limit, 0.5 * info.delta)
-            delta_slow_decay_ok = (~primal_improved) & ((info.iter[0] < 5) | (info.primal_prox_inf < settings.infeasibility_threshold))
-            info.delta[:] = cp.where(primal_improved, delta_fast, cp.where(delta_slow_decay_ok, delta_slow, info.delta))
-            self._prox_vars.duals_all[:] = cp.where(primal_improved[:, None], self._result.duals_all, self._prox_vars.duals_all)
-            info.no_dual_update += 1
-            info.no_dual_update[primal_improved] = 0
+        n = self._data.n
+        num_duals = self._data.p + self._data.num_ineq
+        wp.launch(
+            kernel=self._update_rho_delta_with_ineq_kernel,
+            dim=(self._data.batch_size, n + num_duals),
+            inputs=[
+                info.dual_res, info.prev_dual_res, info.dual_res_rel, info.dual_prox_inf,
+                info.primal_res, info.prev_primal_res, info.primal_res_rel, info.primal_prox_inf,
+                info.reg_limit,
+                info.rho, info.delta,
+                info.no_primal_update, info.no_dual_update,
+                self._result.x, self._prox_vars.x,
+                self._result.duals_all, self._prox_vars.duals_all,
+                settings.eps_abs,
+                settings.eps_rel,
+                settings.reg_finetune_lower_limit,
+                settings.infeasibility_threshold,
+                info.iter[0],
+            ],
+            device="cuda",
+            stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+        )
 
     @nvtx.annotate("Solver::_update_rho_delta_without_ineq")
     def _update_rho_delta_without_ineq(self) -> None:
-        """Update rho/delta based on residual progress — branchless via cp.where."""
         info = self._result.info
         settings = self.settings
-
-        USE_WARP_IMPLEMENTATION = True
-        if USE_WARP_IMPLEMENTATION:
-            n = self._data.n
-            p = self._data.p
-            wp.launch(
-                kernel=self._update_rho_delta_without_ineq_kernel,
-                dim=(self._data.batch_size, n + p),
-                inputs=[
-                    info.dual_res, info.prev_dual_res, info.dual_res_rel, info.dual_prox_inf,
-                    info.primal_res, info.prev_primal_res, info.primal_res_rel, info.primal_prox_inf,
-                    info.reg_limit,
-                    info.rho, info.delta,
-                    info.no_primal_update, info.no_dual_update,
-                    self._result.x, self._prox_vars.x,
-                    self._result.y, self._prox_vars.y,
-                    settings.eps_abs,
-                    settings.eps_rel,
-                    settings.infeasibility_threshold,
-                    info.iter[0],
-                ],
-                device="cuda",
-                stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
-            )
-            return
-
-        # --- Rho update ---
-        dual_improved = (
-            (info.dual_res < 0.95 * info.prev_dual_res) |
-            (info.dual_res < settings.eps_abs) |
-            (info.dual_res_rel < settings.eps_rel)
+        n = self._data.n
+        p = self._data.p
+        wp.launch(
+            kernel=self._update_rho_delta_without_ineq_kernel,
+            dim=(self._data.batch_size, n + p),
+            inputs=[
+                info.dual_res, info.prev_dual_res, info.dual_res_rel, info.dual_prox_inf,
+                info.primal_res, info.prev_primal_res, info.primal_res_rel, info.primal_prox_inf,
+                info.reg_limit,
+                info.rho, info.delta,
+                info.no_primal_update, info.no_dual_update,
+                self._result.x, self._prox_vars.x,
+                self._result.y, self._prox_vars.y,
+                settings.eps_abs,
+                settings.eps_rel,
+                settings.infeasibility_threshold,
+                info.iter[0],
+            ],
+            device="cuda",
+            stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
         )
-        rho_fast = cp.maximum(info.reg_limit, 0.1 * info.rho)
-        rho_slow = cp.maximum(info.reg_limit, 0.5 * info.rho)
-        rho_slow_decay_ok = (~dual_improved) & ((info.iter[0] < 5) | (info.dual_prox_inf < settings.infeasibility_threshold))
-        info.rho[:] = cp.where(dual_improved, rho_fast, cp.where(rho_slow_decay_ok, rho_slow, info.rho))
-        self._prox_vars.x[:] = cp.where(dual_improved[:, None], self._result.x, self._prox_vars.x)
-        info.no_primal_update += 1
-        info.no_primal_update[dual_improved] = 0
 
-        # --- Delta update ---
-        primal_improved = (
-            (info.primal_res < 0.95 * info.prev_primal_res) |
-            (info.primal_res < settings.eps_abs) |
-            (info.primal_res_rel < settings.eps_rel)
-        )
-        delta_fast = cp.maximum(info.reg_limit, 0.1 * info.delta)
-        delta_slow = cp.maximum(info.reg_limit, 0.5 * info.delta)
-        delta_slow_decay_ok = (~primal_improved) & ((info.iter[0] < 5) | (info.primal_prox_inf < settings.infeasibility_threshold))
-        info.delta[:] = cp.where(primal_improved, delta_fast, cp.where(delta_slow_decay_ok, delta_slow, info.delta))
-        self._prox_vars.y[:] = cp.where(primal_improved[:, None], self._result.y, self._prox_vars.y)
-        info.no_dual_update += 1
-        info.no_dual_update[primal_improved] = 0
+
+
+SolverBase = Solver
