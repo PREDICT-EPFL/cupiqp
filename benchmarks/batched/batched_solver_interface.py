@@ -481,6 +481,46 @@ try:
 except ImportError:
     _MOREAU_AVAILABLE = False
 
+
+def _build_batched_cone_A_values(data: BatchedQPData, A_master_sp) -> np.ndarray:
+    """Per-batch values for the conic constraint matrix used by both moreau wrappers.
+
+    Both wrappers form the conic A as the row stack
+    ``[A_eq[i]; G[i]; -G[i]; I; -I]`` per batch (with the obvious blocks
+    omitted when the corresponding data field is None). The structural
+    sparsity pattern is identical across batches — only the numerical values
+    in ``A_eq`` and ``G`` vary — so we reuse the master ``A_master_sp`` from
+    problem 0 and align per-batch values to its (rows, cols) by direct dense
+    indexing. This avoids relying on ``scipy.sparse.csr_matrix(A_cone_i).data``
+    coming back with the same ordering for every batch.
+
+    Returns an array of shape ``(B, A_master_sp.nnz)``.
+    """
+    B, n, p = data.B, data.n, data.p
+    rows = np.repeat(
+        np.arange(A_master_sp.shape[0], dtype=np.int64),
+        np.diff(A_master_sp.indptr),
+    )
+    cols = A_master_sp.indices
+    out = np.zeros((B, A_master_sp.nnz), dtype=np.float64)
+    eye_n = np.eye(n)
+    for i in range(B):
+        parts = []
+        if p > 0:
+            parts.append(data.A[i])
+        if data.G is not None and data.h_u is not None:
+            parts.append(data.G[i])
+        if data.G is not None and data.h_l is not None:
+            parts.append(-data.G[i])
+        if data.x_u is not None:
+            parts.append(eye_n)
+        if data.x_l is not None:
+            parts.append(-eye_n)
+        A_cone_i = np.vstack(parts) if parts else np.zeros((0, n))
+        out[i] = A_cone_i[rows, cols]
+    return out
+
+
 class MoreauTorchBatchedSolver(BatchedQPSolver):
     """moreau batched conic solver via the PyTorch interface (GPU).
 
@@ -555,12 +595,8 @@ class MoreauTorchBatchedSolver(BatchedQPSolver):
             P_vals_np[i] = sparse.csr_matrix(data.P[i]).data
         self._P_vals = torch.tensor(P_vals_np, dtype=torch.float64, device='cuda')
 
-        # A_cone is the same structure for all problems, but values differ
-        # for equality and inequality bounds
-        self._A_vals = torch.tensor(
-            np.tile(self._A_sp.data[None, :], (B, 1)),
-            dtype=torch.float64, device='cuda',
-        )
+        A_vals_np = _build_batched_cone_A_values(data, self._A_sp)
+        self._A_vals = torch.tensor(A_vals_np, dtype=torch.float64, device='cuda')
 
         self._q = torch.tensor(data.c, dtype=torch.float64, device='cuda')
 
@@ -772,13 +808,19 @@ class MoreauJaxBatchedSolver(BatchedQPSolver):
         self._num_zero = num_zero
         self._num_nonneg = num_nonneg
 
-        # In this benchmark the QP layout shares P/A across the batch — only
-        # q and b vary. Match the moreau JAX docs example: store P/A as 1-D
-        # arrays (single problem) and only the per-problem q/b as 2-D batched
-        # arrays. Will be vmapped with ``in_axes=(None, None, 0, 0)``.
-        # https://docs.moreau.so/guide/jax-integration.html
-        self._P_vals = jnp.asarray(self._P_sp.data, dtype=jnp.float64)
-        self._A_vals = jnp.asarray(self._A_sp.data, dtype=jnp.float64)
+        # Per-batch P/A values aligned with the master CSR sparsity pattern.
+        # moreau's JAX impl accepts (B, nnz) on the leading dim (see ``q.ndim``
+        # dispatch in moreau_cuda/jax_wrapper.py). Calling _solve_raw directly
+        # — without jax.vmap — bypasses the custom_vmap rule and lets the
+        # underlying batched CUDA kernels do the work.
+        P_nnz = self._P_sp.nnz
+        P_vals_np = np.zeros((B, P_nnz), dtype=np.float64)
+        for i in range(B):
+            P_vals_np[i] = sparse.csr_matrix(data.P[i]).data
+        A_vals_np = _build_batched_cone_A_values(data, self._A_sp)
+
+        self._P_vals = jnp.asarray(P_vals_np, dtype=jnp.float64)
+        self._A_vals = jnp.asarray(A_vals_np, dtype=jnp.float64)
         self._q = jnp.asarray(data.c, dtype=jnp.float64)
         if b_parts_np:
             self._b = jnp.asarray(np.concatenate(b_parts_np, axis=1), dtype=jnp.float64)
@@ -812,13 +854,8 @@ class MoreauJaxBatchedSolver(BatchedQPSolver):
             cones=cones,
             settings=settings,
         )
-        # Match the moreau JAX docs: vmap solver.solve with P/A shared
-        # across the batch, q/b batched. The custom_vmap rule on the
-        # underlying impl handles the batched dispatch; we use _solve_raw
-        # so the call returns ``(JaxSolution, JaxSolveInfo)`` and we can
-        # read per-batch status / iterations from ``info`` directly.
         self._batch_solve = jax.jit(
-            jax.vmap(self._solver._solve_raw, in_axes=(None, None, 0, 0))
+            jax.vmap(self._solver._solve_raw, in_axes=(0, 0, 0, 0))
         )
 
     @nvtx.annotate("moreau-jax::solve", color=SOLVER_COLORS["moreau-jax"])
