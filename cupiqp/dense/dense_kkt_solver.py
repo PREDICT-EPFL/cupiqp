@@ -5,7 +5,11 @@ import warp as wp
 from ..kkt_solver import KKTSolverBase
 from .dense_data import DenseData
 from .dense_cholesky import CholeskyInplaceSolver, BatchedCholeskyInplaceSolver
-from .dense_kkt_solver_kernels import create_update_kkt_kernel
+from .dense_kkt_solver_kernels import (
+    create_update_kkt_kernel,
+    create_solve_pre_cholesky_kernel,
+    create_solve_post_cholesky_kernel,
+)
 from .cublas_wrappers import (
     cublas_set_stream, cublas_create_handle, cublas_destroy_handle,
     dgemv, dsyrk, cublas_set_stream,
@@ -28,16 +32,19 @@ class DenseKKTSolver(KKTSolverBase):
         self._batch_size = B
 
         # Pre-allocated workspace — all (B, ...) shapes
-        self._delta = cp.empty((B, 1), dtype=cp.float64)
-        self._delta_inv = cp.empty((B, 1), dtype=cp.float64)
+        self._delta = cp.empty(B, dtype=cp.float64)
+        self._delta_inv = cp.empty(B, dtype=cp.float64)
         self._z_reg_inv = cp.empty((B, m), dtype=cp.float64) if m > 0 else cp.empty((B, 0), dtype=cp.float64)
         self._z_reg_inv_sqrt = cp.empty((B, m), dtype=cp.float64) if m > 0 else cp.empty((B, 0), dtype=cp.float64)
         self._kkt_mat = cp.empty((B, n, n), dtype=cp.float64)
         self._AtA = cp.empty((B, n, n), dtype=cp.float64) if p > 0 else cp.zeros((B, 0, 0), dtype=cp.float64)
         self._G_scaled = cp.empty((B, m, n), dtype=cp.float64) if m > 0 else cp.zeros((B, 0, 0), dtype=cp.float64)
-        self._work_n = cp.empty((B, n), dtype=cp.float64)
+        self._work_n_AT = cp.empty((B, n), dtype=cp.float64) if p > 0 else cp.empty((B, 0), dtype=cp.float64)
+        self._work_n_GT = cp.empty((B, n), dtype=cp.float64) if m > 0 else cp.empty((B, 0), dtype=cp.float64)
 
         self._update_kkt_kernel, self._update_kkt_kernel_launch_dim = create_update_kkt_kernel(n, p, m)
+        self._solve_pre_cholesky_kernel = create_solve_pre_cholesky_kernel(p, m)
+        self._solve_post_cholesky_kernel = create_solve_post_cholesky_kernel(p, m)
 
         self._cublas_handle = cublas_create_handle()
 
@@ -102,7 +109,7 @@ class DenseKKTSolver(KKTSolverBase):
             # --- cupy fallback ---
             n = data.n
 
-            self._delta[:] = delta.reshape(-1, 1)
+            self._delta[:] = delta
             cp.reciprocal(self._delta, out=self._delta_inv)
 
             self._kkt_mat[:] = data.P
@@ -118,7 +125,7 @@ class DenseKKTSolver(KKTSolverBase):
             self._kkt_mat.reshape(self._batch_size, -1)[:, ::n + 1] += x_reg
 
             if data.p > 0:
-                self._kkt_mat += self._delta_inv[:, :, None] * self._AtA
+                self._kkt_mat += self._delta_inv[:, None] * self._AtA
 
             if data.m > 0:
                 cp.reciprocal(z_reg, out=self._z_reg_inv)
@@ -136,34 +143,46 @@ class DenseKKTSolver(KKTSolverBase):
               delta_x: cp.ndarray, delta_y: cp.ndarray, delta_z: cp.ndarray):
         """Solve the reduced KKT system and recover delta_y, delta_z."""
         cublas_set_stream(self._cublas_handle, cp.cuda.get_current_stream().ptr)
+        wp_stream = wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr)
 
-        delta_x[:] = rhs_x
+        n, p, m = data.n, data.p, data.m
+        B = self._batch_size
 
-        # delta_x += (1/delta) * A^T @ rhs_y
-        if data.p > 0:
-            self.eval_AT_xt(data, 1.0, rhs_y, self._work_n)
-            delta_x += self._delta_inv * self._work_n
-
-        # delta_x += G^T @ (z_reg_inv * rhs_z)
-        if data.m > 0:
+        # work_n_AT = A^T @ rhs_y
+        if p > 0:
+            self.eval_AT_xt(data, 1.0, rhs_y, self._work_n_AT)
+        # work_n_GT = G^T @ delta_z
+        if m > 0:
+            # delta_z = z_reg_inv * rhs_z   
             cp.multiply(self._z_reg_inv, rhs_z, out=delta_z)
-            self.eval_GT_xt(data, 1.0, delta_z, self._work_n)
-            delta_x += self._work_n
+            self.eval_GT_xt(data, 1.0, delta_z, self._work_n_GT)
 
-        # B=1: CholeskyInplaceSolver expects 1D/2D; B>1: BatchedCholeskyInplaceSolver expects (B, n)
-        self._cholesky_solver.solve(delta_x[0] if self._batch_size == 1 else delta_x)
+        wp.launch(
+            kernel=self._solve_pre_cholesky_kernel,
+            dim=(B, n),
+            inputs=[rhs_x, self._delta_inv,
+                    self._work_n_AT, self._work_n_GT, delta_x],
+            device="cuda", stream=wp_stream,
+        )
 
-        # delta_y = (A @ delta_x - rhs_y) / delta
-        if data.p > 0:
+        # B=1: CholeskyInplaceSolver expects 1D/2D; B>1: BatchedCholeskyInplaceSolver expects (B, n).
+        self._cholesky_solver.solve(delta_x[0] if B == 1 else delta_x)
+
+        # Recover delta_y = (A @ delta_x - rhs_y) / delta
+        if p > 0:
             self.eval_A_xn(data, 1.0, delta_x, delta_y)
-            delta_y -= rhs_y
-            delta_y *= self._delta_inv
-
-        # delta_z = z_reg_inv * (G @ delta_x - rhs_z)
-        if data.m > 0:
+        # Recover delta_z = (G @ delta_x - rhs_z) * z_reg_inv
+        if m > 0:
             self.eval_G_xn(data, 1.0, delta_x, delta_z)
-            delta_z -= rhs_z
-            delta_z *= self._z_reg_inv
+
+        if p > 0 or m > 0:
+            wp.launch(
+                kernel=self._solve_post_cholesky_kernel,
+                dim=(B, p+m),
+                inputs=[rhs_y, rhs_z, self._delta_inv, self._z_reg_inv,
+                        delta_y, delta_z],
+                device="cuda", stream=wp_stream,
+            )
 
     @nvtx.annotate("DenseKKTSolver::eval_P_x")
     def eval_P_x(self, data: DenseData, alpha: float, x: cp.ndarray, z: cp.ndarray):

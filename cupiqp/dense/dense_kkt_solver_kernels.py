@@ -30,7 +30,7 @@ def create_update_kkt_kernel(n: int, p: int, m: int):
         x_reg:     wp.array2d(dtype=wp.float64),   # type: ignore  (B, n)
         z_reg:     wp.array2d(dtype=wp.float64),   # type: ignore  (B, m)
         # Outputs
-        delta_inv:        wp.array2d(dtype=wp.float64),  # type: ignore  (B, 1)
+        delta_inv:        wp.array(dtype=wp.float64),    # type: ignore  (B,)
         z_reg_inv:        wp.array2d(dtype=wp.float64),  # type: ignore  (B, m)
         z_reg_inv_sqrt:   wp.array2d(dtype=wp.float64),  # type: ignore  (B, m)
         kkt_mat:          wp.array3d(dtype=wp.float64),  # type: ignore  (B, n, n)
@@ -44,7 +44,7 @@ def create_update_kkt_kernel(n: int, p: int, m: int):
 
         # Per-batch scalar (one writer per batch).
         if t == 0:
-            delta_inv[b, 0] = wp.float64(1.0) / delta[b]
+            delta_inv[b] = wp.float64(1.0) / delta[b]
 
         if t < n_n_static:
             # Region 1: kkt_mat = P + diag(x_reg) + 1/delta*AtA
@@ -75,3 +75,57 @@ def create_update_kkt_kernel(n: int, p: int, m: int):
 
     return update_kkt_kernel, total_dim
 
+
+def create_solve_pre_cholesky_kernel(p: int, m: int):
+    """Fused post-matvec / pre-Cholesky assembly of the right-hand side
+    ``delta_x``::
+
+        delta_x[b, i] = rhs_x[b, i]
+                        + (p>0 ? delta_inv[b] * work_n_AT[b, i] : 0)
+                        + (m>0 ? work_n_GT[b, i]                : 0)
+    """
+    @wp.kernel
+    def solve_pre_cholesky_kernel(
+        rhs_x:       wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
+        delta_inv:   wp.array(dtype=wp.float64),    # type: ignore  (B,)
+        work_n_AT:   wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)  (zero-shape if p == 0)
+        work_n_GT:   wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)  (zero-shape if m == 0)
+        delta_x:     wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)  output
+    ):
+        b, i = wp.tid()
+        v = rhs_x[b, i]
+        if wp.static(p > 0):
+            v = v + delta_inv[b] * work_n_AT[b, i]
+        if wp.static(m > 0):
+            v = v + work_n_GT[b, i]
+        delta_x[b, i] = v
+
+    return solve_pre_cholesky_kernel
+
+
+def create_solve_post_cholesky_kernel(p: int, m: int):
+    """Fused finalization after the Cholesky solve and the A / G matvecs::
+
+        delta_y[b, i] = (delta_y[b, i] - rhs_y[b, i]) * delta_inv[b, 0]    (i in [0, p))
+        delta_z[b, k] = (delta_z[b, k] - rhs_z[b, k]) * z_reg_inv[b, k]    (k in [0, m))
+
+    """
+    @wp.kernel
+    def solve_post_cholesky_kernel(
+        rhs_y:     wp.array2d(dtype=wp.float64),  # type: ignore  (B, p)
+        rhs_z:     wp.array2d(dtype=wp.float64),  # type: ignore  (B, m)
+        delta_inv: wp.array(dtype=wp.float64),    # type: ignore  (B,)
+        z_reg_inv: wp.array2d(dtype=wp.float64),  # type: ignore  (B, m)
+        delta_y:   wp.array2d(dtype=wp.float64),  # type: ignore  (B, p)  in-out
+        delta_z:   wp.array2d(dtype=wp.float64),  # type: ignore  (B, m)  in-out
+    ):
+        b, t = wp.tid()
+        p_static = wp.static(p)
+        m_static = wp.static(m)
+        if t < p_static:
+            delta_y[b, t] = (delta_y[b, t] - rhs_y[b, t]) * delta_inv[b]
+        elif t < p_static + m_static:
+            k = t - p_static
+            delta_z[b, k] = (delta_z[b, k] - rhs_z[b, k]) * z_reg_inv[b, k]
+
+    return solve_post_cholesky_kernel
