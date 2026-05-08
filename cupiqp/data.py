@@ -58,15 +58,13 @@ class Data(ABC):
         ...
 
     def _finalize(self):
-        """Shared post-init: preprocessing + constraints RHS norm.
+        """Shared post-init: preprocessing.
 
         Must be called by every subclass ``__init__`` after ``_batch_size``,
         ``_n``, ``_P``, ``_c``, ``_A``, ``_b``, ``_G``, ``_h_l``, ``_h_u``,
         ``_x_l``, ``_x_u`` have been populated.
         """
         self._preprocess()
-        self._constraints_rhs_inf_norm = cp.empty(self._batch_size, dtype=cp.float64)
-        self._compute_constraints_rhs_inf_norm()
 
     def _preprocess(self):
         self._init_h_l()
@@ -138,34 +136,6 @@ class Data(ABC):
                 f"Bound structure mismatch in '{name}': all problems in the batch "
                 f"must have the same set of finite bounds."
             )
-
-    # ------------------------------------------------------------------
-    # Constraints RHS inf-norm — shape (B,)
-    # ------------------------------------------------------------------
-
-    def _compute_constraints_rhs_inf_norm(self):
-        """Per-problem inf-norm of constraint RHS vectors — shape ``(B,)``."""
-        self._constraints_rhs_inf_norm[:] = 0.0
-        if self.p > 0:
-            cp.maximum(self._constraints_rhs_inf_norm,
-                       cp.max(cp.abs(self._b), axis=1),
-                       out=self._constraints_rhs_inf_norm)
-        if self.num_hu > 0:
-            cp.maximum(self._constraints_rhs_inf_norm,
-                       cp.max(cp.abs(self._h_u[:, self._idx_hu]), axis=1),
-                       out=self._constraints_rhs_inf_norm)
-        if self.num_hl > 0:
-            cp.maximum(self._constraints_rhs_inf_norm,
-                       cp.max(cp.abs(self._h_l[:, self._idx_hl]), axis=1),
-                       out=self._constraints_rhs_inf_norm)
-        if self.num_xu > 0:
-            cp.maximum(self._constraints_rhs_inf_norm,
-                       cp.max(cp.abs(self._x_u[:, self._idx_xu]), axis=1),
-                       out=self._constraints_rhs_inf_norm)
-        if self.num_xl > 0:
-            cp.maximum(self._constraints_rhs_inf_norm,
-                       cp.max(cp.abs(self._x_l[:, self._idx_xl]), axis=1),
-                       out=self._constraints_rhs_inf_norm)
 
     # ------------------------------------------------------------------
     # Properties

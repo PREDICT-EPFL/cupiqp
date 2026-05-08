@@ -74,7 +74,6 @@ class Solver:
                 self.settings.preconditioner_scale_cost,
                 self.settings.preconditioner_iter,
             )
-            self._data._compute_constraints_rhs_inf_norm()
 
         data = self._data
         B = data.batch_size
@@ -117,43 +116,13 @@ class Solver:
 
         self._enable_iterative_refinement = self.settings.iterative_refinement_always_enabled
 
-
-        n, p, m = self._data.n, self._data.p, self._data.m
-        pc = self._preconditioner
-        if self.settings.preconditioner_iter > 0:
-            self._constraints_rhs_inf_norm_unscaled = cp.zeros(B, dtype=cp.float64)
-            if p > 0:
-                tmp = cp.empty_like(self._data.b)
-                pc.unscale_primal_res_eq(self._data.b, out=tmp)
-                cp.maximum(self._constraints_rhs_inf_norm_unscaled,
-                           cp.max(cp.abs(tmp), axis=1),
-                           out=self._constraints_rhs_inf_norm_unscaled)
-            if self._data.num_hu > 0:
-                tmp = self._data.h_u[:, self._data.idx_hu]   # fancy indexing → fresh copy
-                pc.unscale_primal_res_ineq(tmp, self._data.idx_hu, out=tmp)
-                cp.maximum(self._constraints_rhs_inf_norm_unscaled,
-                           cp.max(cp.abs(tmp), axis=1),
-                           out=self._constraints_rhs_inf_norm_unscaled)
-            if self._data.num_hl > 0:
-                tmp = self._data.h_l[:, self._data.idx_hl]
-                pc.unscale_primal_res_ineq(tmp, self._data.idx_hl, out=tmp)
-                cp.maximum(self._constraints_rhs_inf_norm_unscaled,
-                           cp.max(cp.abs(tmp), axis=1),
-                           out=self._constraints_rhs_inf_norm_unscaled)
-            if self._data.num_xu > 0:
-                tmp = self._data.x_u[:, self._data.idx_xu]
-                pc.unscale_primal_res_b(tmp, self._data.idx_xu, out=tmp)
-                cp.maximum(self._constraints_rhs_inf_norm_unscaled,
-                           cp.max(cp.abs(tmp), axis=1),
-                           out=self._constraints_rhs_inf_norm_unscaled)
-            if self._data.num_xl > 0:
-                tmp = self._data.x_l[:, self._data.idx_xl]
-                pc.unscale_primal_res_b(tmp, self._data.idx_xl, out=tmp)
-                cp.maximum(self._constraints_rhs_inf_norm_unscaled,
-                           cp.max(cp.abs(tmp), axis=1),
-                           out=self._constraints_rhs_inf_norm_unscaled)
-        else:
-            self._constraints_rhs_inf_norm_unscaled = self._data._constraints_rhs_inf_norm  # (B,)
+        # Unscaled-RHS inf-norm. When preconditioner_iter == 0 the stored
+        # factors are identity, so this reduces to the inf-norm of the user-
+        # space b / h_l/u / x_l/u — same answer, single code path.
+        self._constraints_rhs_inf_norm_unscaled = cp.zeros(B, dtype=cp.float64)
+        self._preconditioner.compute_constraints_rhs_inf_norm_unscaled(
+            self._data, self._constraints_rhs_inf_norm_unscaled,
+        )
 
         self._setup_done = True
 
@@ -185,6 +154,9 @@ class Solver:
         if not self._setup_done:
             raise RuntimeError("Solver not setup yet. Call setup() first.")
 
+        if self.settings.preconditioner_iter > 0:
+            self._preconditioner.unscale_data(self._data)
+
         if P is not None:
             self._data.set_P(P, check=check_validity)
         if c is not None:
@@ -204,9 +176,13 @@ class Solver:
         if x_l is not None:
             self._data.set_x_l(x_l, check=check_validity)
 
-        # Apply preconditioner scaling to updated data
+        matrix_changed = P is not None or A is not None or G is not None
+
+        # Apply preconditioner scaling to updated data.
+        preconditioner_did_fresh_ruiz = False
         if self.settings.preconditioner_iter > 0:
-            if self.settings.preconditioner_reuse_on_update:
+            reuse = self.settings.preconditioner_reuse_on_update or not matrix_changed
+            if reuse:
                 self._preconditioner.reuse_scaling(self._data)
             else:
                 self._preconditioner.reset()
@@ -215,9 +191,21 @@ class Solver:
                     self.settings.preconditioner_scale_cost,
                     self.settings.preconditioner_iter,
                 )
+                preconditioner_did_fresh_ruiz = True
 
-        self._data._compute_constraints_rhs_inf_norm()
-        self._kkt_system.update_data(self._data, P is not None, A is not None, G is not None)
+        self._preconditioner.compute_constraints_rhs_inf_norm_unscaled(
+            self._data, self._constraints_rhs_inf_norm_unscaled,
+        )
+        # Fresh Ruiz produces new factors that re-scale ALL of P/A/G in place,
+        # even matrices the user didn't pass. The KKT solver caches things
+        # like A^T A keyed off those scaled values, so flag everything as
+        # changed in that case.
+        self._kkt_system.update_data(
+            self._data,
+            (P is not None) or preconditioner_did_fresh_ruiz,
+            (A is not None) or preconditioner_did_fresh_ruiz,
+            (G is not None) or preconditioner_did_fresh_ruiz,
+        )
 
     def solve(self) -> list:
         if self.settings.verbose:

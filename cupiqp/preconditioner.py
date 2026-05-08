@@ -10,10 +10,11 @@ from .preconditioner_kernels import (
     create_accumulate_deltas_kernel,
     create_ruiz_conv_check_kernel,
     create_calc_scaling_inv_and_scale_bounds_kernel,
+    create_scale_bounds_kernel,
+    create_unscale_bounds_kernel,
+    create_compute_constraints_rhs_inf_norm_unscaled_kernel,
 )
 
-
-USE_WARP = True
 
 
 class PreconditionerBase(ABC):
@@ -285,11 +286,19 @@ class RuizEquilibration(PreconditionerBase):
         # cupy fallback at the launch site is used instead.
         if use_warp_tile_kernels:
             self._conv_check_kernel = create_ruiz_conv_check_kernel(n, p, m)
+            self._compute_rhs_inf_norm_unscaled_kernel = (
+                create_compute_constraints_rhs_inf_norm_unscaled_kernel(
+                    n, p, m, idx_hl.size, idx_hu.size, idx_xl.size, idx_xu.size,
+                )
+            )
         else:
             self._conv_check_kernel = None
+            self._compute_rhs_inf_norm_unscaled_kernel = None
         self._calc_scaling_inv_and_scale_bounds_kernel = create_calc_scaling_inv_and_scale_bounds_kernel(
             n, p, m, idx_hl.size, idx_hu.size, idx_xl.size, idx_xu.size,
         )
+        self._scale_bounds_kernel = create_scale_bounds_kernel(n, p, m)
+        self._unscale_bounds_kernel = create_unscale_bounds_kernel(n, p, m)
 
         # (2B,) buffer for per-batch (max_d, max_db) pairs — cp.max gives global.
         self._conv_buf = cp.empty(2 * B, dtype=cp.float64)
@@ -523,7 +532,7 @@ class RuizEquilibration(PreconditionerBase):
                 self._delta, self._delta_inv,
                 self._delta_b, self._delta_b_inv,
                 self._cost_scaling, self._cost_scaling_inv,
-                data._b, data._h_l, data._h_u, data._x_l, data._x_u,
+                data.b, data.h_l, data.h_u, data.x_l, data.x_u,
                 self._idx_hl, self._idx_hu, self._idx_xl, self._idx_xu,
                 self._dual_res_unscale_factor, self._primal_res_unscale_factor,
             ],
@@ -572,7 +581,7 @@ class RuizEquilibration(PreconditionerBase):
 
     @nvtx.annotate("RuizEquilibration::unscale_data")
     def unscale_data(self, data: Data):
-        """Reverse all scaling transformations on the problem data."""
+        """Reverse scaling on the problem data; leave internal factors intact."""
         n, p = self.n, self.p
         d_x_inv = self._delta_inv[:, :n]
         d_y_inv = self._delta_inv[:, n:n+p]
@@ -584,7 +593,6 @@ class RuizEquilibration(PreconditionerBase):
                             cost_scaling_factor=self._cost_scaling_inv)
         self._unscale_bounds(data)
         self._x_b_scaling *= self._delta_b_inv * d_x_inv
-        self.reset()
 
     @nvtx.annotate("RuizEquilibration::reuse_scaling")
     def reuse_scaling(self, data: Data):
@@ -597,6 +605,9 @@ class RuizEquilibration(PreconditionerBase):
         # Applies D_x P D_x, D_y A D_x, D_z G D_x, D_x c, plus cost_scaling on P, c.
         self.scale_matrices(data, d_x, d_y, d_z, cost_scaling_factor=self._cost_scaling)
         self._scale_bounds(data)
+        # x_b_scaling = x_b_scaling_init * delta_b * d_x.
+        cp.multiply(self._x_b_scaling_init, self._delta_b, out=self._x_b_scaling)
+        self._x_b_scaling *= d_x
 
     # ------------------------------------------------------------------
     # Primal / dual / slack scaling and unscaling
@@ -658,6 +669,56 @@ class RuizEquilibration(PreconditionerBase):
     def unscale_primal_res_b(self, v: cp.ndarray, idx: cp.ndarray, out: cp.ndarray):
         """out = delta_b_inv[idx] * v_scaled"""
         cp.multiply(v, self._delta_b_inv[:, idx], out=out)
+
+    @nvtx.annotate("RuizEquilibration::compute_constraints_rhs_inf_norm_unscaled")
+    def compute_constraints_rhs_inf_norm_unscaled(self, data: Data, out: cp.ndarray) -> None:
+        """Fill ``out`` (B,) with the inf-norm of the user-space constraint RHS.
+
+        Recovers the unscaled b / h_l / h_u / x_l / x_u inf-norm by passing
+        the currently-scaled buffers through ``unscale_primal_res_*``. Caller
+        must invoke this after the preconditioner has been (re-)applied so
+        that ``delta_inv`` / ``delta_b_inv`` reflect current scaling, and
+        must own the ``out`` buffer (allocated once in solver setup).
+        """
+        if self._use_warp_tile_kernels:
+            BLOCK_DIM = 256
+            wp.launch_tiled(
+                kernel=self._compute_rhs_inf_norm_unscaled_kernel,
+                dim=[self.B],
+                inputs=[
+                    self._delta_inv, self._delta_b_inv,
+                    data.b, data.h_l, data.h_u, data.x_l, data.x_u,
+                    self._idx_hl, self._idx_hu, self._idx_xl, self._idx_xu,
+                    out,
+                ],
+                block_dim=BLOCK_DIM,
+                device="cuda",
+                stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+            )
+        
+        else:
+            # cupy fallback (use_warp_tile_kernels=False; LargeProblemSolver path).
+            out.fill(0.0)
+            if data.p > 0:
+                tmp = cp.empty_like(data.b)
+                self.unscale_primal_res_eq(data.b, out=tmp)
+                cp.maximum(out, cp.max(cp.abs(tmp), axis=1), out=out)
+            if data.num_hu > 0:
+                tmp = data.h_u[:, data.idx_hu]   # fancy indexing -> fresh copy
+                self.unscale_primal_res_ineq(tmp, data.idx_hu, out=tmp)
+                cp.maximum(out, cp.max(cp.abs(tmp), axis=1), out=out)
+            if data.num_hl > 0:
+                tmp = data.h_l[:, data.idx_hl]
+                self.unscale_primal_res_ineq(tmp, data.idx_hl, out=tmp)
+                cp.maximum(out, cp.max(cp.abs(tmp), axis=1), out=out)
+            if data.num_xu > 0:
+                tmp = data.x_u[:, data.idx_xu]
+                self.unscale_primal_res_b(tmp, data.idx_xu, out=tmp)
+                cp.maximum(out, cp.max(cp.abs(tmp), axis=1), out=out)
+            if data.num_xl > 0:
+                tmp = data.x_l[:, data.idx_xl]
+                self.unscale_primal_res_b(tmp, data.idx_xl, out=tmp)
+                cp.maximum(out, cp.max(cp.abs(tmp), axis=1), out=out)
 
     # ------------------------------------------------------------------
     # Cost unscaling
@@ -724,31 +785,27 @@ class RuizEquilibration(PreconditionerBase):
         return d
 
     def _scale_bounds(self, data: Data):
-        n, p, m = self.n, self.p, self.m
-        d_y = self._delta[:, n:n + p]    # (B, p)
-        d_z = self._delta[:, n + p:]     # (B, m)
-
-        if p > 0:
-            data._b *= d_y
-        if m > 0:
-            data._h_l *= d_z
-            data._h_u *= d_z
-        if data.num_xl > 0:
-            data._x_l[:, data.idx_xl] *= self._delta_b[:, data.idx_xl]
-        if data.num_xu > 0:
-            data._x_u[:, data.idx_xu] *= self._delta_b[:, data.idx_xu]
+        wp.launch(
+            kernel=self._scale_bounds_kernel,
+            dim=(self.B, self.n + self.p + self.m),
+            inputs=[
+                self._delta, self._delta_b,
+                data.b, data.h_l, data.h_u,
+                data.x_l, data.x_u,
+            ],
+            device="cuda",
+            stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+        )
 
     def _unscale_bounds(self, data: Data):
-        n, p, m = self.n, self.p, self.m
-        d_y_inv = self._delta_inv[:, n:n + p]
-        d_z_inv = self._delta_inv[:, n + p:]
-
-        if p > 0:
-            data._b *= d_y_inv
-        if m > 0:
-            data._h_l *= d_z_inv
-            data._h_u *= d_z_inv
-        if data.num_xl > 0:
-            data._x_l[:, data.idx_xl] *= self._delta_b_inv[:, data.idx_xl]
-        if data.num_xu > 0:
-            data._x_u[:, data.idx_xu] *= self._delta_b_inv[:, data.idx_xu]
+        wp.launch(
+            kernel=self._unscale_bounds_kernel,
+            dim=(self.B, self.n + self.p + self.m),
+            inputs=[
+                self._delta_inv, self._delta_b_inv,
+                data.b, data.h_l, data.h_u,
+                data.x_l, data.x_u,
+            ],
+            device="cuda",
+            stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+        )
