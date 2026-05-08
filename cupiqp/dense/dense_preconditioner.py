@@ -84,38 +84,38 @@ class DenseRuizEquilibration(RuizEquilibration):
             wp.launch(
                 kernel=self._dense_scale_P_c_kernel,
                 dim=(self.B, self.n, self.n),
-                inputs=[data._P, data._c, d_x, cf],
+                inputs=[data.P, data.c, d_x, cf],
                 device="cuda", stream=stream,
             )
             if self.p > 0:
                 wp.launch(
                     kernel=self._dense_scale_A_kernel,
                     dim=(self.B, self.p, self.n),
-                    inputs=[data._A, d_y, d_x],
+                    inputs=[data.A, d_y, d_x],
                     device="cuda", stream=stream,
                 )
             if self.m > 0:
                 wp.launch(
                     kernel=self._dense_scale_G_kernel,
                     dim=(self.B, self.m, self.n),
-                    inputs=[data._G, d_z, d_x],
+                    inputs=[data.G, d_z, d_x],
                     device="cuda", stream=stream,
                 )
             return
 
         # --- cupy fallback ---
-        data._P *= d_x[:, None, :]
-        data._P *= d_x[:, :, None]
-        data._c *= d_x
+        data.P[:] *= d_x[:, None, :]
+        data.P[:] *= d_x[:, :, None]
+        data.c[:] *= d_x
         if cost_scaling_factor is not None:
-            data._P *= cost_scaling_factor[:, None, None]
-            data._c *= cost_scaling_factor[:, None]
+            data.P[:] *= cost_scaling_factor[:, None, None]
+            data.c[:] *= cost_scaling_factor[:, None]
         if self.p > 0:
-            data._A *= d_x[:, None, :]
-            data._A *= d_y[:, :, None]
+            data.A[:] *= d_x[:, None, :]
+            data.A[:] *= d_y[:, :, None]
         if self.m > 0:
-            data._G *= d_x[:, None, :]
-            data._G *= d_z[:, :, None]
+            data.G[:] *= d_x[:, None, :]
+            data.G[:] *= d_z[:, :, None]
 
     def apply_cost_scaling(self, data: DenseData):
         """Per-problem cost scaling gamma = 1/max(mean(||P_cols||), ||c||).
@@ -127,29 +127,29 @@ class DenseRuizEquilibration(RuizEquilibration):
             wp.launch(
                 kernel=self._dense_compute_gamma_kernel,
                 dim=(self.B,),
-                inputs=[data._P, data._c, self._gamma_buf],
+                inputs=[data.P, data.c, self._gamma_buf],
                 device="cuda", stream=stream,
             )
             wp.launch(
                 kernel=self._dense_apply_gamma_kernel,
                 dim=(self.B, self.n, self.n),
-                inputs=[data._P, data._c, self._cost_scaling, self._gamma_buf],
+                inputs=[data.P, data.c, self._cost_scaling, self._gamma_buf],
                 device="cuda", stream=stream,
             )
             return
 
         # --- cupy fallback ---
         n = self.n
-        P_abs = cp.abs(data._P)                                       # (B, n, n)
-        P_utri = cp.triu(P_abs.reshape(-1, n, n)).reshape(data._P.shape)
+        P_abs = cp.abs(data.P)                                       # (B, n, n)
+        P_utri = cp.triu(P_abs.reshape(-1, n, n)).reshape(data.P.shape)
         col_max = cp.max(P_utri, axis=1)                              # (B, n)
         row_max = cp.max(P_utri, axis=2)                              # (B, n)
         gamma = cp.mean(cp.maximum(col_max, row_max), axis=1)         # (B,)
         gamma = cp.clip(gamma, self.min_scaling, self.max_scaling)
-        c_norm = cp.max(cp.abs(data._c), axis=1)                      # (B,)
+        c_norm = cp.max(cp.abs(data.c), axis=1)                      # (B,)
         gamma = cp.maximum(gamma, c_norm)
         gamma = cp.clip(gamma, self.min_scaling, self.max_scaling)
         gamma = 1.0 / gamma                                           # (B,)
-        data._P *= gamma[:, None, None]
-        data._c *= gamma[:, None]
+        data.P[:] *= gamma[:, None, None]
+        data.c[:] *= gamma[:, None]
         self._cost_scaling *= gamma

@@ -49,8 +49,8 @@ class MultistageRuizEquilibration(RuizEquilibration):
         d_x_2d = d_x.reshape(B, N, bs)
 
         # P_D shape (B, N, d, d); P_E shape (B, N-1, d, d).
-        P_D = cp.from_dlpack(wp.to_dlpack(data._P.diag_blocks.data))
-        P_E = cp.from_dlpack(wp.to_dlpack(data._P.off_diag_blocks_lower.data))
+        P_D = cp.from_dlpack(wp.to_dlpack(data.P.diag_blocks.data))
+        P_E = cp.from_dlpack(wp.to_dlpack(data.P.off_diag_blocks_lower.data))
         # P <- D_x P D_x: scale columns then rows of each batch's diag blocks.
         P_D *= d_x_2d[:, :, None, :]
         P_D *= d_x_2d[:, :, :, None]
@@ -58,30 +58,30 @@ class MultistageRuizEquilibration(RuizEquilibration):
             P_E *= d_x_2d[:, :N - 1, None, :]    # column scaling (block k)
             P_E *= d_x_2d[:, 1:N, :, None]       # row scaling (block k+1)
 
-        data._c *= d_x
+        data.c[:] *= d_x
 
         if cost_scaling_factor is not None:
             cf = cost_scaling_factor[:, None, None, None]   # (B, 1, 1, 1)
             P_D *= cf
             if N > 1:
                 P_E *= cf
-            data._c *= cost_scaling_factor[:, None]
+            data.c[:] *= cost_scaling_factor[:, None]
 
         if self.p > 0:
-            r_a = data._A.rows_of_blocks
+            r_a = data.A.rows_of_blocks
             d_y_2d = d_y.reshape(B, N + 1, r_a)
-            A_D = cp.from_dlpack(wp.to_dlpack(data._A.D))
-            A_E = cp.from_dlpack(wp.to_dlpack(data._A.E))
+            A_D = cp.from_dlpack(wp.to_dlpack(data.A.D))
+            A_E = cp.from_dlpack(wp.to_dlpack(data.A.E))
             A_D *= d_x_2d[:, :, None, :]            # column scale by d_x
             A_D *= d_y_2d[:, :N, :, None]           # row scale by d_y[block k]
             A_E *= d_x_2d[:, :, None, :]
             A_E *= d_y_2d[:, 1:N + 1, :, None]      # row scale by d_y[block k+1]
 
         if self.m > 0:
-            r_g = data._G.rows_of_blocks
+            r_g = data.G.rows_of_blocks
             d_z_2d = d_z.reshape(B, N + 1, r_g)
-            G_D = cp.from_dlpack(wp.to_dlpack(data._G.D))
-            G_E = cp.from_dlpack(wp.to_dlpack(data._G.E))
+            G_D = cp.from_dlpack(wp.to_dlpack(data.G.D))
+            G_E = cp.from_dlpack(wp.to_dlpack(data.G.E))
             G_D *= d_x_2d[:, :, None, :]
             G_D *= d_z_2d[:, :N, :, None]
             G_E *= d_x_2d[:, :, None, :]
@@ -91,8 +91,8 @@ class MultistageRuizEquilibration(RuizEquilibration):
         B = self.B
         N = data.num_blocks
         # (B, N, d, d) and (B, N-1, d, d).
-        P_D = cp.from_dlpack(wp.to_dlpack(data._P.diag_blocks.data))
-        P_E = cp.from_dlpack(wp.to_dlpack(data._P.off_diag_blocks_lower.data))
+        P_D = cp.from_dlpack(wp.to_dlpack(data.P.diag_blocks.data))
+        P_E = cp.from_dlpack(wp.to_dlpack(data.P.off_diag_blocks_lower.data))
 
         # Column inf-norms of upper-triangular P (symmetric → col_norm == row_norm).
         # cp.triu broadcasts over the leading (B, N) axes.
@@ -110,14 +110,14 @@ class MultistageRuizEquilibration(RuizEquilibration):
         # gamma per batch: 1 / max(mean(col_norms_per_batch), max_abs_c_per_batch).
         gamma = cp.mean(col_norms.reshape(B, -1), axis=1)         # (B,)
         gamma = self._limit_scaling_array(gamma)
-        gamma = cp.maximum(gamma, cp.max(cp.abs(data._c), axis=1))
+        gamma = cp.maximum(gamma, cp.max(cp.abs(data.c), axis=1))
         gamma = self._limit_scaling_array(gamma)
         gamma = 1.0 / gamma                                        # (B,)
 
         P_D *= gamma[:, None, None, None]
         if N > 1:
             P_E *= gamma[:, None, None, None]
-        data._c *= gamma[:, None]
+        data.c[:] *= gamma[:, None]
         self._cost_scaling *= gamma
 
     # ------------------------------------------------------------------

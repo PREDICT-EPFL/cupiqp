@@ -44,30 +44,30 @@ class SparseRuizEquilibration(RuizEquilibration):
     def scale_matrices(self, data: SparseData,
                        d_x: cp.ndarray, d_y: cp.ndarray, d_z: cp.ndarray,
                        cost_scaling_factor: Optional[cp.ndarray] = None):
-        self._batched_row_scale(data._P, d_x)
-        self._batched_col_scale(data._P, d_x)
-        data._c *= d_x
+        self._batched_row_scale(data.P, d_x)
+        self._batched_col_scale(data.P, d_x)
+        data.c[:] *= d_x
         if cost_scaling_factor is not None:
-            data._P.data *= cost_scaling_factor[:, None]
-            data._c *= cost_scaling_factor[:, None]
+            data.P.data[:] *= cost_scaling_factor[:, None]
+            data.c[:] *= cost_scaling_factor[:, None]
 
         if self.p > 0:
-            self._batched_row_scale(data._A, d_y)
-            self._batched_col_scale(data._A, d_x)
+            self._batched_row_scale(data.A, d_y)
+            self._batched_col_scale(data.A, d_x)
         if self.m > 0:
-            self._batched_row_scale(data._G, d_z)
-            self._batched_col_scale(data._G, d_x)
+            self._batched_row_scale(data.G, d_z)
+            self._batched_col_scale(data.G, d_x)
 
     def apply_cost_scaling(self, data: SparseData):
-        P_norms = self._batched_utri_symmetric_col_inf_norms(data._P)  # (B, n)
+        P_norms = self._batched_utri_symmetric_col_inf_norms(data.P)  # (B, n)
         gamma = cp.mean(P_norms, axis=1)                                # (B,)
         gamma = cp.clip(gamma, self.min_scaling, self.max_scaling)
-        c_norm = cp.max(cp.abs(data._c), axis=1)                        # (B,)
+        c_norm = cp.max(cp.abs(data.c), axis=1)                        # (B,)
         gamma = cp.maximum(gamma, c_norm)
         gamma = cp.clip(gamma, self.min_scaling, self.max_scaling)
         gamma = 1.0 / gamma                                             # (B,)
-        data._P.data *= gamma[:, None]
-        data._c *= gamma[:, None]
+        data.P.data[:] *= gamma[:, None]
+        data.c[:] *= gamma[:, None]
         self._cost_scaling *= gamma
 
     # ------------------------------------------------------------------
