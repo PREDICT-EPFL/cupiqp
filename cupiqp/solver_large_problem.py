@@ -1,16 +1,3 @@
-"""Cupy-axis-reduction variant of ``Solver`` for large per-problem dimensions.
-
-``LargeProblemSolver`` overrides ``_init_kernels`` with a no-op so the
-shape-specialized warp tile kernel factories in ``solver_kernels.py`` are
-never called and never compiled. It also overrides the eight inner-loop
-methods with cupy implementations.
-
-Use this when ``max(n, p, m)`` is large enough that warp tile compile
-time dominates first-solve latency and cupy axis-1 reductions amortize
-their per-launch overhead. Numerically agrees with ``Solver`` to solver
-tolerance.
-"""
-
 import cupy as cp
 import nvtx
 
@@ -22,40 +9,30 @@ from .solver_kernels import (
     create_update_vars_after_corrector_step_kernel,
     create_boundary_shift_kernel,
 )
+from .dense.dense_solver import DenseSolver
+from .sparse.sparse_solver import SparseSolver
+from .multistage.multistage_solver import MultistageSolver
 
-class LargeProblemSolver(SolverBase):
-    """CuPy implementation of some kernels in ``Solver``.
+from .dense.dense_preconditioner import DenseRuizEquilibration
+from .sparse.sparse_preconditioner import SparseRuizEquilibration
+from .multistage.multistage_preconditioner import MultistageRuizEquilibration
 
-    Avoids the warp tile kernel compile cliff for large problems by
-    overriding ``_init_kernels`` (no-op) and the eight inner-loop
-    methods with cupy implementations. Inherits all the shared IPM
-    machinery (setup, solve loop, KKT/preconditioner glue, easy-warp
-    predictor-corrector kernels, residual queries) from ``Solver``.
+
+class LargeProblemSolverBase(SolverBase):
+    """Cupy re-implementation of some methods of SolverBase.
+
+    Replacing the warp-tile inner-loop kernels with cupy kernels.
+    Use this class when ``max(n, p, m)`` is large enough that warp
+    tile-kernel compile time dominates first-solve latency and cupy
+    axis-1 reductions amortize their per-launch overhead. Numerically
+    agrees with the regular backend solver to solver tolerance.
     """
 
-    def _init_preconditioner(self):
-        """Construct the Ruiz preconditioner with ``use_warp_tile_kernels=False``
-        so the conv-check tile factory is never called and never compiled,
-        and the whole equilibration loop runs on the cupy path."""
-        if self.settings.kkt_solver == "dense_cholesky":
-            from .dense.dense_preconditioner import DenseRuizEquilibration
-            PreconditionerClass = DenseRuizEquilibration
-        elif self.settings.kkt_solver == "sparse_ldlt":
-            from .sparse.sparse_preconditioner import SparseRuizEquilibration
-            PreconditionerClass = SparseRuizEquilibration
-        elif self.settings.kkt_solver == "multistage_block_cholesky":
-            from .multistage.multistage_preconditioner import MultistageRuizEquilibration
-            PreconditionerClass = MultistageRuizEquilibration
-        else:
-            raise ValueError(f"No preconditioner for kkt_solver type: {self.settings.kkt_solver}")
-        return PreconditionerClass(
-            self._data.batch_size, self._data.n, self._data.p, self._data.m,
-            self._data.idx_xl, self._data.idx_xu,
-            self._data.idx_hl, self._data.idx_hu,
-            use_warp_tile_kernels=False,
-        )
-
     def _init_warp_kernels(self) -> None:
+        # Subset: only the easy-warp kernels (no shape-specialized tile
+        # kernels). The base class's _init_warp_kernels also builds the
+        # tile-kernel families that takes long time to compile when the
+        # problem size is large
         if self._data.num_ineq > 0:
             self._boundary_shift_kernel = create_boundary_shift_kernel(
                 self._data.num_hl, self._data.num_hu,
@@ -67,7 +44,7 @@ class LargeProblemSolver(SolverBase):
                 n_primal=self._data.n + self._data.num_ineq, n_dual=self._data.p + self._data.num_ineq,
             )
 
-    @nvtx.annotate("LargeProblemSolver::_run_full_newton_step")
+    @nvtx.annotate("LargeProblemSolverBase::_run_full_newton_step")
     def _run_full_newton_step(self):
         self._kkt_system.solve(self._data, self._preconditioner, self.settings, self._res, self._step)
         self._result.info.primal_step[:] = 1.0
@@ -75,7 +52,7 @@ class LargeProblemSolver(SolverBase):
         self._result.x += self._result.info.primal_step[:, None] * self._step.x
         self._result.y += self._result.info.dual_step[:, None] * self._step.y
 
-    @nvtx.annotate("LargeProblemSolver::_calculate_step")
+    @nvtx.annotate("LargeProblemSolverBase::_calculate_step")
     @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
     def _calculate_step(self) -> None:
         # alpha_s: step length for slacks
@@ -88,14 +65,14 @@ class LargeProblemSolver(SolverBase):
         self._result.info.dual_step[:] = cp.min(self._work_z, axis=1)  # alpha_z
         self._result.info.dual_step *= self.settings.tau
 
-    @nvtx.annotate("LargeProblemSolver::_calculate_mu")
+    @nvtx.annotate("LargeProblemSolverBase::_calculate_mu")
     @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
     def _calculate_mu(self) -> None:
         cp.multiply(self._result.s_all, self._result.z_all, out=self._work_s)
         cp.sum(self._work_s, axis=1, out=self._result.info.mu)
         self._result.info.mu /= self._data.num_ineq
 
-    @nvtx.annotate("LargeProblemSolver::_calculate_sigma")
+    @nvtx.annotate("LargeProblemSolverBase::_calculate_sigma")
     @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
     def _calculate_sigma(self) -> None:
         # s_trial = s + alpha_s * ds,  z_trial = z + alpha_z * dz
@@ -111,7 +88,7 @@ class LargeProblemSolver(SolverBase):
         cp.clip(self._result.info.sigma, 0., 1., out=self._result.info.sigma)
         cp.power(self._result.info.sigma, 3., out=self._result.info.sigma)
 
-    @nvtx.annotate("LargeProblemSolver::_update_residuals_nr")
+    @nvtx.annotate("LargeProblemSolverBase::_update_residuals_nr")
     @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
     def _update_residuals_nr(self):
         r"""Compute non-regularized KKT residuals + objective values +
@@ -183,6 +160,10 @@ class LargeProblemSolver(SolverBase):
                            where {w_k} is the set of seven obj sub-terms
                            used above (0.5 x^T P x, c^T x, b^T y, h_u^T z_u,
                            h_l^T z_l, x_u^T z_bu, x_l^T z_bl).
+
+        This is the cupy-axis-reduction implementation; ``SolverBase``'s
+        version in cupiqp/solver.py uses fused warp tile kernels and is
+        numerically equivalent.
         """
         pc = self._preconditioner
         n, p = self._data.n, self._data.p
@@ -354,7 +335,7 @@ class LargeProblemSolver(SolverBase):
         cp.maximum(self._work_dual_res_norm, 1., out=self._work_dual_res_norm)
         cp.divide(self._result.info.dual_res, self._work_dual_res_norm, out=self._result.info.dual_res_rel)
 
-    @nvtx.annotate("LargeProblemSolver::_update_residuals_r")
+    @nvtx.annotate("LargeProblemSolverBase::_update_residuals_r")
     @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
     def _update_residuals_r(self):
         """
@@ -398,7 +379,7 @@ class LargeProblemSolver(SolverBase):
         self._result.info.dual_prox_inf[:] = self._dual_prox_inf()
         self._result.info.dual_prox_inf *= self._result.info.rho
 
-    @nvtx.annotate("LargeProblemSolver::_update_rho_delta_with_ineq")
+    @nvtx.annotate("LargeProblemSolverBase::_update_rho_delta_with_ineq")
     def _update_rho_delta_with_ineq(self) -> None:
         info = self._result.info
         settings = self.settings
@@ -431,7 +412,7 @@ class LargeProblemSolver(SolverBase):
         info.no_dual_update += 1
         info.no_dual_update[primal_improved] = 0
 
-    @nvtx.annotate("LargeProblemSolver::_update_rho_delta_without_ineq")
+    @nvtx.annotate("LargeProblemSolverBase::_update_rho_delta_without_ineq")
     def _update_rho_delta_without_ineq(self) -> None:
         info = self._result.info
         settings = self.settings
@@ -463,3 +444,45 @@ class LargeProblemSolver(SolverBase):
         self._prox_vars.y[:] = cp.where(primal_improved[:, None], self._result.y, self._prox_vars.y)
         info.no_dual_update += 1
         info.no_dual_update[primal_improved] = 0
+
+
+class DenseLargeProblemSolver(LargeProblemSolverBase, DenseSolver):
+    """Dense backend with cupy-axis-reduction inner-loop kernels."""
+
+    def _init_preconditioner(self):
+        # Override DenseSolver: skip the warp tile-kernel compile cliff.
+        return DenseRuizEquilibration(
+            self._data.batch_size, self._data.n, self._data.p, self._data.m,
+            self._data.idx_xl, self._data.idx_xu,
+            self._data.idx_hl, self._data.idx_hu,
+            use_warp_tile_kernels=False,
+        )
+
+
+class SparseLargeProblemSolver(LargeProblemSolverBase, SparseSolver):
+    """Sparse backend with cupy-axis-reduction inner-loop kernels."""
+
+    def _init_preconditioner(self):
+        # Override SparseSolver: skip the warp tile-kernel compile cliff.
+        return SparseRuizEquilibration(
+            self._data.batch_size, self._data.n, self._data.p, self._data.m,
+            self._data.idx_xl, self._data.idx_xu,
+            self._data.idx_hl, self._data.idx_hu,
+            use_warp_tile_kernels=False,
+        )
+
+
+class MultistageLargeProblemSolver(LargeProblemSolverBase, MultistageSolver):
+    """Multistage backend with cupy-axis-reduction inner-loop kernels."""
+
+    def _init_preconditioner(self):
+        # Override MultistageSolver: skip the warp tile-kernel compile
+        # cliff. Multistage needs the block layout via ``data=``.
+        return MultistageRuizEquilibration(
+            self._data.batch_size, self._data.n, self._data.p, self._data.m,
+            self._data.idx_xl, self._data.idx_xu,
+            self._data.idx_hl, self._data.idx_hu,
+            data=self._data,
+            use_warp_tile_kernels=False,
+        )
+

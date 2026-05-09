@@ -1,5 +1,3 @@
-from .solver import SolverBase
-from .solver_large_problem import LargeProblemSolver
 from .data import Data
 from .settings import Settings
 from .results import Result, Status
@@ -12,13 +10,23 @@ from .dense.dense_solver import DenseSolver
 from .sparse.sparse_solver import SparseSolver
 from .multistage.multistage_solver import MultistageSolver
 
+# Cupy-axis-reduction kernel strategy + the three (strategy x backend)
+# concrete classes. Use these when max(n, p, m) is large enough that
+# warp tile-kernel compile time dominates first-solve latency.
+from .solver_large_problem import (
+    DenseLargeProblemSolver,
+    SparseLargeProblemSolver,
+    MultistageLargeProblemSolver,
+)
+
 
 __all__ = [
-    "SolverBase",
-    "LargeProblemSolver",
     "DenseSolver",
     "SparseSolver",
     "MultistageSolver",
+    "DenseLargeProblemSolver",
+    "SparseLargeProblemSolver",
+    "MultistageLargeProblemSolver",
     "Data",
     "Settings",
     "Result",

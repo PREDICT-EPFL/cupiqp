@@ -112,4 +112,5 @@ class MultistageSolver(SolverBase):
             self._data.idx_xl, self._data.idx_xu,
             self._data.idx_hl, self._data.idx_hu,
             data=self._data,
+            use_warp_tile_kernels=True,
         )

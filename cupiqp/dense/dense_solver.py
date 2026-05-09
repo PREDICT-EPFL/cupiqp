@@ -79,4 +79,5 @@ class DenseSolver(SolverBase):
             self._data.batch_size, self._data.n, self._data.p, self._data.m,
             self._data.idx_xl, self._data.idx_xu,
             self._data.idx_hl, self._data.idx_hu,
+            use_warp_tile_kernels=True,
         )
