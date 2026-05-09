@@ -6,6 +6,13 @@ import warp as wp
 from .multistage_data import MultistageData
 from ..preconditioner import RuizEquilibration
 from .multistage_utils import BlockTridiagMat, BlockBidiagMat
+from .multistage_preconditioner_kernels import (
+    create_multistage_scale_matrices_kernel,
+    create_multistage_compute_kkt_norms_kernel,
+)
+
+
+USE_WARP = True
 
 
 class MultistageRuizEquilibration(RuizEquilibration):
@@ -16,14 +23,59 @@ class MultistageRuizEquilibration(RuizEquilibration):
     via DLPack bridges to Warp buffers, with a leading batch axis throughout.
     """
 
+    def __init__(self, *args, data: MultistageData, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # Block layout is fixed at setup; pull it once and bake into the
+        # specialized warp kernels here.
+        N = data.num_blocks
+        d = data.block_size
+        rows_A = data.A.rows_of_blocks if self.p > 0 else 0
+        rows_G = data.G.rows_of_blocks if self.m > 0 else 0
+        self._N, self._d, self._rows_A, self._rows_G = N, d, rows_A, rows_G
+
+        self._multistage_scale_matrices_kernel = create_multistage_scale_matrices_kernel(
+            N, d, rows_A, rows_G,
+        )
+        self._multistage_compute_kkt_norms_kernel = create_multistage_compute_kkt_norms_kernel(
+            N, d, rows_A, rows_G,
+        )
+
+
+        self._dummy_4d = wp.zeros((self.B, 1, 1, 1), dtype=wp.float64, device='cuda')
+        self._P_D = data.P.diag_blocks.data
+        self._P_E = data.P.off_diag_blocks_lower.data
+        self._A_D = data.A.D if self.p > 0 else self._dummy_4d
+        self._A_E = data.A.E if self.p > 0 else self._dummy_4d
+        self._G_D = data.G.D if self.m > 0 else self._dummy_4d
+        self._G_E = data.G.E if self.m > 0 else self._dummy_4d
+        self._c = data.c
+
+        self._ones = cp.ones(self.B, dtype=cp.float64)
+
     # ------------------------------------------------------------------
     # 3-hook backend API
     # ------------------------------------------------------------------
 
     def compute_kkt_norms(self, data: MultistageData,
                           d_iter: cp.ndarray, d_b_iter: cp.ndarray):
-        n, p, m = self.n, self.p, self.m
+        if USE_WARP:
+            wp.launch(
+                kernel=self._multistage_compute_kkt_norms_kernel,
+                dim=(self.B, self.n + self.p + self.m),
+                inputs=[
+                    self._P_D, self._P_E,
+                    self._A_D, self._A_E,
+                    self._G_D, self._G_E,
+                    self._x_b_scaling, d_iter, d_b_iter,
+                ],
+                device="cuda",
+                stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+            )
+            return
 
+        # --- cupy fallback ---
+        n, p, m = self.n, self.p, self.m
         # x-block (B, n): row inf-norms of P (symmetric, so row ≡ col).
         self._tridiag_row_inf_norms(data.P, d_iter[:, :n])
         if p > 0:
@@ -35,12 +87,30 @@ class MultistageRuizEquilibration(RuizEquilibration):
             cp.maximum(d_iter[:, :n], self._work_n, out=d_iter[:, :n])
             self._bidiag_row_inf_norms(data.G, d_iter[:, n + p:n + p + m])
         cp.maximum(d_iter[:, :n], self._x_b_scaling, out=d_iter[:, :n])
-
         d_b_iter[:] = self._x_b_scaling
 
     def scale_matrices(self, data: MultistageData,
                        d_x: cp.ndarray, d_y: cp.ndarray, d_z: cp.ndarray,
                        cost_scaling_factor: Optional[cp.ndarray] = None):
+        if USE_WARP:
+            cf = cost_scaling_factor if cost_scaling_factor is not None else self._ones
+            N, d, rows_A, rows_G = self._N, self._d, self._rows_A, self._rows_G
+            max_rows = max(d, rows_A, rows_G)
+            wp.launch(
+                kernel=self._multistage_scale_matrices_kernel,
+                dim=(self.B, N, max_rows, d),
+                inputs=[
+                    self._P_D, self._P_E,
+                    self._A_D, self._A_E,
+                    self._G_D, self._G_E,
+                    self._c, d_x, d_y, d_z, cf,
+                ],
+                device="cuda",
+                stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+            )
+            return
+
+        # --- cupy fallback ---
         B = self.B
         N = data.num_blocks
         bs = data.block_size
@@ -68,8 +138,8 @@ class MultistageRuizEquilibration(RuizEquilibration):
             data.c[:] *= cost_scaling_factor[:, None]
 
         if self.p > 0:
-            r_a = data.A.rows_of_blocks
-            d_y_2d = d_y.reshape(B, N + 1, r_a)
+            rows_A = data.A.rows_of_blocks
+            d_y_2d = d_y.reshape(B, N + 1, rows_A)
             A_D = cp.from_dlpack(wp.to_dlpack(data.A.D))
             A_E = cp.from_dlpack(wp.to_dlpack(data.A.E))
             A_D *= d_x_2d[:, :, None, :]            # column scale by d_x
@@ -78,8 +148,8 @@ class MultistageRuizEquilibration(RuizEquilibration):
             A_E *= d_y_2d[:, 1:N + 1, :, None]      # row scale by d_y[block k+1]
 
         if self.m > 0:
-            r_g = data.G.rows_of_blocks
-            d_z_2d = d_z.reshape(B, N + 1, r_g)
+            rows_G = data.G.rows_of_blocks
+            d_z_2d = d_z.reshape(B, N + 1, rows_G)
             G_D = cp.from_dlpack(wp.to_dlpack(data.G.D))
             G_E = cp.from_dlpack(wp.to_dlpack(data.G.E))
             G_D *= d_x_2d[:, :, None, :]
@@ -133,7 +203,7 @@ class MultistageRuizEquilibration(RuizEquilibration):
         return cp.minimum(out, self.max_scaling)
 
     # ------------------------------------------------------------------
-    # Block-matrix primitives (batched)
+    # Block-matrix primitives (batched) — used by the cupy fallback path.
     # ------------------------------------------------------------------
 
     @staticmethod
