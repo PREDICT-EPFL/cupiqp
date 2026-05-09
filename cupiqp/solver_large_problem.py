@@ -14,7 +14,7 @@ tolerance.
 import cupy as cp
 import nvtx
 
-from .solver import Solver
+from .solver import SolverBase
 from .utils import cuda_graph_capture
 from .solver_kernels import (
     create_prepare_predictor_step_kernel,
@@ -23,7 +23,7 @@ from .solver_kernels import (
     create_boundary_shift_kernel,
 )
 
-class LargeProblemSolver(Solver):
+class LargeProblemSolver(SolverBase):
     """CuPy implementation of some kernels in ``Solver``.
 
     Avoids the warp tile kernel compile cliff for large problems by
