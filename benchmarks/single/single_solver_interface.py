@@ -21,6 +21,7 @@ Bundled solvers
           moreau-torch (moreau via PyTorch, cuDSS bundled)
 """
 
+import sys
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional, Union, ClassVar, List
@@ -230,8 +231,9 @@ def _stack_box_constraints(data: SingleQPData):
 try:
     import osqp
     _OSQP_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     _OSQP_AVAILABLE = False
+    print(f"[single_solver_interface] osqp unavailable: {e}", file=sys.stderr)
 
 
 class OsqpSolver(SingleQPSolver):
@@ -283,8 +285,9 @@ class OsqpSolver(SingleQPSolver):
 try:
     import piqp
     _PIQP_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     _PIQP_AVAILABLE = False
+    print(f"[single_solver_interface] piqp unavailable: {e}", file=sys.stderr)
 
 
 class PiqpSparseSolver(SingleQPSolver):
@@ -358,9 +361,10 @@ try:
     from qoco.interface import algebra_available as _qoco_algebra_available
     _QOCO_AVAILABLE = True
     _QOCO_GPU_AVAILABLE = _qoco_algebra_available('cuda')
-except ImportError:
+except ImportError as e:
     _QOCO_AVAILABLE = False
     _QOCO_GPU_AVAILABLE = False
+    print(f"[single_solver_interface] qoco unavailable: {e}", file=sys.stderr)
 
 
 class QocoSolver(SingleQPSolver):
@@ -475,17 +479,30 @@ class QocoSolver(SingleQPSolver):
 try:
     import cupy as cp
     from cupyx.scipy.sparse import csr_matrix as gpu_csr_matrix
-    from cupiqp import SolverBase as CupiqpSolverBase
-    from cupiqp import Status as CupiqpStatus
+    from cupiqp import (
+        SparseLargeProblemSolver,
+        DenseLargeProblemSolver,
+        Status as CupiqpStatus,
+    )
     _CUPIQP_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     _CUPIQP_AVAILABLE = False
+    print(f"[single_solver_interface] cupiqp unavailable: {e}", file=sys.stderr)
 
 
 class CupiqpSolverMixin(SingleQPSolver):
-    """Shared logic for cuPIQP backends. Subclasses set ``_kkt_solver``."""
+    """Shared logic for cuPIQP backends. Subclasses set ``_solver_cls``.
+
+    Uses the ``*LargeProblemSolver`` variants from
+    ``cupiqp.solver_large_problem``, which swap the warp tile-kernel inner
+    loop for cupy axis-1 reductions — appropriate when ``max(n, p, m)`` is
+    large enough that tile-kernel JIT compile time dominates first-solve
+    latency. Numerically equivalent to the regular ``DenseSolver`` /
+    ``SparseSolver`` classes.
+    """
     device: ClassVar[str] = 'gpu'
-    _kkt_solver: ClassVar[str]
+    _solver_cls: ClassVar[type]
+    _matrices_are_sparse: ClassVar[bool]
 
     def _prepare_data(self, data: SingleQPData) -> None:
         if not _CUPIQP_AVAILABLE:
@@ -494,7 +511,7 @@ class CupiqpSolverMixin(SingleQPSolver):
 
         kw: dict = {'c': cp.asarray(data.c, dtype=cp.float64)}
 
-        if self._kkt_solver == 'sparse_ldlt':
+        if self._matrices_are_sparse:
             kw['P'] = gpu_csr_matrix(sp.csr_matrix(data.P).astype(np.float64))
             if data.A is not None:
                 kw['A'] = gpu_csr_matrix(sp.csr_matrix(data.A).astype(np.float64))
@@ -506,7 +523,7 @@ class CupiqpSolverMixin(SingleQPSolver):
                 if data.h_u is not None:
                     kw['h_u'] = cp.asarray(data.h_u, dtype=cp.float64)
         else:
-            # dense_cholesky: feed dense cupy arrays
+            # dense_cholesky path: feed dense cupy arrays
             kw['P'] = cp.asarray(_maybe_dense(data.P), dtype=cp.float64)
             if data.A is not None:
                 kw['A'] = cp.asarray(_maybe_dense(data.A), dtype=cp.float64)
@@ -526,8 +543,9 @@ class CupiqpSolverMixin(SingleQPSolver):
         self._setup_kwargs = kw
 
     def setup(self) -> None:
-        self._solver = CupiqpSolverBase()
-        self._solver.settings.kkt_solver = self._kkt_solver
+        # ``kkt_solver`` is set in each concrete class's __init__; we don't
+        # touch it here.
+        self._solver = self._solver_cls()
         self._solver.settings.max_iter = self.max_iter
         self._solver.settings.eps_abs = self.tol_abs
         self._solver.settings.verbose = False
@@ -553,7 +571,8 @@ class CupiqpSolverMixin(SingleQPSolver):
 
 
 class CupiqpSparseSolver(CupiqpSolverMixin):
-    _kkt_solver: ClassVar[str] = 'sparse_ldlt'
+    _solver_cls = SparseLargeProblemSolver if _CUPIQP_AVAILABLE else None
+    _matrices_are_sparse = True
 
     @property
     def name(self) -> str:
@@ -561,7 +580,8 @@ class CupiqpSparseSolver(CupiqpSolverMixin):
 
 
 class CupiqpDenseSolver(CupiqpSolverMixin):
-    _kkt_solver: ClassVar[str] = 'dense_cholesky'
+    _solver_cls = DenseLargeProblemSolver if _CUPIQP_AVAILABLE else None
+    _matrices_are_sparse = False
 
     @property
     def name(self) -> str:
@@ -581,8 +601,9 @@ class CupiqpDenseSolver(CupiqpSolverMixin):
 try:
     import juliacall  # noqa: F401  (only checking the bridge is importable)
     _CUCLARABEL_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     _CUCLARABEL_AVAILABLE = False
+    print(f"[single_solver_interface] cuclarabel unavailable: {e}", file=sys.stderr)
 
 
 class CuClarabelSolver(SingleQPSolver):
@@ -779,8 +800,9 @@ try:
         SolverSettings as _CuoptSettings,
     )
     _CUOPT_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     _CUOPT_AVAILABLE = False
+    print(f"[single_solver_interface] cuopt unavailable: {e}", file=sys.stderr)
 
 
 class CuoptSolver(SingleQPSolver):
@@ -922,8 +944,9 @@ try:
     import moreau as _moreau
     from moreau.torch import Solver as _MoreauTorchSolver
     _MOREAU_TORCH_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     _MOREAU_TORCH_AVAILABLE = False
+    print(f"[single_solver_interface] moreau-torch unavailable: {e}", file=sys.stderr)
 
 
 class MoreauTorchSolver(SingleQPSolver):
