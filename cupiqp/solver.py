@@ -37,8 +37,7 @@ class SolverBase(ABC):
     """Abstract base for the cuPIQP solver."""
 
     def __init__(self):
-
-        self.settings = Settings()
+        self._settings = Settings()
         self._data: Data = None
         self._result = Result()    # store the values of primal, dual and slack variables of current iteration, and other information
         self._step = Variables()   # used to store the step direction of primal and dual variables
@@ -47,6 +46,14 @@ class SolverBase(ABC):
         self._prox_vars = Variables()  # used to store the proximal variables
         self._kkt_system = KKTSystem()
         self._preconditioner = None
+
+    @property
+    def settings(self) -> Settings:
+        return self._settings
+
+    @settings.setter
+    def settings(self, value: Settings) -> None:
+        self._settings = value
 
     @property
     def result(self):

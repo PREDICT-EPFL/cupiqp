@@ -1,3 +1,4 @@
+from ..settings import Settings
 from ..solver import SolverBase
 from ..utils import is_cuda_array
 from .sparse_data import SparseData
@@ -123,7 +124,14 @@ class SparseSolver(SolverBase):
 
     def __init__(self):
         super().__init__()
-        self.settings.kkt_solver = "sparse_ldlt"
+        self._settings.kkt_solver = "sparse_ldlt"
+
+    @SolverBase.settings.setter
+    def settings(self, value: Settings) -> None:
+        # TODO: here we have to set the kkt solver back. That's pretty ugly. Should be improved in the future
+        value.kkt_solver = "sparse_ldlt"
+        self._settings = value
+
 
     def _init_data(self, P, c, A, b, G, h_u, h_l, x_u, x_l):
         # Matrices: CSR-style sparse. Vectors: GPU dense (always).

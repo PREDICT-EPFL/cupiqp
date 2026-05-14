@@ -1,3 +1,4 @@
+from ..settings import Settings
 from ..solver import SolverBase
 from .multistage_data import MultistageData
 from .multistage_preconditioner import MultistageRuizEquilibration
@@ -90,7 +91,14 @@ class MultistageSolver(SolverBase):
 
     def __init__(self):
         super().__init__()
-        self.settings.kkt_solver = "multistage_block_cholesky"
+        self._settings.kkt_solver = "multistage_block_cholesky"
+
+    @SolverBase.settings.setter
+    def settings(self, value: Settings) -> None:
+        # TODO: here we have to set the kkt solver back. That's pretty ugly. Should be improved in the future
+        value.kkt_solver = "multistage_block_cholesky"
+        self._settings = value
+
 
     def _init_data(self, P, c, A, b, G, h_u, h_l, x_u, x_l):
         # Multistage uses block-structured storage end-to-end:

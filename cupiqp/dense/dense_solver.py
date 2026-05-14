@@ -1,3 +1,4 @@
+from ..settings import Settings
 from ..solver import SolverBase
 from ..utils import is_cuda_array
 from .dense_data import DenseData
@@ -58,7 +59,14 @@ class DenseSolver(SolverBase):
 
     def __init__(self):
         super().__init__()
-        self.settings.kkt_solver = "dense_cholesky"
+        self._settings.kkt_solver = "dense_cholesky"
+
+    @SolverBase.settings.setter
+    def settings(self, value: Settings) -> None:
+        # TODO: here we have to set the kkt solver back. That's pretty ugly. Should be improved in the future
+        value.kkt_solver = "dense_cholesky"
+        self._settings = value
+
 
     def _init_data(self, P, c, A, b, G, h_u, h_l, x_u, x_l):
         # Every non-None input must be a GPU dense array — matrices and

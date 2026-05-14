@@ -68,7 +68,6 @@ class KKTSystem:
 
     def init(self, data: Data, settings: Settings):
         self._settings = settings
-        self._backend = settings.kkt_solver
         self._use_iterative_refinement = False
         self._batch_size = data.batch_size
         B = self._batch_size
