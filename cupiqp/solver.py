@@ -252,7 +252,25 @@ class SolverBase(ABC):
         self._result.info.delta[:] = self.settings.delta_init
 
         if self.settings.verbose:
-            print("iter  prim_obj       dual_obj       duality_gap   prim_res      dual_res      rho         delta       mu          p_step   d_step")
+            if self._data.batch_size == 1:
+                print("iter  prim_obj       dual_obj       duality_gap   prim_res      dual_res      rho         delta       mu          p_step   d_step")
+            else:
+                # Match the column widths used in ``_print_iteration_info``
+                # so header + data right-align to the same edge.
+                B = self._data.batch_size
+                counter_w = max(2 * len(str(B)) + 1, len("solved"))
+                print(
+                    f"{'iter':>4}  "
+                    f"{'solved':>{counter_w}}  "
+                    f"{'gap_max':>12}  "
+                    f"{'p_res_max':>12}  "
+                    f"{'d_res_max':>12}  "
+                    f"{'rho_max':>10}  "
+                    f"{'delta_max':>10}  "
+                    f"{'mu_max':>10}  "
+                    f"{'p_step':>6}  "
+                    f"{'d_step':>6}"
+                )
 
         ## ----------- initial iteration --------------
         self._initial_guess()
@@ -308,10 +326,13 @@ class SolverBase(ABC):
                 )
                 self._result.info._status_value[still_unsolved & ~converged & ~primal_infeasible & dual_infeasible] = Status.PIQP_DUAL_INFEASIBLE.value  # CPU write
 
+                if self.settings.verbose:
+                    self._print_iteration_info()
+
                 # exit if all problems have terminated
                 if np.all(self._result.info._status_value != Status.PIQP_UNSOLVED.value):
                     break
-                
+
                 # avoid getting too close to boundary which can result in a division by zero
                 if self._data.num_ineq > 0:
                     wp.launch(
@@ -343,9 +364,6 @@ class SolverBase(ABC):
                     finetune_mask_dev = cp.asarray(finetune_mask)
                     self._result.info.no_primal_update[finetune_mask_dev] = 0
                     self._result.info.no_dual_update[finetune_mask_dev] = 0
-
-                if self.settings.verbose:
-                    self._print_iteration_info()
 
                 self._update_and_factorize_kkt()
                 if np.any(self._result.info._status_value == Status.PIQP_NUMERICAL_ISSUES.value):
@@ -442,20 +460,42 @@ class SolverBase(ABC):
     @nvtx.annotate("Solver::_print_iteration_info")
     def _print_iteration_info(self):
         """Print iteration verbose info."""
-        print(
-            f"{self._result.info.iter[0]:3d}   "
-            f"{float(self._result.info.primal_obj[0]): .5e}   "
-            f"{float(self._result.info.dual_obj[0]): .5e}  "
-            f"{float(self._result.info.duality_gap[0]): .5e}  "
-            f"{float(self._result.info.primal_res[0]): .5e}  "
-            f"{float(self._result.info.dual_res[0]): .5e}  "
-            f"{float(self._result.info.rho[0]): .3e}  "
-            f"{float(self._result.info.delta[0]): .3e}  "
-            f"{float(self._result.info.mu[0]): .3e}  "
-            f"{float(self._result.info.primal_step[0]): .4f}  "
-            f"{float(self._result.info.dual_step[0]): .4f}",
-            flush=True
-        )
+        info_host = self._info_host
+        B = self._data.batch_size
+
+        if B == 1:
+            print(
+                f"{self._result.info.iter[0]:3d}   "
+                f"{info_host.primal_obj[0]: .5e}   "
+                f"{info_host.dual_obj[0]: .5e}  "
+                f"{info_host.duality_gap[0]: .5e}  "
+                f"{info_host.primal_res[0]: .5e}  "
+                f"{info_host.dual_res[0]: .5e}  "
+                f"{info_host.rho[0]: .3e}  "
+                f"{info_host.delta[0]: .3e}  "
+                f"{info_host.mu[0]: .3e}  "
+                f"{info_host.primal_step[0]: .4f}  "
+                f"{info_host.dual_step[0]: .4f}",
+                flush=True,
+            )
+        
+        else:
+            solved  = B - int((self._result.info._status_value == Status.PIQP_UNSOLVED.value).sum())
+            counter = f"{solved}/{B}"
+            counter_w = max(2 * len(str(B)) + 1, len("solved"))
+            print(
+                f"{self._result.info.iter[0]:>4d}  "
+                f"{counter:>{counter_w}}  "
+                f"{info_host.duality_gap.max():>12.5e}  "
+                f"{info_host.primal_res.max():>12.5e}  "
+                f"{info_host.dual_res.max():>12.5e}  "
+                f"{info_host.rho.max():>10.3e}  "
+                f"{info_host.delta.max():>10.3e}  "
+                f"{info_host.mu.max():>10.3e}  "
+                f"{info_host.primal_step.min():>6.4f}  "
+                f"{info_host.dual_step.min():>6.4f}",
+                flush=True,
+            )
 
     @nvtx.annotate("Solver::_update_and_factorize_kkt")
     def _update_and_factorize_kkt(self) -> None:
