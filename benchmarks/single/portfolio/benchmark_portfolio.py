@@ -1,33 +1,34 @@
-"""Benchmark Huber-fitting QP across the unified single-QP solver interface.
+"""Benchmark Portfolio-optimization QP across the unified single-QP solver
+interface.
 
-Robust least-squares with Huber loss, following the OSQP example:
-https://osqp.org/docs/examples/huber.html
+Mean-variance portfolio optimization with a low-rank-plus-diagonal risk
+model. Decision variable ``z = [x; y]`` (x = portfolio weights, y =
+factor exposures), with ``Sigma = F F^T + D``. Introducing the auxiliary
+``y = F^T x`` turns the original problem into the standard QP
 
-Original problem (n features, m observations):
+    min   x^T D x + y^T y - 1/(2 gamma) mu^T x
+    s.t.  F^T x - y = 0           (k equalities)
+          1^T x = 1                (1 equality)
+          0 <= x <= 1              (n box bounds)
 
-    min   sum_i phi_hub( a_i^T x - b_i )
+Settings match **ClarabelBenchmarks'**
+``src/problem_sets/qp/portfolio_optimization.jl``
+(https://github.com/oxfordcontrol/ClarabelBenchmarks): ``F`` density
+0.3, ``k = ceil(0.1 n)``, per-n seed ``271324 + n``, the un-halved
+objective above (so the standard-form Hessian is
+``P = 2 * blockdiag(D, I_k)``).
 
-    phi_hub(u) = u^2,       if |u| <= 1
-                 2|u| - 1,  if |u| > 1
-
-Equivalent QP with auxiliary variables u (residual), r, s (split positive
-and negative tail) — decision z = [x; u; r; s], total dimension N = n + 3m:
-
-    min   u^T u + 2 1^T (r + s)
-    s.t.  A x - u - r + s = b           (m equalities)
-          r >= 0,  s >= 0                (bounds on the last 2m vars)
-
-The script sweeps over (n, m) and runs every solver registered in
-``benchmarks/single/single_solver_interface.py``. Use ``--device`` to pick
-{cpu, gpu, all}. Solvers whose dependencies aren't importable are skipped
-silently via ``available_solvers``.
+The script sweeps over (n, k = round(k_n_ratio * n)) and runs every
+solver registered in
+``benchmarks/single/single_solver_interface.py``. Use ``--device`` to
+pick {cpu, gpu, all}. Solvers whose dependencies aren't importable are
+skipped silently via ``available_solvers``.
 
 Usage:
-    python benchmark_huber.py
-    python benchmark_huber.py --device cpu
-    python benchmark_huber.py --device gpu --m 5000 10000 50000
-    python benchmark_huber.py --device all --m_n_ratio 5 20
-    python benchmark_huber.py --solvers cupiqp-sparse cuclarabel
+    python benchmark_portfolio.py
+    python benchmark_portfolio.py --device cpu
+    python benchmark_portfolio.py --device gpu --n 1000 2000 5000
+    python benchmark_portfolio.py --solvers cupiqp-sparse cuclarabel
 """
 
 import sys
@@ -56,7 +57,7 @@ from benchmarks.single.single_solver_interface import (
 # Running cupiqp + cuopt (cuDF / RMM underneath) + cuclarabel + ... in one
 # process eventually corrupts CUDA state and trips an illegal-memory
 # access in whichever solver is next to allocate (typically symptomatic
-# only at sufficient problem size). To dodge that, each (m, n, solver)
+# only at sufficient problem size). To dodge that, each (n, k, solver)
 # cell is run in its own short-lived Python subprocess that exits before
 # the next one starts. Pass ``--inproc`` to opt out of the wrapper.
 
@@ -65,82 +66,88 @@ from benchmarks.single.single_solver_interface import (
 # Problem generation
 # ---------------------------------------------------------------------------
 
-def generate_huber_problem(m, n, seed=0, density=0.125,
-                           outlier_frac=0.05) -> SingleQPData:
-    """Build the Huber fitting QP for random regression data.
+def generate_portfolio_problem(n, k, seed=271324, density=0.3,
+                               gamma=1.0) -> SingleQPData:
+    """Build the portfolio-optimization QP for random factor-model data.
 
-    Generation matches ClarabelBenchmarks' ``huber_fitting.jl``
+    Generation matches ClarabelBenchmarks'
+    ``portfolio_optimization.jl``
     (https://github.com/oxfordcontrol/ClarabelBenchmarks) so that the
-    *problem instance* is comparable across the two test harnesses:
+    problem instance is comparable across the two test harnesses:
 
-      * sparse-normal regression matrix ``A`` of density 0.125;
-      * ground-truth coefficients ``x_true = randn(n) / sqrt(n)``;
-      * inlier noise (95% of rows) ``0.5 * randn``;
-      * outlier noise (5% of rows)  ``10  * rand`` (uniform, positive).
+      * ``F``: ``sprandn(n, k, density=0.3)`` factor loadings (standard
+        normal nonzeros, Bernoulli sparsity);
+      * ``D``: ``Diagonal(rand(n) * sqrt(k))`` asset-specific risk;
+      * ``mu``: ``randn(n)`` expected returns;
+      * ``gamma``: risk-aversion scalar (default 1);
+      * **objective**: ``x^T D x + y^T y - 1/(2 gamma) mu^T x`` — note
+        the missing ``1/2`` factor on the quadratic terms compared to
+        the OSQP-docs example, so the standard-form Hessian is
+        ``P = 2 * blockdiag(D, I_k)``;
+      * **per-size seed**: ``rng = MersenneTwister(271324 + n)``. We
+        mirror this by seeding numpy's RNG with ``seed + n`` so that the
+        problem instance scales reproducibly with n.
 
     Parameters
     ----------
-    m : int
-        Number of residuals (observations).
     n : int
-        Number of features.
+        Number of assets.
+    k : int
+        Number of factors (rank of the factor-model decomposition).
     seed : int
-        RNG seed.
+        RNG seed *base*; the actual seed is ``seed + n`` so that each
+        problem size gets a fresh instance, matching
+        ClarabelBenchmarks' ``MersenneTwister(271324 + n)`` convention.
     density : float
-        Density of the regression matrix A. ClarabelBenchmarks uses 0.125.
-    outlier_frac : float
-        Fraction of observations corrupted by heavy-tailed noise.
-        ClarabelBenchmarks uses 0.05.
+        Density of the factor-loading matrix F. ClarabelBenchmarks
+        default 0.3.
+    gamma : float
+        Risk-aversion parameter (>0).
 
     Returns
     -------
-    SingleQPData with sparse P, A and dense c, b, x_l, x_u. Variable layout
-    is z = [x (n); u (m); r (m); s (m)], total N = n + 3m.
+    SingleQPData with sparse P (block-diag) and sparse A. Variable layout
+    is z = [x (n); y (k)], total N = n + k.
     """
-    rng = np.random.default_rng(seed)
+    # Per-n seed (mirrors ClarabelBenchmarks' ``MersenneTwister(271324 + n)``).
+    rng = np.random.default_rng(seed + n)
 
-    # Regression matrix A: sprandn(m, n, 0.125) — standard-normal nnz
-    # values on a Bernoulli sparsity pattern.
-    A_data = sp.random(m, n, density=density, format='csr',
-                       random_state=rng,
-                       data_rvs=rng.standard_normal).astype(np.float64)
+    # F: n x k Bernoulli-sparse matrix with standard-normal nonzeros,
+    # matching ``sprandn(rng, n, k, density)`` in ClarabelBenchmarks.
+    F = sp.random(n, k, density=density, format='csc',
+                  random_state=rng,
+                  data_rvs=rng.standard_normal).astype(np.float64)
 
-    # x_true = randn(n) / sqrt(n)  (dense gaussian, scaled by 1/sqrt(n)).
-    x_true = rng.standard_normal(n) / np.sqrt(n)
+    # D: diag(rand(n) * sqrt(k))   — asset-specific risk.
+    d_diag = rng.random(n) * np.sqrt(k)
+    D = sp.diags(d_diag, format='csc')
 
-    # Noise: 95% rows N(0, 0.25), 5% rows U[0, 10].
-    inlier_mask = rng.random(m) >= outlier_frac      # 1 - outlier_frac inliers
-    noise = np.where(
-        inlier_mask,
-        0.5 * rng.standard_normal(m),
-        10.0 * rng.random(m),
-    )
-    b = A_data @ x_true + noise
+    mu = rng.standard_normal(n)
 
-    N = n + 3 * m
+    N = n + k
 
-    # P = blkdiag(0_n, 2 I_m, 0_m, 0_m) — factor 2 because objective is
-    # 0.5 z^T P z and we want u^T u term.
-    P_diag = np.zeros(N)
-    P_diag[n:n + m] = 2.0
-    P = sp.diags(P_diag, format='csr')
+    # Standard-form Hessian P. ClarabelBenchmarks writes the objective
+    # without the conventional 1/2 factor (``x'Dx + y'y``), so in
+    # ``min 0.5 z^T P z + c^T z`` form we need ``P = 2 * blockdiag(D, I_k)``.
+    P = 2.0 * sp.block_diag([D, sp.eye(k, format='csc')], format='csc')
 
-    # c = [0_n; 0_m; 2*1_m; 2*1_m]
-    c = np.zeros(N)
-    c[n + m:] = 2.0
+    # c = [-mu / (2 gamma); zeros(k)].
+    c = np.hstack([-mu / (2.0 * gamma), np.zeros(k)])
 
-    # A_eq = [A | -I_m | -I_m | +I_m]   (m x N)
-    eye_m = sp.eye(m, format='csr')
-    A_eq = sp.hstack([A_data, -eye_m, -eye_m, eye_m], format='csr')
+    # Equality A: [[F^T, -I_k];
+    #              [1^T,  0  ]]   shape (k+1, n+k).
+    A_eq = sp.bmat([[F.T,                          -sp.eye(k, format='csc')],
+                    [sp.csc_matrix(np.ones((1, n))), None]],
+                   format='csc')
+    b_eq = np.hstack([np.zeros(k), 1.0])
 
-    # Bounds: r, s >= 0; x and u unbounded
-    x_l = np.full(N, -np.inf)
-    x_u = np.full(N, +np.inf)
-    x_l[n + m:] = 0.0
+    # Box bounds: x in [0, 1], y unbounded.
+    x_l = np.hstack([np.zeros(n),       np.full(k, -np.inf)])
+    x_u = np.hstack([np.ones(n),        np.full(k, +np.inf)])
 
     return SingleQPData(
         P=P, c=c,
-        A=A_eq, b=b,
+        A=A_eq, b=b_eq,
         x_l=x_l, x_u=x_u,
     )
 
@@ -149,8 +156,8 @@ def generate_huber_problem(m, n, seed=0, density=0.125,
 # Per-cell runner (in-process and subprocess flavours)
 # ---------------------------------------------------------------------------
 
-def _run_one_cell_inproc(m, n, solver_name, args) -> dict:
-    """Generate the (m, n) problem, run ``solver_name``, return a result dict.
+def _run_one_cell_inproc(n, k, solver_name, args) -> dict:
+    """Generate the (n, k) problem, run ``solver_name``, return a result dict.
 
     Called from both the in-process path (``--inproc``) and the subprocess
     worker path (``--worker``). Only one solver is invoked per call, so
@@ -161,14 +168,14 @@ def _run_one_cell_inproc(m, n, solver_name, args) -> dict:
     if cls is None:
         raise KeyError(f"unknown solver: {solver_name!r}")
 
-    data = generate_huber_problem(
-        m=m, n=n, seed=args.seed,
+    data = generate_portfolio_problem(
+        n=n, k=k, seed=args.seed,
         density=args.density,
-        outlier_frac=args.outlier_frac,
+        gamma=args.gamma,
     )
 
     common = dict(
-        m=m, n=n, m_n_ratio=args.current_ratio, N=data.n + 3 * m,
+        n=n, k=k, k_n_ratio=args.current_ratio, N=n + k,
         nnz_P=int(data.P.nnz), nnz_A=int(data.A.nnz),
         solver_name=solver_name, device=cls.device,
     )
@@ -198,39 +205,45 @@ def _run_one_cell_inproc(m, n, solver_name, args) -> dict:
 
 def _run_solver_subprocess(solver_name: str, cells, args) -> list:
     """Spawn ONE ``--worker`` subprocess that runs ``solver_name`` on every
-    ``(m, n, ratio)`` cell in ``cells``. Mirror of the maros / portfolio
-    pattern: amortises one-time per-solver costs (cuClarabel's ~18-27 s
-    Julia JIT, cuPIQP's warp tile-kernel compile) across the whole sweep.
+    ``(n, k, ratio)`` cell in ``cells``.
+
+    Sharing a single Python process across cells amortises one-time
+    per-solver costs — particularly cuClarabel's ~18-27 s Julia JIT —
+    over the whole sweep instead of paying them once per cell. Subprocess
+    isolation is still applied BETWEEN solvers so cuPIQP / cuClarabel /
+    cuOpt / qoco-gpu don't corrupt each other's CUDA state.
+
+    The worker writes its results JSON incrementally, so a crash partway
+    through the cell list still recovers what was already finished.
     """
     with tempfile.NamedTemporaryFile(
             mode='w', suffix='.json', delete=False) as f:
-        f.write('[]')
+        f.write('[]')  # valid JSON for an early-crash read
         out_path = f.name
 
-    ms     = [str(c[0]) for c in cells]
-    ns     = [str(c[1]) for c in cells]
-    ratios = [str(c[2]) for c in cells]
+    ns      = [str(c[0]) for c in cells]
+    ks      = [str(c[1]) for c in cells]
+    ratios  = [str(c[2]) for c in cells]
 
     cmd = [
         sys.executable, os.path.abspath(__file__),
         '--worker',
         '--worker_out', out_path,
         '--worker_solver', solver_name,
-        '--worker_m_vals', *ms,
         '--worker_n_vals', *ns,
+        '--worker_k_vals', *ks,
         '--worker_ratios', *ratios,
         '--n_runs', str(args.n_runs),
         '--max_iter', str(args.max_iter),
         '--tol_abs', str(args.tol_abs),
         '--seed', str(args.seed),
         '--density', str(args.density),
-        '--outlier_frac', str(args.outlier_frac),
-        '--cell_timeout', str(args.cell_timeout),
+        '--gamma', str(args.gamma),
     ]
     device = {c().name: c.device for c in ALL_SOLVERS}.get(solver_name, '?')
 
-    def _failed_row(m, n, ratio, reason):
-        return dict(m=m, n=n, m_n_ratio=ratio, N=n + 3 * m,
+    def _failed_row(n, k, ratio, reason):
+        return dict(n=n, k=k, k_n_ratio=ratio, N=n + k,
                     solver_name=solver_name, device=device,
                     finite=False,
                     mean_ms=float('nan'), std_ms=float('nan'),
@@ -245,12 +258,12 @@ def _run_solver_subprocess(solver_name: str, cells, args) -> list:
         with open(out_path) as f:
             results = json.load(f)
         if proc.returncode != 0:
-            done = {(r['m'], r['n']) for r in results}
+            done = {(r['n'], r['k']) for r in results}
             tail_err = (proc.stderr or '')[-300:]
-            for (m, n, ratio) in cells:
-                if (m, n) not in done:
+            for (n, k, ratio) in cells:
+                if (n, k) not in done:
                     results.append(_failed_row(
-                        m, n, ratio,
+                        n, k, ratio,
                         f"FAILED: subprocess rc={proc.returncode} "
                         f"stderr={tail_err!r}"))
         return results
@@ -260,11 +273,11 @@ def _run_solver_subprocess(solver_name: str, cells, args) -> list:
                 results = json.load(f)
         except (OSError, json.JSONDecodeError):
             results = []
-        done = {(r['m'], r['n']) for r in results}
-        for (m, n, ratio) in cells:
-            if (m, n) not in done:
+        done = {(r['n'], r['k']) for r in results}
+        for (n, k, ratio) in cells:
+            if (n, k) not in done:
                 results.append(_failed_row(
-                    m, n, ratio,
+                    n, k, ratio,
                     f"FAILED: subprocess timeout ({total_timeout:.0f}s)"))
         return results
     finally:
@@ -299,18 +312,12 @@ def _solver_classes_for(device: str, names_filter):
 
 
 # ---------------------------------------------------------------------------
-# Plotting lives in the companion ``plot_results.py`` so the benchmark and
-# the plot can be re-run independently from the same JSON.
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Benchmark Huber fitting QP across CPU/GPU solvers.')
+        description='Benchmark portfolio-optimization QP across CPU/GPU solvers.')
     parser.add_argument('--device', choices=['cpu', 'gpu', 'all'],
                         default='all',
                         help='Restrict to CPU solvers, GPU solvers, or both.')
@@ -319,35 +326,36 @@ def main():
                              '(e.g. cupiqp-sparse osqp). '
                              'Filters within --device selection.')
     parser.add_argument('--n', type=int, nargs='+',
-                        # default=[*range(500, 25_00+1, 500)],
-                        # default=[*range(5000, 25_000+1, 5000)],
-                        default=[*range(500, 25_00+1, 500), *range(5000, 25_000+1, 5000)],
-                        help='Sweep over number of features n.')
-    parser.add_argument('--m_n_ratio', type=float, nargs='+',
-                        default=[1.5],
-                        help='Observation/feature ratios m/n to test '
-                             '(default 1.5 -> m = round(1.5 n), matching '
-                             'ClarabelBenchmarks).')
-    parser.add_argument('--density', type=float, default=0.125,
-                        help='Density of the regression matrix A. '
-                             'ClarabelBenchmarks default is 0.125.')
-    parser.add_argument('--outlier_frac', type=float, default=0.05,
-                        help='Fraction of observations corrupted by '
-                             'heavy-tailed noise. ClarabelBenchmarks uses 0.05.')
-    parser.add_argument('--seed', type=int, default=0)
+                        default=[100, 1000, 5000, 10000, 15000,
+                                 20000, 25000, 30000],
+                        help='Sweep over number of assets n. Default '
+                             'matches ClarabelBenchmarks.')
+    parser.add_argument('--k_n_ratio', type=float, nargs='+',
+                        default=[0.1],
+                        help='Factor/asset ratios k/n to test '
+                             '(default 0.1 -> k = ceil(0.1 n))')
+    parser.add_argument('--density', type=float, default=0.3,
+                        help='Density of the factor-loading matrix F. '
+                             'ClarabelBenchmarks default is 0.3.')
+    parser.add_argument('--gamma', type=float, default=1.0,
+                        help='Risk-aversion parameter (default 1).')
+    parser.add_argument('--seed', type=int, default=271324,
+                        help='RNG seed base; the actual numpy seed is '
+                             '``seed + n``, matching ClarabelBenchmarks '
+                             '``MersenneTwister(271324 + n)``.')
     parser.add_argument('--n_runs', type=int, default=5,
                         help='Timed solves per configuration (excl. warmup).')
     parser.add_argument('--max_iter', type=int, default=200)
     parser.add_argument('--tol_abs', type=float, default=1e-6)
     parser.add_argument('--out_json', type=str, default=None,
-                        help='JSON output path (default: ./benchmark_huber.json).')
+                        help='JSON output path (default: ./benchmark_portfolio.json).')
     parser.add_argument('--out_log', type=str, default=None,
                         help='Mirror stdout to this file '
-                             '(default: ./benchmark_huber.log; pass empty '
+                             '(default: ./benchmark_portfolio.log; pass empty '
                              'string to disable).')
     parser.add_argument('--merge', action='store_true',
                         help='Merge results into --out_json instead of '
-                             'overwriting. Existing (m, n, solver_name) '
+                             'overwriting. Existing (n, k, solver_name) '
                              'entries are replaced; the rest are kept.')
 
     # Isolation knobs.
@@ -376,24 +384,32 @@ def main():
                         help=argparse.SUPPRESS)
     parser.add_argument('--worker_solver', type=str, default=None,
                         help=argparse.SUPPRESS)
-    parser.add_argument('--worker_m_vals', type=int, nargs='+', default=None,
-                        help=argparse.SUPPRESS)
     parser.add_argument('--worker_n_vals', type=int, nargs='+', default=None,
+                        help=argparse.SUPPRESS)
+    parser.add_argument('--worker_k_vals', type=int, nargs='+', default=None,
                         help=argparse.SUPPRESS)
     parser.add_argument('--worker_ratios', type=float, nargs='+',
                         default=None, help=argparse.SUPPRESS)
 
     args = parser.parse_args()
 
-    # Worker mode: run ``worker_solver`` on every (m, n, ratio) cell from
-    # the parallel ``worker_m_vals / worker_n_vals / worker_ratios`` lists.
-    # Per-cell timeout uses SIGALRM (NOT a thread); the daemon-thread
-    # variant turned out to break cuPIQP, see comments in
-    # ``benchmark_portfolio.py``. SIGALRM keeps everything in the main
-    # thread at the cost of not preempting C-extension code.
+    # Worker mode: run ``worker_solver`` on every (n, k, ratio) cell in
+    # the parallel ``worker_n_vals / worker_k_vals / worker_ratios`` lists.
+    # Results are written incrementally so a crash mid-sweep still
+    # recovers what was already finished.
+    #
+    # Per-cell timeout is implemented with SIGALRM (NOT a separate
+    # thread). A daemon-thread wrapper turned out to break cuPIQP: the
+    # CUDA context gets thread-bound on the first cell and subsequent
+    # cells in a new thread see corrupted state (immediate
+    # ``PIQP_NUMERICAL_ISSUES`` at iter=0). SIGALRM keeps everything in
+    # the main thread; the trade-off is that it cannot interrupt code
+    # currently inside a C extension (cuDSS factor, juliacall, ...),
+    # but in practice those operations finish reasonably quickly and
+    # the alarm fires as soon as control returns to Python.
     if args.worker:
         import signal
-        cells = list(zip(args.worker_m_vals, args.worker_n_vals, args.worker_ratios))
+        cells = list(zip(args.worker_n_vals, args.worker_k_vals, args.worker_ratios))
         accumulated: list = []
 
         class _CellTimeout(Exception):
@@ -403,15 +419,15 @@ def main():
             raise _CellTimeout
 
         signal.signal(signal.SIGALRM, _alarm_handler)
-        for m, n, ratio in cells:
+        for n, k, ratio in cells:
             args.current_ratio = ratio
             signal.alarm(int(args.cell_timeout))
             try:
-                row = _run_one_cell_inproc(m, n, args.worker_solver, args)
+                row = _run_one_cell_inproc(n, k, args.worker_solver, args)
             except _CellTimeout:
                 device = ({c().name: c.device for c in ALL_SOLVERS}
                           .get(args.worker_solver, '?'))
-                row = dict(m=m, n=n, m_n_ratio=ratio, N=n + 3 * m,
+                row = dict(n=n, k=k, k_n_ratio=ratio, N=n + k,
                            solver_name=args.worker_solver, device=device,
                            finite=False,
                            mean_ms=float('nan'), std_ms=float('nan'),
@@ -431,7 +447,7 @@ def main():
     # on disk alongside the JSON/PNG. Pass --out_log "" to disable.
     log_path = (
         args.out_log if args.out_log is not None
-        else os.path.join(current_dir, 'benchmark_huber.log')
+        else os.path.join(current_dir, 'benchmark_portfolio.log')
     )
     log_fh = open(log_path, 'w', buffering=1) if log_path else None
     if log_fh is not None:
@@ -457,13 +473,14 @@ def main():
           f"{[cls().name for cls in solver_classes]}")
     print()
 
-    # Build the full (m, n, ratio) cell list upfront so per-solver
+    # Build the full (n, k, ratio) cell list upfront so per-solver
     # subprocesses can iterate it.
+    import math
     cells = []
-    for ratio in args.m_n_ratio:
+    for ratio in args.k_n_ratio:
         for n in args.n:
-            m = max(1, int(round(n * ratio)))
-            cells.append((m, n, ratio))
+            k = max(1, math.ceil(n * ratio))
+            cells.append((n, k, ratio))
 
     results = []
     print(f"Isolation: "
@@ -471,7 +488,7 @@ def main():
           f"(cell timeout: {args.cell_timeout:.0f}s)\n")
 
     def _print_row(name: str, r: dict) -> None:
-        head = f"  [m={r['m']:>6} n={r['n']:>5}] {name:>15}  [{r['device']}]"
+        head = f"  [n={r['n']:>6} k={r['k']:>5}] {name:>15}  [{r['device']}]"
         if r.get('finite'):
             print(f"{head}  {r['mean_ms']:8.2f} ± {r['std_ms']:.2f} ms  "
                   f"setup={r['setup_ms']:7.2f} ms  "
@@ -482,24 +499,28 @@ def main():
             print(f"{head}  {r['status']}")
 
     if args.inproc:
-        for (m, n, ratio) in cells:
+        # Parent-process path: iterate cells then solvers, like before.
+        for (n, k, ratio) in cells:
             args.current_ratio = ratio
-            print(f"{'=' * 70}\nHuber fit:  m={m}  n={n}  "
-                  f"(N = n + 3m = {n + 3 * m})\n{'=' * 70}")
+            print(f"{'=' * 70}\nPortfolio:  n={n}  k={k}  "
+                  f"(N = n + k = {n + k})\n{'=' * 70}")
             for cls in solver_classes:
                 name = cls().name
-                r = _run_one_cell_inproc(m, n, name, args)
+                r = _run_one_cell_inproc(n, k, name, args)
                 _print_row(name, r)
                 results.append(r)
     else:
-        # Per-solver subprocess (JIT amortised across cells).
+        # Per-solver subprocess: outer = solver. JIT-heavy backends
+        # (cuClarabel's Julia startup, cuPIQP's warp tile-kernel compile)
+        # pay their one-time cost once per solver instead of once per
+        # cell. Per-cell timeout still applies inside the worker.
         for cls in solver_classes:
             name = cls().name
             print(f"{'=' * 70}\nSolver: {name}\n{'=' * 70}")
             solver_results = _run_solver_subprocess(name, cells, args)
-            order = {(m, n): i for i, (m, n, _) in enumerate(cells)}
+            order = {(n, k): i for i, (n, k, _) in enumerate(cells)}
             solver_results.sort(
-                key=lambda r: order.get((r.get('m'), r.get('n')),
+                key=lambda r: order.get((r.get('n'), r.get('k')),
                                         len(order)))
             for r in solver_results:
                 _print_row(name, r)
@@ -509,7 +530,7 @@ def main():
     print(f"\n{'=' * 100}")
     print(f"Summary (mean ± std over {args.n_runs} runs)")
     print('=' * 100)
-    print(f"{'m':>7} {'n':>6} {'solver':>16} {'dev':>4}  "
+    print(f"{'n':>6} {'k':>5} {'N':>7} {'solver':>16} {'dev':>4}  "
           f"{'mean ± std (ms)':>20} {'iter':>5}  {'obj':>13}")
     print('-' * 100)
     for r in results:
@@ -519,21 +540,22 @@ def main():
         else:
             t_str = 'FAILED'
             obj_str = 'N/A'
-        print(f"{r['m']:>7d} {r['n']:>6d} {r['solver_name']:>16} "
-              f"{r['device']:>4}  {t_str:>20} {r['iters']:>5d}  {obj_str:>13}")
+        print(f"{r['n']:>6d} {r['k']:>5d} {r['N']:>7d} "
+              f"{r['solver_name']:>16} {r['device']:>4}  "
+              f"{t_str:>20} {r['iters']:>5d}  {obj_str:>13}")
 
     # ---- Save JSON ----
-    json_path = args.out_json or os.path.join(current_dir, 'benchmark_huber.json')
+    json_path = args.out_json or os.path.join(current_dir, 'benchmark_portfolio.json')
     os.makedirs(os.path.dirname(json_path) or '.', exist_ok=True)
 
     if args.merge and os.path.exists(json_path):
         with open(json_path) as f:
             existing = json.load(f)
-        new_keys = {(r['m'], r['n'], r['solver_name']) for r in results}
+        new_keys = {(r['n'], r['k'], r['solver_name']) for r in results}
         kept = [r for r in existing
-                if (r['m'], r['n'], r['solver_name']) not in new_keys]
+                if (r['n'], r['k'], r['solver_name']) not in new_keys]
         merged = kept + results
-        merged.sort(key=lambda r: (r['m'], r['n'], r['solver_name']))
+        merged.sort(key=lambda r: (r['n'], r['k'], r['solver_name']))
         n_replaced = len(existing) - len(kept)
         n_added = len(results) - n_replaced
         with open(json_path, 'w') as f:
