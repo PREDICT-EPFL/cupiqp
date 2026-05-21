@@ -52,12 +52,17 @@ class MultistageData(Data):
         self._batch_size = B
         self._n = n
 
+        # We clone every caller-provided block container so the solver owns
+        # its buffers — the preconditioner (Ruiz scaling) mutates them in
+        # place, and we don't want that to bleed back into the caller's
+        # arrays. Flat dlpack views are then built into the owned clones.
+
         # ---- P (block-tridiagonal) ----
-        self._P = P
+        self._P = P.clone()
 
         # ---- c (linear cost) ----
-        self._c_blk = c
-        self._c = self._block_vec_to_flat(c, B)
+        self._c_blk = c.clone()
+        self._c = self._block_vec_to_flat(self._c_blk, B)
         if self._c.shape != (B, n):
             raise ValueError(
                 f"c flat shape {self._c.shape} != expected ({B}, {n})"
@@ -66,9 +71,9 @@ class MultistageData(Data):
         # ---- A, b (equality constraints) ----
         if A is not None and b is not None:
             self._validate_bidiag(A, block_size, num_blocks, B, "A")
-            self._A = A
-            p = (A.N + 1) * A.rows_of_blocks
-            self._b_blk, self._b = self._init_block_vec(b, B, p, "b")
+            self._A = A.clone()
+            p = (self._A.N + 1) * self._A.rows_of_blocks
+            self._b_blk, self._b = self._init_block_vec(b.clone(), B, p, "b")
         elif A is None and b is None:
             self._A = None
             self._b_blk = None
@@ -83,10 +88,14 @@ class MultistageData(Data):
                 raise ValueError(
                     "Either h_l or h_u must be provided when G is given"
                 )
-            self._G = G
-            m = (G.N + 1) * G.rows_of_blocks
-            self._h_u_blk, self._h_u = self._init_block_vec(h_u, B, m, "h_u")
-            self._h_l_blk, self._h_l = self._init_block_vec(h_l, B, m, "h_l")
+            self._G = G.clone()
+            m = (self._G.N + 1) * self._G.rows_of_blocks
+            self._h_u_blk, self._h_u = self._init_block_vec(
+                h_u.clone() if h_u is not None else None, B, m, "h_u"
+            )
+            self._h_l_blk, self._h_l = self._init_block_vec(
+                h_l.clone() if h_l is not None else None, B, m, "h_l"
+            )
         else:
             if h_u is not None or h_l is not None:
                 raise ValueError("h_u and h_l must be None when G is None")
@@ -96,8 +105,8 @@ class MultistageData(Data):
 
         # ---- x_u, x_l (box constraints) ----
         if x_u is not None:
-            self._x_u_block = x_u
-            self._x_u = self._block_vec_to_flat(x_u, B)
+            self._x_u_block = x_u.clone()
+            self._x_u = self._block_vec_to_flat(self._x_u_block, B)
             if self._x_u.shape != (B, n):
                 raise ValueError(
                     f"x_u flat shape {self._x_u.shape} != expected ({B}, {n})"
@@ -107,8 +116,8 @@ class MultistageData(Data):
             self._x_u = cp.zeros((B, 0), dtype=cp.float64)
 
         if x_l is not None:
-            self._x_l_block = x_l
-            self._x_l = self._block_vec_to_flat(x_l, B)
+            self._x_l_block = x_l.clone()
+            self._x_l = self._block_vec_to_flat(self._x_l_block, B)
             if self._x_l.shape != (B, n):
                 raise ValueError(
                     f"x_l flat shape {self._x_l.shape} != expected ({B}, {n})"

@@ -177,6 +177,14 @@ class DenseBlocks:
         self._dtype = dtype
         self.data = wp.zeros((batch_size, num_blocks, rows, cols), dtype=dtype, device=device)
 
+    def clone(self) -> "DenseBlocks":
+        """Return a deep copy with an independent ``data`` warp buffer."""
+        new = DenseBlocks.__new__(DenseBlocks)
+        new._device = self._device
+        new._dtype = self._dtype
+        new.data = wp.clone(self.data)
+        return new
+
 
 def create_block_syrk_kernel(num_blocks: int, rows_of_blocks: int, cols_of_blocks: int):
     """Batched block-tridiagonal SYRK: ``C[b] = alpha * A[b]^T A[b] + beta * C[b]``.
@@ -312,6 +320,14 @@ class BlockTridiagMat:
     def cols(self):
         return self.num_diag_blocks * self.diag_blocks.data.shape[3]
 
+    def clone(self) -> "BlockTridiagMat":
+        """Return a deep copy with independent diag / off-diag warp buffers."""
+        new = BlockTridiagMat.__new__(BlockTridiagMat)
+        new.block_size = self.block_size
+        new.diag_blocks = self.diag_blocks.clone()
+        new.off_diag_blocks_lower = self.off_diag_blocks_lower.clone()
+        return new
+
 
 class BlockBidiagMat:
     """Block lower-bidiagonal matrix, batched.
@@ -343,6 +359,16 @@ class BlockBidiagMat:
     def batch_size(self):
         return self.D.shape[0]
 
+    def clone(self) -> "BlockBidiagMat":
+        """Return a deep copy with independent ``D`` / ``E`` warp buffers."""
+        new = BlockBidiagMat.__new__(BlockBidiagMat)
+        new.N = self.N
+        new.cols_of_blocks = self.cols_of_blocks
+        new.rows_of_blocks = self.rows_of_blocks
+        new.D = wp.clone(self.D)
+        new.E = wp.clone(self.E)
+        return new
+
 
 class BlockVec:
     """Block vector, batched. ``data`` shape ``(B, num_blocks, rows)``."""
@@ -355,3 +381,11 @@ class BlockVec:
     @property
     def batch_size(self):
         return self.data.shape[0]
+
+    def clone(self) -> "BlockVec":
+        """Return a deep copy with an independent ``data`` warp buffer."""
+        new = BlockVec.__new__(BlockVec)
+        new.num_blocks = self.num_blocks
+        new.rows = self.rows
+        new.data = wp.clone(self.data)
+        return new

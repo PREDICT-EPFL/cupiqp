@@ -65,8 +65,8 @@ class DenseData(Data):
         self._batch_size = B
         self._n = n
 
-        self._P = P.astype(cp.float64, copy=False)
-        self._c = c.astype(cp.float64, copy=False)
+        self._P = P.astype(cp.float64, copy=True)
+        self._c = c.astype(cp.float64, copy=True)
 
         # --- equality constraints ---
         if A is not None and b is not None:
@@ -82,8 +82,8 @@ class DenseData(Data):
                 raise ValueError("Row mismatch between A and b.")
             if A.shape[2] != n:
                 raise ValueError("Column mismatch between A and P.")
-            self._A = A.astype(cp.float64, copy=False)
-            self._b = b.astype(cp.float64, copy=False)
+            self._A = A.astype(cp.float64, copy=True)
+            self._b = b.astype(cp.float64, copy=True)
         else:
             self._A = cp.zeros((B, 0, n), dtype=cp.float64)
             self._b = cp.zeros((B, 0), dtype=cp.float64)
@@ -106,7 +106,7 @@ class DenseData(Data):
                 h_u = _ensure_2d(cp.asarray(h_u))
                 if h_u.shape != (B, m):
                     raise ValueError(f"h_u must have shape ({B}, {m}), got {h_u.shape}")
-            self._G = G.astype(cp.float64, copy=False)
+            self._G = G.astype(cp.float64, copy=True)
         else:
             if h_u is not None or h_l is not None:
                 raise ValueError("h_l and h_u must be None when G is None.")
@@ -130,7 +130,7 @@ class DenseData(Data):
 
     def _as_batched_vec(self, v: Optional[cp.ndarray]) -> cp.ndarray:
         if v is not None:
-            return v.astype(cp.float64, copy=False)
+            return v.astype(cp.float64, copy=True)
         return cp.zeros((self._batch_size, 0), dtype=cp.float64)
 
     def _disable_inf_constraints(self):

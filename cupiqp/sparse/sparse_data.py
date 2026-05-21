@@ -127,9 +127,17 @@ class SparseData(Data):
     @classmethod
     def _to_batched_csr(cls, mat: SparseMatrixInput, name: str) -> BatchedCsrMatrix:
         """Normalize any accepted matrix input form to ``BatchedCsrMatrix``."""
-        # Already a BatchedCsrMatrix — adopt directly, no packing.
+        # Already a BatchedCsrMatrix — reuse the shared sparsity pattern but
+        # clone the values buffer so the solver (preconditioner) can mutate
+        # without touching the caller's matrix.
         if isinstance(mat, BatchedCsrMatrix):
-            return mat
+            return BatchedCsrMatrix(
+                batch_size=mat.batch_size,
+                indices=mat.indices,
+                indptr=mat.indptr,
+                data=mat.data,  # BatchedCsrMatrix.__init__ allocates + copies
+                shape=(mat.rows, mat.cols),
+            )
 
         # torch.sparse_csr_tensor (2-D single or 3-D batched).
         if _is_torch_sparse_csr(mat):
@@ -203,12 +211,14 @@ class SparseData(Data):
         if v.ndim == 1:
             v = v.reshape(1, -1)
         if v.shape[0] == 1 and B > 1:
-            v = cp.broadcast_to(v, (B, v.shape[1])).copy()
+            # broadcast_to + .copy() already produces an owned buffer.
+            return cp.broadcast_to(v, (B, v.shape[1])).copy()
         if v.shape[0] != B:
             raise ValueError(
                 f"{name} batch size ({v.shape[0]}) != expected ({B})"
             )
-        return v
+        # Copy so the solver owns the buffer (preconditioner mutates in place).
+        return v.copy()
 
     # ------------------------------------------------------------------
     # Overrides for batched CSR storage
