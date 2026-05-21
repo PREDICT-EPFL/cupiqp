@@ -1,8 +1,13 @@
+import cupy as cp
+import warp as wp
+
+from ..results import Variables
 from ..settings import Settings
 from ..solver import SolverBase
 from ..utils import is_cuda_array
 from .dense_data import DenseData
 from .dense_preconditioner import DenseRuizEquilibration
+from .dense_solver_kernels import create_dense_data_gradients_kernel
 
 
 def _check_dense(name: str, m) -> None:
@@ -88,4 +93,59 @@ class DenseSolver(SolverBase):
             self._data.idx_xl, self._data.idx_xu,
             self._data.idx_hl, self._data.idx_hu,
             use_warp_tile_kernels=True,
+        )
+
+    def setup(self, P, c, A=None, b=None, G=None,
+              h_u=None, h_l=None, x_u=None, x_l=None):
+        super().setup(P, c, A, b, G, h_u, h_l, x_u, x_l)
+        if self.settings.enable_grad:
+            d = self._data
+            B = d.batch_size
+            self._dense_data_gradients_kernel = create_dense_data_gradients_kernel(
+                d.n, d.p, d.m,
+            )
+            self._dP_buf   = cp.empty((B, d.n, d.n), dtype=cp.float64)
+            self._dA_buf   = cp.empty((B, d.p, d.n), dtype=cp.float64)
+            self._dG_buf   = cp.empty((B, d.m, d.n), dtype=cp.float64)
+            self._db_buf   = cp.empty((B, d.p),       dtype=cp.float64)
+            self._dh_u_buf = cp.empty((B, d.m),       dtype=cp.float64)
+            self._dx_u_buf = cp.empty((B, d.n),       dtype=cp.float64)
+
+    def _compute_data_gradients(self, adjoint_vector: Variables) -> DenseData:
+        data = self._data
+        B = data.batch_size
+        total = (data.n * data.n + data.p * data.n + data.m * data.n
+                 + data.p + data.m + data.n)
+        if total > 0:
+            wp.launch(
+                kernel=self._dense_data_gradients_kernel,
+                dim=(B, total),
+                inputs=[
+                    adjoint_vector.x, adjoint_vector.y,
+                    self._lam_zu_full, self._lam_zl_full,
+                    self._lam_zbu_full,
+                    self._zu_full, self._zl_full,
+                    self._result.x, self._result.y,
+                    self._dP_buf, self._dA_buf, self._dG_buf,
+                    self._db_buf, self._dh_u_buf, self._dx_u_buf,
+                ],
+                device="cuda",
+                stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+            )
+
+        # Aliases (no copy) for the un-flipped vector grads.
+        dc   = adjoint_vector.x
+        db   = self._db_buf         if data.p      > 0 else None
+        dA   = self._dA_buf         if data.p      > 0 else None
+        dG   = self._dG_buf         if data.m      > 0 else None
+        dh_u = self._dh_u_buf       if data.num_hu > 0 else None
+        dh_l = self._lam_zl_full    if data.num_hl > 0 else None
+        dx_u = self._dx_u_buf       if data.num_xu > 0 else None
+        dx_l = self._lam_zbl_full   if data.num_xl > 0 else None
+
+        return DenseData(
+            P=self._dP_buf, c=dc,
+            A=dA, b=db,
+            G=dG, h_u=dh_u, h_l=dh_l,
+            x_u=dx_u, x_l=dx_l,
         )

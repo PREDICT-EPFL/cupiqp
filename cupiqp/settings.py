@@ -46,6 +46,8 @@ class Settings:
     debug: bool = False
     compute_timings: bool = False
 
+    enable_grad: bool = False
+
     def verify_settings(self) -> bool:
         return (self.rho_init > 0 and
                self.delta_init > 0 and

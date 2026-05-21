@@ -1007,3 +1007,622 @@ def create_boundary_shift_kernel(num_hl: int, num_hu: int, num_xl: int, num_xu: 
             return
 
     return boundary_shift_kernel
+
+
+def create_backward_assemble_rhs_kernel(
+    n: int, p: int,
+    num_hu: int, num_hl: int, num_xu: int, num_xl: int,
+    precond_on: bool,
+):
+    r"""Assemble adjoint RHS."""
+    @wp.kernel
+    def backward_assemble_rhs_kernel(
+        grad_x:    wp.array2d(dtype=wp.float64),  # type: ignore (B, n)
+        grad_y:    wp.array2d(dtype=wp.float64),  # type: ignore (B, p)
+        grad_z_u:  wp.array2d(dtype=wp.float64),  # type: ignore (B, num_hu)
+        grad_z_l:  wp.array2d(dtype=wp.float64),  # type: ignore (B, num_hl)
+        grad_z_bu: wp.array2d(dtype=wp.float64),  # type: ignore (B, num_xu)
+        grad_z_bl: wp.array2d(dtype=wp.float64),  # type: ignore (B, num_xl)
+        grad_s_u:  wp.array2d(dtype=wp.float64),  # type: ignore (B, num_hu)
+        grad_s_l:  wp.array2d(dtype=wp.float64),  # type: ignore (B, num_hl)
+        grad_s_bu: wp.array2d(dtype=wp.float64),  # type: ignore (B, num_xu)
+        grad_s_bl: wp.array2d(dtype=wp.float64),  # type: ignore (B, num_xl)
+        # Index maps
+        idx_hu:  wp.array(dtype=wp.int32),  # type: ignore (num_hu,)
+        idx_hl:  wp.array(dtype=wp.int32),  # type: ignore (num_hl,)
+        idx_xu:  wp.array(dtype=wp.int32),  # type: ignore (num_xu,)
+        idx_xl:  wp.array(dtype=wp.int32),  # type: ignore (num_xl,)
+        # Preconditioner factors
+        delta:             wp.array2d(dtype=wp.float64),  # type: ignore (B, n+p+m)
+        delta_b:           wp.array2d(dtype=wp.float64),  # type: ignore (B, n)
+        delta_inv:         wp.array2d(dtype=wp.float64),  # type: ignore (B, n+p+m)
+        delta_b_inv:       wp.array2d(dtype=wp.float64),  # type: ignore (B, n)
+        cost_scaling_inv:  wp.array(dtype=wp.float64),    # type: ignore (B,)
+        # Outputs (rhs_adj fields)
+        rhs_x:    wp.array2d(dtype=wp.float64),  # type: ignore
+        rhs_y:    wp.array2d(dtype=wp.float64),  # type: ignore
+        rhs_z_u:  wp.array2d(dtype=wp.float64),  # type: ignore
+        rhs_z_l:  wp.array2d(dtype=wp.float64),  # type: ignore
+        rhs_z_bu: wp.array2d(dtype=wp.float64),  # type: ignore
+        rhs_z_bl: wp.array2d(dtype=wp.float64),  # type: ignore
+        rhs_s_u:  wp.array2d(dtype=wp.float64),  # type: ignore
+        rhs_s_l:  wp.array2d(dtype=wp.float64),  # type: ignore
+        rhs_s_bu: wp.array2d(dtype=wp.float64),  # type: ignore
+        rhs_s_bl: wp.array2d(dtype=wp.float64),  # type: ignore
+    ):
+        b, t = wp.tid()
+        n_static     = wp.static(n)
+        p_static     = wp.static(p)
+        nhu_static   = wp.static(num_hu)
+        nhl_static   = wp.static(num_hl)
+        nxu_static   = wp.static(num_xu)
+        nxl_static   = wp.static(num_xl)
+        precond      = wp.static(precond_on)
+
+        # Cumulative offsets for the t-range dispatch.
+        end_x   = n_static
+        end_y   = end_x   + p_static
+        end_zu  = end_y   + nhu_static
+        end_zl  = end_zu  + nhl_static
+        end_zbu = end_zl  + nxu_static
+        end_zbl = end_zbu + nxl_static
+        end_su  = end_zbl + nhu_static
+        end_sl  = end_su  + nhl_static
+        end_sbu = end_sl  + nxu_static
+        end_sbl = end_sbu + nxl_static
+
+        if t < end_x:
+            i = t
+            v = -grad_x[b, i]
+            if precond:
+                v = v * delta[b, i]
+            rhs_x[b, i] = v
+
+        elif t < end_y:
+            i = t - end_x
+            v = -grad_y[b, i]
+            if precond:
+                v = v * delta[b, n_static + i] * cost_scaling_inv[b]
+            rhs_y[b, i] = v
+
+        elif t < end_zu:
+            i = t - end_y
+            v = -grad_z_u[b, i]
+            if precond:
+                v = v * delta[b, n_static + p_static + idx_hu[i]] * cost_scaling_inv[b]
+            rhs_z_u[b, i] = v
+
+        elif t < end_zl:
+            i = t - end_zu
+            v = -grad_z_l[b, i]
+            if precond:
+                v = v * delta[b, n_static + p_static + idx_hl[i]] * cost_scaling_inv[b]
+            rhs_z_l[b, i] = v
+
+        elif t < end_zbu:
+            i = t - end_zl
+            v = -grad_z_bu[b, i]
+            if precond:
+                v = v * delta_b[b, idx_xu[i]] * cost_scaling_inv[b]
+            rhs_z_bu[b, i] = v
+
+        elif t < end_zbl:
+            i = t - end_zbu
+            v = -grad_z_bl[b, i]
+            if precond:
+                v = v * delta_b[b, idx_xl[i]] * cost_scaling_inv[b]
+            rhs_z_bl[b, i] = v
+
+        elif t < end_su:
+            i = t - end_zbl
+            v = -grad_s_u[b, i]
+            if precond:
+                v = v * delta_inv[b, n_static + p_static + idx_hu[i]]
+            rhs_s_u[b, i] = v
+
+        elif t < end_sl:
+            i = t - end_su
+            v = -grad_s_l[b, i]
+            if precond:
+                v = v * delta_inv[b, n_static + p_static + idx_hl[i]]
+            rhs_s_l[b, i] = v
+
+        elif t < end_sbu:
+            i = t - end_sl
+            v = -grad_s_bu[b, i]
+            if precond:
+                v = v * delta_b_inv[b, idx_xu[i]]
+            rhs_s_bu[b, i] = v
+
+        elif t < end_sbl:
+            i = t - end_sbu
+            v = -grad_s_bl[b, i]
+            if precond:
+                v = v * delta_b_inv[b, idx_xl[i]]
+            rhs_s_bl[b, i] = v
+
+        else:
+            return
+
+    return backward_assemble_rhs_kernel
+
+
+def create_backward_unscale_lhs_kernel(
+    n: int, p: int,
+    num_hu: int, num_hl: int, num_xu: int, num_xl: int,
+    precond_on: bool,
+):
+    r"""Step 3 of the backward pass — un-scale ``sol`` (scaled-space
+    backsolve output) into user-space lambdas **in place**, in
+    Variables active-size layout.
+
+    Inverse of :func:`create_assemble_grad_rhs_kernel`, restricted to
+    the groups that actually need scaling. The 6 groups are dispatched
+    by t-range over ``(B, n + p + num_hu + num_hl + num_xu + num_xl)``:
+
+    * ``x``     :  ``sol *= cost_scaling * delta[:n]``
+    * ``y``     :  ``sol *= delta[n:n+p]``
+    * ``z_u``   :  ``sol[i] *= delta[n+p+idx_hu[i]]``     (active)
+    * ``z_l``   :  ``sol[i] *= delta[n+p+idx_hl[i]]``     (active)
+    * ``z_bu``  :  ``sol[i] *= delta_b[idx_xu[i]]``        (active)
+    * ``z_bl``  :  ``sol[i] *= delta_b[idx_xl[i]]``        (active)
+    """
+    @wp.kernel
+    def backward_unscale_lhs_kernel(
+        # In-place sol (active sizes), Variables fields of the passed-in `sol`
+        sol_x:    wp.array2d(dtype=wp.float64),  # type: ignore (B, n)
+        sol_y:    wp.array2d(dtype=wp.float64),  # type: ignore (B, p)
+        sol_z_u:  wp.array2d(dtype=wp.float64),  # type: ignore (B, num_hu)
+        sol_z_l:  wp.array2d(dtype=wp.float64),  # type: ignore (B, num_hl)
+        sol_z_bu: wp.array2d(dtype=wp.float64),  # type: ignore (B, num_xu)
+        sol_z_bl: wp.array2d(dtype=wp.float64),  # type: ignore (B, num_xl)
+        # Index maps
+        idx_hu:   wp.array(dtype=wp.int32),  # type: ignore
+        idx_hl:   wp.array(dtype=wp.int32),  # type: ignore
+        idx_xu:   wp.array(dtype=wp.int32),  # type: ignore
+        idx_xl:   wp.array(dtype=wp.int32),  # type: ignore
+        # Preconditioner factors
+        delta:        wp.array2d(dtype=wp.float64),  # type: ignore (B, n+p+m)
+        delta_b:      wp.array2d(dtype=wp.float64),  # type: ignore (B, n)
+        cost_scaling: wp.array(dtype=wp.float64),    # type: ignore (B,)
+    ):
+        b, t = wp.tid()
+        n_static     = wp.static(n)
+        p_static     = wp.static(p)
+        nhu_static   = wp.static(num_hu)
+        nhl_static   = wp.static(num_hl)
+        nxu_static   = wp.static(num_xu)
+        nxl_static   = wp.static(num_xl)
+        precond      = wp.static(precond_on)
+
+        # Cumulative offsets for the t-range dispatch (s_* groups
+        # excluded — they don't need un-scaling).
+        end_x   = n_static
+        end_y   = end_x   + p_static
+        end_zu  = end_y   + nhu_static
+        end_zl  = end_zu  + nhl_static
+        end_zbu = end_zl  + nxu_static
+        end_zbl = end_zbu + nxl_static
+
+        if not precond:
+            return
+
+        if t < end_x:
+            i = t
+            sol_x[b, i] = sol_x[b, i] * cost_scaling[b] * delta[b, i]
+
+        elif t < end_y:
+            i = t - end_x
+            sol_y[b, i] = sol_y[b, i] * delta[b, n_static + i]
+
+        elif t < end_zu:
+            i = t - end_y
+            sol_z_u[b, i] = sol_z_u[b, i] * delta[b, n_static + p_static + idx_hu[i]]
+
+        elif t < end_zl:
+            i = t - end_zu
+            sol_z_l[b, i] = sol_z_l[b, i] * delta[b, n_static + p_static + idx_hl[i]]
+
+        elif t < end_zbu:
+            i = t - end_zl
+            sol_z_bu[b, i] = sol_z_bu[b, i] * delta_b[b, idx_xu[i]]
+
+        elif t < end_zbl:
+            i = t - end_zbu
+            sol_z_bl[b, i] = sol_z_bl[b, i] * delta_b[b, idx_xl[i]]
+
+        else:
+            return
+
+    return backward_unscale_lhs_kernel
+
+
+def create_backward_compute_vector_grad_kernel(
+    n: int, p: int,
+    num_hu: int, num_hl: int, num_xu: int, num_xl: int,
+):
+    r"""Fused per-element sign-flip / copy that turns the user-space
+    adjoint lambdas into the six vector gradients ``(dc, db, dh_u,
+    dh_l, dx_u, dx_l)`` packed into ``sol``'s Variables layout.
+
+    Field mapping (dispatched by t-range over
+    ``(B, n + p + num_hu + num_hl + num_xu + num_xl)``):
+
+    * ``sol.x``    = ``grad.x``     (copy)
+    * ``sol.y``    = ``-grad.y``    (negate)
+    * ``sol.z_u``  = ``-grad.z_u``  (negate)
+    * ``sol.z_l``  =  ``grad.z_l``  (copy)
+    * ``sol.z_bu`` = ``-grad.z_bu`` (negate)
+    * ``sol.z_bl`` =  ``grad.z_bl`` (copy)
+    """
+    @wp.kernel
+    def backward_compute_vector_grad_kernel(
+        grad_x:    wp.array2d(dtype=wp.float64),  # type: ignore (B, n)
+        grad_y:    wp.array2d(dtype=wp.float64),  # type: ignore (B, p)
+        grad_z_u:  wp.array2d(dtype=wp.float64),  # type: ignore (B, num_hu)
+        grad_z_l:  wp.array2d(dtype=wp.float64),  # type: ignore (B, num_hl)
+        grad_z_bu: wp.array2d(dtype=wp.float64),  # type: ignore (B, num_xu)
+        grad_z_bl: wp.array2d(dtype=wp.float64),  # type: ignore (B, num_xl)
+        sol_x:    wp.array2d(dtype=wp.float64),   # type: ignore (B, n)
+        sol_y:    wp.array2d(dtype=wp.float64),   # type: ignore (B, p)
+        sol_z_u:  wp.array2d(dtype=wp.float64),   # type: ignore (B, num_hu)
+        sol_z_l:  wp.array2d(dtype=wp.float64),   # type: ignore (B, num_hl)
+        sol_z_bu: wp.array2d(dtype=wp.float64),   # type: ignore (B, num_xu)
+        sol_z_bl: wp.array2d(dtype=wp.float64),   # type: ignore (B, num_xl)
+    ):
+        b, t = wp.tid()
+        n_static   = wp.static(n)
+        p_static   = wp.static(p)
+        nhu_static = wp.static(num_hu)
+        nhl_static = wp.static(num_hl)
+        nxu_static = wp.static(num_xu)
+        nxl_static = wp.static(num_xl)
+
+        end_x   = n_static
+        end_y   = end_x   + p_static
+        end_zu  = end_y   + nhu_static
+        end_zl  = end_zu  + nhl_static
+        end_zbu = end_zl  + nxu_static
+        end_zbl = end_zbu + nxl_static
+
+        if t < end_x:
+            i = t
+            sol_x[b, i] = grad_x[b, i]
+
+        elif t < end_y:
+            i = t - end_x
+            sol_y[b, i] = -grad_y[b, i]
+
+        elif t < end_zu:
+            i = t - end_y
+            sol_z_u[b, i] = -grad_z_u[b, i]
+
+        elif t < end_zl:
+            i = t - end_zu
+            sol_z_l[b, i] = grad_z_l[b, i]
+
+        elif t < end_zbu:
+            i = t - end_zl
+            sol_z_bu[b, i] = -grad_z_bu[b, i]
+
+        elif t < end_zbl:
+            i = t - end_zbu
+            sol_z_bl[b, i] = grad_z_bl[b, i]
+
+        else:
+            return
+
+    return backward_compute_vector_grad_kernel
+
+
+def create_backward_copy_kernel(
+    n: int, p: int,
+    num_hu: int, num_hl: int, num_xu: int, num_xl: int,
+):
+    @wp.kernel
+    def backward_copy_kernel(
+        in_x:    wp.array2d(dtype=wp.float64),  # type: ignore (B, n)
+        in_y:    wp.array2d(dtype=wp.float64),  # type: ignore (B, p)
+        in_z_u:  wp.array2d(dtype=wp.float64),  # type: ignore (B, num_hu)
+        in_z_l:  wp.array2d(dtype=wp.float64),  # type: ignore (B, num_hl)
+        in_z_bu: wp.array2d(dtype=wp.float64),  # type: ignore (B, num_xu)
+        in_z_bl: wp.array2d(dtype=wp.float64),  # type: ignore (B, num_xl)
+        in_s_u:  wp.array2d(dtype=wp.float64),  # type: ignore (B, num_hu)
+        in_s_l:  wp.array2d(dtype=wp.float64),  # type: ignore (B, num_hl)
+        in_s_bu: wp.array2d(dtype=wp.float64),  # type: ignore (B, num_xu)
+        in_s_bl: wp.array2d(dtype=wp.float64),  # type: ignore (B, num_xl)
+        out_x:    wp.array2d(dtype=wp.float64),  # type: ignore
+        out_y:    wp.array2d(dtype=wp.float64),  # type: ignore
+        out_z_u:  wp.array2d(dtype=wp.float64),  # type: ignore
+        out_z_l:  wp.array2d(dtype=wp.float64),  # type: ignore
+        out_z_bu: wp.array2d(dtype=wp.float64),  # type: ignore
+        out_z_bl: wp.array2d(dtype=wp.float64),  # type: ignore
+        out_s_u:  wp.array2d(dtype=wp.float64),  # type: ignore
+        out_s_l:  wp.array2d(dtype=wp.float64),  # type: ignore
+        out_s_bu: wp.array2d(dtype=wp.float64),  # type: ignore
+        out_s_bl: wp.array2d(dtype=wp.float64),  # type: ignore
+    ):
+        b, t = wp.tid()
+        n_s   = wp.static(n)
+        p_s   = wp.static(p)
+        nhu_s = wp.static(num_hu)
+        nhl_s = wp.static(num_hl)
+        nxu_s = wp.static(num_xu)
+        nxl_s = wp.static(num_xl)
+
+        end_x    = n_s
+        end_y    = end_x    + p_s
+        end_zu   = end_y    + nhu_s
+        end_zl   = end_zu   + nhl_s
+        end_zbu  = end_zl   + nxu_s
+        end_zbl  = end_zbu  + nxl_s
+        end_su   = end_zbl  + nhu_s
+        end_sl   = end_su   + nhl_s
+        end_sbu  = end_sl   + nxu_s
+        end_sbl  = end_sbu  + nxl_s
+
+        if t < end_x:
+            i = t
+            out_x[b, i] = in_x[b, i]
+        elif t < end_y:
+            i = t - end_x
+            out_y[b, i] = in_y[b, i]
+        elif t < end_zu:
+            i = t - end_y
+            out_z_u[b, i] = in_z_u[b, i]
+        elif t < end_zl:
+            i = t - end_zu
+            out_z_l[b, i] = in_z_l[b, i]
+        elif t < end_zbu:
+            i = t - end_zl
+            out_z_bu[b, i] = in_z_bu[b, i]
+        elif t < end_zbl:
+            i = t - end_zbu
+            out_z_bl[b, i] = in_z_bl[b, i]
+        elif t < end_su:
+            i = t - end_zbl
+            out_s_u[b, i] = in_s_u[b, i]
+        elif t < end_sl:
+            i = t - end_su
+            out_s_l[b, i] = in_s_l[b, i]
+        elif t < end_sbu:
+            i = t - end_sl
+            out_s_bu[b, i] = in_s_bu[b, i]
+        elif t < end_sbl:
+            i = t - end_sbu
+            out_s_bl[b, i] = in_s_bl[b, i]
+        else:
+            return
+
+    return backward_copy_kernel
+
+
+def create_backward_pack_full_layout_kernel(m: int, n: int):
+    r"""Fused full-layout pack for the backward pass.
+
+    Outputs:
+
+    * ``lam_zu_full, lam_zl_full ∈ (B, m)`` — scatter of
+      ``sol.z_u/z_l`` via ``inv_idx_hu/hl``.
+    * ``lam_zbu_full, lam_zbl_full ∈ (B, n)`` — scatter of
+      ``sol.z_bu/z_bl`` via ``inv_idx_xu/xl``.
+    * ``zu_full, zl_full ∈ (B, m)`` — scatter of
+      ``result.z_u/z_l`` via ``inv_idx_hu/hl``.
+    """
+    @wp.kernel
+    def backward_pack_full_layout_kernel(
+        # Active-only inputs (Variables fields)
+        sol_z_u:    wp.array2d(dtype=wp.float64),  # type: ignore (B, num_hu)
+        sol_z_l:    wp.array2d(dtype=wp.float64),  # type: ignore (B, num_hl)
+        sol_z_bu:   wp.array2d(dtype=wp.float64),  # type: ignore (B, num_xu)
+        sol_z_bl:   wp.array2d(dtype=wp.float64),  # type: ignore (B, num_xl)
+        result_z_u: wp.array2d(dtype=wp.float64),  # type: ignore (B, num_hu)
+        result_z_l: wp.array2d(dtype=wp.float64),  # type: ignore (B, num_hl)
+        # Inverse-index maps: inv_idx_*[j] = i if j == idx_*[i] else -1.
+        inv_idx_hu: wp.array(dtype=wp.int32),  # type: ignore (m,)
+        inv_idx_hl: wp.array(dtype=wp.int32),  # type: ignore (m,)
+        inv_idx_xu: wp.array(dtype=wp.int32),  # type: ignore (n,)
+        inv_idx_xl: wp.array(dtype=wp.int32),  # type: ignore (n,)
+        # Full-layout outputs (no pre-zero required).
+        lam_zu_full:  wp.array2d(dtype=wp.float64),  # type: ignore (B, m)
+        lam_zl_full:  wp.array2d(dtype=wp.float64),  # type: ignore (B, m)
+        lam_zbu_full: wp.array2d(dtype=wp.float64),  # type: ignore (B, n)
+        lam_zbl_full: wp.array2d(dtype=wp.float64),  # type: ignore (B, n)
+        zu_full:      wp.array2d(dtype=wp.float64),  # type: ignore (B, m)
+        zl_full:      wp.array2d(dtype=wp.float64),  # type: ignore (B, m)
+    ):
+        b, t = wp.tid()
+        m_static = wp.static(m)
+        n_static = wp.static(n)
+
+        # Six regions, one full-buffer position per thread.
+        end_lam_zu  = m_static
+        end_lam_zl  = end_lam_zu  + m_static
+        end_lam_zbu = end_lam_zl  + n_static
+        end_lam_zbl = end_lam_zbu + n_static
+        end_res_zu  = end_lam_zbl + m_static
+        end_res_zl  = end_res_zu  + m_static
+
+        if t < end_lam_zu:
+            j = t
+            i = inv_idx_hu[j]
+            if i >= 0:
+                lam_zu_full[b, j] = sol_z_u[b, i]
+            else:
+                lam_zu_full[b, j] = wp.float64(0.0)
+
+        elif t < end_lam_zl:
+            j = t - end_lam_zu
+            i = inv_idx_hl[j]
+            if i >= 0:
+                lam_zl_full[b, j] = sol_z_l[b, i]
+            else:
+                lam_zl_full[b, j] = wp.float64(0.0)
+
+        elif t < end_lam_zbu:
+            j = t - end_lam_zl
+            i = inv_idx_xu[j]
+            if i >= 0:
+                lam_zbu_full[b, j] = sol_z_bu[b, i]
+            else:
+                lam_zbu_full[b, j] = wp.float64(0.0)
+
+        elif t < end_lam_zbl:
+            j = t - end_lam_zbu
+            i = inv_idx_xl[j]
+            if i >= 0:
+                lam_zbl_full[b, j] = sol_z_bl[b, i]
+            else:
+                lam_zbl_full[b, j] = wp.float64(0.0)
+
+        elif t < end_res_zu:
+            j = t - end_lam_zbl
+            i = inv_idx_hu[j]
+            if i >= 0:
+                zu_full[b, j] = result_z_u[b, i]
+            else:
+                zu_full[b, j] = wp.float64(0.0)
+
+        elif t < end_res_zl:
+            j = t - end_res_zu
+            i = inv_idx_hl[j]
+            if i >= 0:
+                zl_full[b, j] = result_z_l[b, i]
+            else:
+                zl_full[b, j] = wp.float64(0.0)
+
+        else:
+            return
+
+    return backward_pack_full_layout_kernel
+
+
+def create_grad_pack_and_unscale_kernel(
+    n: int, p: int, m: int,
+    num_hu: int, num_hl: int, num_xu: int, num_xl: int,
+    precond_on: bool,
+):
+    r"""Fused step-3 of the backward pass — pack lambdas to full layout
+    and compute scaled primal/dual values at the solution.
+
+    Performs in one launch:
+
+    * Index-pack ``lhs_adj.z_u/z_l/z_bu/z_bl`` into full-``m`` / full-
+      ``n`` layouts (``lam_z_u``, ``lam_z_l``, ``lam_z_bu``,
+      ``lam_z_bl``).
+    * Compute scaled primal/dual values at the solution (``x_val``,
+      ``y_val``, ``zu_full``, ``zl_full``).
+
+    The full layouts (``lam_z_*``, ``zu_full``, ``zl_full``) **must be
+    pre-zeroed** by the caller — this kernel only writes to active
+    positions.
+
+    Total launch dim is
+    ``(B, n + p + num_hu + num_hl + num_xu + num_xl + num_hu + num_hl)``
+    — covers x_val, y_val, the four lam_z_* packings, and the two
+    zu_full/zl_full packings + scalings.
+    """
+    @wp.kernel
+    def grad_pack_and_unscale_kernel(
+        # ---- Inputs ----
+        # lhs_adj fields (active-only sizes)
+        lhs_x:    wp.array2d(dtype=wp.float64),  # type: ignore (B, n)
+        lhs_y:    wp.array2d(dtype=wp.float64),  # type: ignore (B, p)
+        lhs_z_u:  wp.array2d(dtype=wp.float64),  # type: ignore (B, num_hu)
+        lhs_z_l:  wp.array2d(dtype=wp.float64),  # type: ignore (B, num_hl)
+        lhs_z_bu: wp.array2d(dtype=wp.float64),  # type: ignore (B, num_xu)
+        lhs_z_bl: wp.array2d(dtype=wp.float64),  # type: ignore (B, num_xl)
+        # Solution at last solve (active-only sizes for z_u, z_l)
+        result_x:   wp.array2d(dtype=wp.float64),  # type: ignore (B, n)
+        result_y:   wp.array2d(dtype=wp.float64),  # type: ignore (B, p)
+        result_z_u: wp.array2d(dtype=wp.float64),  # type: ignore (B, num_hu)
+        result_z_l: wp.array2d(dtype=wp.float64),  # type: ignore (B, num_hl)
+        # Index maps
+        idx_hu: wp.array(dtype=wp.int32),  # type: ignore
+        idx_hl: wp.array(dtype=wp.int32),  # type: ignore
+        idx_xu: wp.array(dtype=wp.int32),  # type: ignore
+        idx_xl: wp.array(dtype=wp.int32),  # type: ignore
+        # Preconditioner factors
+        delta_inv:    wp.array2d(dtype=wp.float64),  # type: ignore
+        cost_scaling: wp.array(dtype=wp.float64),    # type: ignore
+        # ---- Outputs ----
+        # Padded lambdas (size m or n) — zero-initialised by caller.
+        lam_z_u:  wp.array2d(dtype=wp.float64),  # type: ignore (B, m)
+        lam_z_l:  wp.array2d(dtype=wp.float64),  # type: ignore (B, m)
+        lam_z_bu: wp.array2d(dtype=wp.float64),  # type: ignore (B, n)
+        lam_z_bl: wp.array2d(dtype=wp.float64),  # type: ignore (B, n)
+        # Scaled primal / dual at solution.
+        x_val:    wp.array2d(dtype=wp.float64),  # type: ignore (B, n)
+        y_val:    wp.array2d(dtype=wp.float64),  # type: ignore (B, p)
+        zu_full:  wp.array2d(dtype=wp.float64),  # type: ignore (B, m) zero-init
+        zl_full:  wp.array2d(dtype=wp.float64),  # type: ignore (B, m) zero-init
+    ):
+        b, t = wp.tid()
+        n_c = wp.static(n)
+        p_c = wp.static(p)
+        nhu = wp.static(num_hu)
+        nhl = wp.static(num_hl)
+        nxu = wp.static(num_xu)
+        nxl = wp.static(num_xl)
+        precond = wp.static(precond_on)
+
+        end_x   = n_c
+        end_y   = end_x   + p_c
+        end_zu  = end_y   + nhu
+        end_zl  = end_zu  + nhl
+        end_zbu = end_zl  + nxu
+        end_zbl = end_zbu + nxl
+        end_zuf = end_zbl + nhu
+        end_zlf = end_zuf + nhl
+
+        if t < end_x:
+            # x_val: dense scale (or copy)
+            i = t
+            if precond:
+                x_val[b, i] = result_x[b, i] * delta_inv[b, i]
+            else:
+                x_val[b, i] = result_x[b, i]
+
+        elif t < end_y:
+            i = t - end_x
+            if precond:
+                y_val[b, i] = result_y[b, i] * delta_inv[b, n_c + i] * cost_scaling[b]
+            else:
+                y_val[b, i] = result_y[b, i]
+
+        elif t < end_zu:
+            # lam_z_u[:, idx_hu[i]] = lhs_z_u[b, i]
+            i = t - end_y
+            lam_z_u[b, idx_hu[i]] = lhs_z_u[b, i]
+
+        elif t < end_zl:
+            i = t - end_zu
+            lam_z_l[b, idx_hl[i]] = lhs_z_l[b, i]
+
+        elif t < end_zbu:
+            i = t - end_zl
+            lam_z_bu[b, idx_xu[i]] = lhs_z_bu[b, i]
+
+        elif t < end_zbl:
+            i = t - end_zbu
+            lam_z_bl[b, idx_xl[i]] = lhs_z_bl[b, i]
+
+        elif t < end_zuf:
+            # zu_full[:, idx_hu[i]] = result.z_u[b, i] * scale
+            i = t - end_zbl
+            v = result_z_u[b, i]
+            if precond:
+                v = v * delta_inv[b, n_c + p_c + idx_hu[i]] * cost_scaling[b]
+            zu_full[b, idx_hu[i]] = v
+
+        elif t < end_zlf:
+            i = t - end_zuf
+            v = result_z_l[b, i]
+            if precond:
+                v = v * delta_inv[b, n_c + p_c + idx_hl[i]] * cost_scaling[b]
+            zl_full[b, idx_hl[i]] = v
+
+        else:
+            return
+
+    return grad_pack_and_unscale_kernel

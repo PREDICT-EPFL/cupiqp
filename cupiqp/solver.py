@@ -25,6 +25,11 @@ from .solver_kernels import (
     create_update_rho_delta_with_ineq_kernel,
     create_update_rho_delta_without_ineq_kernel,
     create_run_full_newton_step_kernel,
+    create_backward_assemble_rhs_kernel,
+    create_backward_unscale_lhs_kernel,
+    create_backward_compute_vector_grad_kernel,
+    create_backward_copy_kernel,
+    create_backward_pack_full_layout_kernel,
 )
 
 
@@ -113,6 +118,32 @@ class SolverBase(ABC):
         self._work_primal_rel_norm = cp.empty(B, dtype=cp.float64)  # running max of primal relative norm terms
         self._work_dual_res_norm = cp.empty(B, dtype=cp.float64)    # running max of dual residual norm terms
         self._work_norm_temp = cp.empty(B, dtype=cp.float64)        # temp (B,) for individual norm results
+
+        # Working variables for implicit differentiation
+        self._work_grad_rhs = Variables()
+        self._work_grad_rhs.init(self._data)
+        # User cotangent input (caller packs kwargs into this) and the user-space adjoint solution buffer.
+        self._grad_in = Variables()
+        self._grad_in.init(self._data)
+        self._backward_adjoint_vector = Variables()
+        self._backward_adjoint_vector.init(self._data)
+        # Pre-zeroed Variables used as a placeholder for None cotangents
+        # in the fused pack kernel — the kernel can't read None, so
+        # absent kwargs get substituted with the corresponding field of
+        # this zero buffer.
+        self._zero_grad_in = Variables()
+        self._zero_grad_in.init(self._data)
+        self._zero_grad_in._primal_buffer.fill(0.0)
+        self._zero_grad_in._dual_buffer.fill(0.0)
+        # Full-layout scatter buffers feeding the matrix and vector
+        # gradient assemblies. ineq groups live in length-m; bound
+        # groups live in length-n.
+        self._lam_zu_full  = cp.empty((B, data.m), dtype=cp.float64)
+        self._lam_zl_full  = cp.empty((B, data.m), dtype=cp.float64)
+        self._lam_zbu_full = cp.empty((B, data.n), dtype=cp.float64)
+        self._lam_zbl_full = cp.empty((B, data.n), dtype=cp.float64)
+        self._zu_full      = cp.empty((B, data.m), dtype=cp.float64)
+        self._zl_full      = cp.empty((B, data.m), dtype=cp.float64)
 
         self._enable_iterative_refinement = self.settings.iterative_refinement_always_enabled
 
@@ -564,6 +595,28 @@ class SolverBase(ABC):
             self._run_full_newton_step_kernel = create_run_full_newton_step_kernel(self._data.n, self._data.p)
             self._update_rho_delta_without_ineq_kernel = create_update_rho_delta_without_ineq_kernel(
                 self._data.n, self._data.p,
+            )
+
+        # Adjoint/backward-pass kernels
+        if self.settings.enable_grad:
+            n, p = self._data.n, self._data.p
+            nhu, nhl = self._data.num_hu, self._data.num_hl
+            nxu, nxl = self._data.num_xu, self._data.num_xl
+            precond_on = self.settings.preconditioner_iter > 0
+            self._backward_assemble_rhs_kernel = create_backward_assemble_rhs_kernel(
+                n, p, nhu, nhl, nxu, nxl, precond_on,
+            )
+            self._backward_unscale_lhs_kernel = create_backward_unscale_lhs_kernel(
+                n, p, nhu, nhl, nxu, nxl, precond_on,
+            )
+            self._backward_compute_vector_grad_kernel = create_backward_compute_vector_grad_kernel(
+                n, p, nhu, nhl, nxu, nxl,
+            )
+            self._backward_pack_full_layout_kernel = create_backward_pack_full_layout_kernel(
+                self._data.m, n,
+            )
+            self._backward_copy_kernel = create_backward_copy_kernel(
+                n, p, nhu, nhl, nxu, nxl,
             )
 
     @nvtx.annotate("Solver::_run_full_newton_step")
@@ -1059,6 +1112,225 @@ class SolverBase(ABC):
             stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
         )
 
+    @nvtx.annotate("Solver::_compute_adjoint")
+    def _compute_adjoint(self, grad: Variables, sol: Variables) -> None:
+        r"""Solve the adjoint KKT system :math:`K^\top \lambda = -\partial L / \partial v`.
 
+        Backend-agnostic: the math operates only on cupy arrays and the
+        cached KKT factor (which every backend's ``_kkt_system`` exposes
+        with a uniform ``solve(..., transpose=True)`` API). Used by every
+        subclass's ``grad()`` to obtain the lambdas; per-backend matrix
+        and vector gradient assembly happens in the caller.
 
-SolverBase = Solver
+        Parameters
+        ----------
+        grad : Variables
+            User cotangents :math:`\partial L / \partial v` for every
+            variable group (``x, y, z_u, z_l, z_{bu}, z_{bl}, s_u, s_l,
+            s_{bu}, s_{bl}``). Absent constraint groups have zero-sized
+            fields and the kernel's t-range naturally skips them.
+        sol : Variables
+            **Output.** The adjoint solution :math:`\lambda` is written
+            in-place into ``sol`` with the same field layout as ``grad``.
+            Each ``sol.<field>`` aliases the corresponding lambda.
+
+        Notes
+        -----
+        Cotangents in ``grad`` are interpreted in **user (un-scaled)**
+        space. The adjoint KKT system is solved in scaled space when
+        ``preconditioner_iter > 0``, but the scaled-to-user push-back is
+        applied here so that ``sol`` is written in **user space**. The
+        per-backend ``grad()`` only contributes the matrix-gradient
+        push-back on top of that.
+
+        Raises
+        ------
+        RuntimeError
+            If :meth:`solve` has not been called yet (no cached KKT factor).
+        """
+        if not getattr(self, "_setup_done", False) or self._result is None:
+            raise RuntimeError(
+                f"{type(self).__name__}.grad() requires a prior solve(); "
+                f"call setup() and solve() before grad()."
+            )
+
+        data = self._data
+        settings = self.settings
+        kkt_system = self._kkt_system
+        precond = self._preconditioner
+        B = data.batch_size
+        n, p = data.n, data.p
+        wp_stream = wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr)
+
+        rhs = self._work_grad_rhs              # Variables pre-allocated in setup (scaled-space RHS)
+
+        # ---- Step 1 (fused): rhs = -grad_v L, scaled to scaled space
+        rhs_total = n + p + 2 * grad.num_ineq
+        wp.launch(
+            kernel=self._backward_assemble_rhs_kernel,
+            dim=(B, rhs_total),
+            inputs=[
+                grad.x, grad.y,
+                grad.z_u, grad.z_l, grad.z_bu, grad.z_bl,
+                grad.s_u, grad.s_l, grad.s_bu, grad.s_bl,
+                data.idx_hu, data.idx_hl, data.idx_xu, data.idx_xl,
+                precond.delta, precond.delta_b,
+                precond.delta_inv, precond.delta_b_inv,
+                precond.cost_scaling_inv,
+                rhs.x, rhs.y,
+                rhs.z_u, rhs.z_l, rhs.z_bu, rhs.z_bl,
+                rhs.s_u, rhs.s_l, rhs.s_bu, rhs.s_bl,
+            ],
+            device="cuda",
+            stream=wp_stream,
+        )
+
+        # ---- Step 2: K^T sol = rhs (reuses cached forward factor).
+        kkt_system.solve(data, precond, settings, rhs, sol, transpose=True)
+
+        # ---- Step 3 (fused): un-scale sol from scaled space to user
+        # space in place.
+        wp.launch(
+            kernel=self._backward_unscale_lhs_kernel,
+            dim=(B, n + p + grad.num_ineq),
+            inputs=[
+                sol.x, sol.y,
+                sol.z_u, sol.z_l, sol.z_bu, sol.z_bl,
+                data.idx_hu, data.idx_hl, data.idx_xu, data.idx_xl,
+                precond.delta, precond.delta_b, precond.cost_scaling,
+            ],
+            device="cuda",
+            stream=wp_stream,
+        )
+
+    def _compute_vector_gradients(self, grad: Variables, sol: Variables) -> None:
+        data = self._data
+        B = data.batch_size
+        wp.launch(
+            kernel=self._backward_compute_vector_grad_kernel,
+            dim=(B, data.n + data.p + data.num_ineq),
+            inputs=[
+                grad.x, grad.y,
+                grad.z_u, grad.z_l, grad.z_bu, grad.z_bl,
+                sol.x, sol.y,
+                sol.z_u, sol.z_l, sol.z_bu, sol.z_bl,
+            ],
+            device="cuda",
+            stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+        )
+
+    @nvtx.annotate("Solver::grad")
+    def backward(self,
+             grad_x=None, grad_y=None,
+             grad_z_u=None, grad_z_l=None, grad_z_bu=None, grad_z_bl=None,
+             grad_s_u=None, grad_s_l=None, grad_s_bu=None, grad_s_bl=None):
+        r"""Compute gradients of an outer scalar :math:`L` w.r.t. problem
+        data, given upstream cotangents on the solution variables.
+
+        Orchestration (backend-agnostic):
+
+        1. Pack the per-field cotangent kwargs into ``self._grad_in``
+           (a pre-allocated ``Variables``); missing kwargs are treated
+           as zeros.
+        2. Solve the adjoint KKT system via :meth:`_compute_adjoint`,
+           producing user-space adjoint vectors.
+        3. Scatter the four active-size lambda groups (``z_u, z_l,
+           z_bu, z_bl``) and the two active-size ineq result groups
+           into full-``m`` / full-``n`` buffers
+           (``self._lam_z*_full``, ``self._z*_full``). Both the dG
+           outer product and the ``dh_*`` / ``dx_*`` vector gradients
+           consume these full-layout buffers.
+        4. Delegate to :meth:`_compute_data_gradients` for backend-
+           specific matrix-gradient assembly + ``Data`` subclass
+           construction.
+
+        Returns the backend's ``Data`` subclass populated with the
+        gradients in user space. Cotangents and returned gradients are
+        interpreted in user (un-scaled) space throughout — the
+        adjoint solve and scatter chain handles all preconditioner
+        bookkeeping internally.
+
+        Raises
+        ------
+        RuntimeError
+            If :meth:`solve` has not been called yet (no cached KKT factor).
+        """
+        if not self.settings.enable_grad:
+            raise RuntimeError("Set enable_grad to True to enable gradient computation.")
+
+        if not getattr(self, "_setup_done", False) or self._result is None:
+            raise RuntimeError(
+                f"{type(self).__name__}.grad() requires a prior solve(); "
+                f"call setup() and solve() before grad()."
+            )
+
+        data = self._data
+        B = data.batch_size
+        wp_stream = wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr)
+
+        # ---- Step 1
+        zeros = self._zero_grad_in
+        pack_total = data.n + data.p + 2 * zeros.num_ineq
+        if pack_total > 0:
+            wp.launch(
+                kernel=self._backward_copy_kernel,
+                dim=(B, pack_total),
+                inputs=[
+                    grad_x    if grad_x    is not None else zeros.x,
+                    grad_y    if grad_y    is not None else zeros.y,
+                    grad_z_u  if grad_z_u  is not None else zeros.z_u,
+                    grad_z_l  if grad_z_l  is not None else zeros.z_l,
+                    grad_z_bu if grad_z_bu is not None else zeros.z_bu,
+                    grad_z_bl if grad_z_bl is not None else zeros.z_bl,
+                    grad_s_u  if grad_s_u  is not None else zeros.s_u,
+                    grad_s_l  if grad_s_l  is not None else zeros.s_l,
+                    grad_s_bu if grad_s_bu is not None else zeros.s_bu,
+                    grad_s_bl if grad_s_bl is not None else zeros.s_bl,
+                    self._grad_in.x,    self._grad_in.y,
+                    self._grad_in.z_u,  self._grad_in.z_l,
+                    self._grad_in.z_bu, self._grad_in.z_bl,
+                    self._grad_in.s_u,  self._grad_in.s_l,
+                    self._grad_in.s_bu, self._grad_in.s_bl,
+                ],
+                device="cuda",
+                stream=wp_stream,
+            )
+
+        # ---- Step 2: adjoint KKT solve
+        self._compute_adjoint(self._grad_in, self._backward_adjoint_vector)
+
+        # ---- Step 3: write into full-layout buffers
+        kkt = self._kkt_system
+        wp.launch(
+            kernel=self._backward_pack_full_layout_kernel,
+            dim=(B, 4 * data.m + 2 * data.n),
+            inputs=[
+                self._backward_adjoint_vector.z_u, self._backward_adjoint_vector.z_l,
+                self._backward_adjoint_vector.z_bu, self._backward_adjoint_vector.z_bl,
+                self._result.z_u, self._result.z_l,
+                kkt._inv_idx_hu, kkt._inv_idx_hl,
+                kkt._inv_idx_xu, kkt._inv_idx_xl,
+                self._lam_zu_full, self._lam_zl_full,
+                self._lam_zbu_full, self._lam_zbl_full,
+                self._zu_full, self._zl_full,
+            ],
+            device="cuda",
+            stream=wp_stream,
+        )
+
+        # ---- Step 4: backend-specific matrix and vector gradient
+        # assembly + Data subclass construction.
+        return self._compute_data_gradients(self._backward_adjoint_vector)
+
+    @abstractmethod
+    def _compute_data_gradients(self, sol_adj: Variables):
+        """Build and return the backend's ``Data`` subclass populated
+        with user-space gradients ``(P, c, A, b, G, h_u, h_l, x_u,
+        x_l)``.
+
+        Implementations read user-space adjoint lambdas from
+        ``sol_adj`` (active-only sizes), the user-space primal/dual
+        solution from ``self._result``, and the pre-scattered full-
+        layout buffers ``self._lam_z*_full`` / ``self._z*_full`` set
+        up by :meth:`grad`'s scatter step.
+        """
