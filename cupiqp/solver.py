@@ -438,16 +438,19 @@ class SolverBase(ABC):
             self._result
         )
 
-        self._res.x[:] = -self._data.c
-        self._res.y[:] = self._data.b
+        cp.negative(self._data.c, out=self._res.x)
+        if self._data.p > 0:
+            self._res.y[:] = self._data.b
         if self._data.num_hl > 0:
-            self._res.z_l[:] = -self._data.h_l[:, self._data.idx_hl]
+            cp.take(self._data.h_l, self._data.idx_hl, axis=1, out=self._res.z_l)
+            cp.negative(self._res.z_l, out=self._res.z_l)
         if self._data.num_hu > 0:
-            self._res.z_u[:] = self._data.h_u[:, self._data.idx_hu]
+            cp.take(self._data.h_u, self._data.idx_hu, axis=1, out=self._res.z_u)
         if self._data.num_xl > 0:
-            self._res.z_bl[:] = -self._data.x_l[:, self._data.idx_xl]
+            cp.take(self._data.x_l, self._data.idx_xl, axis=1, out=self._res.z_bl)
+            cp.negative(self._res.z_bl, out=self._res.z_bl)
         if self._data.num_xu > 0:
-            self._res.z_bu[:] = self._data.x_u[:, self._data.idx_xu]
+            cp.take(self._data.x_u, self._data.idx_xu, axis=1, out=self._res.z_bu)
         self._res.s_all[:] = 0.
 
         self._kkt_system.solve(self._data, self._preconditioner, self.settings, self._res, self._result)  # getting an initial point of _result
@@ -457,7 +460,9 @@ class SolverBase(ABC):
 
         if self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu > 0:
             ## ----------- keep z and s non-negative --------------
-            # this is according to the IV.A part of Roland Schwan 2023 paper
+            # this is according to the IV.A part of Roland Schwan 2023 paper.
+            # Uses pre-allocated (B, 1) scratch buffers — see Solver.setup
+            # for the rationale (no transient cupy allocs in the solve path).
             delta_s = -cp.min(self._result.s_all, axis=1, keepdims=True)  # (B, 1)
             delta_z = -cp.min(self._result.z_all, axis=1, keepdims=True)  # (B, 1)
             self._result.s_all += delta_s
