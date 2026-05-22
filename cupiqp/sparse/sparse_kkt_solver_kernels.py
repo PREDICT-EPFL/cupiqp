@@ -1,7 +1,9 @@
 import warp as wp
+from ..utils import to_warp_dtype
 
 
-def create_update_kkt_diag_kernel(n: int, p: int, m: int):
+def create_update_kkt_diag_kernel(n: int, p: int, m: int, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     """Fused scatter into the diagonal of the KKT matrix in sparse kkt solver. Performs:
     
         kkt_data[:, idx_x] = P_diag + x_reg
@@ -10,14 +12,14 @@ def create_update_kkt_diag_kernel(n: int, p: int, m: int):
     """
     @wp.kernel
     def update_kkt_diag_kernel(
-        P_diag:         wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
-        x_reg:          wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
-        delta:          wp.array(dtype=wp.float64),    # type: ignore  (B,)
-        z_reg:          wp.array2d(dtype=wp.float64),  # type: ignore  (B, m)
+        P_diag:         wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        x_reg:          wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        delta:          wp.array(dtype=dtype),    # type: ignore  (B,)
+        z_reg:          wp.array2d(dtype=dtype),  # type: ignore  (B, m)
         diag_x_indices: wp.array(dtype=wp.int32),      # type: ignore  (n,)
         diag_y_indices: wp.array(dtype=wp.int32),      # type: ignore  (p,)
         diag_z_indices: wp.array(dtype=wp.int32),      # type: ignore  (m,)
-        kkt_data:       wp.array2d(dtype=wp.float64),  # type: ignore  (B, kkt_nnz)
+        kkt_data:       wp.array2d(dtype=dtype),  # type: ignore  (B, kkt_nnz)
     ):
         b, t = wp.tid()
         n_static = wp.static(n)

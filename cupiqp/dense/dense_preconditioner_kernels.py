@@ -13,29 +13,21 @@ Kernels defined here:
 """
 
 import warp as wp
+from ..utils import to_warp_dtype
 
 
-@wp.func
-def _ruiz_limit_scaling(d: wp.float64, min_scaling: wp.float64, max_scaling: wp.float64) -> wp.float64:
-    if d < min_scaling:
-        return wp.float64(1.0)
-    if d > max_scaling:
-        return max_scaling
-    return d
-
-
-
-def create_dense_compute_kkt_norms_kernel(n: int, p: int, m: int):
+def create_dense_compute_kkt_norms_kernel(n: int, p: int, m: int, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     """Fused KKT row/col inf-norm computation for the dense backend.
     """
     @wp.kernel
     def dense_compute_kkt_norms_kernel(
-        P:           wp.array3d(dtype=wp.float64),   # type: ignore  (B, n, n)
-        A:           wp.array3d(dtype=wp.float64),   # type: ignore  (B, p, n) — may be (B,0,n)
-        G:           wp.array3d(dtype=wp.float64),   # type: ignore  (B, m, n) — may be (B,0,n)
-        x_b_scaling: wp.array2d(dtype=wp.float64),   # type: ignore  (B, n)
-        d_iter:      wp.array2d(dtype=wp.float64),   # type: ignore  (B, n+p+m) output
-        d_b_iter:    wp.array2d(dtype=wp.float64),   # type: ignore  (B, n) output
+        P:           wp.array3d(dtype=dtype),   # type: ignore  (B, n, n)
+        A:           wp.array3d(dtype=dtype),   # type: ignore  (B, p, n) — may be (B,0,n)
+        G:           wp.array3d(dtype=dtype),   # type: ignore  (B, m, n) — may be (B,0,n)
+        x_b_scaling: wp.array2d(dtype=dtype),   # type: ignore  (B, n)
+        d_iter:      wp.array2d(dtype=dtype),   # type: ignore  (B, n+p+m) output
+        d_b_iter:    wp.array2d(dtype=dtype),   # type: ignore  (B, n) output
     ):
         b, j = wp.tid()
         n_static = wp.static(n)
@@ -43,7 +35,7 @@ def create_dense_compute_kkt_norms_kernel(n: int, p: int, m: int):
         m_static = wp.static(m)
 
         if j < n_static:
-            v = wp.float64(0.0)
+            v = dtype(0.0)
             for k in range(wp.static(n)):
                 v = wp.max(v, wp.abs(P[b, j, k]))
             if wp.static(p > 0):
@@ -58,13 +50,13 @@ def create_dense_compute_kkt_norms_kernel(n: int, p: int, m: int):
             d_b_iter[b, j] = xbs
         elif j < n_static + p_static:
             jp = j - n_static
-            v = wp.float64(0.0)
+            v = dtype(0.0)
             for k in range(wp.static(n)):
                 v = wp.max(v, wp.abs(A[b, jp, k]))
             d_iter[b, j] = v
         elif j < n_static + p_static + m_static:
             jm = j - n_static - p_static
-            v = wp.float64(0.0)
+            v = dtype(0.0)
             for k in range(wp.static(n)):
                 v = wp.max(v, wp.abs(G[b, jm, k]))
             d_iter[b, j] = v
@@ -74,7 +66,8 @@ def create_dense_compute_kkt_norms_kernel(n: int, p: int, m: int):
     return dense_compute_kkt_norms_kernel
 
 
-def create_dense_scale_P_and_c_kernel(n: int):
+def create_dense_scale_P_and_c_kernel(n: int, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     """Fused row+col scaling for P (symmetric) and c, plus optional cost factor.
 
         P[b, i, j] *= d_x[b, i] * d_x[b, j] * cost_scaling_factor[b]
@@ -85,10 +78,10 @@ def create_dense_scale_P_and_c_kernel(n: int):
     """
     @wp.kernel
     def dense_scale_P_and_c_kernel(
-        P:        wp.array3d(dtype=wp.float64),   # type: ignore  (B, n, n) in-out
-        c:        wp.array2d(dtype=wp.float64),   # type: ignore  (B, n)    in-out
-        d_x:      wp.array2d(dtype=wp.float64),   # type: ignore  (B, n)
-        cost_scaling_factor: wp.array(dtype=wp.float64),     # type: ignore  (B,) — ones if no cost factor
+        P:        wp.array3d(dtype=dtype),   # type: ignore  (B, n, n) in-out
+        c:        wp.array2d(dtype=dtype),   # type: ignore  (B, n)    in-out
+        d_x:      wp.array2d(dtype=dtype),   # type: ignore  (B, n)
+        cost_scaling_factor: wp.array(dtype=dtype),     # type: ignore  (B,) — ones if no cost factor
     ):
         b, i, j = wp.tid()
         cf = cost_scaling_factor[b]
@@ -99,7 +92,8 @@ def create_dense_scale_P_and_c_kernel(n: int):
     return dense_scale_P_and_c_kernel
 
 
-def create_dense_scale_A_or_G_kernel(rows: int, cols: int):
+def create_dense_scale_A_or_G_kernel(rows: int, cols: int, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     """Fused row+col scaling for a dense rectangular (B, rows, cols) matrix.
 
         M[b, i, j] *= d_row[b, i] * d_col[b, j]
@@ -108,9 +102,9 @@ def create_dense_scale_A_or_G_kernel(rows: int, cols: int):
     """
     @wp.kernel
     def dense_scale_A_or_G_kernel(
-        M:     wp.array3d(dtype=wp.float64),   # type: ignore  (B, rows, cols) in-out
-        d_row: wp.array2d(dtype=wp.float64),   # type: ignore  (B, rows)
-        d_col: wp.array2d(dtype=wp.float64),   # type: ignore  (B, cols)
+        M:     wp.array3d(dtype=dtype),   # type: ignore  (B, rows, cols) in-out
+        d_row: wp.array2d(dtype=dtype),   # type: ignore  (B, rows)
+        d_col: wp.array2d(dtype=dtype),   # type: ignore  (B, cols)
     ):
         b, i, j = wp.tid()
         M[b, i, j] = M[b, i, j] * d_row[b, i] * d_col[b, j]
@@ -119,7 +113,8 @@ def create_dense_scale_A_or_G_kernel(rows: int, cols: int):
 
 
 def create_dense_compute_gamma_kernel(n: int,
-                                      min_scaling: float, max_scaling: float):
+                                      min_scaling: float, max_scaling: float, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     """Per-batch computation of Ruiz cost-scaling factor gamma.
 
     For each batch b:
@@ -136,37 +131,46 @@ def create_dense_compute_gamma_kernel(n: int,
     lo = float(min_scaling)
     hi = float(max_scaling)
 
+    @wp.func
+    def _ruiz_limit_scaling(d: dtype, min_scaling: dtype, max_scaling: dtype) -> dtype:
+        if d < min_scaling:
+            return dtype(1.0)
+        if d > max_scaling:
+            return max_scaling
+        return d
+
     @wp.kernel
     def dense_compute_gamma_kernel(
-        P:     wp.array3d(dtype=wp.float64),   # type: ignore  (B, n, n)
-        c:     wp.array2d(dtype=wp.float64),   # type: ignore  (B, n)
-        gamma: wp.array(dtype=wp.float64),     # type: ignore  (B,) output
+        P:     wp.array3d(dtype=dtype),   # type: ignore  (B, n, n)
+        c:     wp.array2d(dtype=dtype),   # type: ignore  (B, n)
+        gamma: wp.array(dtype=dtype),     # type: ignore  (B,) output
     ):
         b = wp.tid()
-        total = wp.float64(0.0)
+        total = dtype(0.0)
         for i in range(wp.static(n)):
-            row_max = wp.float64(0.0)
-            col_max = wp.float64(0.0)
+            row_max = dtype(0.0)
+            col_max = dtype(0.0)
             for j in range(wp.static(n)):
                 if j >= i:
                     row_max = wp.max(row_max, wp.abs(P[b, i, j]))
                 if j <= i:
                     col_max = wp.max(col_max, wp.abs(P[b, j, i]))
             total = total + wp.max(row_max, col_max)
-        g = total / wp.float64(wp.static(n))
-        g = _ruiz_limit_scaling(g, wp.float64(lo), wp.float64(hi))
+        g = total / dtype(wp.static(n))
+        g = _ruiz_limit_scaling(g, dtype(lo), dtype(hi))
 
-        cn = wp.float64(0.0)
+        cn = dtype(0.0)
         for i in range(wp.static(n)):
             cn = wp.max(cn, wp.abs(c[b, i]))
         g = wp.max(g, cn)
-        g = _ruiz_limit_scaling(g, wp.float64(lo), wp.float64(hi))
-        gamma[b] = wp.float64(1.0) / g
+        g = _ruiz_limit_scaling(g, dtype(lo), dtype(hi))
+        gamma[b] = dtype(1.0) / g
 
     return dense_compute_gamma_kernel
 
 
-def create_dense_apply_gamma_kernel(n: int):
+def create_dense_apply_gamma_kernel(n: int, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     """Apply computed gamma to P, c, and accumulate into cost_scaling.
 
         data._P *= gamma[:, None, None]
@@ -175,10 +179,10 @@ def create_dense_apply_gamma_kernel(n: int):
     """
     @wp.kernel
     def dense_apply_gamma_kernel(
-        P:            wp.array3d(dtype=wp.float64),   # type: ignore  (B, n, n)
-        c:            wp.array2d(dtype=wp.float64),   # type: ignore  (B, n)
-        cost_scaling: wp.array(dtype=wp.float64),     # type: ignore  (B,)
-        gamma:        wp.array(dtype=wp.float64),     # type: ignore  (B,)
+        P:            wp.array3d(dtype=dtype),   # type: ignore  (B, n, n)
+        c:            wp.array2d(dtype=dtype),   # type: ignore  (B, n)
+        cost_scaling: wp.array(dtype=dtype),     # type: ignore  (B,)
+        gamma:        wp.array(dtype=dtype),     # type: ignore  (B,)
     ):
         b, i, j = wp.tid()
         g = gamma[b]

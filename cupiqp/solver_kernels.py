@@ -1,16 +1,18 @@
 import warp as wp
+from .utils import to_warp_dtype
 
 
-def create_prepare_predictor_step_kernel():
+def create_prepare_predictor_step_kernel(dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     """Fused kernel for the predictor-step RHS assembly:
 
         res.s_all[b, i] = -s_all[b, i] * z_all[b, i]
     """
     @wp.kernel
     def prepare_predictor_step_kernel(
-        s_all:     wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_ineq)
-        z_all:     wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_ineq)
-        res_s_all: wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_ineq) output
+        s_all:     wp.array2d(dtype=dtype),  # type: ignore  (B, num_ineq)
+        z_all:     wp.array2d(dtype=dtype),  # type: ignore  (B, num_ineq)
+        res_s_all: wp.array2d(dtype=dtype),  # type: ignore  (B, num_ineq) output
     ):
         b, i = wp.tid()
         res_s_all[b, i] = -s_all[b, i] * z_all[b, i]
@@ -18,7 +20,8 @@ def create_prepare_predictor_step_kernel():
     return prepare_predictor_step_kernel
 
 
-def create_prepare_corrector_step_kernel():
+def create_prepare_corrector_step_kernel(dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     """Fused kernel for the corrector-step RHS update:
 
         res.s_all[b, i] = res.s_all[b, i] - step.s_all[b, i] * step.z_all[b, i] + sigma[b] * mu[b]
@@ -29,11 +32,11 @@ def create_prepare_corrector_step_kernel():
     """
     @wp.kernel
     def prepare_corrector_step_kernel(
-        step_s_all: wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_ineq)
-        step_z_all: wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_ineq)
-        sigma:      wp.array(dtype=wp.float64),    # type: ignore  (B,)
-        mu:         wp.array(dtype=wp.float64),    # type: ignore  (B,)
-        res_s_all:  wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_ineq) in-out
+        step_s_all: wp.array2d(dtype=dtype),  # type: ignore  (B, num_ineq)
+        step_z_all: wp.array2d(dtype=dtype),  # type: ignore  (B, num_ineq)
+        sigma:      wp.array(dtype=dtype),    # type: ignore  (B,)
+        mu:         wp.array(dtype=dtype),    # type: ignore  (B,)
+        res_s_all:  wp.array2d(dtype=dtype),  # type: ignore  (B, num_ineq) in-out
     ):
         b, i = wp.tid()
         sigma_mu = sigma[b] * mu[b]  # cheap redundant per-thread compute; no sync
@@ -42,7 +45,8 @@ def create_prepare_corrector_step_kernel():
     return prepare_corrector_step_kernel
 
 
-def create_update_vars_after_corrector_step_kernel(n_primal: int, n_dual: int):
+def create_update_vars_after_corrector_step_kernel(n_primal: int, n_dual: int, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     """Fused scaled-add for ``_update_vars_after_corrector_step``::
 
         result.primals_all[b, i] += primal_step[b] * step.primals_all[b, i]   (i in [0, n_primal))
@@ -55,12 +59,12 @@ def create_update_vars_after_corrector_step_kernel(n_primal: int, n_dual: int):
     """
     @wp.kernel
     def update_vars_after_corrector_step_kernel(
-        primal_step:      wp.array(dtype=wp.float64),    # type: ignore  (B,)
-        dual_step:        wp.array(dtype=wp.float64),    # type: ignore  (B,)
-        step_primals_all: wp.array2d(dtype=wp.float64),  # type: ignore  (B, n_primal)
-        step_duals_all:   wp.array2d(dtype=wp.float64),  # type: ignore  (B, n_dual)
-        primals_all:      wp.array2d(dtype=wp.float64),  # type: ignore  (B, n_primal) in-out
-        duals_all:        wp.array2d(dtype=wp.float64),  # type: ignore  (B, n_dual)   in-out
+        primal_step:      wp.array(dtype=dtype),    # type: ignore  (B,)
+        dual_step:        wp.array(dtype=dtype),    # type: ignore  (B,)
+        step_primals_all: wp.array2d(dtype=dtype),  # type: ignore  (B, n_primal)
+        step_duals_all:   wp.array2d(dtype=dtype),  # type: ignore  (B, n_dual)
+        primals_all:      wp.array2d(dtype=dtype),  # type: ignore  (B, n_primal) in-out
+        duals_all:        wp.array2d(dtype=dtype),  # type: ignore  (B, n_dual)   in-out
     ):
         b, t = wp.tid()
         n_primal_static = wp.static(n_primal)
@@ -75,7 +79,8 @@ def create_update_vars_after_corrector_step_kernel(n_primal: int, n_dual: int):
     return update_vars_after_corrector_step_kernel
 
 
-def create_run_full_newton_step_kernel(n: int, p: int):
+def create_run_full_newton_step_kernel(n: int, p: int, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     """Fused post-solve variable update for the equality-only (no-inequality)
     path ``_run_full_newton_step``.
 
@@ -95,12 +100,12 @@ def create_run_full_newton_step_kernel(n: int, p: int):
     """
     @wp.kernel
     def run_full_newton_step_kernel(
-        step_x:      wp.array2d(dtype=wp.float64),  # (B, n)   # type: ignore
-        step_y:      wp.array2d(dtype=wp.float64),  # (B, p)   # type: ignore
-        result_x:    wp.array2d(dtype=wp.float64),  # (B, n)   # type: ignore
-        result_y:    wp.array2d(dtype=wp.float64),  # (B, p)   # type: ignore
-        primal_step: wp.array(dtype=wp.float64),    # (B,)     # type: ignore
-        dual_step:   wp.array(dtype=wp.float64),    # (B,)     # type: ignore
+        step_x:      wp.array2d(dtype=dtype),  # (B, n)   # type: ignore
+        step_y:      wp.array2d(dtype=dtype),  # (B, p)   # type: ignore
+        result_x:    wp.array2d(dtype=dtype),  # (B, n)   # type: ignore
+        result_y:    wp.array2d(dtype=dtype),  # (B, p)   # type: ignore
+        primal_step: wp.array(dtype=dtype),    # (B,)     # type: ignore
+        dual_step:   wp.array(dtype=dtype),    # (B,)     # type: ignore
     ):
         b, t = wp.tid()
         n_static = wp.static(n)
@@ -114,13 +119,14 @@ def create_run_full_newton_step_kernel(n: int, p: int):
 
         # Thread 0 of each batch sets the scalar step-length outputs.
         if t == 0:
-            primal_step[b] = wp.float64(1.0)
-            dual_step[b] = wp.float64(1.0)
+            primal_step[b] = dtype(1.0)
+            dual_step[b] = dtype(1.0)
 
     return run_full_newton_step_kernel
 
 
-def create_calculate_step_kernel(num_ineq: int):
+def create_calculate_step_kernel(num_ineq: int, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     """Fused block-reduction kernel for step lengths (primal and dual).
 
     For each batch ``b``, computes:
@@ -136,18 +142,18 @@ def create_calculate_step_kernel(num_ineq: int):
     finalizes both outputs by multiplying by ``tau``.
     """
     @wp.func
-    def step_candidate(a: wp.float64, b: wp.float64) -> wp.float64:
-        return wp.where(a < wp.float64(0.0), -b / a, wp.float64(1.0))
+    def step_candidate(a: dtype, b: dtype) -> dtype:
+        return wp.where(a < dtype(0.0), -b / a, dtype(1.0))
 
     @wp.kernel
     def calculate_step_kernel(
-        s_all: wp.array2d(dtype=wp.float64),        # (B, num_ineq)  # type: ignore
-        z_all: wp.array2d(dtype=wp.float64),        # (B, num_ineq)  # type: ignore
-        step_s_all: wp.array2d(dtype=wp.float64),   # (B, num_ineq)  # type: ignore
-        step_z_all: wp.array2d(dtype=wp.float64),   # (B, num_ineq)  # type: ignore
-        tau: wp.array(dtype=wp.float64),            # (1,)           # type: ignore
-        alpha_s: wp.array(dtype=wp.float64),        # (B,) output    # type: ignore
-        alpha_z: wp.array(dtype=wp.float64),        # (B,) output    # type: ignore
+        s_all: wp.array2d(dtype=dtype),        # (B, num_ineq)  # type: ignore
+        z_all: wp.array2d(dtype=dtype),        # (B, num_ineq)  # type: ignore
+        step_s_all: wp.array2d(dtype=dtype),   # (B, num_ineq)  # type: ignore
+        step_z_all: wp.array2d(dtype=dtype),   # (B, num_ineq)  # type: ignore
+        tau: wp.array(dtype=dtype),            # (1,)           # type: ignore
+        alpha_s: wp.array(dtype=dtype),        # (B,) output    # type: ignore
+        alpha_z: wp.array(dtype=dtype),        # (B,) output    # type: ignore
     ):
         b, i = wp.tid()
 
@@ -174,7 +180,8 @@ def create_calculate_step_kernel(num_ineq: int):
     return calculate_step_kernel
 
 
-def create_calculate_mu_kernel(num_ineq: int):
+def create_calculate_mu_kernel(num_ineq: int, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     """Fused block-reduction kernel for the duality measure mu.
 
     For each batch ``b``, computes:
@@ -189,9 +196,9 @@ def create_calculate_mu_kernel(num_ineq: int):
     """
     @wp.kernel
     def calculate_mu_kernel(
-        s_all: wp.array2d(dtype=wp.float64),  # (B, num_ineq)  # type: ignore
-        z_all: wp.array2d(dtype=wp.float64),  # (B, num_ineq)  # type: ignore
-        mu:    wp.array(dtype=wp.float64),    # (B,) output    # type: ignore
+        s_all: wp.array2d(dtype=dtype),  # (B, num_ineq)  # type: ignore
+        z_all: wp.array2d(dtype=dtype),  # (B, num_ineq)  # type: ignore
+        mu:    wp.array(dtype=dtype),    # (B,) output    # type: ignore
     ):
         b, tid = wp.tid()
 
@@ -205,12 +212,13 @@ def create_calculate_mu_kernel(num_ineq: int):
 
         # Scalar finalize by thread 0; safe because tile_store is block-collective.
         if tid == 0:
-            mu[b] = mu[b] / wp.float64(num_ineq)
+            mu[b] = mu[b] / dtype(num_ineq)
 
     return calculate_mu_kernel
 
 
-def create_calculate_sigma_kernel(num_ineq: int):
+def create_calculate_sigma_kernel(num_ineq: int, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     """Fused block-reduction kernel for the centering parameter sigma.
 
     For each batch ``b``, computes:
@@ -227,20 +235,20 @@ def create_calculate_sigma_kernel(num_ineq: int):
     """
     @wp.kernel
     def calculate_sigma_kernel(
-        s_all: wp.array2d(dtype=wp.float64),        # (B, num_ineq)  # type: ignore
-        z_all: wp.array2d(dtype=wp.float64),        # (B, num_ineq)  # type: ignore
-        step_s_all: wp.array2d(dtype=wp.float64),   # (B, num_ineq)  # type: ignore
-        step_z_all: wp.array2d(dtype=wp.float64),   # (B, num_ineq)  # type: ignore
-        primal_step: wp.array(dtype=wp.float64),    # (B,) alpha_s   # type: ignore
-        dual_step: wp.array(dtype=wp.float64),      # (B,) alpha_z   # type: ignore
-        mu: wp.array(dtype=wp.float64),             # (B,)           # type: ignore
-        sigma: wp.array(dtype=wp.float64),          # (B,) output    # type: ignore
+        s_all: wp.array2d(dtype=dtype),        # (B, num_ineq)  # type: ignore
+        z_all: wp.array2d(dtype=dtype),        # (B, num_ineq)  # type: ignore
+        step_s_all: wp.array2d(dtype=dtype),   # (B, num_ineq)  # type: ignore
+        step_z_all: wp.array2d(dtype=dtype),   # (B, num_ineq)  # type: ignore
+        primal_step: wp.array(dtype=dtype),    # (B,) alpha_s   # type: ignore
+        dual_step: wp.array(dtype=dtype),      # (B,) alpha_z   # type: ignore
+        mu: wp.array(dtype=dtype),             # (B,)           # type: ignore
+        sigma: wp.array(dtype=dtype),          # (B,) output    # type: ignore
     ):
         # launch_tiled gives us (batch_idx, thread_in_block).
         b, i = wp.tid()
         alpha_s = primal_step[b]
         alpha_z = dual_step[b]
-        denominator = mu[b] * wp.float64(num_ineq)
+        denominator = mu[b] * dtype(num_ineq)
 
         # Block-wide tile loads + elementwise fuse + reduction. All intermediates
         # stay in registers / shared memory (no DRAM round-trip).
@@ -257,7 +265,7 @@ def create_calculate_sigma_kernel(num_ineq: int):
         wp.tile_store(sigma, sum_tile, offset=b)
         if i == 0:
             val = sigma[b] / denominator
-            val = wp.clamp(val, wp.float64(0.0), wp.float64(1.0))
+            val = wp.clamp(val, dtype(0.0), dtype(1.0))
             sigma[b] = val * val * val
 
     return calculate_sigma_kernel
@@ -265,7 +273,8 @@ def create_calculate_sigma_kernel(num_ineq: int):
 
 def create_update_residuals_r_kernel(
     n: int, p: int, num_hu: int, num_hl: int, num_xu: int, num_xl: int,
-):
+dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     """Single fused kernel for the whole ``_update_residuals_r`` body.
 
     Residual-unscaling factors are passed pre-combined as
@@ -322,38 +331,38 @@ def create_update_residuals_r_kernel(
     num_duals = p + num_hu + num_hl + num_xu + num_xl
 
     @wp.func
-    def _abs_mul(a: wp.float64, b: wp.float64) -> wp.float64:
+    def _abs_mul(a: dtype, b: dtype) -> dtype:
         return wp.abs(a) * b
 
     @wp.kernel
     def update_residuals_r_kernel(
         # Stage 1 inputs
-        rho:           wp.array(dtype=wp.float64),    # type: ignore  (B,)
-        delta:         wp.array(dtype=wp.float64),    # type: ignore  (B,)
-        res_nr_x:      wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
-        res_nr_duals:   wp.array2d(dtype=wp.float64), # type: ignore  (B, num_duals)
-        result_x:      wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
-        result_duals:  wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_duals)
-        prox_x:        wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
-        prox_duals:    wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_duals)
+        rho:           wp.array(dtype=dtype),    # type: ignore  (B,)
+        delta:         wp.array(dtype=dtype),    # type: ignore  (B,)
+        res_nr_x:      wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        res_nr_duals:   wp.array2d(dtype=dtype), # type: ignore  (B, num_duals)
+        result_x:      wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        result_duals:  wp.array2d(dtype=dtype),  # type: ignore  (B, num_duals)
+        prox_x:        wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        prox_duals:    wp.array2d(dtype=dtype),  # type: ignore  (B, num_duals)
         # Stage 1 outputs
-        res_x:         wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
-        res_duals:     wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_duals)
+        res_x:         wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        res_duals:     wp.array2d(dtype=dtype),  # type: ignore  (B, num_duals)
         # Pre-combined residual unscaling factors (from preconditioner)
-        dual_res_unscale_factor:   wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
-        primal_res_unscale_factor: wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_duals)
+        dual_res_unscale_factor:   wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        primal_res_unscale_factor: wp.array2d(dtype=dtype),  # type: ignore  (B, num_duals)
         # Stage 3 scalar inputs
-        primal_res:     wp.array(dtype=wp.float64),  # type: ignore  (B,)
-        primal_res_rel: wp.array(dtype=wp.float64),  # type: ignore  (B,)
-        dual_res:       wp.array(dtype=wp.float64),  # type: ignore  (B,)
-        dual_res_rel:   wp.array(dtype=wp.float64),  # type: ignore  (B,)
+        primal_res:     wp.array(dtype=dtype),  # type: ignore  (B,)
+        primal_res_rel: wp.array(dtype=dtype),  # type: ignore  (B,)
+        dual_res:       wp.array(dtype=dtype),  # type: ignore  (B,)
+        dual_res_rel:   wp.array(dtype=dtype),  # type: ignore  (B,)
         # Outputs
-        primal_res_reg:     wp.array(dtype=wp.float64),  # type: ignore
-        primal_res_reg_rel: wp.array(dtype=wp.float64),  # type: ignore
-        dual_res_reg:       wp.array(dtype=wp.float64),  # type: ignore
-        dual_res_reg_rel:   wp.array(dtype=wp.float64),  # type: ignore
-        primal_prox_inf:    wp.array(dtype=wp.float64),  # type: ignore
-        dual_prox_inf:      wp.array(dtype=wp.float64),  # type: ignore
+        primal_res_reg:     wp.array(dtype=dtype),  # type: ignore
+        primal_res_reg_rel: wp.array(dtype=dtype),  # type: ignore
+        dual_res_reg:       wp.array(dtype=dtype),  # type: ignore
+        dual_res_reg_rel:   wp.array(dtype=dtype),  # type: ignore
+        primal_prox_inf:    wp.array(dtype=dtype),  # type: ignore
+        dual_prox_inf:      wp.array(dtype=dtype),  # type: ignore
     ):
         b, i = wp.tid()
 
@@ -397,17 +406,17 @@ def create_update_residuals_r_kernel(
             wp.tile_store(primal_res_reg, mt, offset=b)
         else:
             if i == 0:
-                primal_prox_inf[b] = wp.float64(0.0)
-                primal_res_reg[b]  = wp.float64(0.0)
+                primal_prox_inf[b] = dtype(0.0)
+                primal_res_reg[b]  = dtype(0.0)
 
         # --- Stage 3: scalar finalize --------------------------------------
         if i == 0:
-            if primal_res_rel[b] > wp.float64(0.0):
+            if primal_res_rel[b] > dtype(0.0):
                 primal_res_reg_rel[b] = primal_res_reg[b] * primal_res_rel[b] / primal_res[b]
             else:
                 primal_res_reg_rel[b] = primal_res_reg[b]
 
-            if dual_res_rel[b] > wp.float64(0.0):
+            if dual_res_rel[b] > dtype(0.0):
                 dual_res_reg_rel[b] = dual_res_reg[b] * dual_res_rel[b] / dual_res[b]
             else:
                 dual_res_reg_rel[b] = dual_res_reg[b]
@@ -415,7 +424,8 @@ def create_update_residuals_r_kernel(
     return update_residuals_r_kernel
 
 
-def create_update_residual_nr_kernel(n: int, p: int, m: int, num_hl: int, num_hu: int, num_xl: int, num_xu: int):
+def create_update_residual_nr_kernel(n: int, p: int, m: int, num_hl: int, num_hu: int, num_xl: int, num_xu: int, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     r"""Fused kernel to update non-regularized residuals
 
     - ``minus_Px``      = ``-P*x``                             from ``eval_P_x(alpha=-1)``  (also used as the in-place ``res_nr.x`` slot)
@@ -451,59 +461,59 @@ def create_update_residual_nr_kernel(n: int, p: int, m: int, num_hl: int, num_hu
     """
     @wp.kernel
     def update_residual_nr_kernel(
-        minus_Px:                   wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
-        A_x:                        wp.array2d(dtype=wp.float64),  # type: ignore  (B, p)
-        AT_y:                       wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
-        G_x:                        wp.array2d(dtype=wp.float64),  # type: ignore  (B, m)
-        GT_zh_assembled:            wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
-        zb_assembled:               wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
+        minus_Px:                   wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        A_x:                        wp.array2d(dtype=dtype),  # type: ignore  (B, p)
+        AT_y:                       wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        G_x:                        wp.array2d(dtype=dtype),  # type: ignore  (B, m)
+        GT_zh_assembled:            wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        zb_assembled:               wp.array2d(dtype=dtype),  # type: ignore  (B, n)
         # Data
-        data_c:                     wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
-        data_b:                     wp.array2d(dtype=wp.float64),  # type: ignore  (B, p)
-        data_h_l:                   wp.array2d(dtype=wp.float64),  # type: ignore  (B, m)
-        data_h_u:                   wp.array2d(dtype=wp.float64),  # type: ignore  (B, m)
-        data_x_l:                   wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
-        data_x_u:                   wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
+        data_c:                     wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        data_b:                     wp.array2d(dtype=dtype),  # type: ignore  (B, p)
+        data_h_l:                   wp.array2d(dtype=dtype),  # type: ignore  (B, m)
+        data_h_u:                   wp.array2d(dtype=dtype),  # type: ignore  (B, m)
+        data_x_l:                   wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        data_x_u:                   wp.array2d(dtype=dtype),  # type: ignore  (B, n)
         # Variables at current iteration
-        result_x:                   wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
-        result_y:                   wp.array2d(dtype=wp.float64),  # type: ignore  (B, p)
-        result_z_hl:                wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_hl)
-        result_z_hu:                wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_hu)
-        result_z_xl:                wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_xl)
-        result_z_xu:                wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_xu)
-        result_s_hl:                wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_hl)
-        result_s_hu:                wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_hu)
-        result_s_xl:                wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_xl)
-        result_s_xu:                wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_xu)
+        result_x:                   wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        result_y:                   wp.array2d(dtype=dtype),  # type: ignore  (B, p)
+        result_z_hl:                wp.array2d(dtype=dtype),  # type: ignore  (B, num_hl)
+        result_z_hu:                wp.array2d(dtype=dtype),  # type: ignore  (B, num_hu)
+        result_z_xl:                wp.array2d(dtype=dtype),  # type: ignore  (B, num_xl)
+        result_z_xu:                wp.array2d(dtype=dtype),  # type: ignore  (B, num_xu)
+        result_s_hl:                wp.array2d(dtype=dtype),  # type: ignore  (B, num_hl)
+        result_s_hu:                wp.array2d(dtype=dtype),  # type: ignore  (B, num_hu)
+        result_s_xl:                wp.array2d(dtype=dtype),  # type: ignore  (B, num_xl)
+        result_s_xu:                wp.array2d(dtype=dtype),  # type: ignore  (B, num_xu)
         # Preconditioner
-        x_b_scaling:                wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
-        cost_scaling_inv:           wp.array(dtype=wp.float64),    # type: ignore  (B,)
-        delta_inv:                  wp.array2d(dtype=wp.float64),  # type: ignore  (B, n+p+m)
-        delta_b_inv:                wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
-        constraints_rhs_inf_norm:   wp.array(dtype=wp.float64),    # type: ignore  (B,)
+        x_b_scaling:                wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        cost_scaling_inv:           wp.array(dtype=dtype),    # type: ignore  (B,)
+        delta_inv:                  wp.array2d(dtype=dtype),  # type: ignore  (B, n+p+m)
+        delta_b_inv:                wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        constraints_rhs_inf_norm:   wp.array(dtype=dtype),    # type: ignore  (B,)
         # Segment index maps
         idx_hl:                     wp.array(dtype=wp.int32),      # type: ignore
         idx_hu:                     wp.array(dtype=wp.int32),      # type: ignore
         idx_xl:                     wp.array(dtype=wp.int32),      # type: ignore
         idx_xu:                     wp.array(dtype=wp.int32),      # type: ignore
         # Residuals
-        res_nr_x:                   wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
-        res_nr_y:                   wp.array2d(dtype=wp.float64),  # type: ignore  (B, p)
-        res_nr_z_hl:                wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_hl)
-        res_nr_z_hu:                wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_hu)
-        res_nr_z_xl:                wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_xl)
-        res_nr_z_xu:                wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_xu)
+        res_nr_x:                   wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        res_nr_y:                   wp.array2d(dtype=dtype),  # type: ignore  (B, p)
+        res_nr_z_hl:                wp.array2d(dtype=dtype),  # type: ignore  (B, num_hl)
+        res_nr_z_hu:                wp.array2d(dtype=dtype),  # type: ignore  (B, num_hu)
+        res_nr_z_xl:                wp.array2d(dtype=dtype),  # type: ignore  (B, num_xl)
+        res_nr_z_xu:                wp.array2d(dtype=dtype),  # type: ignore  (B, num_xu)
         # Objectices and residuals
-        info_primal_obj:            wp.array(dtype=wp.float64),  # type: ignore  shape (B,)
-        info_dual_obj:              wp.array(dtype=wp.float64),  # type: ignore  shape (B,)
-        info_duality_gap:           wp.array(dtype=wp.float64),  # type: ignore  shape (B,)
-        info_duality_gap_rel:       wp.array(dtype=wp.float64),  # type: ignore  shape (B,)
-        info_primal_res:            wp.array(dtype=wp.float64),  # type: ignore  shape (B,)
-        info_primal_res_rel:        wp.array(dtype=wp.float64),  # type: ignore  shape (B,)
-        info_dual_res:              wp.array(dtype=wp.float64),  # type: ignore  shape (B,)
-        info_dual_res_rel:          wp.array(dtype=wp.float64),  # type: ignore  shape (B,)
-        info_prev_primal_res:       wp.array(dtype=wp.float64),  # type: ignore  shape (B,)
-        info_prev_dual_res:         wp.array(dtype=wp.float64),  # type: ignore  shape (B,)
+        info_primal_obj:            wp.array(dtype=dtype),  # type: ignore  shape (B,)
+        info_dual_obj:              wp.array(dtype=dtype),  # type: ignore  shape (B,)
+        info_duality_gap:           wp.array(dtype=dtype),  # type: ignore  shape (B,)
+        info_duality_gap_rel:       wp.array(dtype=dtype),  # type: ignore  shape (B,)
+        info_primal_res:            wp.array(dtype=dtype),  # type: ignore  shape (B,)
+        info_primal_res_rel:        wp.array(dtype=dtype),  # type: ignore  shape (B,)
+        info_dual_res:              wp.array(dtype=dtype),  # type: ignore  shape (B,)
+        info_dual_res_rel:          wp.array(dtype=dtype),  # type: ignore  shape (B,)
+        info_prev_primal_res:       wp.array(dtype=dtype),  # type: ignore  shape (B,)
+        info_prev_dual_res:         wp.array(dtype=dtype),  # type: ignore  shape (B,)
     ):
         b, i = wp.tid()
 
@@ -531,20 +541,20 @@ def create_update_residual_nr_kernel(n: int, p: int, m: int, num_hl: int, num_hu
             info_dual_res[b] = dual_res
 
         half_xT_Px = wp.tile_extract(
-            wp.float64(-0.5) * wp.tile_sum(minus_Px_tile * x_tile), 0,
+            dtype(-0.5) * wp.tile_sum(minus_Px_tile * x_tile), 0,
         )
         cT_x = wp.tile_extract(wp.tile_sum(c_tile * x_tile), 0)
 
         # ---- segment obj-sum scalars (default 0; overridden inside guards) ----
-        bT_y    = wp.float64(0.0)
-        hl_zhl  = wp.float64(0.0)
-        hu_zhu  = wp.float64(0.0)
-        xl_zxl  = wp.float64(0.0)
-        xu_zxu  = wp.float64(0.0)
+        bT_y    = dtype(0.0)
+        hl_zhl  = dtype(0.0)
+        hu_zhu  = dtype(0.0)
+        xl_zxl  = dtype(0.0)
+        xu_zxu  = dtype(0.0)
 
         # ---- primal_res / primal_rel_norm running maxes (scalar) ----
-        primal_res  = wp.float64(0.0)
-        primal_res_rel_norm = wp.float64(0.0)
+        primal_res  = dtype(0.0)
+        primal_res_rel_norm = dtype(0.0)
 
         # ---- dual_res_rel: 3-term running max ----
         Px_norm = wp.tile_extract(wp.tile_max(wp.tile_map(wp.abs, minus_Px_tile * delta_x_inv_tile)), 0)
@@ -715,23 +725,24 @@ def create_update_residual_nr_kernel(n: int, p: int, m: int, num_hl: int, num_hu
             duality_gap_rel_norm = wp.max(duality_gap_rel_norm, wp.abs(hu_zhu))
             duality_gap_rel_norm = wp.max(duality_gap_rel_norm, wp.abs(xl_zxl))
             duality_gap_rel_norm = wp.max(duality_gap_rel_norm, wp.abs(xu_zxu))
-            duality_gap_rel_norm = wp.max(cost_scaling_inv[b] * duality_gap_rel_norm, wp.float64(1.0))
+            duality_gap_rel_norm = wp.max(cost_scaling_inv[b] * duality_gap_rel_norm, dtype(1.0))
             info_duality_gap_rel[b] = info_duality_gap[b] / duality_gap_rel_norm
 
             # primal_res / primal_res_rel
             info_primal_res[b] = primal_res
             prn = wp.max(primal_res_rel_norm, constraints_rhs_inf_norm[b])
-            prn = wp.max(prn, wp.float64(1.0))
+            prn = wp.max(prn, dtype(1.0))
             info_primal_res_rel[b] = primal_res / prn
 
             # dual_res_rel  (info.dual_res already = dr_x)
-            dual_res_rel_norm = wp.max(drn_max * cost_scaling_inv[b], wp.float64(1.0))
+            dual_res_rel_norm = wp.max(drn_max * cost_scaling_inv[b], dtype(1.0))
             info_dual_res_rel[b] = dual_res / dual_res_rel_norm
 
     return update_residual_nr_kernel
 
 
-def create_prepare_zu_minus_zl_and_zbu_minus_zbl_kernel(m: int, n: int):
+def create_prepare_zu_minus_zl_and_zbu_minus_zbl_kernel(m: int, n: int, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     """Pre-matvec scatter-gather for _update_residuals_nr.
 
           zhu_minus_zhl = 0
@@ -746,23 +757,23 @@ def create_prepare_zu_minus_zl_and_zbu_minus_zbl_kernel(m: int, n: int):
 
     @wp.kernel
     def prepare_zu_minus_zl_and_zbu_minus_zbl_kernel(
-        z_u:              wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_hu)
-        z_l:              wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_hl)
-        z_bl:             wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_xl)
-        z_bu:             wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_xu)
-        x_b_scaling:      wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
+        z_u:              wp.array2d(dtype=dtype),  # type: ignore  (B, num_hu)
+        z_l:              wp.array2d(dtype=dtype),  # type: ignore  (B, num_hl)
+        z_bl:             wp.array2d(dtype=dtype),  # type: ignore  (B, num_xl)
+        z_bu:             wp.array2d(dtype=dtype),  # type: ignore  (B, num_xu)
+        x_b_scaling:      wp.array2d(dtype=dtype),  # type: ignore  (B, n)
         inv_idx_hu:       wp.array(dtype=wp.int32),      # type: ignore  (m,)
         inv_idx_hl:       wp.array(dtype=wp.int32),      # type: ignore  (m,)
         inv_idx_xu:       wp.array(dtype=wp.int32),      # type: ignore  (n,)
         inv_idx_xl:       wp.array(dtype=wp.int32),      # type: ignore  (n,)
-        zu_minus_zl:      wp.array2d(dtype=wp.float64),  # type: ignore  (B, m) output
-        zbu_minus_zbl:    wp.array2d(dtype=wp.float64),  # type: ignore  (B, n) output
+        zu_minus_zl:      wp.array2d(dtype=dtype),  # type: ignore  (B, m) output
+        zbu_minus_zbl:    wp.array2d(dtype=dtype),  # type: ignore  (B, n) output
     ):
         m_static = wp.static(m)
         b, i = wp.tid()
 
         if i < m_static:
-            val = wp.float64(0.0)
+            val = dtype(0.0)
             k_hu = inv_idx_hu[i]
             if k_hu >= 0:
                 val = val + z_u[b, k_hu]
@@ -772,7 +783,7 @@ def create_prepare_zu_minus_zl_and_zbu_minus_zbl_kernel(m: int, n: int):
             zu_minus_zl[b, i] = val
         else:
             j = i - m_static
-            val = wp.float64(0.0)
+            val = dtype(0.0)
             k_xu = inv_idx_xu[j]
             if k_xu >= 0:
                 val = val + z_bu[b, k_xu]
@@ -784,32 +795,33 @@ def create_prepare_zu_minus_zl_and_zbu_minus_zbl_kernel(m: int, n: int):
     return prepare_zu_minus_zl_and_zbu_minus_zbl_kernel
 
 
-def create_update_rho_delta_with_ineq_kernel(n: int, num_duals: int):
+def create_update_rho_delta_with_ineq_kernel(n: int, num_duals: int, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     """Fused adaptive-regularization update for the inequality-constrained path.
     """
     @wp.kernel
     def update_rho_delta_with_ineq_kernel(
-        info_dual_res:         wp.array(dtype=wp.float64),   # type: ignore
-        info_prev_dual_res:    wp.array(dtype=wp.float64),   # type: ignore
-        info_dual_res_rel:     wp.array(dtype=wp.float64),   # type: ignore
-        info_dual_prox_inf:    wp.array(dtype=wp.float64),   # type: ignore
-        info_primal_res:       wp.array(dtype=wp.float64),   # type: ignore
-        info_prev_primal_res:  wp.array(dtype=wp.float64),   # type: ignore
-        info_primal_res_rel:   wp.array(dtype=wp.float64),   # type: ignore
-        info_primal_prox_inf:  wp.array(dtype=wp.float64),   # type: ignore
-        info_reg_limit:        wp.array(dtype=wp.float64),   # type: ignore
-        info_rho:              wp.array(dtype=wp.float64),   # type: ignore
-        info_delta:            wp.array(dtype=wp.float64),   # type: ignore
+        info_dual_res:         wp.array(dtype=dtype),   # type: ignore
+        info_prev_dual_res:    wp.array(dtype=dtype),   # type: ignore
+        info_dual_res_rel:     wp.array(dtype=dtype),   # type: ignore
+        info_dual_prox_inf:    wp.array(dtype=dtype),   # type: ignore
+        info_primal_res:       wp.array(dtype=dtype),   # type: ignore
+        info_prev_primal_res:  wp.array(dtype=dtype),   # type: ignore
+        info_primal_res_rel:   wp.array(dtype=dtype),   # type: ignore
+        info_primal_prox_inf:  wp.array(dtype=dtype),   # type: ignore
+        info_reg_limit:        wp.array(dtype=dtype),   # type: ignore
+        info_rho:              wp.array(dtype=dtype),   # type: ignore
+        info_delta:            wp.array(dtype=dtype),   # type: ignore
         info_no_primal_update: wp.array(dtype=wp.int32),     # type: ignore  in-out (B,)
         info_no_dual_update:   wp.array(dtype=wp.int32),     # type: ignore  in-out (B,)
-        result_x:              wp.array2d(dtype=wp.float64), # type: ignore
-        prox_x:                wp.array2d(dtype=wp.float64), # type: ignore
-        result_duals:          wp.array2d(dtype=wp.float64), # type: ignore
-        prox_duals:            wp.array2d(dtype=wp.float64), # type: ignore
-        settings_eps_abs:              wp.float64,
-        settings_eps_rel:              wp.float64,
-        settings_reg_finetune_lower:   wp.float64,
-        settings_infeas_thresh:        wp.float64,
+        result_x:              wp.array2d(dtype=dtype), # type: ignore
+        prox_x:                wp.array2d(dtype=dtype), # type: ignore
+        result_duals:          wp.array2d(dtype=dtype), # type: ignore
+        prox_duals:            wp.array2d(dtype=dtype), # type: ignore
+        settings_eps_abs:              dtype,
+        settings_eps_rel:              dtype,
+        settings_reg_finetune_lower:   dtype,
+        settings_infeas_thresh:        dtype,
         current_iter:                  wp.int32,
     ):
         b, i = wp.tid()
@@ -818,13 +830,13 @@ def create_update_rho_delta_with_ineq_kernel(n: int, num_duals: int):
         iter_under_5 = (current_iter < wp.int32(5))
 
         dual_improved = (
-            (info_dual_res[b] < wp.float64(0.95) * info_prev_dual_res[b])
+            (info_dual_res[b] < dtype(0.95) * info_prev_dual_res[b])
             or (info_dual_res[b] < settings_eps_abs)
             or (info_dual_res_rel[b] < settings_eps_rel)
             or ((info_rho[b] == settings_reg_finetune_lower) and (info_dual_prox_inf[b] < settings_infeas_thresh))
         )
         primal_improved = (
-            (info_primal_res[b] < wp.float64(0.95) * info_prev_primal_res[b])
+            (info_primal_res[b] < dtype(0.95) * info_prev_primal_res[b])
             or (info_primal_res[b] < settings_eps_abs)
             or (info_primal_res_rel[b] < settings_eps_rel)
             or ((info_delta[b] == settings_reg_finetune_lower) and (info_primal_prox_inf[b] < settings_infeas_thresh))
@@ -832,8 +844,8 @@ def create_update_rho_delta_with_ineq_kernel(n: int, num_duals: int):
 
         if i == 0:
             old_rho = info_rho[b]
-            rho_fast = wp.max(info_reg_limit[b], wp.float64(0.1) * old_rho)
-            rho_slow = wp.max(info_reg_limit[b], wp.float64(0.5) * old_rho)
+            rho_fast = wp.max(info_reg_limit[b], dtype(0.1) * old_rho)
+            rho_slow = wp.max(info_reg_limit[b], dtype(0.5) * old_rho)
             rho_slow_ok = (not dual_improved) and (
                 iter_under_5 or (info_dual_prox_inf[b] < settings_infeas_thresh)
             )
@@ -845,8 +857,8 @@ def create_update_rho_delta_with_ineq_kernel(n: int, num_duals: int):
                 pass
 
             old_delta = info_delta[b]
-            delta_fast = wp.max(info_reg_limit[b], wp.float64(0.1) * old_delta)
-            delta_slow = wp.max(info_reg_limit[b], wp.float64(0.5) * old_delta)
+            delta_fast = wp.max(info_reg_limit[b], dtype(0.1) * old_delta)
+            delta_slow = wp.max(info_reg_limit[b], dtype(0.5) * old_delta)
             delta_slow_ok = (not primal_improved) and (
                 iter_under_5 or (info_primal_prox_inf[b] < settings_infeas_thresh)
             )
@@ -875,31 +887,32 @@ def create_update_rho_delta_with_ineq_kernel(n: int, num_duals: int):
     return update_rho_delta_with_ineq_kernel
 
 
-def create_update_rho_delta_without_ineq_kernel(n: int, p: int):
+def create_update_rho_delta_without_ineq_kernel(n: int, p: int, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     """Fused adaptive-regularization update for the equality-only path.
     """
     @wp.kernel
     def update_rho_delta_without_ineq_kernel(
-        info_dual_res:         wp.array(dtype=wp.float64),   # type: ignore
-        info_prev_dual_res:    wp.array(dtype=wp.float64),   # type: ignore
-        info_dual_res_rel:     wp.array(dtype=wp.float64),   # type: ignore
-        info_dual_prox_inf:    wp.array(dtype=wp.float64),   # type: ignore
-        info_primal_res:       wp.array(dtype=wp.float64),   # type: ignore
-        info_prev_primal_res:  wp.array(dtype=wp.float64),   # type: ignore
-        info_primal_res_rel:   wp.array(dtype=wp.float64),   # type: ignore
-        info_primal_prox_inf:  wp.array(dtype=wp.float64),   # type: ignore
-        info_reg_limit:        wp.array(dtype=wp.float64),   # type: ignore
-        info_rho:              wp.array(dtype=wp.float64),   # type: ignore
-        info_delta:            wp.array(dtype=wp.float64),   # type: ignore
+        info_dual_res:         wp.array(dtype=dtype),   # type: ignore
+        info_prev_dual_res:    wp.array(dtype=dtype),   # type: ignore
+        info_dual_res_rel:     wp.array(dtype=dtype),   # type: ignore
+        info_dual_prox_inf:    wp.array(dtype=dtype),   # type: ignore
+        info_primal_res:       wp.array(dtype=dtype),   # type: ignore
+        info_prev_primal_res:  wp.array(dtype=dtype),   # type: ignore
+        info_primal_res_rel:   wp.array(dtype=dtype),   # type: ignore
+        info_primal_prox_inf:  wp.array(dtype=dtype),   # type: ignore
+        info_reg_limit:        wp.array(dtype=dtype),   # type: ignore
+        info_rho:              wp.array(dtype=dtype),   # type: ignore
+        info_delta:            wp.array(dtype=dtype),   # type: ignore
         info_no_primal_update: wp.array(dtype=wp.int32),     # type: ignore
         info_no_dual_update:   wp.array(dtype=wp.int32),     # type: ignore
-        result_x:              wp.array2d(dtype=wp.float64), # type: ignore
-        prox_x:                wp.array2d(dtype=wp.float64), # type: ignore
-        result_y:              wp.array2d(dtype=wp.float64), # type: ignore
-        prox_y:                wp.array2d(dtype=wp.float64), # type: ignore
-        settings_eps_abs:              wp.float64,
-        settings_eps_rel:              wp.float64,
-        settings_infeas_thresh:        wp.float64,
+        result_x:              wp.array2d(dtype=dtype), # type: ignore
+        prox_x:                wp.array2d(dtype=dtype), # type: ignore
+        result_y:              wp.array2d(dtype=dtype), # type: ignore
+        prox_y:                wp.array2d(dtype=dtype), # type: ignore
+        settings_eps_abs:              dtype,
+        settings_eps_rel:              dtype,
+        settings_infeas_thresh:        dtype,
         current_iter:                  wp.int32,
     ):
         b, i = wp.tid()
@@ -908,20 +921,20 @@ def create_update_rho_delta_without_ineq_kernel(n: int, p: int):
         iter_under_5 = (current_iter < wp.int32(5))
 
         dual_improved = (
-            (info_dual_res[b] < wp.float64(0.95) * info_prev_dual_res[b])
+            (info_dual_res[b] < dtype(0.95) * info_prev_dual_res[b])
             or (info_dual_res[b] < settings_eps_abs)
             or (info_dual_res_rel[b] < settings_eps_rel)
         )
         primal_improved = (
-            (info_primal_res[b] < wp.float64(0.95) * info_prev_primal_res[b])
+            (info_primal_res[b] < dtype(0.95) * info_prev_primal_res[b])
             or (info_primal_res[b] < settings_eps_abs)
             or (info_primal_res_rel[b] < settings_eps_rel)
         )
 
         if i == 0:
             old_rho = info_rho[b]
-            rho_fast = wp.max(info_reg_limit[b], wp.float64(0.1) * old_rho)
-            rho_slow = wp.max(info_reg_limit[b], wp.float64(0.5) * old_rho)
+            rho_fast = wp.max(info_reg_limit[b], dtype(0.1) * old_rho)
+            rho_slow = wp.max(info_reg_limit[b], dtype(0.5) * old_rho)
             rho_slow_ok = (not dual_improved) and (
                 iter_under_5 or (info_dual_prox_inf[b] < settings_infeas_thresh)
             )
@@ -933,8 +946,8 @@ def create_update_rho_delta_without_ineq_kernel(n: int, p: int):
                 pass
 
             old_delta = info_delta[b]
-            delta_fast = wp.max(info_reg_limit[b], wp.float64(0.1) * old_delta)
-            delta_slow = wp.max(info_reg_limit[b], wp.float64(0.5) * old_delta)
+            delta_fast = wp.max(info_reg_limit[b], dtype(0.1) * old_delta)
+            delta_slow = wp.max(info_reg_limit[b], dtype(0.5) * old_delta)
             delta_slow_ok = (not primal_improved) and (
                 iter_under_5 or (info_primal_prox_inf[b] < settings_infeas_thresh)
             )
@@ -964,7 +977,8 @@ def create_update_rho_delta_without_ineq_kernel(n: int, p: int):
     return update_rho_delta_without_ineq_kernel
 
 
-def create_boundary_shift_kernel(num_hl: int, num_hu: int, num_xl: int, num_xu: int):
+def create_boundary_shift_kernel(num_hl: int, num_hu: int, num_xl: int, num_xu: int, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     """Per-element ``z`` boundary shift to avoid division-by-zero in the IPM.
 
         if z_hl[b, k] < eps: z_hl[b, k] += eps    (k in [0, num_hl))
@@ -973,14 +987,14 @@ def create_boundary_shift_kernel(num_hl: int, num_hu: int, num_xl: int, num_xu: 
         if z_bu[b, k] < eps: z_bu[b, k] += eps    (k in [0, num_xu))
     """
     # IEEE 754 float64 machine epsilon (== np.finfo(np.float64).eps)
-    EPS_F64 = wp.constant(wp.float64(2.220446049250313e-16))
+    EPS_F64 = wp.constant(dtype(2.220446049250313e-16))
     
     @wp.kernel
     def boundary_shift_kernel(
-        z_hl:  wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_hl)
-        z_hu:  wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_hu)
-        z_bl: wp.array2d(dtype=wp.float64),   # type: ignore  (B, num_xl)
-        z_bu: wp.array2d(dtype=wp.float64),   # type: ignore  (B, num_xu)
+        z_hl:  wp.array2d(dtype=dtype),  # type: ignore  (B, num_hl)
+        z_hu:  wp.array2d(dtype=dtype),  # type: ignore  (B, num_hu)
+        z_bl: wp.array2d(dtype=dtype),   # type: ignore  (B, num_xl)
+        z_bu: wp.array2d(dtype=dtype),   # type: ignore  (B, num_xu)
     ):
         b, t = wp.tid()
         n_hl = wp.static(num_hl)
@@ -1013,42 +1027,43 @@ def create_backward_assemble_rhs_kernel(
     n: int, p: int,
     num_hu: int, num_hl: int, num_xu: int, num_xl: int,
     precond_on: bool,
-):
+dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     r"""Assemble adjoint RHS."""
     @wp.kernel
     def backward_assemble_rhs_kernel(
-        grad_x:    wp.array2d(dtype=wp.float64),  # type: ignore (B, n)
-        grad_y:    wp.array2d(dtype=wp.float64),  # type: ignore (B, p)
-        grad_z_u:  wp.array2d(dtype=wp.float64),  # type: ignore (B, num_hu)
-        grad_z_l:  wp.array2d(dtype=wp.float64),  # type: ignore (B, num_hl)
-        grad_z_bu: wp.array2d(dtype=wp.float64),  # type: ignore (B, num_xu)
-        grad_z_bl: wp.array2d(dtype=wp.float64),  # type: ignore (B, num_xl)
-        grad_s_u:  wp.array2d(dtype=wp.float64),  # type: ignore (B, num_hu)
-        grad_s_l:  wp.array2d(dtype=wp.float64),  # type: ignore (B, num_hl)
-        grad_s_bu: wp.array2d(dtype=wp.float64),  # type: ignore (B, num_xu)
-        grad_s_bl: wp.array2d(dtype=wp.float64),  # type: ignore (B, num_xl)
+        grad_x:    wp.array2d(dtype=dtype),  # type: ignore (B, n)
+        grad_y:    wp.array2d(dtype=dtype),  # type: ignore (B, p)
+        grad_z_u:  wp.array2d(dtype=dtype),  # type: ignore (B, num_hu)
+        grad_z_l:  wp.array2d(dtype=dtype),  # type: ignore (B, num_hl)
+        grad_z_bu: wp.array2d(dtype=dtype),  # type: ignore (B, num_xu)
+        grad_z_bl: wp.array2d(dtype=dtype),  # type: ignore (B, num_xl)
+        grad_s_u:  wp.array2d(dtype=dtype),  # type: ignore (B, num_hu)
+        grad_s_l:  wp.array2d(dtype=dtype),  # type: ignore (B, num_hl)
+        grad_s_bu: wp.array2d(dtype=dtype),  # type: ignore (B, num_xu)
+        grad_s_bl: wp.array2d(dtype=dtype),  # type: ignore (B, num_xl)
         # Index maps
         idx_hu:  wp.array(dtype=wp.int32),  # type: ignore (num_hu,)
         idx_hl:  wp.array(dtype=wp.int32),  # type: ignore (num_hl,)
         idx_xu:  wp.array(dtype=wp.int32),  # type: ignore (num_xu,)
         idx_xl:  wp.array(dtype=wp.int32),  # type: ignore (num_xl,)
         # Preconditioner factors
-        delta:             wp.array2d(dtype=wp.float64),  # type: ignore (B, n+p+m)
-        delta_b:           wp.array2d(dtype=wp.float64),  # type: ignore (B, n)
-        delta_inv:         wp.array2d(dtype=wp.float64),  # type: ignore (B, n+p+m)
-        delta_b_inv:       wp.array2d(dtype=wp.float64),  # type: ignore (B, n)
-        cost_scaling_inv:  wp.array(dtype=wp.float64),    # type: ignore (B,)
+        delta:             wp.array2d(dtype=dtype),  # type: ignore (B, n+p+m)
+        delta_b:           wp.array2d(dtype=dtype),  # type: ignore (B, n)
+        delta_inv:         wp.array2d(dtype=dtype),  # type: ignore (B, n+p+m)
+        delta_b_inv:       wp.array2d(dtype=dtype),  # type: ignore (B, n)
+        cost_scaling_inv:  wp.array(dtype=dtype),    # type: ignore (B,)
         # Outputs (rhs_adj fields)
-        rhs_x:    wp.array2d(dtype=wp.float64),  # type: ignore
-        rhs_y:    wp.array2d(dtype=wp.float64),  # type: ignore
-        rhs_z_u:  wp.array2d(dtype=wp.float64),  # type: ignore
-        rhs_z_l:  wp.array2d(dtype=wp.float64),  # type: ignore
-        rhs_z_bu: wp.array2d(dtype=wp.float64),  # type: ignore
-        rhs_z_bl: wp.array2d(dtype=wp.float64),  # type: ignore
-        rhs_s_u:  wp.array2d(dtype=wp.float64),  # type: ignore
-        rhs_s_l:  wp.array2d(dtype=wp.float64),  # type: ignore
-        rhs_s_bu: wp.array2d(dtype=wp.float64),  # type: ignore
-        rhs_s_bl: wp.array2d(dtype=wp.float64),  # type: ignore
+        rhs_x:    wp.array2d(dtype=dtype),  # type: ignore
+        rhs_y:    wp.array2d(dtype=dtype),  # type: ignore
+        rhs_z_u:  wp.array2d(dtype=dtype),  # type: ignore
+        rhs_z_l:  wp.array2d(dtype=dtype),  # type: ignore
+        rhs_z_bu: wp.array2d(dtype=dtype),  # type: ignore
+        rhs_z_bl: wp.array2d(dtype=dtype),  # type: ignore
+        rhs_s_u:  wp.array2d(dtype=dtype),  # type: ignore
+        rhs_s_l:  wp.array2d(dtype=dtype),  # type: ignore
+        rhs_s_bu: wp.array2d(dtype=dtype),  # type: ignore
+        rhs_s_bl: wp.array2d(dtype=dtype),  # type: ignore
     ):
         b, t = wp.tid()
         n_static     = wp.static(n)
@@ -1151,7 +1166,8 @@ def create_backward_unscale_lhs_kernel(
     n: int, p: int,
     num_hu: int, num_hl: int, num_xu: int, num_xl: int,
     precond_on: bool,
-):
+dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     r"""Step 3 of the backward pass — un-scale ``sol`` (scaled-space
     backsolve output) into user-space lambdas **in place**, in
     Variables active-size layout.
@@ -1170,21 +1186,21 @@ def create_backward_unscale_lhs_kernel(
     @wp.kernel
     def backward_unscale_lhs_kernel(
         # In-place sol (active sizes), Variables fields of the passed-in `sol`
-        sol_x:    wp.array2d(dtype=wp.float64),  # type: ignore (B, n)
-        sol_y:    wp.array2d(dtype=wp.float64),  # type: ignore (B, p)
-        sol_z_u:  wp.array2d(dtype=wp.float64),  # type: ignore (B, num_hu)
-        sol_z_l:  wp.array2d(dtype=wp.float64),  # type: ignore (B, num_hl)
-        sol_z_bu: wp.array2d(dtype=wp.float64),  # type: ignore (B, num_xu)
-        sol_z_bl: wp.array2d(dtype=wp.float64),  # type: ignore (B, num_xl)
+        sol_x:    wp.array2d(dtype=dtype),  # type: ignore (B, n)
+        sol_y:    wp.array2d(dtype=dtype),  # type: ignore (B, p)
+        sol_z_u:  wp.array2d(dtype=dtype),  # type: ignore (B, num_hu)
+        sol_z_l:  wp.array2d(dtype=dtype),  # type: ignore (B, num_hl)
+        sol_z_bu: wp.array2d(dtype=dtype),  # type: ignore (B, num_xu)
+        sol_z_bl: wp.array2d(dtype=dtype),  # type: ignore (B, num_xl)
         # Index maps
         idx_hu:   wp.array(dtype=wp.int32),  # type: ignore
         idx_hl:   wp.array(dtype=wp.int32),  # type: ignore
         idx_xu:   wp.array(dtype=wp.int32),  # type: ignore
         idx_xl:   wp.array(dtype=wp.int32),  # type: ignore
         # Preconditioner factors
-        delta:        wp.array2d(dtype=wp.float64),  # type: ignore (B, n+p+m)
-        delta_b:      wp.array2d(dtype=wp.float64),  # type: ignore (B, n)
-        cost_scaling: wp.array(dtype=wp.float64),    # type: ignore (B,)
+        delta:        wp.array2d(dtype=dtype),  # type: ignore (B, n+p+m)
+        delta_b:      wp.array2d(dtype=dtype),  # type: ignore (B, n)
+        cost_scaling: wp.array(dtype=dtype),    # type: ignore (B,)
     ):
         b, t = wp.tid()
         n_static     = wp.static(n)
@@ -1240,7 +1256,8 @@ def create_backward_unscale_lhs_kernel(
 def create_backward_compute_vector_grad_kernel(
     n: int, p: int,
     num_hu: int, num_hl: int, num_xu: int, num_xl: int,
-):
+dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     r"""Fused per-element sign-flip / copy that turns the user-space
     adjoint lambdas into the six vector gradients ``(dc, db, dh_u,
     dh_l, dx_u, dx_l)`` packed into ``sol``'s Variables layout.
@@ -1257,18 +1274,18 @@ def create_backward_compute_vector_grad_kernel(
     """
     @wp.kernel
     def backward_compute_vector_grad_kernel(
-        grad_x:    wp.array2d(dtype=wp.float64),  # type: ignore (B, n)
-        grad_y:    wp.array2d(dtype=wp.float64),  # type: ignore (B, p)
-        grad_z_u:  wp.array2d(dtype=wp.float64),  # type: ignore (B, num_hu)
-        grad_z_l:  wp.array2d(dtype=wp.float64),  # type: ignore (B, num_hl)
-        grad_z_bu: wp.array2d(dtype=wp.float64),  # type: ignore (B, num_xu)
-        grad_z_bl: wp.array2d(dtype=wp.float64),  # type: ignore (B, num_xl)
-        sol_x:    wp.array2d(dtype=wp.float64),   # type: ignore (B, n)
-        sol_y:    wp.array2d(dtype=wp.float64),   # type: ignore (B, p)
-        sol_z_u:  wp.array2d(dtype=wp.float64),   # type: ignore (B, num_hu)
-        sol_z_l:  wp.array2d(dtype=wp.float64),   # type: ignore (B, num_hl)
-        sol_z_bu: wp.array2d(dtype=wp.float64),   # type: ignore (B, num_xu)
-        sol_z_bl: wp.array2d(dtype=wp.float64),   # type: ignore (B, num_xl)
+        grad_x:    wp.array2d(dtype=dtype),  # type: ignore (B, n)
+        grad_y:    wp.array2d(dtype=dtype),  # type: ignore (B, p)
+        grad_z_u:  wp.array2d(dtype=dtype),  # type: ignore (B, num_hu)
+        grad_z_l:  wp.array2d(dtype=dtype),  # type: ignore (B, num_hl)
+        grad_z_bu: wp.array2d(dtype=dtype),  # type: ignore (B, num_xu)
+        grad_z_bl: wp.array2d(dtype=dtype),  # type: ignore (B, num_xl)
+        sol_x:    wp.array2d(dtype=dtype),   # type: ignore (B, n)
+        sol_y:    wp.array2d(dtype=dtype),   # type: ignore (B, p)
+        sol_z_u:  wp.array2d(dtype=dtype),   # type: ignore (B, num_hu)
+        sol_z_l:  wp.array2d(dtype=dtype),   # type: ignore (B, num_hl)
+        sol_z_bu: wp.array2d(dtype=dtype),   # type: ignore (B, num_xu)
+        sol_z_bl: wp.array2d(dtype=dtype),   # type: ignore (B, num_xl)
     ):
         b, t = wp.tid()
         n_static   = wp.static(n)
@@ -1318,29 +1335,30 @@ def create_backward_compute_vector_grad_kernel(
 def create_backward_copy_kernel(
     n: int, p: int,
     num_hu: int, num_hl: int, num_xu: int, num_xl: int,
-):
+dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     @wp.kernel
     def backward_copy_kernel(
-        in_x:    wp.array2d(dtype=wp.float64),  # type: ignore (B, n)
-        in_y:    wp.array2d(dtype=wp.float64),  # type: ignore (B, p)
-        in_z_u:  wp.array2d(dtype=wp.float64),  # type: ignore (B, num_hu)
-        in_z_l:  wp.array2d(dtype=wp.float64),  # type: ignore (B, num_hl)
-        in_z_bu: wp.array2d(dtype=wp.float64),  # type: ignore (B, num_xu)
-        in_z_bl: wp.array2d(dtype=wp.float64),  # type: ignore (B, num_xl)
-        in_s_u:  wp.array2d(dtype=wp.float64),  # type: ignore (B, num_hu)
-        in_s_l:  wp.array2d(dtype=wp.float64),  # type: ignore (B, num_hl)
-        in_s_bu: wp.array2d(dtype=wp.float64),  # type: ignore (B, num_xu)
-        in_s_bl: wp.array2d(dtype=wp.float64),  # type: ignore (B, num_xl)
-        out_x:    wp.array2d(dtype=wp.float64),  # type: ignore
-        out_y:    wp.array2d(dtype=wp.float64),  # type: ignore
-        out_z_u:  wp.array2d(dtype=wp.float64),  # type: ignore
-        out_z_l:  wp.array2d(dtype=wp.float64),  # type: ignore
-        out_z_bu: wp.array2d(dtype=wp.float64),  # type: ignore
-        out_z_bl: wp.array2d(dtype=wp.float64),  # type: ignore
-        out_s_u:  wp.array2d(dtype=wp.float64),  # type: ignore
-        out_s_l:  wp.array2d(dtype=wp.float64),  # type: ignore
-        out_s_bu: wp.array2d(dtype=wp.float64),  # type: ignore
-        out_s_bl: wp.array2d(dtype=wp.float64),  # type: ignore
+        in_x:    wp.array2d(dtype=dtype),  # type: ignore (B, n)
+        in_y:    wp.array2d(dtype=dtype),  # type: ignore (B, p)
+        in_z_u:  wp.array2d(dtype=dtype),  # type: ignore (B, num_hu)
+        in_z_l:  wp.array2d(dtype=dtype),  # type: ignore (B, num_hl)
+        in_z_bu: wp.array2d(dtype=dtype),  # type: ignore (B, num_xu)
+        in_z_bl: wp.array2d(dtype=dtype),  # type: ignore (B, num_xl)
+        in_s_u:  wp.array2d(dtype=dtype),  # type: ignore (B, num_hu)
+        in_s_l:  wp.array2d(dtype=dtype),  # type: ignore (B, num_hl)
+        in_s_bu: wp.array2d(dtype=dtype),  # type: ignore (B, num_xu)
+        in_s_bl: wp.array2d(dtype=dtype),  # type: ignore (B, num_xl)
+        out_x:    wp.array2d(dtype=dtype),  # type: ignore
+        out_y:    wp.array2d(dtype=dtype),  # type: ignore
+        out_z_u:  wp.array2d(dtype=dtype),  # type: ignore
+        out_z_l:  wp.array2d(dtype=dtype),  # type: ignore
+        out_z_bu: wp.array2d(dtype=dtype),  # type: ignore
+        out_z_bl: wp.array2d(dtype=dtype),  # type: ignore
+        out_s_u:  wp.array2d(dtype=dtype),  # type: ignore
+        out_s_l:  wp.array2d(dtype=dtype),  # type: ignore
+        out_s_bu: wp.array2d(dtype=dtype),  # type: ignore
+        out_s_bl: wp.array2d(dtype=dtype),  # type: ignore
     ):
         b, t = wp.tid()
         n_s   = wp.static(n)
@@ -1397,7 +1415,8 @@ def create_backward_copy_kernel(
     return backward_copy_kernel
 
 
-def create_backward_pack_full_layout_kernel(m: int, n: int):
+def create_backward_pack_full_layout_kernel(m: int, n: int, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     r"""Fused full-layout pack for the backward pass.
 
     Outputs:
@@ -1412,24 +1431,24 @@ def create_backward_pack_full_layout_kernel(m: int, n: int):
     @wp.kernel
     def backward_pack_full_layout_kernel(
         # Active-only inputs (Variables fields)
-        sol_z_u:    wp.array2d(dtype=wp.float64),  # type: ignore (B, num_hu)
-        sol_z_l:    wp.array2d(dtype=wp.float64),  # type: ignore (B, num_hl)
-        sol_z_bu:   wp.array2d(dtype=wp.float64),  # type: ignore (B, num_xu)
-        sol_z_bl:   wp.array2d(dtype=wp.float64),  # type: ignore (B, num_xl)
-        result_z_u: wp.array2d(dtype=wp.float64),  # type: ignore (B, num_hu)
-        result_z_l: wp.array2d(dtype=wp.float64),  # type: ignore (B, num_hl)
+        sol_z_u:    wp.array2d(dtype=dtype),  # type: ignore (B, num_hu)
+        sol_z_l:    wp.array2d(dtype=dtype),  # type: ignore (B, num_hl)
+        sol_z_bu:   wp.array2d(dtype=dtype),  # type: ignore (B, num_xu)
+        sol_z_bl:   wp.array2d(dtype=dtype),  # type: ignore (B, num_xl)
+        result_z_u: wp.array2d(dtype=dtype),  # type: ignore (B, num_hu)
+        result_z_l: wp.array2d(dtype=dtype),  # type: ignore (B, num_hl)
         # Inverse-index maps: inv_idx_*[j] = i if j == idx_*[i] else -1.
         inv_idx_hu: wp.array(dtype=wp.int32),  # type: ignore (m,)
         inv_idx_hl: wp.array(dtype=wp.int32),  # type: ignore (m,)
         inv_idx_xu: wp.array(dtype=wp.int32),  # type: ignore (n,)
         inv_idx_xl: wp.array(dtype=wp.int32),  # type: ignore (n,)
         # Full-layout outputs (no pre-zero required).
-        lam_zu_full:  wp.array2d(dtype=wp.float64),  # type: ignore (B, m)
-        lam_zl_full:  wp.array2d(dtype=wp.float64),  # type: ignore (B, m)
-        lam_zbu_full: wp.array2d(dtype=wp.float64),  # type: ignore (B, n)
-        lam_zbl_full: wp.array2d(dtype=wp.float64),  # type: ignore (B, n)
-        zu_full:      wp.array2d(dtype=wp.float64),  # type: ignore (B, m)
-        zl_full:      wp.array2d(dtype=wp.float64),  # type: ignore (B, m)
+        lam_zu_full:  wp.array2d(dtype=dtype),  # type: ignore (B, m)
+        lam_zl_full:  wp.array2d(dtype=dtype),  # type: ignore (B, m)
+        lam_zbu_full: wp.array2d(dtype=dtype),  # type: ignore (B, n)
+        lam_zbl_full: wp.array2d(dtype=dtype),  # type: ignore (B, n)
+        zu_full:      wp.array2d(dtype=dtype),  # type: ignore (B, m)
+        zl_full:      wp.array2d(dtype=dtype),  # type: ignore (B, m)
     ):
         b, t = wp.tid()
         m_static = wp.static(m)
@@ -1449,7 +1468,7 @@ def create_backward_pack_full_layout_kernel(m: int, n: int):
             if i >= 0:
                 lam_zu_full[b, j] = sol_z_u[b, i]
             else:
-                lam_zu_full[b, j] = wp.float64(0.0)
+                lam_zu_full[b, j] = dtype(0.0)
 
         elif t < end_lam_zl:
             j = t - end_lam_zu
@@ -1457,7 +1476,7 @@ def create_backward_pack_full_layout_kernel(m: int, n: int):
             if i >= 0:
                 lam_zl_full[b, j] = sol_z_l[b, i]
             else:
-                lam_zl_full[b, j] = wp.float64(0.0)
+                lam_zl_full[b, j] = dtype(0.0)
 
         elif t < end_lam_zbu:
             j = t - end_lam_zl
@@ -1465,7 +1484,7 @@ def create_backward_pack_full_layout_kernel(m: int, n: int):
             if i >= 0:
                 lam_zbu_full[b, j] = sol_z_bu[b, i]
             else:
-                lam_zbu_full[b, j] = wp.float64(0.0)
+                lam_zbu_full[b, j] = dtype(0.0)
 
         elif t < end_lam_zbl:
             j = t - end_lam_zbu
@@ -1473,7 +1492,7 @@ def create_backward_pack_full_layout_kernel(m: int, n: int):
             if i >= 0:
                 lam_zbl_full[b, j] = sol_z_bl[b, i]
             else:
-                lam_zbl_full[b, j] = wp.float64(0.0)
+                lam_zbl_full[b, j] = dtype(0.0)
 
         elif t < end_res_zu:
             j = t - end_lam_zbl
@@ -1481,7 +1500,7 @@ def create_backward_pack_full_layout_kernel(m: int, n: int):
             if i >= 0:
                 zu_full[b, j] = result_z_u[b, i]
             else:
-                zu_full[b, j] = wp.float64(0.0)
+                zu_full[b, j] = dtype(0.0)
 
         elif t < end_res_zl:
             j = t - end_res_zu
@@ -1489,7 +1508,7 @@ def create_backward_pack_full_layout_kernel(m: int, n: int):
             if i >= 0:
                 zl_full[b, j] = result_z_l[b, i]
             else:
-                zl_full[b, j] = wp.float64(0.0)
+                zl_full[b, j] = dtype(0.0)
 
         else:
             return
@@ -1501,7 +1520,8 @@ def create_grad_pack_and_unscale_kernel(
     n: int, p: int, m: int,
     num_hu: int, num_hl: int, num_xu: int, num_xl: int,
     precond_on: bool,
-):
+dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     r"""Fused step-3 of the backward pass — pack lambdas to full layout
     and compute scaled primal/dual values at the solution.
 
@@ -1526,36 +1546,36 @@ def create_grad_pack_and_unscale_kernel(
     def grad_pack_and_unscale_kernel(
         # ---- Inputs ----
         # lhs_adj fields (active-only sizes)
-        lhs_x:    wp.array2d(dtype=wp.float64),  # type: ignore (B, n)
-        lhs_y:    wp.array2d(dtype=wp.float64),  # type: ignore (B, p)
-        lhs_z_u:  wp.array2d(dtype=wp.float64),  # type: ignore (B, num_hu)
-        lhs_z_l:  wp.array2d(dtype=wp.float64),  # type: ignore (B, num_hl)
-        lhs_z_bu: wp.array2d(dtype=wp.float64),  # type: ignore (B, num_xu)
-        lhs_z_bl: wp.array2d(dtype=wp.float64),  # type: ignore (B, num_xl)
+        lhs_x:    wp.array2d(dtype=dtype),  # type: ignore (B, n)
+        lhs_y:    wp.array2d(dtype=dtype),  # type: ignore (B, p)
+        lhs_z_u:  wp.array2d(dtype=dtype),  # type: ignore (B, num_hu)
+        lhs_z_l:  wp.array2d(dtype=dtype),  # type: ignore (B, num_hl)
+        lhs_z_bu: wp.array2d(dtype=dtype),  # type: ignore (B, num_xu)
+        lhs_z_bl: wp.array2d(dtype=dtype),  # type: ignore (B, num_xl)
         # Solution at last solve (active-only sizes for z_u, z_l)
-        result_x:   wp.array2d(dtype=wp.float64),  # type: ignore (B, n)
-        result_y:   wp.array2d(dtype=wp.float64),  # type: ignore (B, p)
-        result_z_u: wp.array2d(dtype=wp.float64),  # type: ignore (B, num_hu)
-        result_z_l: wp.array2d(dtype=wp.float64),  # type: ignore (B, num_hl)
+        result_x:   wp.array2d(dtype=dtype),  # type: ignore (B, n)
+        result_y:   wp.array2d(dtype=dtype),  # type: ignore (B, p)
+        result_z_u: wp.array2d(dtype=dtype),  # type: ignore (B, num_hu)
+        result_z_l: wp.array2d(dtype=dtype),  # type: ignore (B, num_hl)
         # Index maps
         idx_hu: wp.array(dtype=wp.int32),  # type: ignore
         idx_hl: wp.array(dtype=wp.int32),  # type: ignore
         idx_xu: wp.array(dtype=wp.int32),  # type: ignore
         idx_xl: wp.array(dtype=wp.int32),  # type: ignore
         # Preconditioner factors
-        delta_inv:    wp.array2d(dtype=wp.float64),  # type: ignore
-        cost_scaling: wp.array(dtype=wp.float64),    # type: ignore
+        delta_inv:    wp.array2d(dtype=dtype),  # type: ignore
+        cost_scaling: wp.array(dtype=dtype),    # type: ignore
         # ---- Outputs ----
         # Padded lambdas (size m or n) — zero-initialised by caller.
-        lam_z_u:  wp.array2d(dtype=wp.float64),  # type: ignore (B, m)
-        lam_z_l:  wp.array2d(dtype=wp.float64),  # type: ignore (B, m)
-        lam_z_bu: wp.array2d(dtype=wp.float64),  # type: ignore (B, n)
-        lam_z_bl: wp.array2d(dtype=wp.float64),  # type: ignore (B, n)
+        lam_z_u:  wp.array2d(dtype=dtype),  # type: ignore (B, m)
+        lam_z_l:  wp.array2d(dtype=dtype),  # type: ignore (B, m)
+        lam_z_bu: wp.array2d(dtype=dtype),  # type: ignore (B, n)
+        lam_z_bl: wp.array2d(dtype=dtype),  # type: ignore (B, n)
         # Scaled primal / dual at solution.
-        x_val:    wp.array2d(dtype=wp.float64),  # type: ignore (B, n)
-        y_val:    wp.array2d(dtype=wp.float64),  # type: ignore (B, p)
-        zu_full:  wp.array2d(dtype=wp.float64),  # type: ignore (B, m) zero-init
-        zl_full:  wp.array2d(dtype=wp.float64),  # type: ignore (B, m) zero-init
+        x_val:    wp.array2d(dtype=dtype),  # type: ignore (B, n)
+        y_val:    wp.array2d(dtype=dtype),  # type: ignore (B, p)
+        zu_full:  wp.array2d(dtype=dtype),  # type: ignore (B, m) zero-init
+        zl_full:  wp.array2d(dtype=dtype),  # type: ignore (B, m) zero-init
     ):
         b, t = wp.tid()
         n_c = wp.static(n)

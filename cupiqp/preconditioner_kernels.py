@@ -1,16 +1,18 @@
 import warp as wp
+from .utils import to_warp_dtype
 
-
-@wp.func
-def _ruiz_limit_scaling(d: wp.float64, min_scaling: wp.float64, max_scaling: wp.float64) -> wp.float64:
-    if d < min_scaling:
-        return wp.float64(1.0)
-    if d > max_scaling:
-        return max_scaling
-    return d
 
 def create_clamp_and_rsqrt_kernel(n: int, p: int, m: int,
-                              min_scaling: float, max_scaling: float):
+                              min_scaling: float, max_scaling: float, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
+    @wp.func
+    def _ruiz_limit_scaling(d: dtype, min_scaling: dtype, max_scaling: dtype) -> dtype:
+        if d < min_scaling:
+            return dtype(1.0)
+        if d > max_scaling:
+            return max_scaling
+        return d
+
     """Fused the following cupy chain:
 
         delta_iter[delta_iter < self.min_scaling] = 1.0
@@ -26,18 +28,18 @@ def create_clamp_and_rsqrt_kernel(n: int, p: int, m: int,
 
     @wp.kernel
     def clamp_rsqrt_kernel(
-        delta_iter:   wp.array2d(dtype=wp.float64),   # type: ignore  (B, n+p+m)
-        delta_b_iter: wp.array2d(dtype=wp.float64),   # type: ignore  (B, n)
+        delta_iter:   wp.array2d(dtype=dtype),   # type: ignore  (B, n+p+m)
+        delta_b_iter: wp.array2d(dtype=dtype),   # type: ignore  (B, n)
     ):
         b, k = wp.tid()
         delta = delta_iter[b, k]
-        delta = _ruiz_limit_scaling(delta, wp.float64(low), wp.float64(high))
-        delta_iter[b, k] = wp.float64(1.0) / wp.sqrt(delta)
+        delta = _ruiz_limit_scaling(delta, dtype(low), dtype(high))
+        delta_iter[b, k] = dtype(1.0) / wp.sqrt(delta)
 
         if k < wp.static(n):
             delta_b = delta_b_iter[b, k]
-            delta_b = _ruiz_limit_scaling(delta_b, wp.float64(low), wp.float64(high))
-            delta_b_iter[b, k] = wp.float64(1.0) / wp.sqrt(delta_b)
+            delta_b = _ruiz_limit_scaling(delta_b, dtype(low), dtype(high))
+            delta_b_iter[b, k] = dtype(1.0) / wp.sqrt(delta_b)
 
     return clamp_rsqrt_kernel
 
@@ -45,7 +47,8 @@ def create_clamp_and_rsqrt_kernel(n: int, p: int, m: int,
 def create_calc_scaling_inv_and_scale_bounds_kernel(
     n: int, p: int, m: int,
     num_hl: int, num_hu: int, num_xl: int, num_xu: int,
-):
+dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     """Fuse the kernel for storing the inverse of scaling factors and scaling the bounds.
 
     Replaces the cupy/warp chain
@@ -73,23 +76,23 @@ def create_calc_scaling_inv_and_scale_bounds_kernel(
     """
     @wp.kernel
     def finalize_and_scale_bounds_kernel(
-        delta:            wp.array2d(dtype=wp.float64),  # type: ignore  (B, n+p+m)
-        delta_inv:        wp.array2d(dtype=wp.float64),  # type: ignore  (B, n+p+m)
-        delta_b:          wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
-        delta_b_inv:      wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
-        cost_scaling:     wp.array(dtype=wp.float64),    # type: ignore  (B,)
-        cost_scaling_inv: wp.array(dtype=wp.float64),    # type: ignore  (B,)
-        data_b:           wp.array2d(dtype=wp.float64),  # type: ignore  (B, p) — to be scaled in-place
-        data_h_l:         wp.array2d(dtype=wp.float64),  # type: ignore  (B, m) — to be scaled in-place
-        data_h_u:         wp.array2d(dtype=wp.float64),  # type: ignore  (B, m) — to be scaled in-place
-        data_x_l:         wp.array2d(dtype=wp.float64),  # type: ignore  (B, n) — to be scaled in-place
-        data_x_u:         wp.array2d(dtype=wp.float64),  # type: ignore  (B, n) — to be scaled in-place
+        delta:            wp.array2d(dtype=dtype),  # type: ignore  (B, n+p+m)
+        delta_inv:        wp.array2d(dtype=dtype),  # type: ignore  (B, n+p+m)
+        delta_b:          wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        delta_b_inv:      wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        cost_scaling:     wp.array(dtype=dtype),    # type: ignore  (B,)
+        cost_scaling_inv: wp.array(dtype=dtype),    # type: ignore  (B,)
+        data_b:           wp.array2d(dtype=dtype),  # type: ignore  (B, p) — to be scaled in-place
+        data_h_l:         wp.array2d(dtype=dtype),  # type: ignore  (B, m) — to be scaled in-place
+        data_h_u:         wp.array2d(dtype=dtype),  # type: ignore  (B, m) — to be scaled in-place
+        data_x_l:         wp.array2d(dtype=dtype),  # type: ignore  (B, n) — to be scaled in-place
+        data_x_u:         wp.array2d(dtype=dtype),  # type: ignore  (B, n) — to be scaled in-place
         idx_hl:                    wp.array(dtype=wp.int32),      # type: ignore  (num_hl,)
         idx_hu:                    wp.array(dtype=wp.int32),      # type: ignore  (num_hu,)
         idx_xl:                    wp.array(dtype=wp.int32),      # type: ignore  (num_xl,)
         idx_xu:                    wp.array(dtype=wp.int32),      # type: ignore  (num_xu,)
-        dual_res_unscale_factor:   wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)          output
-        primal_res_unscale_factor: wp.array2d(dtype=wp.float64),  # type: ignore  (B, num_duals)  output
+        dual_res_unscale_factor:   wp.array2d(dtype=dtype),  # type: ignore  (B, n)          output
+        primal_res_unscale_factor: wp.array2d(dtype=dtype),  # type: ignore  (B, num_duals)  output
     ):
         b, k = wp.tid()
         n_static = wp.static(n)
@@ -103,52 +106,53 @@ def create_calc_scaling_inv_and_scale_bounds_kernel(
         num_duals   = wp.static(p + num_hl + num_hu + num_xl + num_xu)
 
         if k < n_static:
-            delta_inv[b, k] = wp.float64(1.0) / delta[b, k]
-            delta_b_inv[b, k] = wp.float64(1.0) / delta_b[b, k]
+            delta_inv[b, k] = dtype(1.0) / delta[b, k]
+            delta_b_inv[b, k] = dtype(1.0) / delta_b[b, k]
             # scale x_l and x_u inplace
             data_x_l[b, k] = data_x_l[b, k] * delta_b[b, k]
             data_x_u[b, k] = data_x_u[b, k] * delta_b[b, k]
             # dual_res_unscale_factor = cost_scaling_inv * delta_inv on x-block
-            dual_res_unscale_factor[b, k] = wp.float64(1.0) / (cost_scaling[b] * delta[b, k])
+            dual_res_unscale_factor[b, k] = dtype(1.0) / (cost_scaling[b] * delta[b, k])
         elif k < np_static:
-            delta_inv[b, k] = wp.float64(1.0) / delta[b, k]
+            delta_inv[b, k] = dtype(1.0) / delta[b, k]
             # scale rhs of equality constraints inplace
             data_b[b, k - n_static] = data_b[b, k - n_static] * delta[b, k]
         elif k < npm_static:
-            delta_inv[b, k] = wp.float64(1.0) / delta[b, k]
+            delta_inv[b, k] = dtype(1.0) / delta[b, k]
             # scale rhs of inequality constraints inplace
             jm = k - np_static
             data_h_l[b, jm] = data_h_l[b, jm] * delta[b, k]
             data_h_u[b, jm] = data_h_u[b, jm] * delta[b, k]
         elif k < npm_static + 1:
             # compute inverse of cost scaling
-            cost_scaling_inv[b] = wp.float64(1.0) / cost_scaling[b]
+            cost_scaling_inv[b] = dtype(1.0) / cost_scaling[b]
         elif k < tail_start + num_duals:
             # primal_res_unscale_factor[b, j], packed in _dual_buffer order
             # [y | z_l | z_u | z_bl | z_bu]. Read only inputs (delta, delta_b,
             # idx_*) — no read-after-write hazard within this kernel.
             j = k - tail_start
             if j < off_zl_end:
-                primal_res_unscale_factor[b, j] = wp.float64(1.0) / delta[b, wp.static(n) + j]
+                primal_res_unscale_factor[b, j] = dtype(1.0) / delta[b, wp.static(n) + j]
             elif j < off_zu_end:
                 idx = idx_hl[j - wp.static(p)]
-                primal_res_unscale_factor[b, j] = wp.float64(1.0) / delta[b, wp.static(n + p) + idx]
+                primal_res_unscale_factor[b, j] = dtype(1.0) / delta[b, wp.static(n + p) + idx]
             elif j < off_zbl_end:
                 idx = idx_hu[j - wp.static(p + num_hl)]
-                primal_res_unscale_factor[b, j] = wp.float64(1.0) / delta[b, wp.static(n + p) + idx]
+                primal_res_unscale_factor[b, j] = dtype(1.0) / delta[b, wp.static(n + p) + idx]
             elif j < off_zbu_end:
                 idx = idx_xl[j - wp.static(p + num_hl + num_hu)]
-                primal_res_unscale_factor[b, j] = wp.float64(1.0) / delta_b[b, idx]
+                primal_res_unscale_factor[b, j] = dtype(1.0) / delta_b[b, idx]
             else:
                 idx = idx_xu[j - wp.static(p + num_hl + num_hu + num_xl)]
-                primal_res_unscale_factor[b, j] = wp.float64(1.0) / delta_b[b, idx]
+                primal_res_unscale_factor[b, j] = dtype(1.0) / delta_b[b, idx]
         else:
             return
 
     return finalize_and_scale_bounds_kernel
 
 
-def create_scale_bounds_kernel(n: int, p: int, m: int):
+def create_scale_bounds_kernel(n: int, p: int, m: int, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     """Sentinel-safe in-place forward bound scaling, single launch (B, n+p+m).
 
     Perform:
@@ -160,13 +164,13 @@ def create_scale_bounds_kernel(n: int, p: int, m: int):
     """
     @wp.kernel
     def scale_bounds_kernel(
-        delta:    wp.array2d(dtype=wp.float64),  # type: ignore  (B, n+p+m)
-        delta_b:  wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
-        data_b:   wp.array2d(dtype=wp.float64),  # type: ignore  (B, p)
-        data_h_l: wp.array2d(dtype=wp.float64),  # type: ignore  (B, m)
-        data_h_u: wp.array2d(dtype=wp.float64),  # type: ignore  (B, m)
-        data_x_l: wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
-        data_x_u: wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
+        delta:    wp.array2d(dtype=dtype),  # type: ignore  (B, n+p+m)
+        delta_b:  wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        data_b:   wp.array2d(dtype=dtype),  # type: ignore  (B, p)
+        data_h_l: wp.array2d(dtype=dtype),  # type: ignore  (B, m)
+        data_h_u: wp.array2d(dtype=dtype),  # type: ignore  (B, m)
+        data_x_l: wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        data_x_u: wp.array2d(dtype=dtype),  # type: ignore  (B, n)
     ):
         b, k = wp.tid()
         n_static = wp.static(n)
@@ -190,7 +194,8 @@ def create_scale_bounds_kernel(n: int, p: int, m: int):
     return scale_bounds_kernel
 
 
-def create_unscale_bounds_kernel(n: int, p: int, m: int):
+def create_unscale_bounds_kernel(n: int, p: int, m: int, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     """Sentinel-safe in-place inverse bound scaling, single launch (B, n+p+m).
 
     Mirrors ``create_scale_bounds_kernel`` but multiplies by the stored
@@ -208,13 +213,13 @@ def create_unscale_bounds_kernel(n: int, p: int, m: int):
     """
     @wp.kernel
     def unscale_bounds_kernel(
-        delta_inv:   wp.array2d(dtype=wp.float64),  # type: ignore  (B, n+p+m)
-        delta_b_inv: wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
-        data_b:      wp.array2d(dtype=wp.float64),  # type: ignore  (B, p)
-        data_h_l:    wp.array2d(dtype=wp.float64),  # type: ignore  (B, m)
-        data_h_u:    wp.array2d(dtype=wp.float64),  # type: ignore  (B, m)
-        data_x_l:    wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
-        data_x_u:    wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
+        delta_inv:   wp.array2d(dtype=dtype),  # type: ignore  (B, n+p+m)
+        delta_b_inv: wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        data_b:      wp.array2d(dtype=dtype),  # type: ignore  (B, p)
+        data_h_l:    wp.array2d(dtype=dtype),  # type: ignore  (B, m)
+        data_h_u:    wp.array2d(dtype=dtype),  # type: ignore  (B, m)
+        data_x_l:    wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        data_x_u:    wp.array2d(dtype=dtype),  # type: ignore  (B, n)
     ):
         b, k = wp.tid()
         n_static = wp.static(n)
@@ -238,7 +243,8 @@ def create_unscale_bounds_kernel(n: int, p: int, m: int):
     return unscale_bounds_kernel
 
 
-def create_accumulate_deltas_kernel(n: int, p: int, m: int):
+def create_accumulate_deltas_kernel(n: int, p: int, m: int, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     """Fused per-iteration state update.
 
     Replaces the 4-launch cupy chain
@@ -252,11 +258,11 @@ def create_accumulate_deltas_kernel(n: int, p: int, m: int):
     """
     @wp.kernel
     def accumulate_deltas_kernel(
-        delta:        wp.array2d(dtype=wp.float64),  # type: ignore  (B, n+p+m) in-out
-        delta_b:      wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)     in-out
-        x_b_scaling:  wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)     in-out
-        delta_iter:   wp.array2d(dtype=wp.float64),  # type: ignore  (B, n+p+m) input
-        delta_b_iter: wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)     input
+        delta:        wp.array2d(dtype=dtype),  # type: ignore  (B, n+p+m) in-out
+        delta_b:      wp.array2d(dtype=dtype),  # type: ignore  (B, n)     in-out
+        x_b_scaling:  wp.array2d(dtype=dtype),  # type: ignore  (B, n)     in-out
+        delta_iter:   wp.array2d(dtype=dtype),  # type: ignore  (B, n+p+m) input
+        delta_b_iter: wp.array2d(dtype=dtype),  # type: ignore  (B, n)     input
     ):
         b, k = wp.tid()
         di = delta_iter[b, k]
@@ -269,12 +275,12 @@ def create_accumulate_deltas_kernel(n: int, p: int, m: int):
     return accumulate_deltas_kernel
 
 
-@wp.func
-def _diff_with_one(d: wp.float64) -> wp.float64:
-    return wp.abs(wp.float64(1.0) - d)
+def create_ruiz_conv_check_kernel(n: int, p: int, m: int, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
+    @wp.func
+    def _diff_with_one(d: dtype) -> dtype:
+        return wp.abs(dtype(1.0) - d)
 
-
-def create_ruiz_conv_check_kernel(n: int, p: int, m: int):
     """Tile-based per-batch convergence reduction.
 
     Replaces the 4-launch cupy chain
@@ -292,9 +298,9 @@ def create_ruiz_conv_check_kernel(n: int, p: int, m: int):
 
     @wp.kernel
     def conv_check_kernel(
-        delta_iter:   wp.array2d(dtype=wp.float64),   # type: ignore  (B, n+p+m)
-        delta_b_iter: wp.array2d(dtype=wp.float64),   # type: ignore  (B, n)
-        conv_buf:     wp.array(dtype=wp.float64),     # type: ignore  (2B,) output
+        delta_iter:   wp.array2d(dtype=dtype),   # type: ignore  (B, n+p+m)
+        delta_b_iter: wp.array2d(dtype=dtype),   # type: ignore  (B, n)
+        conv_buf:     wp.array(dtype=dtype),     # type: ignore  (2B,) output
     ):
         b, _ = wp.tid()
 
@@ -314,7 +320,8 @@ def create_ruiz_conv_check_kernel(n: int, p: int, m: int):
 def create_compute_constraints_rhs_inf_norm_unscaled_kernel(
     n: int, p: int, m: int,
     num_hl: int, num_hu: int, num_xl: int, num_xu: int,
-):
+dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     """Tile-based per-batch unscaled-RHS inf-norm reduction.
 
         Perform:
@@ -328,22 +335,22 @@ def create_compute_constraints_rhs_inf_norm_unscaled_kernel(
     """
     @wp.kernel
     def kernel(
-        delta_inv:   wp.array2d(dtype=wp.float64),  # type: ignore  (B, n+p+m)
-        delta_b_inv: wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
-        data_b:      wp.array2d(dtype=wp.float64),  # type: ignore  (B, p)
-        data_h_l:    wp.array2d(dtype=wp.float64),  # type: ignore  (B, m)
-        data_h_u:    wp.array2d(dtype=wp.float64),  # type: ignore  (B, m)
-        data_x_l:    wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
-        data_x_u:    wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
+        delta_inv:   wp.array2d(dtype=dtype),  # type: ignore  (B, n+p+m)
+        delta_b_inv: wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        data_b:      wp.array2d(dtype=dtype),  # type: ignore  (B, p)
+        data_h_l:    wp.array2d(dtype=dtype),  # type: ignore  (B, m)
+        data_h_u:    wp.array2d(dtype=dtype),  # type: ignore  (B, m)
+        data_x_l:    wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        data_x_u:    wp.array2d(dtype=dtype),  # type: ignore  (B, n)
         idx_hl:      wp.array(dtype=wp.int32),      # type: ignore  (num_hl,)
         idx_hu:      wp.array(dtype=wp.int32),      # type: ignore  (num_hu,)
         idx_xl:      wp.array(dtype=wp.int32),      # type: ignore  (num_xl,)
         idx_xu:      wp.array(dtype=wp.int32),      # type: ignore  (num_xu,)
-        out:         wp.array(dtype=wp.float64),    # type: ignore  (B,)  output
+        out:         wp.array(dtype=dtype),    # type: ignore  (B,)  output
     ):
         b, i = wp.tid()
 
-        m_val = wp.float64(0.0)
+        m_val = dtype(0.0)
 
         # Eq: contiguous slice — no gather.
         if wp.static(p > 0):

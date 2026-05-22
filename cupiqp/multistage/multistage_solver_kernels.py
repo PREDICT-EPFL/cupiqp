@@ -1,4 +1,5 @@
 import warp as wp
+from ..utils import to_warp_dtype
 
 
 def create_multistage_data_gradients_kernel(
@@ -6,7 +7,9 @@ def create_multistage_data_gradients_kernel(
     N_a: int, r_a: int,
     N_g: int, r_g: int,
     p: int, m: int, n: int,
-):
+    dtype=wp.float64
+    ):
+    dtype = to_warp_dtype(dtype)
     r"""Fused assembly of multistage matrix + vector gradients.
 
     Single warp launch that writes:
@@ -60,31 +63,31 @@ def create_multistage_data_gradients_kernel(
     @wp.kernel
     def multistage_data_gradients_kernel(
         # Inputs — user-space lambdas (active sizes) and full-layout scatters.
-        lam_x:        wp.array2d(dtype=wp.float64),  # type: ignore (B, n)
-        lam_y:        wp.array2d(dtype=wp.float64),  # type: ignore (B, p)
-        lam_zu_full:  wp.array2d(dtype=wp.float64),  # type: ignore (B, m)
-        lam_zl_full:  wp.array2d(dtype=wp.float64),  # type: ignore (B, m)
-        lam_zbu_full: wp.array2d(dtype=wp.float64),  # type: ignore (B, n)
-        lam_zbl_full: wp.array2d(dtype=wp.float64),  # type: ignore (B, n)
-        zu_full:      wp.array2d(dtype=wp.float64),  # type: ignore (B, m)
-        zl_full:      wp.array2d(dtype=wp.float64),  # type: ignore (B, m)
+        lam_x:        wp.array2d(dtype=dtype),  # type: ignore (B, n)
+        lam_y:        wp.array2d(dtype=dtype),  # type: ignore (B, p)
+        lam_zu_full:  wp.array2d(dtype=dtype),  # type: ignore (B, m)
+        lam_zl_full:  wp.array2d(dtype=dtype),  # type: ignore (B, m)
+        lam_zbu_full: wp.array2d(dtype=dtype),  # type: ignore (B, n)
+        lam_zbl_full: wp.array2d(dtype=dtype),  # type: ignore (B, n)
+        zu_full:      wp.array2d(dtype=dtype),  # type: ignore (B, m)
+        zl_full:      wp.array2d(dtype=dtype),  # type: ignore (B, m)
         # Primal / dual solution at the optimum (user space, flat).
-        res_x: wp.array2d(dtype=wp.float64),  # type: ignore (B, n)
-        res_y: wp.array2d(dtype=wp.float64),  # type: ignore (B, p)
+        res_x: wp.array2d(dtype=dtype),  # type: ignore (B, n)
+        res_y: wp.array2d(dtype=dtype),  # type: ignore (B, p)
         # Outputs — block-structured matrix grads.
-        dP_diag:           wp.array4d(dtype=wp.float64),  # type: ignore (B, N, d, d)
-        dP_offdiag_lower:  wp.array4d(dtype=wp.float64),  # type: ignore (B, N-1, d, d)
-        dA_D:              wp.array4d(dtype=wp.float64),  # type: ignore (B, N_a, r_a, d)
-        dA_E:              wp.array4d(dtype=wp.float64),  # type: ignore (B, N_a, r_a, d)
-        dG_D:              wp.array4d(dtype=wp.float64),  # type: ignore (B, N_g, r_g, d)
-        dG_E:              wp.array4d(dtype=wp.float64),  # type: ignore (B, N_g, r_g, d)
+        dP_diag:           wp.array4d(dtype=dtype),  # type: ignore (B, N, d, d)
+        dP_offdiag_lower:  wp.array4d(dtype=dtype),  # type: ignore (B, N-1, d, d)
+        dA_D:              wp.array4d(dtype=dtype),  # type: ignore (B, N_a, r_a, d)
+        dA_E:              wp.array4d(dtype=dtype),  # type: ignore (B, N_a, r_a, d)
+        dG_D:              wp.array4d(dtype=dtype),  # type: ignore (B, N_g, r_g, d)
+        dG_E:              wp.array4d(dtype=dtype),  # type: ignore (B, N_g, r_g, d)
         # Outputs — flat (B, k) vector grads (aliased to BlockVec.data).
-        dc:   wp.array2d(dtype=wp.float64),  # type: ignore (B, n)
-        db:   wp.array2d(dtype=wp.float64),  # type: ignore (B, p)
-        dh_u: wp.array2d(dtype=wp.float64),  # type: ignore (B, m)
-        dh_l: wp.array2d(dtype=wp.float64),  # type: ignore (B, m)
-        dx_u: wp.array2d(dtype=wp.float64),  # type: ignore (B, n)
-        dx_l: wp.array2d(dtype=wp.float64),  # type: ignore (B, n)
+        dc:   wp.array2d(dtype=dtype),  # type: ignore (B, n)
+        db:   wp.array2d(dtype=dtype),  # type: ignore (B, p)
+        dh_u: wp.array2d(dtype=dtype),  # type: ignore (B, m)
+        dh_l: wp.array2d(dtype=dtype),  # type: ignore (B, m)
+        dx_u: wp.array2d(dtype=dtype),  # type: ignore (B, n)
+        dx_l: wp.array2d(dtype=dtype),  # type: ignore (B, n)
     ):
         b, t = wp.tid()
         d_s   = wp.static(d)
@@ -113,7 +116,7 @@ def create_multistage_data_gradients_kernel(
             r = t %  dd_s
             i = r // d_s
             j = r %  d_s
-            dP_diag[b, k, i, j] = wp.float64(0.5) * (
+            dP_diag[b, k, i, j] = dtype(0.5) * (
                 lam_x[b, k * d_s + i] * res_x[b, k * d_s + j]
                 + res_x[b, k * d_s + i] * lam_x[b, k * d_s + j]
             )
@@ -125,7 +128,7 @@ def create_multistage_data_gradients_kernel(
             r = idx %  dd_s
             i = r // d_s
             j = r %  d_s
-            dP_offdiag_lower[b, k, i, j] = wp.float64(0.5) * (
+            dP_offdiag_lower[b, k, i, j] = dtype(0.5) * (
                 lam_x[b, (k + 1) * d_s + i] * res_x[b, k * d_s + j]
                 + res_x[b, (k + 1) * d_s + i] * lam_x[b, k * d_s + j]
             )

@@ -1,8 +1,10 @@
 import warp as wp
+from ..utils import to_warp_dtype
 
 
 def create_update_kkt_kernel(num_blocks: int, block_size: int,
-                             p: int, m: int, rows_of_G: int):
+                             p: int, m: int, rows_of_G: int, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     """Fused warp kernel that builds the entire condensed KKT matrix 
     and also writes the reciprocals ``delta_inv`` and ``z_reg_inv``.
 
@@ -20,27 +22,27 @@ def create_update_kkt_kernel(num_blocks: int, block_size: int,
     @wp.kernel
     def update_kkt_kernel(
         # ---- inputs ----
-        P_D:        wp.array4d(dtype=wp.float64),  # type: ignore   (B, N, d, d)
-        P_E:        wp.array4d(dtype=wp.float64),  # type: ignore   (B, N-1, d, d)
-        x_reg:      wp.array2d(dtype=wp.float64),  # type: ignore   (B, N*d)
-        AtA_D:      wp.array4d(dtype=wp.float64),  # type: ignore   (B, N, d, d)    if p>0
-        AtA_E:      wp.array4d(dtype=wp.float64),  # type: ignore   (B, N-1, d, d)  if p>0
-        delta:      wp.array(dtype=wp.float64),    # type: ignore   (B,)            raw delta
-        G_D:        wp.array4d(dtype=wp.float64),  # type: ignore   (B, N, rg, d)   if m>0
-        G_E:        wp.array4d(dtype=wp.float64),  # type: ignore   (B, N, rg, d)   if m>0
-        z_reg:      wp.array2d(dtype=wp.float64),  # type: ignore   (B, (N+1)*rg)   raw z_reg, if m>0
+        P_D:        wp.array4d(dtype=dtype),  # type: ignore   (B, N, d, d)
+        P_E:        wp.array4d(dtype=dtype),  # type: ignore   (B, N-1, d, d)
+        x_reg:      wp.array2d(dtype=dtype),  # type: ignore   (B, N*d)
+        AtA_D:      wp.array4d(dtype=dtype),  # type: ignore   (B, N, d, d)    if p>0
+        AtA_E:      wp.array4d(dtype=dtype),  # type: ignore   (B, N-1, d, d)  if p>0
+        delta:      wp.array(dtype=dtype),    # type: ignore   (B,)            raw delta
+        G_D:        wp.array4d(dtype=dtype),  # type: ignore   (B, N, rg, d)   if m>0
+        G_E:        wp.array4d(dtype=dtype),  # type: ignore   (B, N, rg, d)   if m>0
+        z_reg:      wp.array2d(dtype=dtype),  # type: ignore   (B, (N+1)*rg)   raw z_reg, if m>0
         # ---- outputs ----
-        KKT_D:      wp.array4d(dtype=wp.float64),  # type: ignore   (B, N, d, d)
-        KKT_E:      wp.array4d(dtype=wp.float64),  # type: ignore   (B, N-1, d, d)
-        delta_inv:  wp.array(dtype=wp.float64),    # type: ignore   (B,)            output
-        z_reg_inv:  wp.array2d(dtype=wp.float64),  # type: ignore   (B, (N+1)*rg)   output, if m>0
+        KKT_D:      wp.array4d(dtype=dtype),  # type: ignore   (B, N, d, d)
+        KKT_E:      wp.array4d(dtype=dtype),  # type: ignore   (B, N-1, d, d)
+        delta_inv:  wp.array(dtype=dtype),    # type: ignore   (B,)            output
+        z_reg_inv:  wp.array2d(dtype=dtype),  # type: ignore   (B, (N+1)*rg)   output, if m>0
     ):
         b, k, i, j = wp.tid()
         N_static = wp.static(num_blocks)
         d_static = wp.static(block_size)
         rows_G_static = wp.static(rows_of_G)
 
-        delta_inv_b = wp.float64(1.0) / delta[b]
+        delta_inv_b = dtype(1.0) / delta[b]
 
         # ---- write delta_inv ----
         if k == 0 and i == 0 and j == 0:
@@ -51,7 +53,7 @@ def create_update_kkt_kernel(num_blocks: int, block_size: int,
         # (N+1)*rg = m elements. Trailing j > 0 / i >= rg threads skip.
         if wp.static(m > 0):
             if k <= N_static and i < rows_G_static and j == 0:
-                z_reg_inv[b, k * rows_G_static + i] = wp.float64(1.0) / z_reg[b, k * rows_G_static + i]
+                z_reg_inv[b, k * rows_G_static + i] = dtype(1.0) / z_reg[b, k * rows_G_static + i]
 
         # ---- diagonal block element (k in [0, N)) ----
         if k < N_static:
@@ -61,10 +63,10 @@ def create_update_kkt_kernel(num_blocks: int, block_size: int,
             if wp.static(p > 0):
                 v_D = v_D + delta_inv_b * AtA_D[b, k, i, j]
             if wp.static(m > 0):
-                acc_D = wp.float64(0.0)
+                acc_D = dtype(0.0)
                 for q in range(rows_G_static):
-                    w_dk = wp.float64(1.0) / z_reg[b, k * rows_G_static + q]
-                    w_ek = wp.float64(1.0) / z_reg[b, (k + 1) * rows_G_static + q]
+                    w_dk = dtype(1.0) / z_reg[b, k * rows_G_static + q]
+                    w_ek = dtype(1.0) / z_reg[b, (k + 1) * rows_G_static + q]
                     acc_D = acc_D + w_dk * G_D[b, k, q, i] * G_D[b, k, q, j]
                     acc_D = acc_D + w_ek * G_E[b, k, q, i] * G_E[b, k, q, j]
                 v_D = v_D + acc_D
@@ -76,9 +78,9 @@ def create_update_kkt_kernel(num_blocks: int, block_size: int,
             if wp.static(p > 0):
                 v_E = v_E + delta_inv_b * AtA_E[b, k, i, j]
             if wp.static(m > 0):
-                acc_E = wp.float64(0.0)
+                acc_E = dtype(0.0)
                 for q in range(rows_G_static):
-                    w_kp1 = wp.float64(1.0) / z_reg[b, (k + 1) * rows_G_static + q]
+                    w_kp1 = dtype(1.0) / z_reg[b, (k + 1) * rows_G_static + q]
                     acc_E = acc_E + w_kp1 * G_D[b, k + 1, q, i] * G_E[b, k, q, j]
                 v_E = v_E + acc_E
             KKT_E[b, k, i, j] = v_E

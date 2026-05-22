@@ -14,9 +14,11 @@ all access at codegen.
 """
 
 import warp as wp
+from ..utils import to_warp_dtype
 
 
-def create_multistage_scale_matrices_kernel(N: int, d: int, rows_A: int, rows_G: int):
+def create_multistage_scale_matrices_kernel(N: int, d: int, rows_A: int, rows_G: int, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     """Single fused kernel for ``scale_matrices``.
 
     Per ``(b, k, i, j)`` thread (grid (B, N, max(d, rows_A, rows_G), d)):
@@ -35,17 +37,17 @@ def create_multistage_scale_matrices_kernel(N: int, d: int, rows_A: int, rows_G:
     """
     @wp.kernel
     def multistage_scale_matrices_kernel(
-        P_D:         wp.array4d(dtype=wp.float64),  # type: ignore  (B, N, d, d) in-out
-        P_E:         wp.array4d(dtype=wp.float64),  # type: ignore  (B, N-1, d, d) in-out
-        A_D:         wp.array4d(dtype=wp.float64),  # type: ignore  (B, N, rows_A, d) in-out
-        A_E:         wp.array4d(dtype=wp.float64),  # type: ignore  (B, N, rows_A, d) in-out
-        G_D:         wp.array4d(dtype=wp.float64),  # type: ignore  (B, N, rows_G, d) in-out
-        G_E:         wp.array4d(dtype=wp.float64),  # type: ignore  (B, N, rows_G, d) in-out
-        c:           wp.array2d(dtype=wp.float64),  # type: ignore  (B, n) in-out
-        d_x:         wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
-        d_y:         wp.array2d(dtype=wp.float64),  # type: ignore  (B, p)
-        d_z:         wp.array2d(dtype=wp.float64),  # type: ignore  (B, m)
-        cost_factor: wp.array(dtype=wp.float64),    # type: ignore  (B,)
+        P_D:         wp.array4d(dtype=dtype),  # type: ignore  (B, N, d, d) in-out
+        P_E:         wp.array4d(dtype=dtype),  # type: ignore  (B, N-1, d, d) in-out
+        A_D:         wp.array4d(dtype=dtype),  # type: ignore  (B, N, rows_A, d) in-out
+        A_E:         wp.array4d(dtype=dtype),  # type: ignore  (B, N, rows_A, d) in-out
+        G_D:         wp.array4d(dtype=dtype),  # type: ignore  (B, N, rows_G, d) in-out
+        G_E:         wp.array4d(dtype=dtype),  # type: ignore  (B, N, rows_G, d) in-out
+        c:           wp.array2d(dtype=dtype),  # type: ignore  (B, n) in-out
+        d_x:         wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        d_y:         wp.array2d(dtype=dtype),  # type: ignore  (B, p)
+        d_z:         wp.array2d(dtype=dtype),  # type: ignore  (B, m)
+        cost_factor: wp.array(dtype=dtype),    # type: ignore  (B,)
     ):
         b, k, i, j = wp.tid()
         cf = cost_factor[b]
@@ -77,7 +79,8 @@ def create_multistage_scale_matrices_kernel(N: int, d: int, rows_A: int, rows_G:
     return multistage_scale_matrices_kernel
 
 
-def create_multistage_compute_kkt_norms_kernel(N: int, d: int, rows_A: int, rows_G: int):
+def create_multistage_compute_kkt_norms_kernel(N: int, d: int, rows_A: int, rows_G: int, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     """Single fused kernel for ``compute_kkt_norms``.
 
     Per ``(b, j)`` thread (grid (B, n+p+m)) — j addresses one slot of d_iter:
@@ -96,15 +99,15 @@ def create_multistage_compute_kkt_norms_kernel(N: int, d: int, rows_A: int, rows
 
     @wp.kernel
     def multistage_compute_kkt_norms_kernel(
-        P_D:         wp.array4d(dtype=wp.float64),  # type: ignore  (B, N, d, d)
-        P_E:         wp.array4d(dtype=wp.float64),  # type: ignore  (B, N-1, d, d)
-        A_D:         wp.array4d(dtype=wp.float64),  # type: ignore  (B, N, rows_A, d)
-        A_E:         wp.array4d(dtype=wp.float64),  # type: ignore  (B, N, rows_A, d)
-        G_D:         wp.array4d(dtype=wp.float64),  # type: ignore  (B, N, rows_G, d)
-        G_E:         wp.array4d(dtype=wp.float64),  # type: ignore  (B, N, rows_G, d)
-        x_b_scaling: wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
-        d_iter:      wp.array2d(dtype=wp.float64),  # type: ignore  (B, n+p+m) out
-        d_b_iter:    wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)     out
+        P_D:         wp.array4d(dtype=dtype),  # type: ignore  (B, N, d, d)
+        P_E:         wp.array4d(dtype=dtype),  # type: ignore  (B, N-1, d, d)
+        A_D:         wp.array4d(dtype=dtype),  # type: ignore  (B, N, rows_A, d)
+        A_E:         wp.array4d(dtype=dtype),  # type: ignore  (B, N, rows_A, d)
+        G_D:         wp.array4d(dtype=dtype),  # type: ignore  (B, N, rows_G, d)
+        G_E:         wp.array4d(dtype=dtype),  # type: ignore  (B, N, rows_G, d)
+        x_b_scaling: wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        d_iter:      wp.array2d(dtype=dtype),  # type: ignore  (B, n+p+m) out
+        d_b_iter:    wp.array2d(dtype=dtype),  # type: ignore  (B, n)     out
     ):
         b, j = wp.tid()
         n_static = wp.static(n)
@@ -118,7 +121,7 @@ def create_multistage_compute_kkt_norms_kernel(N: int, d: int, rows_A: int, rows
             k_blk = j // d_static
             i = j - k_blk * d_static
 
-            v = wp.float64(0.0)
+            v = dtype(0.0)
             # P diag block: row i of P_D[k_blk]
             for col in range(d_static):
                 v = wp.max(v, wp.abs(P_D[b, k_blk, i, col]))
@@ -155,7 +158,7 @@ def create_multistage_compute_kkt_norms_kernel(N: int, d: int, rows_A: int, rows
                 k_blk = jp // wp.static(rows_A)
                 i = jp - k_blk * wp.static(rows_A)
 
-                v = wp.float64(0.0)
+                v = dtype(0.0)
                 if k_blk < N_static:
                     for col in range(d_static):
                         v = wp.max(v, wp.abs(A_D[b, k_blk, i, col]))
@@ -171,7 +174,7 @@ def create_multistage_compute_kkt_norms_kernel(N: int, d: int, rows_A: int, rows
                 k_blk = jm // wp.static(rows_G)
                 i = jm - k_blk * wp.static(rows_G)
 
-                v = wp.float64(0.0)
+                v = dtype(0.0)
                 if k_blk < N_static:
                     for col in range(d_static):
                         v = wp.max(v, wp.abs(G_D[b, k_blk, i, col]))

@@ -1,28 +1,30 @@
 import warp as wp
+from ..utils import to_warp_dtype
 
 
-def create_dense_data_gradients_kernel(n: int, p: int, m: int):
+def create_dense_data_gradients_kernel(n: int, p: int, m: int, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     
     @wp.kernel
     def dense_data_gradients_kernel(
         # Inputs — user-space lambdas (active sizes) and full-layout scatters.
-        lam_x:        wp.array2d(dtype=wp.float64),  # type: ignore (B, n)
-        lam_y:        wp.array2d(dtype=wp.float64),  # type: ignore (B, p)
-        lam_zu_full:  wp.array2d(dtype=wp.float64),  # type: ignore (B, m)
-        lam_zl_full:  wp.array2d(dtype=wp.float64),  # type: ignore (B, m)
-        lam_zbu_full: wp.array2d(dtype=wp.float64),  # type: ignore (B, n)
-        zu_full:      wp.array2d(dtype=wp.float64),  # type: ignore (B, m)
-        zl_full:      wp.array2d(dtype=wp.float64),  # type: ignore (B, m)
+        lam_x:        wp.array2d(dtype=dtype),  # type: ignore (B, n)
+        lam_y:        wp.array2d(dtype=dtype),  # type: ignore (B, p)
+        lam_zu_full:  wp.array2d(dtype=dtype),  # type: ignore (B, m)
+        lam_zl_full:  wp.array2d(dtype=dtype),  # type: ignore (B, m)
+        lam_zbu_full: wp.array2d(dtype=dtype),  # type: ignore (B, n)
+        zu_full:      wp.array2d(dtype=dtype),  # type: ignore (B, m)
+        zl_full:      wp.array2d(dtype=dtype),  # type: ignore (B, m)
         # Primal / dual solution at the optimum (user space).
-        res_x: wp.array2d(dtype=wp.float64),  # type: ignore (B, n)
-        res_y: wp.array2d(dtype=wp.float64),  # type: ignore (B, p)
+        res_x: wp.array2d(dtype=dtype),  # type: ignore (B, n)
+        res_y: wp.array2d(dtype=dtype),  # type: ignore (B, p)
         # Outputs.
-        dP:   wp.array3d(dtype=wp.float64),  # type: ignore (B, n, n)
-        dA:   wp.array3d(dtype=wp.float64),  # type: ignore (B, p, n)
-        dG:   wp.array3d(dtype=wp.float64),  # type: ignore (B, m, n)
-        db:   wp.array2d(dtype=wp.float64),  # type: ignore (B, p)
-        dh_u: wp.array2d(dtype=wp.float64),  # type: ignore (B, m)
-        dx_u: wp.array2d(dtype=wp.float64),  # type: ignore (B, n)
+        dP:   wp.array3d(dtype=dtype),  # type: ignore (B, n, n)
+        dA:   wp.array3d(dtype=dtype),  # type: ignore (B, p, n)
+        dG:   wp.array3d(dtype=dtype),  # type: ignore (B, m, n)
+        db:   wp.array2d(dtype=dtype),  # type: ignore (B, p)
+        dh_u: wp.array2d(dtype=dtype),  # type: ignore (B, m)
+        dx_u: wp.array2d(dtype=dtype),  # type: ignore (B, n)
     ):
         b, t = wp.tid()
         n_s = wp.static(n)
@@ -40,7 +42,7 @@ def create_dense_data_gradients_kernel(n: int, p: int, m: int):
             # dP[b, i, j] = 0.5 (λ_x[b,i]·x[b,j] + x[b,i]·λ_x[b,j])
             i = t // n_s
             j = t %  n_s
-            dP[b, i, j] = wp.float64(0.5) * (
+            dP[b, i, j] = dtype(0.5) * (
                 lam_x[b, i] * res_x[b, j] + res_x[b, i] * lam_x[b, j]
             )
 

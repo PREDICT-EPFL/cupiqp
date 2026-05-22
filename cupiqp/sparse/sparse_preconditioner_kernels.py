@@ -7,9 +7,11 @@ the nz range owned by that row.
 """
 
 import warp as wp
+from ..utils import to_warp_dtype
 
 
-def create_sparse_scale_matrices_kernel(n: int, p: int, m: int):
+def create_sparse_scale_matrices_kernel(n: int, p: int, m: int, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     """Single fused kernel for ``scale_matrices``: applies row+col Ruiz scaling
     to P, A, G and the linear cost c, plus an optional batchwise cost-scaling
     factor on (P, c), all in one launch.
@@ -30,20 +32,20 @@ def create_sparse_scale_matrices_kernel(n: int, p: int, m: int):
     """
     @wp.kernel
     def sparse_scale_matrices_kernel(
-        P_data:      wp.array2d(dtype=wp.float64),  # type: ignore  (B, nnz_P) in-out
+        P_data:      wp.array2d(dtype=dtype),  # type: ignore  (B, nnz_P) in-out
         P_indptr:    wp.array(dtype=wp.int32),      # type: ignore  (n+1,)
         P_indices:   wp.array(dtype=wp.int32),      # type: ignore  (nnz_P,)
-        A_data:      wp.array2d(dtype=wp.float64),  # type: ignore  (B, nnz_A) in-out
+        A_data:      wp.array2d(dtype=dtype),  # type: ignore  (B, nnz_A) in-out
         A_indptr:    wp.array(dtype=wp.int32),      # type: ignore  (p+1,)
         A_indices:   wp.array(dtype=wp.int32),      # type: ignore  (nnz_A,)
-        G_data:      wp.array2d(dtype=wp.float64),  # type: ignore  (B, nnz_G) in-out
+        G_data:      wp.array2d(dtype=dtype),  # type: ignore  (B, nnz_G) in-out
         G_indptr:    wp.array(dtype=wp.int32),      # type: ignore  (m+1,)
         G_indices:   wp.array(dtype=wp.int32),      # type: ignore  (nnz_G,)
-        c:           wp.array2d(dtype=wp.float64),  # type: ignore  (B, n) in-out
-        d_x:         wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
-        d_y:         wp.array2d(dtype=wp.float64),  # type: ignore  (B, p)
-        d_z:         wp.array2d(dtype=wp.float64),  # type: ignore  (B, m)
-        cost_factor: wp.array(dtype=wp.float64),    # type: ignore  (B,)
+        c:           wp.array2d(dtype=dtype),  # type: ignore  (B, n) in-out
+        d_x:         wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        d_y:         wp.array2d(dtype=dtype),  # type: ignore  (B, p)
+        d_z:         wp.array2d(dtype=dtype),  # type: ignore  (B, m)
+        cost_factor: wp.array(dtype=dtype),    # type: ignore  (B,)
     ):
         b, r = wp.tid()
 
@@ -77,7 +79,8 @@ def create_sparse_scale_matrices_kernel(n: int, p: int, m: int):
     return sparse_scale_matrices_kernel
 
 
-def create_sparse_compute_kkt_norms_kernel(n: int, p: int, m: int):
+def create_sparse_compute_kkt_norms_kernel(n: int, p: int, m: int, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     """Two fused kernels backing ``compute_kkt_norms``: row scans for
     ``[P; A; G]`` and the per-block ``x_b_scaling`` integration in one pass,
     then a per-nz col scatter that atomically maxes A and G column
@@ -108,20 +111,20 @@ def create_sparse_compute_kkt_norms_kernel(n: int, p: int, m: int):
     """
     @wp.kernel
     def sparse_compute_row_inf_norm_kernel(
-        P_data:      wp.array2d(dtype=wp.float64),  # type: ignore  (B, nnz_P)
+        P_data:      wp.array2d(dtype=dtype),  # type: ignore  (B, nnz_P)
         P_indptr:    wp.array(dtype=wp.int32),      # type: ignore  (n+1,)
-        A_data:      wp.array2d(dtype=wp.float64),  # type: ignore  (B, nnz_A)
+        A_data:      wp.array2d(dtype=dtype),  # type: ignore  (B, nnz_A)
         A_indptr:    wp.array(dtype=wp.int32),      # type: ignore  (p+1,)
-        G_data:      wp.array2d(dtype=wp.float64),  # type: ignore  (B, nnz_G)
+        G_data:      wp.array2d(dtype=dtype),  # type: ignore  (B, nnz_G)
         G_indptr:    wp.array(dtype=wp.int32),      # type: ignore  (m+1,)
-        x_b_scaling: wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)
-        d_iter:      wp.array2d(dtype=wp.float64),  # type: ignore  (B, n+p+m) out
-        d_b_iter:    wp.array2d(dtype=wp.float64),  # type: ignore  (B, n)     out
+        x_b_scaling: wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        d_iter:      wp.array2d(dtype=dtype),  # type: ignore  (B, n+p+m) out
+        d_b_iter:    wp.array2d(dtype=dtype),  # type: ignore  (B, n)     out
     ):
         b, j = wp.tid()
 
         if j < wp.static(n):
-            v = wp.float64(0.0)
+            v = dtype(0.0)
             start = P_indptr[j]
             end = P_indptr[j + 1]
             for k in range(start, end):
@@ -133,7 +136,7 @@ def create_sparse_compute_kkt_norms_kernel(n: int, p: int, m: int):
 
         if wp.static(p > 0):
             if j < wp.static(p):
-                v = wp.float64(0.0)
+                v = dtype(0.0)
                 start = A_indptr[j]
                 end = A_indptr[j + 1]
                 for k in range(start, end):
@@ -142,7 +145,7 @@ def create_sparse_compute_kkt_norms_kernel(n: int, p: int, m: int):
 
         if wp.static(m > 0):
             if j < wp.static(m):
-                v = wp.float64(0.0)
+                v = dtype(0.0)
                 start = G_indptr[j]
                 end = G_indptr[j + 1]
                 for k in range(start, end):
@@ -151,11 +154,11 @@ def create_sparse_compute_kkt_norms_kernel(n: int, p: int, m: int):
 
     @wp.kernel
     def sparse_compute_col_inf_norm_kernel(
-        A_data:    wp.array2d(dtype=wp.float64),  # type: ignore  (B, nnz_A)
+        A_data:    wp.array2d(dtype=dtype),  # type: ignore  (B, nnz_A)
         A_indices: wp.array(dtype=wp.int32),      # type: ignore  (nnz_A,)
-        G_data:    wp.array2d(dtype=wp.float64),  # type: ignore  (B, nnz_G)
+        G_data:    wp.array2d(dtype=dtype),  # type: ignore  (B, nnz_G)
         G_indices: wp.array(dtype=wp.int32),      # type: ignore  (nnz_G,)
-        d_iter:    wp.array2d(dtype=wp.float64),  # type: ignore  (B, n+p+m) in-out
+        d_iter:    wp.array2d(dtype=dtype),  # type: ignore  (B, n+p+m) in-out
     ):
         b, k = wp.tid()
         if wp.static(p > 0):

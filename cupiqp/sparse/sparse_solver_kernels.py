@@ -1,24 +1,26 @@
 import warp as wp
+from ..utils import to_warp_dtype
 
 
 def create_sparse_data_gradients_kernel(
     nnz_P: int, nnz_A: int, nnz_G: int,
     p: int, m: int, n: int,
-):
+dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     
     @wp.kernel
     def sparse_data_gradients_kernel(
         # Inputs — user-space lambdas (active sizes) and full-layout scatters.
-        lam_x:        wp.array2d(dtype=wp.float64),  # type: ignore (B, n)
-        lam_y:        wp.array2d(dtype=wp.float64),  # type: ignore (B, p)
-        lam_zu_full:  wp.array2d(dtype=wp.float64),  # type: ignore (B, m)
-        lam_zl_full:  wp.array2d(dtype=wp.float64),  # type: ignore (B, m)
-        lam_zbu_full: wp.array2d(dtype=wp.float64),  # type: ignore (B, n)
-        zu_full:      wp.array2d(dtype=wp.float64),  # type: ignore (B, m)
-        zl_full:      wp.array2d(dtype=wp.float64),  # type: ignore (B, m)
+        lam_x:        wp.array2d(dtype=dtype),  # type: ignore (B, n)
+        lam_y:        wp.array2d(dtype=dtype),  # type: ignore (B, p)
+        lam_zu_full:  wp.array2d(dtype=dtype),  # type: ignore (B, m)
+        lam_zl_full:  wp.array2d(dtype=dtype),  # type: ignore (B, m)
+        lam_zbu_full: wp.array2d(dtype=dtype),  # type: ignore (B, n)
+        zu_full:      wp.array2d(dtype=dtype),  # type: ignore (B, m)
+        zl_full:      wp.array2d(dtype=dtype),  # type: ignore (B, m)
         # Primal / dual solution at the optimum (user space).
-        res_x: wp.array2d(dtype=wp.float64),  # type: ignore (B, n)
-        res_y: wp.array2d(dtype=wp.float64),  # type: ignore (B, p)
+        res_x:     wp.array2d(dtype=dtype),  # type: ignore (B, n)
+        res_y:     wp.array2d(dtype=dtype),  # type: ignore (B, p)
         # CSR row/col indices for each matrix's nnz positions.
         p_rows:    wp.array(dtype=wp.int32),  # type: ignore (nnz_P,)
         p_indices: wp.array(dtype=wp.int32),  # type: ignore (nnz_P,)
@@ -27,12 +29,12 @@ def create_sparse_data_gradients_kernel(
         g_rows:    wp.array(dtype=wp.int32),  # type: ignore (nnz_G,)
         g_indices: wp.array(dtype=wp.int32),  # type: ignore (nnz_G,)
         # Outputs.
-        dP_values: wp.array2d(dtype=wp.float64),  # type: ignore (B, nnz_P)
-        dA_values: wp.array2d(dtype=wp.float64),  # type: ignore (B, nnz_A)
-        dG_values: wp.array2d(dtype=wp.float64),  # type: ignore (B, nnz_G)
-        db:        wp.array2d(dtype=wp.float64),  # type: ignore (B, p)
-        dh_u:      wp.array2d(dtype=wp.float64),  # type: ignore (B, m)
-        dx_u:      wp.array2d(dtype=wp.float64),  # type: ignore (B, n)
+        dP_values: wp.array2d(dtype=dtype),  # type: ignore (B, nnz_P)
+        dA_values: wp.array2d(dtype=dtype),  # type: ignore (B, nnz_A)
+        dG_values: wp.array2d(dtype=dtype),  # type: ignore (B, nnz_G)
+        db:        wp.array2d(dtype=dtype),  # type: ignore (B, p)
+        dh_u:      wp.array2d(dtype=dtype),  # type: ignore (B, m)
+        dx_u:      wp.array2d(dtype=dtype),  # type: ignore (B, n)
     ):
         b, t = wp.tid()
         nnzP_s = wp.static(nnz_P)
@@ -53,7 +55,7 @@ def create_sparse_data_gradients_kernel(
             k = t
             i = p_rows[k]
             j = p_indices[k]
-            dP_values[b, k] = wp.float64(0.5) * (
+            dP_values[b, k] = dtype(0.5) * (
                 lam_x[b, i] * res_x[b, j] + res_x[b, i] * lam_x[b, j]
             )
 

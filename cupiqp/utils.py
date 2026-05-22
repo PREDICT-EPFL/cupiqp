@@ -1,6 +1,14 @@
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 import functools
 import cupy as cp
+import warp as wp
+
+
+def to_warp_dtype(dtype: Any):
+    try:
+        return wp.dtype_from_numpy(dtype)
+    except Exception:
+        return dtype
 
 
 def is_cuda_array(m) -> bool:

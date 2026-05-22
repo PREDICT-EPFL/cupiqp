@@ -1,7 +1,9 @@
 import warp as wp
+from .utils import to_warp_dtype
 
 
-def create_build_inverse_index_kernel():
+def create_build_inverse_index_kernel(dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     """Create a kernel that builds an inverse index map: inv_idx[idx[t]] = t."""
     @wp.kernel
     def build_inverse_index_kernel(
@@ -13,7 +15,8 @@ def create_build_inverse_index_kernel():
     return build_inverse_index_kernel
 
 
-def create_update_regularizations_step_1_kernel():
+def create_update_regularizations_step_1_kernel(dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     """Create kernel operating on contiguous s_all/z_all buffers. Performs:
 
         self._m_s_u = vars.s_u
@@ -38,23 +41,24 @@ def create_update_regularizations_step_1_kernel():
     """
     @wp.kernel
     def update_regularizations_step_1_kernel(
-        vars_s_all: wp.array2d(dtype=wp.float64),       # type: ignore
-        vars_z_all: wp.array2d(dtype=wp.float64),       # type: ignore
-        m_s_all: wp.array2d(dtype=wp.float64),           # type: ignore
-        m_z_inv_all: wp.array2d(dtype=wp.float64),       # type: ignore
-        w_delta_inv_all: wp.array2d(dtype=wp.float64),   # type: ignore
-        delta: wp.array(dtype=wp.float64),               # type: ignore
+        vars_s_all: wp.array2d(dtype=dtype),       # type: ignore
+        vars_z_all: wp.array2d(dtype=dtype),       # type: ignore
+        m_s_all: wp.array2d(dtype=dtype),           # type: ignore
+        m_z_inv_all: wp.array2d(dtype=dtype),       # type: ignore
+        w_delta_inv_all: wp.array2d(dtype=dtype),   # type: ignore
+        delta: wp.array(dtype=dtype),               # type: ignore
     ):
         b, i = wp.tid()
         s = vars_s_all[b, i]
-        z_inv = wp.float64(1.0) / vars_z_all[b, i]
+        z_inv = dtype(1.0) / vars_z_all[b, i]
         m_s_all[b, i] = s
         m_z_inv_all[b, i] = z_inv
-        w_delta_inv_all[b, i] = wp.float64(1.0) / (s * z_inv + delta[b])
+        w_delta_inv_all[b, i] = dtype(1.0) / (s * z_inv + delta[b])
     return update_regularizations_step_1_kernel
 
 
-def create_update_regularizations_step_2_kernel(nx: int, nz: int):
+def create_update_regularizations_step_2_kernel(nx: int, nz: int, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     """Create kernel specialized for computing the regularization terms for x and z
     using a gather pattern.
 
@@ -77,14 +81,14 @@ def create_update_regularizations_step_2_kernel(nx: int, nz: int):
         inv_idx_xl: wp.array(dtype=wp.int32),  # type: ignore
         inv_idx_hu: wp.array(dtype=wp.int32),  # type: ignore
         inv_idx_hl: wp.array(dtype=wp.int32),  # type: ignore
-        w_bu_delta_inv: wp.array2d(dtype=wp.float64),  # type: ignore
-        w_bl_delta_inv: wp.array2d(dtype=wp.float64),  # type: ignore
-        x_b_scaling: wp.array2d(dtype=wp.float64),  # type: ignore
-        rho: wp.array(dtype=wp.float64),  # type: ignore
-        x_reg: wp.array2d(dtype=wp.float64),  # type: ignore
-        w_u_delta_inv: wp.array2d(dtype=wp.float64),  # type: ignore
-        w_l_delta_inv: wp.array2d(dtype=wp.float64),  # type: ignore
-        z_reg: wp.array2d(dtype=wp.float64),  # type: ignore
+        w_bu_delta_inv: wp.array2d(dtype=dtype),  # type: ignore
+        w_bl_delta_inv: wp.array2d(dtype=dtype),  # type: ignore
+        x_b_scaling: wp.array2d(dtype=dtype),  # type: ignore
+        rho: wp.array(dtype=dtype),  # type: ignore
+        x_reg: wp.array2d(dtype=dtype),  # type: ignore
+        w_u_delta_inv: wp.array2d(dtype=dtype),  # type: ignore
+        w_l_delta_inv: wp.array2d(dtype=dtype),  # type: ignore
+        z_reg: wp.array2d(dtype=dtype),  # type: ignore
     ):
         b, t = wp.tid()
         nx_static = wp.static(nx)
@@ -103,19 +107,20 @@ def create_update_regularizations_step_2_kernel(nx: int, nz: int):
             x_reg[b, t] = val
         elif t < nx_static + nz_static:
             tz = t - nx_static
-            val = wp.float64(0.)
+            val = dtype(0.)
             ihu = inv_idx_hu[tz]
             ihl = inv_idx_hl[tz]
             if ihu >= 0:
                 val = val + w_u_delta_inv[b, ihu]
             if ihl >= 0:
                 val = val + w_l_delta_inv[b, ihl]
-            z_reg[b, tz] = wp.float64(1.0) / val
+            z_reg[b, tz] = dtype(1.0) / val
 
     return update_regularizations_step_2_kernel
 
 
-def create_eliminate_duals_kernel(nx: int, nz: int):
+def create_eliminate_duals_kernel(nx: int, nz: int, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     """Create kernel specialized for eliminating duals using a gather pattern.
 
     Equivalent to:
@@ -139,20 +144,20 @@ def create_eliminate_duals_kernel(nx: int, nz: int):
         inv_idx_hu: wp.array(dtype=wp.int32),  # type: ignore
         inv_idx_hl: wp.array(dtype=wp.int32),  # type: ignore
         # prepare new rhs_x
-        rhs_x: wp.array2d(dtype=wp.float64),  # type: ignore
-        w_bu_delta_inv: wp.array2d(dtype=wp.float64),  # type: ignore
-        w_bl_delta_inv: wp.array2d(dtype=wp.float64),  # type: ignore
-        x_b_scaling: wp.array2d(dtype=wp.float64),  # type: ignore
-        rhs_z_bu: wp.array2d(dtype=wp.float64),  # type: ignore
-        rhs_z_bl: wp.array2d(dtype=wp.float64),  # type: ignore
-        rhs_x_updated: wp.array2d(dtype=wp.float64),  # type: ignore
+        rhs_x: wp.array2d(dtype=dtype),  # type: ignore
+        w_bu_delta_inv: wp.array2d(dtype=dtype),  # type: ignore
+        w_bl_delta_inv: wp.array2d(dtype=dtype),  # type: ignore
+        x_b_scaling: wp.array2d(dtype=dtype),  # type: ignore
+        rhs_z_bu: wp.array2d(dtype=dtype),  # type: ignore
+        rhs_z_bl: wp.array2d(dtype=dtype),  # type: ignore
+        rhs_x_updated: wp.array2d(dtype=dtype),  # type: ignore
         # prepare new rhs_z
-        w_u_delta_inv: wp.array2d(dtype=wp.float64),  # type: ignore
-        w_l_delta_inv: wp.array2d(dtype=wp.float64),  # type: ignore
-        rhs_z_u: wp.array2d(dtype=wp.float64),  # type: ignore
-        rhs_z_l: wp.array2d(dtype=wp.float64),  # type: ignore
-        z_reg: wp.array2d(dtype=wp.float64),  # type: ignore
-        rhs_z_updated: wp.array2d(dtype=wp.float64),  # type: ignore
+        w_u_delta_inv: wp.array2d(dtype=dtype),  # type: ignore
+        w_l_delta_inv: wp.array2d(dtype=dtype),  # type: ignore
+        rhs_z_u: wp.array2d(dtype=dtype),  # type: ignore
+        rhs_z_l: wp.array2d(dtype=dtype),  # type: ignore
+        z_reg: wp.array2d(dtype=dtype),  # type: ignore
+        rhs_z_updated: wp.array2d(dtype=dtype),  # type: ignore
     ):
         b, t = wp.tid()
         nx_static = wp.static(nx)
@@ -171,7 +176,7 @@ def create_eliminate_duals_kernel(nx: int, nz: int):
 
         elif t < nx_static + nz_static:
             tz = t - nx_static
-            val = wp.float64(0.)
+            val = dtype(0.)
             ihu = inv_idx_hu[tz]
             ihl = inv_idx_hl[tz]
             if ihu >= 0:
@@ -183,17 +188,18 @@ def create_eliminate_duals_kernel(nx: int, nz: int):
     return eliminate_duals_kernel
 
 
-def create_eliminate_slacks_kernel():
+def create_eliminate_slacks_kernel(dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     """Batched element-wise kernel for eliminating slacks for inequalities.
 
         updated_rhs_z_all[b, i] = rhs_z_all[b, i] - m_z_inv_all[b, i] * rhs_s_all[b, i]
     """
     @wp.kernel
     def eliminate_slacks_kernel(
-        rhs_z_all: wp.array2d(dtype=wp.float64),          # type: ignore
-        rhs_s_all: wp.array2d(dtype=wp.float64),          # type: ignore
-        m_z_inv_all: wp.array2d(dtype=wp.float64),        # type: ignore
-        updated_rhs_z_all: wp.array2d(dtype=wp.float64),  # type: ignore
+        rhs_z_all: wp.array2d(dtype=dtype),          # type: ignore
+        rhs_s_all: wp.array2d(dtype=dtype),          # type: ignore
+        m_z_inv_all: wp.array2d(dtype=dtype),        # type: ignore
+        updated_rhs_z_all: wp.array2d(dtype=dtype),  # type: ignore
     ):
         b, i = wp.tid()
         updated_rhs_z_all[b, i] = -m_z_inv_all[b, i] * rhs_s_all[b, i] + rhs_z_all[b, i]
@@ -201,7 +207,8 @@ def create_eliminate_slacks_kernel():
     return eliminate_slacks_kernel
 
 
-def create_eliminate_slacks_transposed_kernel():
+def create_eliminate_slacks_transposed_kernel(dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     """Transposed (K^T) variant of eliminate_slacks. Scales rhs_s by W = S/Z instead
     of 1/Z, because row 7..10 of K^T have S in the off-diagonal (vs. I in K).
 
@@ -209,11 +216,11 @@ def create_eliminate_slacks_transposed_kernel():
     """
     @wp.kernel
     def eliminate_slacks_transposed_kernel(
-        rhs_z_all: wp.array2d(dtype=wp.float64),          # type: ignore
-        rhs_s_all: wp.array2d(dtype=wp.float64),          # type: ignore
-        m_s_all: wp.array2d(dtype=wp.float64),            # type: ignore
-        m_z_inv_all: wp.array2d(dtype=wp.float64),        # type: ignore
-        updated_rhs_z_all: wp.array2d(dtype=wp.float64),  # type: ignore
+        rhs_z_all: wp.array2d(dtype=dtype),          # type: ignore
+        rhs_s_all: wp.array2d(dtype=dtype),          # type: ignore
+        m_s_all: wp.array2d(dtype=dtype),            # type: ignore
+        m_z_inv_all: wp.array2d(dtype=dtype),        # type: ignore
+        updated_rhs_z_all: wp.array2d(dtype=dtype),  # type: ignore
     ):
         b, i = wp.tid()
         w = m_s_all[b, i] * m_z_inv_all[b, i]  # W = S / Z
@@ -222,7 +229,8 @@ def create_eliminate_slacks_transposed_kernel():
     return eliminate_slacks_transposed_kernel
 
 
-def create_recover_duals_kernel(num_hu: int, num_hl: int, num_xu: int, num_xl: int):
+def create_recover_duals_kernel(num_hu: int, num_hl: int, num_xu: int, num_xl: int, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     """Create kernel specialized for recovering duals. Performs the operation:
 
     Performs the operation:
@@ -233,34 +241,34 @@ def create_recover_duals_kernel(num_hu: int, num_hl: int, num_xu: int, num_xl: i
     """
     @wp.kernel
     def recover_duals_kernel(
-        G_dx: wp.array2d(dtype=wp.float64),  # type: ignore
-        lhs_x: wp.array2d(dtype=wp.float64),  # type: ignore
+        G_dx: wp.array2d(dtype=dtype),  # type: ignore
+        lhs_x: wp.array2d(dtype=dtype),  # type: ignore
         # h_u
         idx_hu: wp.array(dtype=wp.int32),  # type: ignore
-        w_u_delta_inv: wp.array2d(dtype=wp.float64),  # type: ignore
-        rhs_z_u: wp.array2d(dtype=wp.float64),  # type: ignore
-        lhs_z_u: wp.array2d(dtype=wp.float64),  # type: ignore
+        w_u_delta_inv: wp.array2d(dtype=dtype),  # type: ignore
+        rhs_z_u: wp.array2d(dtype=dtype),  # type: ignore
+        lhs_z_u: wp.array2d(dtype=dtype),  # type: ignore
         # h_l
         idx_hl: wp.array(dtype=wp.int32),  # type: ignore
-        w_l_delta_inv: wp.array2d(dtype=wp.float64),  # type: ignore
-        rhs_z_l: wp.array2d(dtype=wp.float64),  # type: ignore
-        lhs_z_l: wp.array2d(dtype=wp.float64),  # type: ignore
+        w_l_delta_inv: wp.array2d(dtype=dtype),  # type: ignore
+        rhs_z_l: wp.array2d(dtype=dtype),  # type: ignore
+        lhs_z_l: wp.array2d(dtype=dtype),  # type: ignore
         # x_u
         idx_xu: wp.array(dtype=wp.int32),  # type: ignore
-        w_bu_delta_inv: wp.array2d(dtype=wp.float64),  # type: ignore
-        m_z_bu_inv: wp.array2d(dtype=wp.float64),  # type: ignore
-        rhs_z_bu: wp.array2d(dtype=wp.float64),  # type: ignore
-        rhs_s_bu: wp.array2d(dtype=wp.float64),  # type: ignore
-        lhs_z_bu: wp.array2d(dtype=wp.float64),  # type: ignore
+        w_bu_delta_inv: wp.array2d(dtype=dtype),  # type: ignore
+        m_z_bu_inv: wp.array2d(dtype=dtype),  # type: ignore
+        rhs_z_bu: wp.array2d(dtype=dtype),  # type: ignore
+        rhs_s_bu: wp.array2d(dtype=dtype),  # type: ignore
+        lhs_z_bu: wp.array2d(dtype=dtype),  # type: ignore
         # x_l
         idx_xl: wp.array(dtype=wp.int32),  # type: ignore
-        w_bl_delta_inv: wp.array2d(dtype=wp.float64),  # type: ignore
-        m_z_bl_inv: wp.array2d(dtype=wp.float64),  # type: ignore
-        rhs_z_bl: wp.array2d(dtype=wp.float64),  # type: ignore
-        rhs_s_bl: wp.array2d(dtype=wp.float64),  # type: ignore
-        lhs_z_bl: wp.array2d(dtype=wp.float64),  # type: ignore
+        w_bl_delta_inv: wp.array2d(dtype=dtype),  # type: ignore
+        m_z_bl_inv: wp.array2d(dtype=dtype),  # type: ignore
+        rhs_z_bl: wp.array2d(dtype=dtype),  # type: ignore
+        rhs_s_bl: wp.array2d(dtype=dtype),  # type: ignore
+        lhs_z_bl: wp.array2d(dtype=dtype),  # type: ignore
         # x_b_scaling
-        x_b_scaling: wp.array2d(dtype=wp.float64),  # type: ignore
+        x_b_scaling: wp.array2d(dtype=dtype),  # type: ignore
     ):
         b, t = wp.tid()
         num_hu_static = wp.static(num_hu)
@@ -287,7 +295,8 @@ def create_recover_duals_kernel(num_hu: int, num_hl: int, num_xu: int, num_xl: i
     return recover_duals_kernel
 
 
-def create_recover_slacks_kernel():
+def create_recover_slacks_kernel(dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     """Create kernel specialized for eliminating slacks. Performs the operation:
 
         updated_lhs_z_u = inv(Z_u) (r_s_u - S_u lhs_z_u)
@@ -302,11 +311,11 @@ def create_recover_slacks_kernel():
     """
     @wp.kernel
     def recover_slacks_kernel(
-        rhs_s_all: wp.array2d(dtype=wp.float64),    # type: ignore
-        lhs_z_all: wp.array2d(dtype=wp.float64),    # type: ignore
-        m_s_all: wp.array2d(dtype=wp.float64),      # type: ignore
-        m_z_inv_all: wp.array2d(dtype=wp.float64),  # type: ignore
-        lhs_s_all: wp.array2d(dtype=wp.float64),    # type: ignore
+        rhs_s_all: wp.array2d(dtype=dtype),    # type: ignore
+        lhs_z_all: wp.array2d(dtype=dtype),    # type: ignore
+        m_s_all: wp.array2d(dtype=dtype),      # type: ignore
+        m_z_inv_all: wp.array2d(dtype=dtype),  # type: ignore
+        lhs_s_all: wp.array2d(dtype=dtype),    # type: ignore
     ):
         b, i = wp.tid()
         lhs_s_all[b, i] = m_z_inv_all[b, i] * ((-m_s_all[b, i]) * lhs_z_all[b, i] + rhs_s_all[b, i])
@@ -314,7 +323,8 @@ def create_recover_slacks_kernel():
     return recover_slacks_kernel
 
 
-def create_recover_slacks_transposed_kernel():
+def create_recover_slacks_transposed_kernel(dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     """Transposed (K^T) variant of recover_slacks. The slack rows in K^T read
     ``I lhs_z + Z lhs_s = rhs_s``, so ``lhs_s = inv(Z) (rhs_s - lhs_z)``.
 
@@ -322,10 +332,10 @@ def create_recover_slacks_transposed_kernel():
     """
     @wp.kernel
     def recover_slacks_transposed_kernel(
-        rhs_s_all: wp.array2d(dtype=wp.float64),    # type: ignore
-        lhs_z_all: wp.array2d(dtype=wp.float64),    # type: ignore
-        m_z_inv_all: wp.array2d(dtype=wp.float64),  # type: ignore
-        lhs_s_all: wp.array2d(dtype=wp.float64),    # type: ignore
+        rhs_s_all: wp.array2d(dtype=dtype),    # type: ignore
+        lhs_z_all: wp.array2d(dtype=dtype),    # type: ignore
+        m_z_inv_all: wp.array2d(dtype=dtype),  # type: ignore
+        lhs_s_all: wp.array2d(dtype=dtype),    # type: ignore
     ):
         b, i = wp.tid()
         lhs_s_all[b, i] = m_z_inv_all[b, i] * (-lhs_z_all[b, i] + rhs_s_all[b, i])
