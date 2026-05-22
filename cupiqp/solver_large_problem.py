@@ -359,10 +359,10 @@ class LargeProblemSolverBase(SolverBase):
         # self._res.z_bl[:] = self._res_nr.z_bl - self._result.info.delta * (self._prox_vars.z_bl - self._result.z_bl)
         # self._res.z_bu[:] = self._res_nr.z_bu - self._result.info.delta * (self._prox_vars.z_bu - self._result.z_bu)
         cp.subtract(self._result.x, self._prox_vars.x, out=self._res.x)
-        self._res.x *= self._result.info.rho[:, None]
+        cp.multiply(cp.asarray(self._res.x), self._result.info.rho[:, None], out=cp.asarray(self._res.x))
         cp.subtract(self._res_nr.x, self._res.x, out=self._res.x)
         cp.subtract(self._prox_vars.duals_all, self._result.duals_all, out=self._res.duals_all)
-        self._res.duals_all *= self._result.info.delta[:, None]
+        cp.multiply(cp.asarray(self._res.duals_all), self._result.info.delta[:, None], out=cp.asarray(self._res.duals_all))
         cp.subtract(self._res_nr.duals_all, self._res.duals_all, out=self._res.duals_all)
 
         self._result.info.primal_res_reg[:] = self._primal_res_r()
@@ -417,7 +417,7 @@ class LargeProblemSolverBase(SolverBase):
         delta_slow = cp.maximum(info.reg_limit, 0.5 * info.delta)
         delta_slow_decay_ok = (~primal_improved) & ((info.iter[0] < 5) | (info.primal_prox_inf < settings.infeasibility_threshold))
         info.delta[:] = cp.where(primal_improved, delta_fast, cp.where(delta_slow_decay_ok, delta_slow, info.delta))
-        self._prox_vars.duals_all[:] = cp.where(primal_improved[:, None], self._result.duals_all, self._prox_vars.duals_all)
+        self._prox_vars.duals_all = cp.where(primal_improved[:, None], self._result.duals_all, self._prox_vars.duals_all)
         info.no_dual_update += 1
         info.no_dual_update[primal_improved] = 0
 

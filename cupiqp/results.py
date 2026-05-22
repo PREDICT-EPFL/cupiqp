@@ -1,5 +1,6 @@
 import cupy as cp
 import numpy as np
+import warp as wp
 from typing import List
 from enum import Enum, IntEnum, auto
 import nvtx
@@ -40,105 +41,112 @@ class Variables:
 
         B = self._batch_size
 
+        def _slice(buf, start, count):
+            # warp's slicer rejects empty slices at the boundary (e.g. 5:5),
+            # so return a fresh (B, 0) array when count==0.
+            if count == 0:
+                return wp.empty((buf.shape[0], 0), dtype=buf.dtype, device="cuda")
+            return buf[:, start:start+count]
+
         # Primal buffer: [x | s_l | s_u | s_bl | s_bu]
-        self._primal_buffer = cp.empty((B, data.n + self.num_ineq), dtype=cp.float64)
+        self._primal_buffer = wp.empty((B, data.n + self.num_ineq), dtype=wp.float64, device="cuda")
         offset = 0
-        self._x = self._primal_buffer[:, offset : offset+data.n]
-        self._s_all = self._primal_buffer[:, data.n:]
+        self._x = _slice(self._primal_buffer, offset, data.n)
+        self._s_all = _slice(self._primal_buffer, data.n, self.num_ineq)
         offset += data.n
-        self._s_l = self._primal_buffer[:, offset : offset+data.num_hl]
+        self._s_l = _slice(self._primal_buffer, offset, data.num_hl)
         offset += data.num_hl
-        self._s_u = self._primal_buffer[:, offset : offset+data.num_hu]
+        self._s_u = _slice(self._primal_buffer, offset, data.num_hu)
         offset += data.num_hu
-        self._s_bl = self._primal_buffer[:, offset : offset+data.num_xl]
+        self._s_bl = _slice(self._primal_buffer, offset, data.num_xl)
         offset += data.num_xl
-        self._s_bu = self._primal_buffer[:, offset : offset+data.num_xu]
+        self._s_bu = _slice(self._primal_buffer, offset, data.num_xu)
 
         # Dual buffer: [y | z_l | z_u | z_bl | z_bu]
-        self._dual_buffer = cp.empty((B, data.p + self.num_ineq), dtype=cp.float64)
+        self._dual_buffer = wp.empty((B, data.p + self.num_ineq), dtype=wp.float64, device="cuda")
         offset = 0
-        self._y = self._dual_buffer[:, offset : offset+data.p]
-        self._z_all = self._dual_buffer[:, data.p:]
+        self._y = _slice(self._dual_buffer, offset, data.p)
+        self._z_all = _slice(self._dual_buffer, data.p, self.num_ineq)
         offset += data.p
-        self._z_l = self._dual_buffer[:, offset : offset+data.num_hl]
+        self._z_l = _slice(self._dual_buffer, offset, data.num_hl)
         offset += data.num_hl
-        self._z_u = self._dual_buffer[:, offset : offset+data.num_hu]
+        self._z_u = _slice(self._dual_buffer, offset, data.num_hu)
         offset += data.num_hu
-        self._z_bl = self._dual_buffer[:, offset : offset+data.num_xl]
+        self._z_bl = _slice(self._dual_buffer, offset, data.num_xl)
         offset += data.num_xl
-        self._z_bu = self._dual_buffer[:, offset : offset+data.num_xu]
+        self._z_bu = _slice(self._dual_buffer, offset, data.num_xu)
 
     # -- Properties: getters return (batch_size, *) views, setters copy in-place --
 
     @property
     def x(self): return self._x
     @x.setter
-    def x(self, value): self._x[:] = value
+    def x(self, value): cp.asarray(self._x)[:] = value
 
     @property
     def y(self): return self._y
     @y.setter
-    def y(self, value): self._y[:] = value
+    def y(self, value): cp.asarray(self._y)[:] = value
 
     @property
     def s_all(self): return self._s_all
     @s_all.setter
-    def s_all(self, value): self._s_all[:] = value
+    def s_all(self, value): cp.asarray(self._s_all)[:] = value
 
     @property
     def s_l(self): return self._s_l
     @s_l.setter
-    def s_l(self, value): self._s_l[:] = value
+    def s_l(self, value): cp.asarray(self._s_l)[:] = value
 
     @property
     def s_u(self): return self._s_u
     @s_u.setter
-    def s_u(self, value): self._s_u[:] = value
+    def s_u(self, value): cp.asarray(self._s_u)[:] = value
 
     @property
     def s_bl(self): return self._s_bl
     @s_bl.setter
-    def s_bl(self, value): self._s_bl[:] = value
+    def s_bl(self, value): cp.asarray(self._s_bl)[:] = value
 
     @property
     def s_bu(self): return self._s_bu
     @s_bu.setter
-    def s_bu(self, value): self._s_bu[:] = value
+    def s_bu(self, value): cp.asarray(self._s_bu)[:] = value
 
     @property
     def z_all(self): return self._z_all
     @z_all.setter
-    def z_all(self, value): self._z_all[:] = value
+    def z_all(self, value): cp.asarray(self._z_all)[:] = value
 
     @property
     def z_l(self): return self._z_l
     @z_l.setter
-    def z_l(self, value): self._z_l[:] = value
+    def z_l(self, value): cp.asarray(self._z_l)[:] = value
 
     @property
     def z_u(self): return self._z_u
     @z_u.setter
-    def z_u(self, value): self._z_u[:] = value
+    def z_u(self, value): cp.asarray(self._z_u)[:] = value
 
     @property
     def z_bl(self): return self._z_bl
     @z_bl.setter
-    def z_bl(self, value): self._z_bl[:] = value
+    def z_bl(self, value): cp.asarray(self._z_bl)[:] = value
 
     @property
     def z_bu(self): return self._z_bu
     @z_bu.setter
-    def z_bu(self, value): self._z_bu[:] = value
+    def z_bu(self, value): cp.asarray(self._z_bu)[:] = value
 
     @property
     def primals_all(self): return self._primal_buffer
     @primals_all.setter
-    def primals_all(self, value): self._primal_buffer[:] = value
+    def primals_all(self, value): cp.asarray(self._primal_buffer)[:] = value
 
     @property
     def duals_all(self): return self._dual_buffer
     @duals_all.setter
-    def duals_all(self, value): self._dual_buffer[:] = value
+    def duals_all(self, value): cp.asarray(self._dual_buffer)[:] = value
 
     @property
     def batch_size(self) -> int:
@@ -147,21 +155,21 @@ class Variables:
     def all_finite(self) -> bool:
         """Test purpose only"""
         return bool(
-            cp.isfinite(self._primal_buffer).all() and
-            cp.isfinite(self._dual_buffer).all()
+            cp.isfinite(cp.asarray(self._primal_buffer)).all() and
+            cp.isfinite(cp.asarray(self._dual_buffer)).all()
         )
 
     @property
     def buffer_ptr(self) -> tuple:
         """Memory addresses for CUDA graph cache keys."""
         return (
-            self._primal_buffer.data.ptr,
-            self._dual_buffer.data.ptr,
+            self._primal_buffer.ptr,
+            self._dual_buffer.ptr,
         )
 
     def allclose(self, other: 'Variables', rtol: float = 1e-8, atol: float = 1e-8) -> bool:
-        return (cp.allclose(self._primal_buffer, other._primal_buffer, rtol=rtol, atol=atol) and
-                cp.allclose(self._dual_buffer, other._dual_buffer, rtol=rtol, atol=atol))
+        return (cp.allclose(cp.asarray(self._primal_buffer), cp.asarray(other._primal_buffer), rtol=rtol, atol=atol) and
+                cp.allclose(cp.asarray(self._dual_buffer), cp.asarray(other._dual_buffer), rtol=rtol, atol=atol))
 
     def __str__(self) -> str:
         return (f"Variables (B={self._batch_size}):\n"
@@ -178,21 +186,21 @@ class Variables:
 
     def to_array(self) -> cp.ndarray:
         """Test purpose only."""
-        return cp.concatenate((self._primal_buffer, self._dual_buffer), axis=1)
+        return cp.concatenate((cp.asarray(self._primal_buffer), cp.asarray(self._dual_buffer)), axis=1)
 
     def set_random(self):
         """Testing purpose only: set all variables to random values."""
         cp.random.seed(0)
-        self._x[:] = cp.random.randn(*self._x.shape)
-        self._y[:] = cp.random.randn(*self._y.shape)
-        self._z_u[:] = cp.random.rand(*self._z_u.shape) + 1.0  # ensure positiveness
-        self._z_l[:] = cp.random.rand(*self._z_l.shape) + 1.0
-        self._z_bu[:] = cp.random.rand(*self._z_bu.shape) + 1.0
-        self._z_bl[:] = cp.random.rand(*self._z_bl.shape) + 1.0
-        self._s_u[:] = cp.random.rand(*self._s_u.shape) + 1.0
-        self._s_l[:] = cp.random.rand(*self._s_l.shape) + 1.0
-        self._s_bu[:] = cp.random.rand(*self._s_bu.shape) + 1.0
-        self._s_bl[:] = cp.random.rand(*self._s_bl.shape) + 1.0
+        cp.asarray(self._x)[:] = cp.random.randn(*self._x.shape)
+        cp.asarray(self._y)[:] = cp.random.randn(*self._y.shape)
+        cp.asarray(self._z_u)[:] = cp.random.rand(*self._z_u.shape) + 1.0  # ensure positiveness
+        cp.asarray(self._z_l)[:] = cp.random.rand(*self._z_l.shape) + 1.0
+        cp.asarray(self._z_bu)[:] = cp.random.rand(*self._z_bu.shape) + 1.0
+        cp.asarray(self._z_bl)[:] = cp.random.rand(*self._z_bl.shape) + 1.0
+        cp.asarray(self._s_u)[:] = cp.random.rand(*self._s_u.shape) + 1.0
+        cp.asarray(self._s_l)[:] = cp.random.rand(*self._s_l.shape) + 1.0
+        cp.asarray(self._s_bu)[:] = cp.random.rand(*self._s_bu.shape) + 1.0
+        cp.asarray(self._s_bl)[:] = cp.random.rand(*self._s_bl.shape) + 1.0
 
 class InfoIdx(IntEnum):
     """Index mapping for the contiguous Info scalar buffer."""

@@ -11,6 +11,7 @@ from .dense_kkt_solver_kernels import (
     create_solve_post_cholesky_kernel,
 )
 from .cublas_wrappers import (
+    array_ptr,
     cublas_set_stream, cublas_create_handle, cublas_destroy_handle,
     dgemv, dsyrk, cublas_set_stream,
     dgemm_strided_batched, dgemv_strided_batched,
@@ -30,17 +31,21 @@ class DenseKKTSolver(KKTSolverBase):
         n, p, m = data.n, data.p, data.m
         B = data.batch_size
         self._batch_size = B
+        self._device = data._device
+        self._dtype = data._dtype
 
         # Pre-allocated workspace — all (B, ...) shapes
-        self._delta = cp.empty(B, dtype=cp.float64)
-        self._delta_inv = cp.empty(B, dtype=cp.float64)
-        self._z_reg_inv = cp.empty((B, m), dtype=cp.float64) if m > 0 else cp.empty((B, 0), dtype=cp.float64)
-        self._z_reg_inv_sqrt = cp.empty((B, m), dtype=cp.float64) if m > 0 else cp.empty((B, 0), dtype=cp.float64)
-        self._kkt_mat = cp.empty((B, n, n), dtype=cp.float64)
-        self._AtA = cp.empty((B, n, n), dtype=cp.float64) if p > 0 else cp.zeros((B, 0, 0), dtype=cp.float64)
-        self._G_scaled = cp.empty((B, m, n), dtype=cp.float64) if m > 0 else cp.zeros((B, 0, 0), dtype=cp.float64)
-        self._work_n_AT = cp.empty((B, n), dtype=cp.float64) if p > 0 else cp.empty((B, 0), dtype=cp.float64)
-        self._work_n_GT = cp.empty((B, n), dtype=cp.float64) if m > 0 else cp.empty((B, 0), dtype=cp.float64)
+        self._delta = wp.empty(B, dtype=self._dtype, device=self._device)
+        self._delta_inv = wp.empty(B, dtype=self._dtype, device=self._device)
+        self._z_reg_inv = wp.empty((B, m if m > 0 else 0), dtype=self._dtype, device=self._device)
+        self._z_reg_inv_sqrt = wp.empty((B, m if m > 0 else 0), dtype=self._dtype, device=self._device)
+        self._kkt_mat = wp.empty((B, n, n), dtype=self._dtype, device=self._device)
+        self._AtA = (wp.empty((B, n, n), dtype=self._dtype, device=self._device) if p > 0
+                     else wp.zeros((B, 0, 0), dtype=self._dtype, device=self._device))
+        self._G_scaled = (wp.empty((B, m, n), dtype=self._dtype, device=self._device) if m > 0
+                          else wp.zeros((B, 0, 0), dtype=self._dtype, device=self._device))
+        self._work_n_AT = wp.empty((B, n if p > 0 else 0), dtype=self._dtype, device=self._device)
+        self._work_n_GT = wp.empty((B, n if m > 0 else 0), dtype=self._dtype, device=self._device)
 
         self._update_kkt_kernel, self._update_kkt_kernel_launch_dim = create_update_kkt_kernel(n, p, m)
         self._solve_pre_cholesky_kernel = create_solve_pre_cholesky_kernel(p, m)
@@ -61,7 +66,7 @@ class DenseKKTSolver(KKTSolverBase):
             # dsyrk exploits symmetry; A is (1, k, n), C is (1, n, n)
             self._syrk = lambda handle, A, C, alpha, beta: dsyrk(
                 handle, 1, 0, A.shape[-1], A.shape[-2],  # FILL_UPPER, OP_N, n, k
-                alpha, A.data.ptr, A.shape[-1], beta, C.data.ptr, C.shape[-1])
+                alpha, array_ptr(A), A.shape[-1], beta, array_ptr(C), C.shape[-1])
 
         if p > 0:
             self._compute_AtA(data)

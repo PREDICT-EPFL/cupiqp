@@ -115,11 +115,12 @@ class CholeskyInplaceSolver:
     def factorize(self, A: cp.ndarray) -> bool:
         # point the cusolver handle at CuPy's current stream
         cusolver_set_stream(self._cusolver_handle, cp.cuda.get_current_stream().ptr)
+        A = cp.asarray(A)  # accept warp arrays via __cuda_array_interface__
         if not cp.dtype(A.dtype).char == self._dtype:
             raise TypeError(f"Input matrix dtype {A.dtype} does not match solver dtype {self._dtype}.")
         if A.shape[0] != self.n or A.shape[1] != self.n:
             raise ValueError(f"Shape mismatch. Expected ({self.n}, {self.n}), got {A.shape}")
-        
+
         # Layout Detection
         if A.flags.f_contiguous:
             self._uplo = cublas.CUBLAS_FILL_MODE_LOWER
@@ -151,6 +152,8 @@ class CholeskyInplaceSolver:
         cusolver_set_stream(self._cusolver_handle, cp.cuda.get_current_stream().ptr)
         if self._factor_ptr is None:
             raise RuntimeError("You must call factorize() before solve().")
+
+        B = cp.asarray(B)  # accept warp arrays via __cuda_array_interface__
 
         # Handle dimensions
         if B.ndim == 1:
@@ -274,6 +277,7 @@ class BatchedCholeskyInplaceSolver:
         """
         cusolver_set_stream(self._cusolver_handle,
                             cp.cuda.get_current_stream().ptr)
+        A = cp.asarray(A)  # accept warp arrays via __cuda_array_interface__
         self._A_base_ptr = self._ensure_ptrs(A, self._A_ptrs, self._A_base_ptr)
         self._ctx_A = A
 
@@ -302,6 +306,7 @@ class BatchedCholeskyInplaceSolver:
         if not self._factorized:
             raise RuntimeError("You must call factorize() before solve().")
 
+        B = cp.asarray(B)  # accept warp arrays via __cuda_array_interface__
         self._B_base_ptr = self._ensure_ptrs(B, self._B_ptrs, self._B_base_ptr)
         self._ctx_B = B
 

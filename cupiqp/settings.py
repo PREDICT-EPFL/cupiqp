@@ -1,8 +1,10 @@
 from dataclasses import dataclass
 from typing import Literal
+import warp as wp
 
 @dataclass
 class Settings:
+    dtype = wp.float64
     rho_init: float = 1e-6
     delta_init: float = 1e-4
 

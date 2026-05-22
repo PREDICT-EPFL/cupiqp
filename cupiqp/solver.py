@@ -55,6 +55,8 @@ class SolverBase(ABC):
         self._preconditioner = None
         self._setup_done = False
 
+        self._device = "cuda"
+
     @property
     def settings(self) -> Settings:
         return self._settings
@@ -70,6 +72,10 @@ class SolverBase(ABC):
     @property
     def result(self) -> Result:
         return self._result
+    
+    @property
+    def dtype(self):
+        return self.settings.dtype
     
     @nvtx.annotate("Solver::setup")
     def setup(self, P, c, A=None, b=None, G=None, h_u=None, h_l=None, x_u=None, x_l=None):
@@ -103,28 +109,27 @@ class SolverBase(ABC):
         self._kkt_system.init(self._data, self.settings)
         self._info_host = InfoHost(B)
 
-        self._work_z_1 = cp.empty((data.batch_size, data.m))  # used to store intermediate results in _update_residuals_nr
-        self._work_z_2 = cp.empty((data.batch_size, data.m))  # used to store intermediate results in _update_residuals_nr
+        self._work_z_1 = wp.empty((data.batch_size, data.m), dtype=self.dtype, device=self._device)  # used to store intermediate results in _update_residuals_nr
+        self._work_z_2 = wp.empty((data.batch_size, data.m), dtype=self.dtype, device=self._device)  # used to store intermediate results in _update_residuals_nr
 
-        self._work_z = cp.empty((data.batch_size, data.num_ineq))  # used in _calculate_step to hold all concatenated slack or dual steps / results
-        self._work_s = cp.empty((data.batch_size, data.num_ineq))  # used in _calculate_step to hold all concatenated slack or dual steps / results
-        self._work_primals = cp.empty((data.batch_size, data.n))
-        self._work_duals = cp.empty((data.batch_size, data.p + data.num_ineq))  # used to hold the concatenated dual variables for computing the residuals in _update_residuals_nr
-        self._work_residual = cp.empty((data.batch_size, ))
-        self._work_reduce = cp.empty((data.batch_size, 8))  # used to hold the intermediate results of the reductions related to s_l, s_u, s_bl, s_bu and z_l, z_u, z_bl, z_bu
+        self._work_z = wp.empty((data.batch_size, data.num_ineq), dtype=self.dtype, device=self._device)  # used in _calculate_step to hold all concatenated slack or dual steps / results
+        self._work_s = wp.empty((data.batch_size, data.num_ineq), dtype=self.dtype, device=self._device)  # used in _calculate_step to hold all concatenated slack or dual steps / results
+        self._work_primals = wp.empty((data.batch_size, data.n), dtype=self.dtype, device=self._device)
+        self._work_duals = wp.empty((data.batch_size, data.p + data.num_ineq), dtype=self.dtype, device=self._device)  # used to hold the concatenated dual variables for computing the residuals in _update_residuals_nr
+        self._work_residual = wp.empty((data.batch_size, ), dtype=self.dtype, device=self._device)
+        self._work_reduce = wp.empty((data.batch_size, 8), dtype=self.dtype, device=self._device)  # used to hold the intermediate results of the reductions related to s_l, s_u, s_bl, s_bu and z_l, z_u, z_bl, z_bu
         
         self._init_warp_kernels()
 
-        self._work_x = cp.empty((B, self._data.n), dtype=cp.float64)
+        self._work_x = wp.empty((B, self._data.n), dtype=self.dtype, device=self._device)
 
-        self._tau_device = cp.empty(1, dtype=cp.float64)
-        self._tau_device[0] = self.settings.tau  # device copy used by warp kernels
+        self._tau_device = wp.full(1, value=self.settings.tau, dtype=self.dtype, device=self._device)  # device copy used by warp kernels
         self._tau_host = float(self.settings.tau)  # host cache -- only H2D when tau actually changes
 
         # Pre-allocated (B,) buffers for CUDA-graph-safe norm computations in _update_residuals_nr / _update_residuals_r
-        self._work_primal_rel_norm = cp.empty(B, dtype=cp.float64)  # running max of primal relative norm terms
-        self._work_dual_res_norm = cp.empty(B, dtype=cp.float64)    # running max of dual residual norm terms
-        self._work_norm_temp = cp.empty(B, dtype=cp.float64)        # temp (B,) for individual norm results
+        self._work_primal_rel_norm = wp.empty(B, dtype=self.dtype, device=self._device)  # running max of primal relative norm terms
+        self._work_dual_res_norm = wp.empty(B, dtype=self.dtype, device=self._device)    # running max of dual residual norm terms
+        self._work_norm_temp = wp.empty(B, dtype=self.dtype, device=self._device)        # temp (B,) for individual norm results
 
         # Working variables for implicit differentiation
         self._work_grad_rhs = Variables()
@@ -140,24 +145,24 @@ class SolverBase(ABC):
         # this zero buffer.
         self._zero_grad_in = Variables()
         self._zero_grad_in.init(self._data)
-        self._zero_grad_in._primal_buffer.fill(0.0)
-        self._zero_grad_in._dual_buffer.fill(0.0)
+        self._zero_grad_in._primal_buffer.zero_()
+        self._zero_grad_in._dual_buffer.zero_()
         # Full-layout scatter buffers feeding the matrix and vector
         # gradient assemblies. ineq groups live in length-m; bound
         # groups live in length-n.
-        self._lam_zu_full  = cp.empty((B, data.m), dtype=cp.float64)
-        self._lam_zl_full  = cp.empty((B, data.m), dtype=cp.float64)
-        self._lam_zbu_full = cp.empty((B, data.n), dtype=cp.float64)
-        self._lam_zbl_full = cp.empty((B, data.n), dtype=cp.float64)
-        self._zu_full      = cp.empty((B, data.m), dtype=cp.float64)
-        self._zl_full      = cp.empty((B, data.m), dtype=cp.float64)
+        self._lam_zu_full  = wp.empty((B, data.m), dtype=self.dtype, device=self._device)
+        self._lam_zl_full  = wp.empty((B, data.m), dtype=self.dtype, device=self._device)
+        self._lam_zbu_full = wp.empty((B, data.n), dtype=self.dtype, device=self._device)
+        self._lam_zbl_full = wp.empty((B, data.n), dtype=self.dtype, device=self._device)
+        self._zu_full      = wp.empty((B, data.m), dtype=self.dtype, device=self._device)
+        self._zl_full      = wp.empty((B, data.m), dtype=self.dtype, device=self._device)
 
         self._enable_iterative_refinement = self.settings.iterative_refinement_always_enabled
 
         # Unscaled-RHS inf-norm. When preconditioner_iter == 0 the stored
         # factors are identity, so this reduces to the inf-norm of the user-
         # space b / h_l/u / x_l/u — same answer, single code path.
-        self._constraints_rhs_inf_norm_unscaled = cp.zeros(B, dtype=cp.float64)
+        self._constraints_rhs_inf_norm_unscaled = wp.zeros(B, dtype=self.dtype, device=self._device)
         self._preconditioner.compute_constraints_rhs_inf_norm_unscaled(
             self._data, self._constraints_rhs_inf_norm_unscaled,
         )
@@ -430,10 +435,10 @@ class SolverBase(ABC):
     @nvtx.annotate("Solver::_initial_guess")
     def _initial_guess(self):
         # eq(12) in Roland Schwan 2023 paper
-        self._result.x.fill(0.0)
-        self._result.y.fill(0.0)
-        self._result.s_all.fill(1.0)
-        self._result.z_all.fill(1.0)
+        self._result.x = 0.0
+        self._result.y = 0.0
+        self._result.s_all = 1.0
+        self._result.z_all = 1.0
 
         self._kkt_system.update_scalings_and_factor(
             self._data,
@@ -464,7 +469,7 @@ class SolverBase(ABC):
             device="cuda",
             stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
         )
-        self._res.s_all[:] = 0.
+        self._res.s_all = 0.
 
         self._kkt_system.solve(self._data, self._preconditioner, self.settings, self._res, self._result)  # getting an initial point of _result
 
@@ -476,10 +481,10 @@ class SolverBase(ABC):
             # this is according to the IV.A part of Roland Schwan 2023 paper.
             # Uses pre-allocated (B, 1) scratch buffers — see Solver.setup
             # for the rationale (no transient cupy allocs in the solve path).
-            delta_s = -cp.min(self._result.s_all, axis=1, keepdims=True)  # (B, 1)
-            delta_z = -cp.min(self._result.z_all, axis=1, keepdims=True)  # (B, 1)
-            self._result.s_all += delta_s
-            self._result.z_all += delta_z
+            delta_s = -cp.min(cp.asarray(self._result.s_all), axis=1, keepdims=True)  # (B, 1)
+            delta_z = -cp.min(cp.asarray(self._result.z_all), axis=1, keepdims=True)  # (B, 1)
+            cp.add(self._result.s_all, delta_s, out=cp.asarray(self._result.s_all))
+            cp.add(self._result.z_all, delta_z, out=cp.asarray(self._result.z_all))
 
             # need to make sure mu is positive here, otherwise in the next step (put s and z on central path) sqrt(mu) the computed z_* will be zeros
             self._calculate_mu()
@@ -504,8 +509,8 @@ class SolverBase(ABC):
 
             self._calculate_mu()
 
-        self._prox_vars.primals_all[:] = self._result.primals_all
-        self._prox_vars.duals_all[:] = self._result.duals_all
+        self._prox_vars.primals_all = self._result.primals_all
+        self._prox_vars.duals_all = self._result.duals_all
 
     @nvtx.annotate("Solver::_print_iteration_info")
     def _print_iteration_info(self):
@@ -887,8 +892,8 @@ class SolverBase(ABC):
             self._kkt_system.eval_A_xn(data, 1., result.x, self._res.y)
             self._kkt_system.eval_AT_xt(data, 1., result.y, self._res.x)
         else:
-            self._res.y.fill(0.)
-            self._res.x.fill(0.)
+            self._res.y = 0.
+            self._res.x = 0.
 
         # build work_z_1 (G^T * (z_u_scatter - z_l_scatter))
         # and self._work_x (x_b_scaling*(z_bu_scatter - z_bl_scattered))
@@ -912,8 +917,8 @@ class SolverBase(ABC):
             self._kkt_system.eval_G_xn(data, 1., result.x, G_x)
             self._kkt_system.eval_GT_xt(data, 1., self._work_z_1, GT_zu_minus_zl)
         else:
-            G_x.fill(0.)
-            GT_zu_minus_zl.fill(0.)
+            G_x.fill_(0.)
+            GT_zu_minus_zl.fill_(0.)
 
         wp.launch_tiled(
             kernel=self._update_residual_nr_kernel,
@@ -1016,7 +1021,7 @@ class SolverBase(ABC):
             cp.absolute(self._work_duals[:, :offset], out=self._work_duals[:, :offset])
             cp.max(self._work_duals[:, :offset], axis=1, out=self._work_residual)
         else:
-            self._work_residual.fill(0.)
+            self._work_residual.fill_(0.)
         return self._work_residual
 
     @nvtx.annotate("Solver::_primal_res_r")
@@ -1043,7 +1048,7 @@ class SolverBase(ABC):
             cp.absolute(self._work_duals[:, :offset], out=self._work_duals[:, :offset])
             cp.max(self._work_duals[:, :offset], axis=1, out=self._work_residual)
         else:
-            self._work_residual.fill(0.)
+            self._work_residual.fill_(0.)
         return self._work_residual
 
     @nvtx.annotate("Solver::_dual_res_nr")
@@ -1074,7 +1079,7 @@ class SolverBase(ABC):
             cp.absolute(self._work_duals, out=self._work_duals)
             cp.max(self._work_duals, axis=1, out=self._work_residual)
         else:
-            self._work_residual.fill(0.)
+            self._work_residual.fill_(0.)
         return self._work_residual
 
     @nvtx.annotate("Solver::_dual_prox_inf")

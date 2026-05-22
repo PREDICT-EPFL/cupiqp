@@ -698,6 +698,8 @@ class RuizEquilibration(PreconditionerBase):
         
         else:
             # cupy fallback (use_warp_tile_kernels=False; LargeProblemSolver path).
+            # `out` may be a warp array; wrap as a cupy view for the elementwise ops below.
+            out = cp.asarray(out)
             out.fill(0.0)
             if data.p > 0:
                 tmp = cp.empty_like(data.b)

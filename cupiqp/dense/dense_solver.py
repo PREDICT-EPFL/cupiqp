@@ -85,7 +85,8 @@ class DenseSolver(SolverBase):
         _check_dense("h_l", h_l)
         _check_dense("x_u", x_u)
         _check_dense("x_l", x_l)
-        return DenseData(P, c, A, b, G, h_u, h_l, x_u, x_l)
+        return DenseData(dtype=self.dtype, device=self._device).init(
+            P, c, A, b, G, h_u, h_l, x_u, x_l)
 
     def _init_preconditioner(self):
         return DenseRuizEquilibration(
@@ -143,7 +144,7 @@ class DenseSolver(SolverBase):
         dx_u = self._dx_u_buf       if data.num_xu > 0 else None
         dx_l = self._lam_zbl_full   if data.num_xl > 0 else None
 
-        return DenseData(
+        return DenseData(dtype=self.dtype, device=self._device).init(
             P=self._dP_buf, c=dc,
             A=dA, b=db,
             G=dG, h_u=dh_u, h_l=dh_l,
