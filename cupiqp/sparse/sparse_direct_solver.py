@@ -118,9 +118,15 @@ class CudssSparseDirectSolver(SparseDirectSolver):
             sparse_system_view=DirectSolverMatrixViewType.LOWER,  # NOTE: only take the lower triangular part of the matrix
             multithreading_lib=self._find_cudss_mt_lib()
         )
-        exe = ExecutionCUDA()  # Optional: ExecutionCUDA(). NOTE: hybrid mode seems more numerically stable
+
+        # NOTE: ExecutionHybrid() seems to be more efficient in some cases I tested. It triggers the cudss::factorize_v3_ker
+        # while ExecutionCUDA() triggers cudss::superpanel_update_ker, which takes much long time
+        # However, use_superpanels on/off also effects this. We explicitly disable superpanels here since
+        # we find that with it disabled it's more efficient for large problems
+        # However, with ExecuteHybrid(), fac_info.diag are always all zeros so we cannot check the quality of factorization.
 
         if batch_size == 1:
+            exe = ExecutionCUDA()  # NOTE: hybrid mode seems more efficient on some big problems
             # Non-batched nvmath DirectSolver. ``self._mat`` is the raw
             # csr_matrix when the user passed one directly, or None +
             # self._mat_list[0] when a BatchedCsrMatrix with B=1 was passed.
@@ -133,6 +139,7 @@ class CudssSparseDirectSolver(SparseDirectSolver):
                 stream=cp.cuda.get_current_stream().ptr,
             )
         else:
+            exe = ExecutionCUDA()
             # Explicit-batching nvmath DirectSolver. ``self._mat_list`` is a
             # list of csr_matrix views on top of the BatchedCsrMatrix.
             self._cudss_solver = DirectSolver(
@@ -143,6 +150,7 @@ class CudssSparseDirectSolver(SparseDirectSolver):
                 stream=cp.cuda.get_current_stream().ptr,
             )
         self._cudss_solver.plan_config.reordering_algorithm = DirectSolverAlgType.ALG_DEFAULT
+        self._cudss_solver.plan_config.use_superpanels = 0
         self._cudss_solver.solution_config.ir_num_steps = 0  # NOTE: iterative refinement steps, to be tuned
         # cudss has IR_TOL, but not implemented yet according to https://docs.nvidia.com/cuda/cudss/types.html#c.cudssConfigParam_t.CUDSS_CONFIG_IR_TOL
         # self._cudss_solver.plan_config.pivot_type = cudss_bindings.PivotType.PIVOT_COL
