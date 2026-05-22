@@ -8,6 +8,8 @@ from .solver_kernels import (
     create_prepare_corrector_step_kernel,
     create_update_vars_after_corrector_step_kernel,
     create_boundary_shift_kernel,
+    create_init_guess_rhs_kernel,
+    create_init_guess_project_to_central_path_kernel,
 )
 from .dense.dense_solver import DenseSolver
 from .sparse.sparse_solver import SparseSolver
@@ -43,6 +45,13 @@ class LargeProblemSolverBase(SolverBase):
             self._update_vars_after_corrector_step_kernel = create_update_vars_after_corrector_step_kernel(
                 n_primal=self._data.n + self._data.num_ineq, n_dual=self._data.p + self._data.num_ineq,
             )
+            self._init_guess_project_to_central_path_kernel = create_init_guess_project_to_central_path_kernel()
+
+        self._init_guess_rhs_kernel = create_init_guess_rhs_kernel(
+            self._data.n, self._data.p,
+            int(self._data.num_hl), int(self._data.num_hu),
+            int(self._data.num_xl), int(self._data.num_xu),
+        )
 
     @nvtx.annotate("LargeProblemSolverBase::_run_full_newton_step")
     def _run_full_newton_step(self):
