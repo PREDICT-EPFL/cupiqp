@@ -12,6 +12,8 @@ from .results import Result, Status, Variables, InfoHost
 from .kkt_systems import KKTSystem
 from .utils import cuda_graph_capture
 from .solver_kernels import (
+    create_init_guess_rhs_kernel,
+    create_init_guess_project_to_central_path_kernel,
     create_prepare_predictor_step_kernel,
     create_prepare_corrector_step_kernel,
     create_update_vars_after_corrector_step_kernel,
@@ -443,19 +445,25 @@ class SolverBase(ABC):
             self._result
         )
 
-        cp.negative(self._data.c, out=self._res.x)
-        if self._data.p > 0:
-            self._res.y[:] = self._data.b
-        if self._data.num_hl > 0:
-            cp.take(self._data.h_l, self._data.idx_hl, axis=1, out=self._res.z_l)
-            cp.negative(self._res.z_l, out=self._res.z_l)
-        if self._data.num_hu > 0:
-            cp.take(self._data.h_u, self._data.idx_hu, axis=1, out=self._res.z_u)
-        if self._data.num_xl > 0:
-            cp.take(self._data.x_l, self._data.idx_xl, axis=1, out=self._res.z_bl)
-            cp.negative(self._res.z_bl, out=self._res.z_bl)
-        if self._data.num_xu > 0:
-            cp.take(self._data.x_u, self._data.idx_xu, axis=1, out=self._res.z_bu)
+        total_t = (self._data.n + self._data.p
+                   + self._data.num_hl + self._data.num_hu 
+                   + self._data.num_xl + self._data.num_xu)
+        wp.launch(
+            kernel=self._initial_guess_rhs_kernel,
+            dim=(self._data.batch_size, total_t),
+            inputs=[
+                self._data.c, self._data.b,
+                self._data.h_l, self._data.h_u,
+                self._data.x_l, self._data.x_u,
+                self._data.idx_hl, self._data.idx_hu,
+                self._data.idx_xl, self._data.idx_xu,
+                self._res.x, self._res.y,
+                self._res.z_l, self._res.z_u,
+                self._res.z_bl, self._res.z_bu,
+            ],
+            device="cuda",
+            stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+        )
         self._res.s_all[:] = 0.
 
         self._kkt_system.solve(self._data, self._preconditioner, self.settings, self._res, self._result)  # getting an initial point of _result
@@ -482,13 +490,14 @@ class SolverBase(ABC):
 
             # put s and z on the central path
             # c = z - delta_z; z = (c + sqrt(c^2 + 4*mu)) / 2; s = z - c
-            cp.subtract(self._result.z_all, delta_z, out=self._result.s_all)
-            cp.power(self._result.s_all, 2, out=self._result.z_all)
-            self._result.z_all += 4. * self._result.info.mu[:, None]
-            cp.sqrt(self._result.z_all, out=self._result.z_all)
-            self._result.z_all += self._result.s_all
-            self._result.z_all /= 2.
-            cp.subtract(self._result.z_all, self._result.s_all, out=self._result.s_all)
+            wp.launch(
+                kernel=self._init_guess_project_to_central_path_kernel,
+                dim=(self._data.batch_size, self._data.num_ineq),
+                inputs=[delta_z, self._result.info.mu,
+                        self._result.z_all, self._result.s_all],
+                device="cuda",
+                stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+            )
 
             if self.settings.debug:
                 print("self._result:", self._result)
@@ -594,10 +603,16 @@ class SolverBase(ABC):
             self._data.n, self._data.p, self._data.m,
             self._data.num_hl, self._data.num_hu, self._data.num_xl, self._data.num_xu,
         )
+        self._initial_guess_rhs_kernel = create_init_guess_rhs_kernel(
+            self._data.n, self._data.p,
+            self._data.num_hl, self._data.num_hu,
+            self._data.num_xl, self._data.num_xu,
+        )
         if self._data.num_ineq > 0:
             self._calculate_sigma_kernel = create_calculate_sigma_kernel(self._data.num_ineq)
             self._calculate_step_kernel = create_calculate_step_kernel(self._data.num_ineq)
             self._calculate_mu_kernel = create_calculate_mu_kernel(self._data.num_ineq)
+            self._init_guess_project_to_central_path_kernel = create_init_guess_project_to_central_path_kernel()
             self._update_rho_delta_with_ineq_kernel = create_update_rho_delta_with_ineq_kernel(
                 self._data.n, self._data.p + self._data.num_ineq,
             )
