@@ -1,14 +1,36 @@
+from abc import ABC, abstractmethod
+from typing import Optional, Any
+
+import numpy as np
 import cupy as cp
 import warp as wp
-from typing import Optional, Any
 import nvtx
 
 from .settings import Settings
 from .data import Data
-from .results import Result, Status, Variables
+from .results import Result, Status, Variables, InfoHost
 from .kkt_systems import KKTSystem
-from .preconditioner import RuizEquilibration
 from .utils import cuda_graph_capture
+from .solver_kernels import (
+    create_prepare_predictor_step_kernel,
+    create_prepare_corrector_step_kernel,
+    create_update_vars_after_corrector_step_kernel,
+    create_boundary_shift_kernel,
+    create_calculate_step_kernel,
+    create_calculate_sigma_kernel,
+    create_calculate_mu_kernel,
+    create_update_residuals_r_kernel,
+    create_prepare_zu_minus_zl_and_zbu_minus_zbl_kernel,
+    create_update_residual_nr_kernel,
+    create_update_rho_delta_with_ineq_kernel,
+    create_update_rho_delta_without_ineq_kernel,
+    create_run_full_newton_step_kernel,
+    create_backward_assemble_rhs_kernel,
+    create_backward_unscale_lhs_kernel,
+    create_backward_compute_vector_grad_kernel,
+    create_backward_copy_kernel,
+    create_backward_pack_full_layout_kernel,
+)
 
 
 wp.config.quiet = True  # disable warp module initialization messages.
@@ -16,10 +38,11 @@ wp.config.enable_backward = False  # disable backward mode, cut down kernel comp
 wp.init()
 
 
-class SolverBase:
-    def __init__(self):
+class SolverBase(ABC):
+    """Abstract base for the cuPIQP solver."""
 
-        self.settings = Settings()
+    def __init__(self):
+        self._settings = Settings()
         self._data: Data = None
         self._result = Result()    # store the values of primal, dual and slack variables of current iteration, and other information
         self._step = Variables()   # used to store the step direction of primal and dual variables
@@ -30,53 +53,40 @@ class SolverBase:
         self._preconditioner = None
 
     @property
+    def settings(self) -> Settings:
+        return self._settings
+
+    @settings.setter
+    def settings(self, value: Settings) -> None:
+        self._settings = value
+
+    @property
     def result(self):
         return self._result
     
     @nvtx.annotate("Solver::setup")
-    def setup(self, P, c, A, b, G, h_u, h_l, x_u, x_l):
-        if self.settings.kkt_solver == "dense_cholesky":
-            from .dense.dense_data import DenseData
-            self._data = DenseData(P, c, A, b, G, h_u, h_l, x_u, x_l)
-        elif self.settings.kkt_solver == "sparse_ldlt":
-            from .sparse.sparse_data import SparseData
-            self._data = SparseData(P, c, A, b, G, h_u, h_l, x_u, x_l)
-        elif self.settings.kkt_solver == "multistage_block_cholesky":
-            from .multistage.multistage_data import MultistageData
-            self._data = MultistageData(P, c, A, b, G, h_u, h_l, x_u, x_l)
-        else:
-            raise ValueError(f"Unknown kkt_solver type: {self.settings.kkt_solver}")
+    def setup(self, P, c, A=None, b=None, G=None, h_u=None, h_l=None, x_u=None, x_l=None):
+        # Detect if user provided batched (3D P) or non-batched (2D P) data.
+        # DenseData auto-unsqueezes non-batched to (1, ...) internally,
+        # but we track this so solve() returns the right type.
+        self._user_batched = (hasattr(P, 'ndim') and P.ndim == 3) or (isinstance(P, (list, tuple)) and len(P) > 1)
 
-        # Apply Ruiz equilibration preconditioner
+        self._data = self._init_data(P, c, A, b, G, h_u, h_l, x_u, x_l)
+        self._preconditioner = self._init_preconditioner()
         if self.settings.preconditioner_iter > 0:
-            if self.settings.kkt_solver == "dense_cholesky":
-                from .dense.dense_preconditioner import DenseRuizEquilibration
-                PreconditionerClass = DenseRuizEquilibration
-            elif self.settings.kkt_solver == "sparse_ldlt":
-                from .sparse.sparse_preconditioner import SparseRuizEquilibration
-                PreconditionerClass = SparseRuizEquilibration
-            elif self.settings.kkt_solver == "multistage_block_cholesky":
-                from .multistage.multistage_preconditioner import MultistageRuizEquilibration
-                PreconditionerClass = MultistageRuizEquilibration
-            else:
-                raise ValueError(f"No preconditioner for kkt_solver type: {self.settings.kkt_solver}")
-            self._preconditioner = PreconditionerClass(
-                self._data.n, self._data.p, self._data.m,
-                self._data.idx_xl, self._data.idx_xu,
-            )
             self._preconditioner.scale_data(
                 self._data,
                 self.settings.preconditioner_scale_cost,
                 self.settings.preconditioner_iter,
             )
-            self._data._compute_constraints_rhs_inf_norm()
-        else:
-            self._preconditioner = None
 
+        data = self._data
+        B = data.batch_size
+
+        self._result = Result(B)
         self._result.init(self._data)
-        self._result.info.rho[0] = self.settings.rho_init
-        self._result.info.delta[0] = self.settings.delta_init
-        self._result.init(self._data)
+        self._result.info.rho[:] = self.settings.rho_init
+        self._result.info.delta[:] = self.settings.delta_init
 
         self._step.init(self._data)
         self._res_nr.init(self._data)
@@ -84,80 +94,66 @@ class SolverBase:
         self._prox_vars.init(self._data)
 
         self._kkt_system.init(self._data, self.settings)
+        self._info_host = InfoHost(B)
 
-        self._work_z_1 = cp.empty(self._data.m)  # used to store intermediate results in _update_residuals_nr
-        self._work_z_2 = cp.empty(self._data.m)  # used to store intermediate results in _update_residuals_nr
+        self._work_z_1 = cp.empty((data.batch_size, data.m))  # used to store intermediate results in _update_residuals_nr
+        self._work_z_2 = cp.empty((data.batch_size, data.m))  # used to store intermediate results in _update_residuals_nr
 
-        self._work_z = cp.empty(self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)  # used in _calculate_step to hold all concatenated slack or dual steps / results
-        self._work_s = cp.empty(self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)  # used in _calculate_step to hold all concatenated slack or dual steps / results
-        self._alpha_sz = cp.empty(2) # step lengths of slack and dual variables [alpha_s, alpha_z]
-        self._work_primals = cp.empty(self._data.n)
-        self._work_duals = cp.empty(self._data.p + self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)  # used to hold the concatenated dual variables for computing the residuals in _update_residuals_nr
-        self._work_residual = cp.empty(())
-        self._work_reduce = cp.empty(8)  # used to hold the intermediate results of the reductions related to s_l, s_u, s_bl, s_bu and z_l, z_u, z_bl, z_bu
+        self._work_z = cp.empty((data.batch_size, data.num_ineq))  # used in _calculate_step to hold all concatenated slack or dual steps / results
+        self._work_s = cp.empty((data.batch_size, data.num_ineq))  # used in _calculate_step to hold all concatenated slack or dual steps / results
+        self._work_primals = cp.empty((data.batch_size, data.n))
+        self._work_duals = cp.empty((data.batch_size, data.p + data.num_ineq))  # used to hold the concatenated dual variables for computing the residuals in _update_residuals_nr
+        self._work_residual = cp.empty((data.batch_size, ))
+        self._work_reduce = cp.empty((data.batch_size, 8))  # used to hold the intermediate results of the reductions related to s_l, s_u, s_bl, s_bu and z_l, z_u, z_bl, z_bu
         
-        self._update_residuals_r_kernel = create_update_residual_r_kernel(
-            self._data.n, self._data.p, self._data.num_hl, self._data.num_hu, self._data.num_xl, self._data.num_xu
-        )
-        # Pre-allocated scalar buffers for CUDA-graph-safe norm computations in _update_residuals_nr / _update_residuals_r
-        self._work_primal_rel_norm = cp.empty(1, dtype=cp.float64)  # running max of primal relative norm terms
-        self._work_dual_res_norm = cp.empty(1, dtype=cp.float64)    # running max of dual residual norm terms
-        self._work_norm_temp = cp.empty(1, dtype=cp.float64)        # temp scalar for individual norm results
+        self._init_warp_kernels()
 
-        self._mu_prev = cp.empty(1)
-        self._mu_rate = cp.empty(1)
+        self._work_x = cp.empty((B, self._data.n), dtype=cp.float64)
+
+        self._tau_device = cp.empty(1, dtype=cp.float64)
+        self._tau_device[0] = self.settings.tau  # device copy used by warp kernels
+        self._tau_host = float(self.settings.tau)  # host cache -- only H2D when tau actually changes
+
+        # Pre-allocated (B,) buffers for CUDA-graph-safe norm computations in _update_residuals_nr / _update_residuals_r
+        self._work_primal_rel_norm = cp.empty(B, dtype=cp.float64)  # running max of primal relative norm terms
+        self._work_dual_res_norm = cp.empty(B, dtype=cp.float64)    # running max of dual residual norm terms
+        self._work_norm_temp = cp.empty(B, dtype=cp.float64)        # temp (B,) for individual norm results
+
+        # Working variables for implicit differentiation
+        self._work_grad_rhs = Variables()
+        self._work_grad_rhs.init(self._data)
+        # User cotangent input (caller packs kwargs into this) and the user-space adjoint solution buffer.
+        self._grad_in = Variables()
+        self._grad_in.init(self._data)
+        self._backward_adjoint_vector = Variables()
+        self._backward_adjoint_vector.init(self._data)
+        # Pre-zeroed Variables used as a placeholder for None cotangents
+        # in the fused pack kernel — the kernel can't read None, so
+        # absent kwargs get substituted with the corresponding field of
+        # this zero buffer.
+        self._zero_grad_in = Variables()
+        self._zero_grad_in.init(self._data)
+        self._zero_grad_in._primal_buffer.fill(0.0)
+        self._zero_grad_in._dual_buffer.fill(0.0)
+        # Full-layout scatter buffers feeding the matrix and vector
+        # gradient assemblies. ineq groups live in length-m; bound
+        # groups live in length-n.
+        self._lam_zu_full  = cp.empty((B, data.m), dtype=cp.float64)
+        self._lam_zl_full  = cp.empty((B, data.m), dtype=cp.float64)
+        self._lam_zbu_full = cp.empty((B, data.n), dtype=cp.float64)
+        self._lam_zbl_full = cp.empty((B, data.n), dtype=cp.float64)
+        self._zu_full      = cp.empty((B, data.m), dtype=cp.float64)
+        self._zl_full      = cp.empty((B, data.m), dtype=cp.float64)
 
         self._enable_iterative_refinement = self.settings.iterative_refinement_always_enabled
 
-        # Pre-compute residual unscaling factors for preconditioner.
-        # These are cached arrays used every iteration in _update_residuals_nr
-        # to compute norms in the original (unscaled) coordinate system.
-        # When no preconditioner is active, all factors are 1.0 (identity).
-        n, p, m = self._data.n, self._data.p, self._data.m
-        pc = self._preconditioner
-        if pc is not None:
-            self._c_scaling_inv = pc.c_scaling_inv
-            self._unscale_dual_res_factor = pc.c_scaling_inv * pc.delta_inv[:n]
-            self._unscale_primal_res_eq_factor = pc.delta_inv[n:n + p] if p > 0 else cp.empty(0)
-            self._unscale_primal_res_ineq_hu = pc.delta_inv[n + p + self._data.idx_hu] if self._data.num_hu > 0 else cp.empty(0)
-            self._unscale_primal_res_ineq_hl = pc.delta_inv[n + p + self._data.idx_hl] if self._data.num_hl > 0 else cp.empty(0)
-            self._unscale_primal_res_b_xu = pc.delta_b_inv[self._data.idx_xu] if self._data.num_xu > 0 else cp.empty(0)
-            self._unscale_primal_res_b_xl = pc.delta_b_inv[self._data.idx_xl] if self._data.num_xl > 0 else cp.empty(0)
-            # Compute unscaled constraints RHS norm from original (pre-scaling) bounds
-            self._constraints_rhs_inf_norm_unscaled = cp.zeros(1, dtype=cp.float64)
-            if p > 0:
-                cp.maximum(self._constraints_rhs_inf_norm_unscaled,
-                           cp.max(cp.abs(pc.unscale_primal_res_eq(self._data.b))),
-                           out=self._constraints_rhs_inf_norm_unscaled)
-            if self._data.num_hu > 0:
-                cp.maximum(self._constraints_rhs_inf_norm_unscaled,
-                           cp.max(cp.abs(pc.unscale_primal_res_ineq(self._data.h_u[self._data.idx_hu], self._data.idx_hu))),
-                           out=self._constraints_rhs_inf_norm_unscaled)
-            if self._data.num_hl > 0:
-                cp.maximum(self._constraints_rhs_inf_norm_unscaled,
-                           cp.max(cp.abs(pc.unscale_primal_res_ineq(self._data.h_l[self._data.idx_hl], self._data.idx_hl))),
-                           out=self._constraints_rhs_inf_norm_unscaled)
-            if self._data.num_xu > 0:
-                cp.maximum(self._constraints_rhs_inf_norm_unscaled,
-                           cp.max(cp.abs(pc.unscale_primal_res_b(self._data.x_u[self._data.idx_xu], self._data.idx_xu))),
-                           out=self._constraints_rhs_inf_norm_unscaled)
-            if self._data.num_xl > 0:
-                cp.maximum(self._constraints_rhs_inf_norm_unscaled,
-                           cp.max(cp.abs(pc.unscale_primal_res_b(self._data.x_l[self._data.idx_xl], self._data.idx_xl))),
-                           out=self._constraints_rhs_inf_norm_unscaled)
-        else:
-            self._c_scaling_inv = cp.ones(1, dtype=cp.float64)
-            self._unscale_dual_res_factor = cp.ones(n, dtype=cp.float64)
-            self._unscale_primal_res_eq_factor = cp.ones(p, dtype=cp.float64) if p > 0 else cp.empty(0)
-            self._unscale_primal_res_ineq_hu = cp.ones(self._data.num_hu, dtype=cp.float64) if self._data.num_hu > 0 else cp.empty(0)
-            self._unscale_primal_res_ineq_hl = cp.ones(self._data.num_hl, dtype=cp.float64) if self._data.num_hl > 0 else cp.empty(0)
-            self._unscale_primal_res_b_xu = cp.ones(self._data.num_xu, dtype=cp.float64) if self._data.num_xu > 0 else cp.empty(0)
-            self._unscale_primal_res_b_xl = cp.ones(self._data.num_xl, dtype=cp.float64) if self._data.num_xl > 0 else cp.empty(0)
-            self._constraints_rhs_inf_norm_unscaled = self._data._constraints_rhs_inf_norm
-
-        # Clear CUDA graph cache (invalidated by new setup)
-        self._update_residuals_nr_cuda_graphs = {}
-        self._update_residuals_nr_cuda_graphs_capture_count = 0
+        # Unscaled-RHS inf-norm. When preconditioner_iter == 0 the stored
+        # factors are identity, so this reduces to the inf-norm of the user-
+        # space b / h_l/u / x_l/u — same answer, single code path.
+        self._constraints_rhs_inf_norm_unscaled = cp.zeros(B, dtype=cp.float64)
+        self._preconditioner.compute_constraints_rhs_inf_norm_unscaled(
+            self._data, self._constraints_rhs_inf_norm_unscaled,
+        )
 
         self._setup_done = True
 
@@ -189,6 +185,9 @@ class SolverBase:
         if not self._setup_done:
             raise RuntimeError("Solver not setup yet. Call setup() first.")
 
+        if self.settings.preconditioner_iter > 0:
+            self._preconditioner.unscale_data(self._data)
+
         if P is not None:
             self._data.set_P(P, check=check_validity)
         if c is not None:
@@ -208,10 +207,14 @@ class SolverBase:
         if x_l is not None:
             self._data.set_x_l(x_l, check=check_validity)
 
-        # Apply preconditioner scaling to updated data
-        if self._preconditioner is not None:
-            if self.settings.preconditioner_reuse_on_update:
-                self._preconditioner.apply_scaling(self._data)
+        matrix_changed = P is not None or A is not None or G is not None
+
+        # Apply preconditioner scaling to updated data.
+        preconditioner_did_fresh_ruiz = False
+        if self.settings.preconditioner_iter > 0:
+            reuse = self.settings.preconditioner_reuse_on_update or not matrix_changed
+            if reuse:
+                self._preconditioner.reuse_scaling(self._data)
             else:
                 self._preconditioner.reset()
                 self._preconditioner.scale_data(
@@ -219,11 +222,23 @@ class SolverBase:
                     self.settings.preconditioner_scale_cost,
                     self.settings.preconditioner_iter,
                 )
+                preconditioner_did_fresh_ruiz = True
 
-        self._data._compute_constraints_rhs_inf_norm()
-        self._kkt_system.update_data(self._data, P is not None, A is not None, G is not None)
+        self._preconditioner.compute_constraints_rhs_inf_norm_unscaled(
+            self._data, self._constraints_rhs_inf_norm_unscaled,
+        )
+        # Fresh Ruiz produces new factors that re-scale ALL of P/A/G in place,
+        # even matrices the user didn't pass. The KKT solver caches things
+        # like A^T A keyed off those scaled values, so flag everything as
+        # changed in that case.
+        self._kkt_system.update_data(
+            self._data,
+            (P is not None) or preconditioner_did_fresh_ruiz,
+            (A is not None) or preconditioner_did_fresh_ruiz,
+            (G is not None) or preconditioner_did_fresh_ruiz,
+        )
 
-    def solve(self) -> Status:
+    def solve(self) -> list:
         if self.settings.verbose:
             if self.settings.kkt_solver == "dense_cholesky":
                 print("dense backend:")
@@ -251,20 +266,42 @@ class SolverBase:
         return self._solve_impl()
 
     def _solve_impl(self) -> Status:
-        self._result.info.status = Status.PIQP_UNSOLVED 
-        self._result.info.iter = 0
-        self._result.info.reg_limit[0] = self.settings.reg_lower_limit
-        self._result.info.factor_retires = 0
-        self._result.info.no_primal_update = 0
-        self._result.info.no_dual_update = 0
-        self._result.info.mu[0] = 0.
-        self._result.info.primal_step[0] = 0.
-        self._result.info.dual_step[0] = 0.
-        self._result.info.rho[0] = self.settings.rho_init
-        self._result.info.delta[0] = self.settings.delta_init
+        self._result.info._status_value[:] = Status.PIQP_UNSOLVED.value
+        self._result.info.iter[:] = 0
+        self._result.info.reg_limit[:] = self.settings.reg_lower_limit
+        # Refresh tau only if the user changed settings.tau between solves because it requires H2D memcpy
+        if self._tau_host != self.settings.tau:
+            self._tau_device[0] = self.settings.tau
+            self._tau_host = float(self.settings.tau)
+        self._result.info.factor_retires[:] = 0
+        self._result.info.no_primal_update[:] = 0
+        self._result.info.no_dual_update[:] = 0
+        self._result.info.mu[:] = 0.
+        self._result.info.primal_step[:] = 0.
+        self._result.info.dual_step[:] = 0.
+        self._result.info.rho[:] = self.settings.rho_init
+        self._result.info.delta[:] = self.settings.delta_init
 
         if self.settings.verbose:
-            print("iter  prim_obj       dual_obj       duality_gap   prim_res      dual_res      rho         delta       mu          p_step   d_step")
+            if self._data.batch_size == 1:
+                print("iter  prim_obj       dual_obj       duality_gap   prim_res      dual_res      rho         delta       mu          p_step   d_step")
+            else:
+                # Match the column widths used in ``_print_iteration_info``
+                # so header + data right-align to the same edge.
+                B = self._data.batch_size
+                counter_w = max(2 * len(str(B)) + 1, len("solved"))
+                print(
+                    f"{'iter':>4}  "
+                    f"{'solved':>{counter_w}}  "
+                    f"{'gap_max':>12}  "
+                    f"{'p_res_max':>12}  "
+                    f"{'d_res_max':>12}  "
+                    f"{'rho_max':>10}  "
+                    f"{'delta_max':>10}  "
+                    f"{'mu_max':>10}  "
+                    f"{'p_step':>6}  "
+                    f"{'d_step':>6}"
+                )
 
         ## ----------- initial iteration --------------
         self._initial_guess()
@@ -274,74 +311,94 @@ class SolverBase:
         ## ---------------------------------------------
         for iter in range(self.settings.max_iter):
             with nvtx.annotate(f"Solver::ipm_iteration"):
-                self._result.info.iter = iter
+                self._result.info.iter[:] = iter
                 if iter == 0:
                     self._update_residuals_nr()
                     self._result.info.prev_primal_res[:] = self._result.info.primal_res
                     self._result.info.prev_dual_res[:] = self._result.info.dual_res
 
-                # ? The convergence criteria seems different from the one in the paper
-                if ((self._result.info.primal_res < self.settings.eps_abs or self._result.info.primal_res_rel < self.settings.eps_rel) and
-                    (self._result.info.dual_res < self.settings.eps_abs or self._result.info.dual_res_rel < self.settings.eps_rel) and
-                    (not self.settings.check_duality_gap or self._result.info.duality_gap < self.settings.eps_duality_gap_abs or self._result.info.duality_gap_rel < self.settings.eps_duality_gap_rel)):
-                    self._result.info.status = Status.PIQP_SOLVED
-                    self._preconditioner.unscale_solution(self._result, self._data)
-                    return self._result.info.status
-                
                 self._update_residuals_r()
 
-                if (self._result.info.no_dual_update > cp.minimum(5., self.settings.reg_finetune_dual_update_threshold) and
-                    self._result.info.primal_prox_inf > self.settings.infeasibility_threshold and
-                    (self._result.info.primal_res_reg < self.settings.eps_abs or self._result.info.primal_res_reg_rel < self.settings.eps_rel)):
-                    self._result.info.status = Status.PIQP_PRIMAL_INFEASIBLE
-                    self._preconditioner.unscale_solution(self._result, self._data)
-                    return self._result.info.status
-                
-                if (self._result.info.no_primal_update > cp.minimum(5., self.settings.reg_finetune_primal_update_threshold) and
-                    self._result.info.dual_prox_inf > self.settings.infeasibility_threshold and
-                    (self._result.info.dual_res_reg < self.settings.eps_abs or self._result.info.dual_res_reg_rel < self.settings.eps_rel)):
-                    self._result.info.status = Status.PIQP_DUAL_INFEASIBLE
-                    self._preconditioner.unscale_solution(self._result, self._data)
-                    return self._result.info.status
-                
-                # avoid getting too close to boundary which can result in a division by zero
-                epsilon = float(cp.finfo(cp.float64).eps)
-                boundary_shifted = False
-                if self._data.num_hl > 0 and bool(cp.any(self._result.z_l < epsilon)):
-                    self._result.z_l += (self._result.z_l < epsilon) * epsilon
-                    boundary_shifted = True
-                if self._data.num_hu > 0 and bool(cp.any(self._result.z_u < epsilon)):
-                    self._result.z_u += (self._result.z_u < epsilon) * epsilon
-                    boundary_shifted = True
-                if self._data.num_xl > 0 and bool(cp.min(self._result.z_bl) < epsilon):
-                    self._result.z_bl += epsilon
-                    boundary_shifted = True
-                if self._data.num_xu > 0 and bool(cp.min(self._result.z_bu) < epsilon):
-                    self._result.z_bu += epsilon
-                    boundary_shifted = True
-                if boundary_shifted:
-                    print("Boundary shifted to avoid division by zero")
-                    self._calculate_mu()
-                
-                # avoid possibility of converging to a local minimum -> decrease the minimum regularization value
-                if ((self._result.info.no_primal_update > self.settings.reg_finetune_primal_update_threshold and
-                    self._result.info.rho[0] == self._result.info.reg_limit[0] and
-                    self._result.info.reg_limit[0] != self.settings.reg_finetune_lower_limit) or
-                    (self._result.info.no_dual_update > self.settings.reg_finetune_dual_update_threshold and
-                    self._result.info.delta[0] == self._result.info.reg_limit[0] and
-                    self._result.info.reg_limit[0] != self.settings.reg_finetune_lower_limit)):
-                    if (self._result.info.dual_prox_inf < self.settings.infeasibility_threshold and self._result.info.primal_prox_inf < self.settings.infeasibility_threshold):
-                        self._result.info.reg_limit[0] = self.settings.reg_finetune_lower_limit
-                        self._result.info.no_primal_update = 0
-                        self._result.info.no_dual_update = 0
+                # fetch all info to host all at once, at the cost of one D2H memcpy
+                self._result.info.to_host(self._info_host)  # CPU: numpy (B, num_fields) buffer
+                info_host = self._info_host 
+
+                # ============================================================
+                # Per-problem termination check — ALL ON CPU (host-side numpy)
+                # h = info_host (numpy mirror), status/no_*_update are numpy arrays.
+                # Vectorized over batch: no Python loops, just numpy boolean ops.
+                # All problems keep running until every one has terminated.
+                # ============================================================
+                settings = self.settings
+                still_unsolved = (self._result.info._status_value == Status.PIQP_UNSOLVED.value)  # CPU: numpy bool (B,)
+
+                # convergence check
+                primal_ok = (info_host.primal_res < settings.eps_abs) | (info_host.primal_res_rel < settings.eps_rel)
+                dual_ok = (info_host.dual_res < settings.eps_abs) | (info_host.dual_res_rel < settings.eps_rel)
+                converged = primal_ok & dual_ok
+                if settings.check_duality_gap:
+                    gap_ok = (info_host.duality_gap < settings.eps_duality_gap_abs) | (info_host.duality_gap_rel < settings.eps_duality_gap_rel)
+                    converged &= gap_ok
+                self._result.info._status_value[still_unsolved & converged] = Status.PIQP_SOLVED.value  # CPU write
+
+                # primal infeasibility check
+                primal_infeasible = (
+                    (info_host.no_dual_update > min(5, settings.reg_finetune_dual_update_threshold)) &
+                    (info_host.primal_prox_inf > settings.infeasibility_threshold) &
+                    ((info_host.primal_res_reg < settings.eps_abs) | (info_host.primal_res_reg_rel < settings.eps_rel))
+                )
+                self._result.info._status_value[still_unsolved & ~converged & primal_infeasible] = Status.PIQP_PRIMAL_INFEASIBLE.value  # CPU write
+
+                # dual infeasibility check
+                dual_infeasible = (
+                    (info_host.no_primal_update > min(5, settings.reg_finetune_primal_update_threshold)) &
+                    (info_host.dual_prox_inf > settings.infeasibility_threshold) &
+                    ((info_host.dual_res_reg < settings.eps_abs) | (info_host.dual_res_reg_rel < settings.eps_rel))
+                )
+                self._result.info._status_value[still_unsolved & ~converged & ~primal_infeasible & dual_infeasible] = Status.PIQP_DUAL_INFEASIBLE.value  # CPU write
 
                 if self.settings.verbose:
                     self._print_iteration_info()
 
+                # exit if all problems have terminated
+                if np.all(self._result.info._status_value != Status.PIQP_UNSOLVED.value):
+                    break
+
+                # avoid getting too close to boundary which can result in a division by zero
+                if self._data.num_ineq > 0:
+                    wp.launch(
+                        kernel=self._boundary_shift_kernel,
+                        dim=(self._data.batch_size,
+                             self._data.num_hl + self._data.num_hu
+                             + self._data.num_xl + self._data.num_xu),
+                        inputs=[
+                            self._result.z_l, self._result.z_u,
+                            self._result.z_bl, self._result.z_bu,
+                        ],
+                        device="cuda",
+                        stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+                    )
+                    self._calculate_mu()
+                
+                # avoid possibility of converging to a local minimum -> decrease the minimum regularization value (vectorized)
+                finetune_mask = (
+                    ((info_host.no_primal_update > self.settings.reg_finetune_primal_update_threshold) &
+                     (info_host.rho == info_host.reg_limit) &
+                     (info_host.reg_limit != self.settings.reg_finetune_lower_limit)) |
+                    ((info_host.no_dual_update > self.settings.reg_finetune_dual_update_threshold) &
+                     (info_host.delta == info_host.reg_limit) &
+                     (info_host.reg_limit != self.settings.reg_finetune_lower_limit))
+                )
+                finetune_mask &= (info_host.dual_prox_inf < self.settings.infeasibility_threshold) & (info_host.primal_prox_inf < self.settings.infeasibility_threshold)
+                if np.any(finetune_mask):
+                    self._result.info.reg_limit[finetune_mask] = self.settings.reg_finetune_lower_limit
+                    finetune_mask_dev = cp.asarray(finetune_mask)
+                    self._result.info.no_primal_update[finetune_mask_dev] = 0
+                    self._result.info.no_dual_update[finetune_mask_dev] = 0
+
                 self._update_and_factorize_kkt()
-                if self._result.info.status == Status.PIQP_NUMERICAL_ISSUES:
-                    self._preconditioner.unscale_solution(self._result, self._data)
-                    return self._result.info.status
+                if np.any(self._result.info._status_value == Status.PIQP_NUMERICAL_ISSUES.value):
+                    break
 
                 if self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu == 0:
                     # since there are no inequalities we can take full Newton steps
@@ -353,26 +410,27 @@ class SolverBase:
                     self._update_residuals_nr()
                     self._update_rho_delta_with_ineq()
 
-        self._result.info.status = Status.PIQP_MAX_ITER_REACHED
-        self._preconditioner.unscale_solution(self._result, self._data)
-        return self._result.info.status
+        # Mark remaining unsolved as max iter reached
+        self._result.info._status_value[self._result.info._status_value == Status.PIQP_UNSOLVED.value] = Status.PIQP_MAX_ITER_REACHED.value
+        if self.settings.preconditioner_iter > 0:
+            self._preconditioner.unscale_solution(self._result, self._data)
+        statuses = self._result.info.status
+        if self._user_batched:
+            return statuses
+        else:
+            return statuses[0]
 
     @nvtx.annotate("Solver::_initial_guess")
     def _initial_guess(self):
         # eq(12) in Roland Schwan 2023 paper
         self._result.x.fill(0.0)
         self._result.y.fill(0.0)
-        self._result.s_l.fill(1.0)
-        self._result.z_l.fill(1.0)
-        self._result.s_u.fill(1.0)
-        self._result.z_u.fill(1.0)
-        self._result.s_bl.fill(1.0)
-        self._result.z_bl.fill(1.0)
-        self._result.s_bu.fill(1.0)
-        self._result.z_bu.fill(1.0)
+        self._result.s_all.fill(1.0)
+        self._result.z_all.fill(1.0)
 
         self._kkt_system.update_scalings_and_factor(
             self._data,
+            self._preconditioner,
             self.settings,
             self._enable_iterative_refinement,
             self._result.info.rho,
@@ -380,53 +438,35 @@ class SolverBase:
             self._result
         )
 
-        self._res.x[:] = self._data.c
-        self._res.x *= -1.0
-        self._res.y[:] = self._data.b
-        cp.take(self._data.h_l, self._data.idx_hl, out=self._res.z_l)
-        self._res.z_l *= -1.0
-        cp.take(self._data.h_u, self._data.idx_hu, out=self._res.z_u)
-        cp.take(self._data.x_l, self._data.idx_xl, out=self._res.z_bl)
-        self._res.z_bl *= -1.0
-        cp.take(self._data.x_u, self._data.idx_xu, out=self._res.z_bu)
-        self._res.s_l[:] = 0.
-        self._res.s_u[:] = 0.
-        self._res.s_bl[:] = 0.
-        self._res.s_bu[:] = 0.
+        cp.negative(self._data.c, out=self._res.x)
+        if self._data.p > 0:
+            self._res.y[:] = self._data.b
+        if self._data.num_hl > 0:
+            cp.take(self._data.h_l, self._data.idx_hl, axis=1, out=self._res.z_l)
+            cp.negative(self._res.z_l, out=self._res.z_l)
+        if self._data.num_hu > 0:
+            cp.take(self._data.h_u, self._data.idx_hu, axis=1, out=self._res.z_u)
+        if self._data.num_xl > 0:
+            cp.take(self._data.x_l, self._data.idx_xl, axis=1, out=self._res.z_bl)
+            cp.negative(self._res.z_bl, out=self._res.z_bl)
+        if self._data.num_xu > 0:
+            cp.take(self._data.x_u, self._data.idx_xu, axis=1, out=self._res.z_bu)
+        self._res.s_all[:] = 0.
 
-        self._kkt_system.solve(self._data, self.settings, self._res, self._result)  # getting an initial point of _result
+        self._kkt_system.solve(self._data, self._preconditioner, self.settings, self._res, self._result)  # getting an initial point of _result
 
         if self.settings.debug:
             print("Initial point after solving KKT system:", self._result)
 
         if self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu > 0:
             ## ----------- keep z and s non-negative --------------
-            # this is according to the IV.A part of Roland Schwan 2023 paper
-            offset = 0
-            self._work_s[offset:offset+self._data.num_hl] = self._result.s_l
-            self._work_z[offset:offset+self._data.num_hl] = self._result.z_l
-            offset += self._data.num_hl
-            self._work_s[offset:offset+self._data.num_hu] = self._result.s_u
-            self._work_z[offset:offset+self._data.num_hu] = self._result.z_u
-            offset += self._data.num_hu
-            self._work_s[offset:offset+self._data.num_xl] = self._result.s_bl
-            self._work_z[offset:offset+self._data.num_xl] = self._result.z_bl
-            offset += self._data.num_xl
-            self._work_s[offset:offset+self._data.num_xu] = self._result.s_bu
-            self._work_z[offset:offset+self._data.num_xu] = self._result.z_bu
-            offset += self._data.num_xu
-            delta_s = -cp.min(self._work_s[:offset]) # single D2H transfer
-            delta_z = -cp.min(self._work_z[:offset]) # single D2H transfer
-
-            self._result.s_l += delta_s
-            self._result.z_l += delta_z
-            self._result.s_u += delta_s
-            self._result.z_u += delta_z
-
-            self._result.s_bl += delta_s
-            self._result.z_bl += delta_z
-            self._result.s_bu += delta_s
-            self._result.z_bu += delta_z
+            # this is according to the IV.A part of Roland Schwan 2023 paper.
+            # Uses pre-allocated (B, 1) scratch buffers — see Solver.setup
+            # for the rationale (no transient cupy allocs in the solve path).
+            delta_s = -cp.min(self._result.s_all, axis=1, keepdims=True)  # (B, 1)
+            delta_z = -cp.min(self._result.z_all, axis=1, keepdims=True)  # (B, 1)
+            self._result.s_all += delta_s
+            self._result.z_all += delta_z
 
             # need to make sure mu is positive here, otherwise in the next step (put s and z on central path) sqrt(mu) the computed z_* will be zeros
             self._calculate_mu()
@@ -436,79 +476,168 @@ class SolverBase:
                 print("Initial mu:", self._result.info.mu)
 
             # put s and z on the central path
-            # Do the following: c = z* - delta-z; z = (c + sqrt(c^2 + 4*mu)) / 2; s = z - c
-            for s, z in zip(
-                [self._result.s_l, self._result.s_u, self._result.s_bl, self._result.s_bu], 
-                [self._result.z_l, self._result.z_u, self._result.z_bl, self._result.z_bu]
-                ):
-                cp.subtract(z, delta_z, out=s)
-                cp.power(s, 2, out=z)
-                z += 4. * self._result.info.mu[0]
-                cp.sqrt(z, out=z)
-                z += s
-                z /= 2.
-                cp.subtract(z, s, out=s)
+            # c = z - delta_z; z = (c + sqrt(c^2 + 4*mu)) / 2; s = z - c
+            cp.subtract(self._result.z_all, delta_z, out=self._result.s_all)
+            cp.power(self._result.s_all, 2, out=self._result.z_all)
+            self._result.z_all += 4. * self._result.info.mu[:, None]
+            cp.sqrt(self._result.z_all, out=self._result.z_all)
+            self._result.z_all += self._result.s_all
+            self._result.z_all /= 2.
+            cp.subtract(self._result.z_all, self._result.s_all, out=self._result.s_all)
 
             if self.settings.debug:
                 print("self._result:", self._result)
 
             self._calculate_mu()
 
-        self._prox_vars.x[:] = self._result.x
-        self._prox_vars.y[:] = self._result.y
-        self._prox_vars.z_l[:] = self._result.z_l
-        self._prox_vars.z_u[:] = self._result.z_u
-        self._prox_vars.z_bl[:] = self._result.z_bl
-        self._prox_vars.z_bu[:] = self._result.z_bu
+        self._prox_vars.primals_all[:] = self._result.primals_all
+        self._prox_vars.duals_all[:] = self._result.duals_all
 
     @nvtx.annotate("Solver::_print_iteration_info")
     def _print_iteration_info(self):
         """Print iteration verbose info."""
-        print(
-            f"{self._result.info.iter:3d}   "
-            f"{float(self._result.info.primal_obj[0]): .5e}   "
-            f"{float(self._result.info.dual_obj[0]): .5e}  "
-            f"{float(self._result.info.duality_gap[0]): .5e}  "
-            f"{float(self._result.info.primal_res[0]): .5e}  "
-            f"{float(self._result.info.dual_res[0]): .5e}  "
-            f"{float(self._result.info.rho[0]): .3e}  "
-            f"{float(self._result.info.delta[0]): .3e}  "
-            f"{float(self._result.info.mu[0]): .3e}  "
-            f"{float(self._result.info.primal_step[0]): .4f}  "
-            f"{float(self._result.info.dual_step[0]): .4f}",
-            flush=True
-        )
+        info_host = self._info_host
+        B = self._data.batch_size
+
+        if B == 1:
+            print(
+                f"{self._result.info.iter[0]:3d}   "
+                f"{info_host.primal_obj[0]: .5e}   "
+                f"{info_host.dual_obj[0]: .5e}  "
+                f"{info_host.duality_gap[0]: .5e}  "
+                f"{info_host.primal_res[0]: .5e}  "
+                f"{info_host.dual_res[0]: .5e}  "
+                f"{info_host.rho[0]: .3e}  "
+                f"{info_host.delta[0]: .3e}  "
+                f"{info_host.mu[0]: .3e}  "
+                f"{info_host.primal_step[0]: .4f}  "
+                f"{info_host.dual_step[0]: .4f}",
+                flush=True,
+            )
+        
+        else:
+            solved  = B - int((self._result.info._status_value == Status.PIQP_UNSOLVED.value).sum())
+            counter = f"{solved}/{B}"
+            counter_w = max(2 * len(str(B)) + 1, len("solved"))
+            print(
+                f"{self._result.info.iter[0]:>4d}  "
+                f"{counter:>{counter_w}}  "
+                f"{info_host.duality_gap.max():>12.5e}  "
+                f"{info_host.primal_res.max():>12.5e}  "
+                f"{info_host.dual_res.max():>12.5e}  "
+                f"{info_host.rho.max():>10.3e}  "
+                f"{info_host.delta.max():>10.3e}  "
+                f"{info_host.mu.max():>10.3e}  "
+                f"{info_host.primal_step.min():>6.4f}  "
+                f"{info_host.dual_step.min():>6.4f}",
+                flush=True,
+            )
 
     @nvtx.annotate("Solver::_update_and_factorize_kkt")
     def _update_and_factorize_kkt(self) -> None:
         """Update the KKT matrix and refactorize."""
-        while self._result.info.factor_retires < self.settings.max_factor_retires:
+        retries = 0
+        while retries < self.settings.max_factor_retires:
             factor_succeeded = self._kkt_system.update_scalings_and_factor(
-                self._data, self.settings, self._enable_iterative_refinement,
+                self._data, self._preconditioner, self.settings, self._enable_iterative_refinement,
                 self._result.info.rho, self._result.info.delta, self._result)
             if factor_succeeded:
                 break
             else:
                 if not self._enable_iterative_refinement:
                     self._enable_iterative_refinement = True
-                self._result.info.factor_retires += 1
+                retries += 1
                 self._result.info.rho *= 100.
                 self._result.info.delta *= 100.
                 self._result.info.reg_limit[:] = cp.minimum(10 * self._result.info.reg_limit, self.settings.eps_abs)
-        
-        if self._result.info.factor_retires >= self.settings.max_factor_retires:
-            self._result.info.status = Status.PIQP_NUMERICAL_ISSUES
-        
-        # reset factor retires for next iteration
-        self._result.info.factor_retires = 0
+
+        if retries >= self.settings.max_factor_retires:
+            # Mark all still-unsolved problems as numerical issues
+            still_unsolved = (self._result.info._status_value == Status.PIQP_UNSOLVED.value)
+            self._result.info._status_value[still_unsolved] = Status.PIQP_NUMERICAL_ISSUES.value
+
+    @abstractmethod
+    def _init_data(self, P, c, A, b, G, h_u, h_l, x_u, x_l):
+        """Backend-specific data construction hook."""
+
+    @abstractmethod
+    def _init_preconditioner(self):
+        """Backend-specific Ruiz preconditioner construction hook."""
+
+    def _init_warp_kernels(self) -> None:
+        if self._data.num_ineq > 0:
+            self._boundary_shift_kernel = create_boundary_shift_kernel(
+                self._data.num_hl, self._data.num_hu,
+                self._data.num_xl, self._data.num_xu,
+            )
+            self._prepare_predictor_step_kernel = create_prepare_predictor_step_kernel()
+            self._prepare_corrector_step_kernel = create_prepare_corrector_step_kernel()
+            self._update_vars_after_corrector_step_kernel = create_update_vars_after_corrector_step_kernel(
+                n_primal=self._data.n + self._data.num_ineq, n_dual=self._data.p + self._data.num_ineq,
+            )
+
+        # Tile-based kernels
+        self._update_residuals_r_kernel = create_update_residuals_r_kernel(
+            self._data.n, self._data.p,
+            int(self._data.num_hu), int(self._data.num_hl),
+            int(self._data.num_xu), int(self._data.num_xl),
+        )
+        self._prepare_zu_minus_zl_and_zbu_minus_zbl_kernel = create_prepare_zu_minus_zl_and_zbu_minus_zbl_kernel(
+            self._data.m, self._data.n,
+        )
+        self._update_residual_nr_kernel = create_update_residual_nr_kernel(
+            self._data.n, self._data.p, self._data.m,
+            self._data.num_hl, self._data.num_hu, self._data.num_xl, self._data.num_xu,
+        )
+        if self._data.num_ineq > 0:
+            self._calculate_sigma_kernel = create_calculate_sigma_kernel(self._data.num_ineq)
+            self._calculate_step_kernel = create_calculate_step_kernel(self._data.num_ineq)
+            self._calculate_mu_kernel = create_calculate_mu_kernel(self._data.num_ineq)
+            self._update_rho_delta_with_ineq_kernel = create_update_rho_delta_with_ineq_kernel(
+                self._data.n, self._data.p + self._data.num_ineq,
+            )
+        else:
+            self._run_full_newton_step_kernel = create_run_full_newton_step_kernel(self._data.n, self._data.p)
+            self._update_rho_delta_without_ineq_kernel = create_update_rho_delta_without_ineq_kernel(
+                self._data.n, self._data.p,
+            )
+
+        # Adjoint/backward-pass kernels
+        if self.settings.enable_grad:
+            n, p = self._data.n, self._data.p
+            nhu, nhl = self._data.num_hu, self._data.num_hl
+            nxu, nxl = self._data.num_xu, self._data.num_xl
+            precond_on = self.settings.preconditioner_iter > 0
+            self._backward_assemble_rhs_kernel = create_backward_assemble_rhs_kernel(
+                n, p, nhu, nhl, nxu, nxl, precond_on,
+            )
+            self._backward_unscale_lhs_kernel = create_backward_unscale_lhs_kernel(
+                n, p, nhu, nhl, nxu, nxl, precond_on,
+            )
+            self._backward_compute_vector_grad_kernel = create_backward_compute_vector_grad_kernel(
+                n, p, nhu, nhl, nxu, nxl,
+            )
+            self._backward_pack_full_layout_kernel = create_backward_pack_full_layout_kernel(
+                self._data.m, n,
+            )
+            self._backward_copy_kernel = create_backward_copy_kernel(
+                n, p, nhu, nhl, nxu, nxl,
+            )
 
     @nvtx.annotate("Solver::_run_full_newton_step")
     def _run_full_newton_step(self):
-        self._kkt_system.solve(self._data, self.settings, self._res, self._step)
-        self._result.info.primal_step[:] = 1.0
-        self._result.info.dual_step[:] = 1.0
-        self._result.x += self._result.info.primal_step * self._step.x
-        self._result.y += self._result.info.dual_step * self._step.y
+        self._kkt_system.solve(self._data, self._preconditioner, self.settings, self._res, self._step)
+        wp.launch(
+            kernel=self._run_full_newton_step_kernel,
+            dim=(self._data.batch_size, self._data.n + self._data.p),
+            inputs=[
+                self._step.x, self._step.y,
+                self._result.x, self._result.y,
+                self._result.info.primal_step, self._result.info.dual_step,
+            ],
+            device="cuda",
+            stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+        )
 
     @nvtx.annotate("Solver::_run_predictor_corrector")
     def _run_predictor_corrector(self):
@@ -525,21 +654,20 @@ class SolverBase:
         # Drop the quadratic term Δs ∘ Δz (first‑order Newton linearization) to get the linear system S Δz + Z Δs = - s ∘ z.
         # Thus the predictor RHS for the slack/dual complementarity equations is - s ∘ z (elementwise product), which is exactly what the four lines set for the different constraint groups.
         # In words: those lines build the complementarity residual r_s = - s .* z so the KKT solve computes Δs, Δz satisfying S Δz + Z Δs = r_s (the linearized complementarity equation) for the predictor (affine) direction. The .array() calls implement the elementwise product s .* z.
-        with nvtx.annotate("Solver::prepare_predictor_step"):
-            cp.multiply(self._result.s_l, self._result.z_l, out=self._res.s_l)
-            self._res.s_l *= -1.
-            cp.multiply(self._result.s_u, self._result.z_u, out=self._res.s_u)
-            self._res.s_u *= -1.
-            cp.multiply(self._result.s_bl, self._result.z_bl, out=self._res.s_bl)
-            self._res.s_bl *= -1.
-            cp.multiply(self._result.s_bu, self._result.z_bu, out=self._res.s_bu)
-            self._res.s_bu *= -1.
-            
+        
+        # one fused kernel: res.s_all[b, i] = -s_all[b, i] * z_all[b, i].
+        wp.launch(
+            kernel=self._prepare_predictor_step_kernel,
+            dim=(self._data.batch_size, self._data.num_ineq),
+            inputs=[self._result.s_all, self._result.z_all, self._res.s_all],
+            device="cuda",
+            stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+        )
 
         if self.settings.debug:
             print("predictor step rhs is: res= ", self._res)
 
-        self._kkt_system.solve(self._data, self.settings, self._res, self._step)
+        self._kkt_system.solve(self._data, self._preconditioner, self.settings, self._res, self._step)
 
         if self.settings.debug:
             print("predictor step is:", self._step)
@@ -547,343 +675,266 @@ class SolverBase:
         # step in the non-negative orthant
         self._calculate_step()
 
-        # avoid getting too close to the boundary
-        self._alpha_sz *= self.settings.tau
-
         # ------------------ compute centering parameter sigma ------------------
         self._calculate_sigma()
 
         # ------------------ corrector step ------------------
-        with nvtx.annotate("Solver::prepare_corrector_step"):
-            # self._res.s_l += -self._step.s_l * self._step.z_l + self._result.info.sigma * self._result.info.mu
-            # self._res.s_u += -self._step.s_u * self._step.z_u + self._result.info.sigma * self._result.info.mu
-            # self._res.s_bl += -self._step.s_bl * self._step.z_bl + self._result.info.sigma * self._result.info.mu
-            # self._res.s_bu += -self._step.s_bu * self._step.z_bu + self._result.info.sigma * self._result.info.mu
-            tmp_sigma_mu = self._result.info.sigma * self._result.info.mu
-            cp.multiply(self._step.s_l, self._step.z_l, out=self._work_duals[:self._data.num_hl])
-            self._res.s_l -= self._work_duals[:self._data.num_hl]
-            self._res.s_l += tmp_sigma_mu
-            cp.multiply(self._step.s_u, self._step.z_u, out=self._work_duals[:self._data.num_hu])
-            self._res.s_u -= self._work_duals[:self._data.num_hu]
-            self._res.s_u += tmp_sigma_mu
-            cp.multiply(self._step.s_bl, self._step.z_bl, out=self._work_duals[:self._data.num_xl])
-            self._res.s_bl -= self._work_duals[:self._data.num_xl]
-            self._res.s_bl += tmp_sigma_mu
-            cp.multiply(self._step.s_bu, self._step.z_bu, out=self._work_duals[:self._data.num_xu])
-            self._res.s_bu -= self._work_duals[:self._data.num_xu]
-            self._res.s_bu += tmp_sigma_mu
+        # self._res.s_l += -self._step.s_l * self._step.z_l + self._result.info.sigma * self._result.info.mu
+        # self._res.s_u += -self._step.s_u * self._step.z_u + self._result.info.sigma * self._result.info.mu
+        # self._res.s_bl += -self._step.s_bl * self._step.z_bl + self._result.info.sigma * self._result.info.mu
+        # self._res.s_bu += -self._step.s_bu * self._step.z_bu + self._result.info.sigma * self._result.info.mu
+        wp.launch(
+            kernel=self._prepare_corrector_step_kernel,
+            dim=(self._data.batch_size, self._data.num_ineq),
+            inputs=[
+                self._step.s_all, self._step.z_all,
+                self._result.info.sigma, self._result.info.mu,
+                self._res.s_all,
+            ],
+            device="cuda",
+            stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+        )
 
         if self.settings.debug:
             print("corrector step rhs is: res= ", self._res)
-        self._kkt_system.solve(self._data, self.settings, self._res, self._step)
+        self._kkt_system.solve(self._data, self._preconditioner, self.settings, self._res, self._step)
 
         if self.settings.debug:
             print("corrector step is:", self._step)
 
         # step in the non-negative orthant
         self._calculate_step()
-        # avoid getting too close to the boundary
-        self._alpha_sz *= self.settings.tau
-        self._result.info.primal_step[:] = self._alpha_sz[0]
-        self._result.info.dual_step[:] = self._alpha_sz[1]
-
-        # ------------------ update variables ------------------
-        self._result.x += self._result.info.primal_step * self._step.x
-        self._result.y += self._result.info.dual_step * self._step.y
-        self._result.z_l += self._result.info.dual_step * self._step.z_l
-        self._result.z_u += self._result.info.dual_step * self._step.z_u
-        self._result.z_bl += self._result.info.dual_step * self._step.z_bl
-        self._result.z_bu += self._result.info.dual_step * self._step.z_bu
-        self._result.s_l += self._result.info.primal_step * self._step.s_l
-        self._result.s_u += self._result.info.primal_step * self._step.s_u
-        self._result.s_bl += self._result.info.primal_step * self._step.s_bl
-        self._result.s_bu += self._result.info.primal_step * self._step.s_bu
-
-        # ------------------ update mu and mu_rate for adaptive regularization ------------------
-        self._mu_prev[:] = self._result.info.mu
+        self._update_vars_after_corrector_step()
         self._calculate_mu()
-        cp.subtract(self._mu_prev, self._result.info.mu, out=self._mu_rate)
-        cp.divide(self._mu_rate, self._mu_prev, out=self._mu_rate)
-        cp.maximum(self._mu_rate, 0., out=self._mu_rate)
+
+    @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
+    def _update_vars_after_corrector_step(self):
+        # self._result.primals_all += self._result.info.primal_step[:, None] * self._step.primals_all
+        # self._result.duals_all += self._result.info.dual_step[:, None] * self._step.duals_all
+        n_primal = self._data.n + self._data.num_ineq
+        n_dual   = self._data.p + self._data.num_ineq
+        wp.launch(
+            kernel=self._update_vars_after_corrector_step_kernel,
+            dim=(self._data.batch_size, n_primal + n_dual),
+            inputs=[
+                self._result.info.primal_step,
+                self._result.info.dual_step,
+                self._step.primals_all,
+                self._step.duals_all,
+                self._result.primals_all,
+                self._result.duals_all,
+            ],
+            device="cuda",
+            stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+        )
 
     @nvtx.annotate("Solver::_calculate_step")
     @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
     def _calculate_step(self) -> None:
-        """
-        Compute the step length of the slack variables and dual variables. Make sure they remain non-negative.
-        Vectorized implementation to minimize GPU kernel launches and synchronization.
-        """
-        num_hl, num_hu, num_xl, num_xu = self._data.num_hl, self._data.num_hu, self._data.num_xl, self._data.num_xu
-        
-        # first compute alpha_s, use self._work_s to concatenate step, use self._work_z to concatenate result
-        offset = 0
-        self._work_s[offset : offset+num_hl] = self._step.s_l
-        self._work_z[offset : offset+num_hl] = self._result.s_l
-        offset += num_hl
-        self._work_s[offset:offset + num_hu] = self._step.s_u
-        self._work_z[offset:offset + num_hu] = self._result.s_u
-        offset += num_hu
-        self._work_s[offset:offset + num_xl] = self._step.s_bl
-        self._work_z[offset:offset + num_xl] = self._result.s_bl
-        offset += num_xl
-        self._work_s[offset:offset + num_xu] = self._step.s_bu
-        self._work_z[offset:offset + num_xu] = self._result.s_bu
-        offset += num_xu
-
-        # if step < 0, must limit alpha <= -s / step, otherwise take full step 1.0
-        self._work_s[:offset] = cp.where(self._work_s[:offset] < 0, -self._work_z[:offset] / self._work_s[:offset], 1.)
-        self._alpha_sz[0] = cp.min(self._work_s[:offset]) # alpha_s
-
-        # then compute alpha_z, use self._work_s to concatenate step, use self._work_z to concatenate result
-        offset = 0
-        self._work_z[offset : offset+num_hl] = self._step.z_l
-        self._work_s[offset : offset+num_hl] = self._result.z_l
-        offset += num_hl
-        self._work_z[offset : offset+num_hu] = self._step.z_u
-        self._work_s[offset : offset+num_hu] = self._result.z_u
-        offset += num_hu
-        self._work_z[offset : offset+num_xl] = self._step.z_bl
-        self._work_s[offset : offset+num_xl] = self._result.z_bl
-        offset += num_xl
-        self._work_z[offset : offset+num_xu] = self._step.z_bu
-        self._work_s[offset : offset+num_xu] = self._result.z_bu
-        offset += num_xu
-
-        self._work_z[:offset] = cp.where(self._work_z[:offset] < 0, -self._work_s[:offset] / self._work_z[:offset], 1.)
-        self._alpha_sz[1] = cp.min(self._work_z[:offset]) # alpha_z
+        STEP_BLOCK_DIM = 256
+        wp.launch_tiled(
+            kernel=self._calculate_step_kernel,
+            dim=[self._data.batch_size],
+            inputs=[
+                self._result.s_all, self._result.z_all,
+                self._step.s_all, self._step.z_all,
+                self._tau_device,
+                self._result.info.primal_step, self._result.info.dual_step,
+            ],
+            block_dim=STEP_BLOCK_DIM,
+            device="cuda",
+            stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+        )
 
     @nvtx.annotate("Solver::_calculate_mu")
     @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
     def _calculate_mu(self) -> None:
-        cp.dot(self._result.s_l, self._result.z_l, out=self._work_reduce[0:1])
-        cp.dot(self._result.s_u, self._result.z_u, out=self._work_reduce[1:2])
-        cp.dot(self._result.s_bl, self._result.z_bl, out=self._work_reduce[2:3])
-        cp.dot(self._result.s_bu, self._result.z_bu, out=self._work_reduce[3:4])
-        cp.sum(self._work_reduce[0:4], out=self._result.info.mu[:], keepdims=True)
-        self._result.info.mu /= (self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu)
+        MU_BLOCK_DIM = 256
+        wp.launch_tiled(
+            kernel=self._calculate_mu_kernel,
+            dim=[self._data.batch_size],
+            inputs=[
+                self._result.s_all, self._result.z_all,
+                self._result.info.mu,
+            ],
+            block_dim=MU_BLOCK_DIM,
+            device="cuda",
+            stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+        )
 
     @nvtx.annotate("Solver::_calculate_sigma")
     @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
-    def _calculate_sigma(self) -> None:        
-        self._result.info.sigma[:] = 0.
-        self._result.info.sigma += cp.dot(self._result.s_l + self._alpha_sz[0] * self._step.s_l, self._result.z_l + self._alpha_sz[1] * self._step.z_l)
-        self._result.info.sigma += cp.dot(self._result.s_u + self._alpha_sz[0] * self._step.s_u, self._result.z_u + self._alpha_sz[1] * self._step.z_u)
-        self._result.info.sigma += cp.dot(self._result.s_bl + self._alpha_sz[0] * self._step.s_bl, self._result.z_bl + self._alpha_sz[1] * self._step.z_bl)
-        self._result.info.sigma += cp.dot(self._result.s_bu + self._alpha_sz[0] * self._step.s_bu, self._result.z_bu + self._alpha_sz[1] * self._step.z_bu)        
-        cp.divide(self._result.info.sigma, self._result.info.mu, out=self._result.info.sigma)
-        self._result.info.sigma /= self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu
-        cp.clip(self._result.info.sigma, 0., 1., out=self._result.info.sigma)
-        cp.power(self._result.info.sigma, 3., out=self._result.info.sigma)
+    def _calculate_sigma(self) -> None:
+        SIGMA_BLOCK_DIM = 256
+        wp.launch_tiled(
+            kernel=self._calculate_sigma_kernel,
+            dim=[self._data.batch_size],
+            inputs=[
+                self._result.s_all, self._result.z_all,
+                self._step.s_all, self._step.z_all,
+                self._result.info.primal_step, self._result.info.dual_step,
+                self._result.info.mu,
+                self._result.info.sigma,
+            ],
+            block_dim=SIGMA_BLOCK_DIM,
+            device="cuda",
+            stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+        )
 
     @nvtx.annotate("Solver::_update_residuals_nr")
     @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
     def _update_residuals_nr(self):
+        r"""Compute non-regularized KKT residuals + objective values +
+        relative norms (used for convergence checks).
+
+        All variables (``x``, ``y``, ``z_l``, ``z_u``, ``z_bl``, ``z_bu``,
+        ``s_*``) and data (``P``, ``c``, ``A``, ``b``, ``G``, ``h_*``,
+        ``x_*``) are stored in the **scaled** problem space (Ruiz
+        preconditioner). The bound rows pick up an extra ``x_b_scaling``
+        factor because ``x_l <= x <= x_u`` becomes
+        ``x_l_scaled <= x_b_scaling * x_scaled <= x_u_scaled`` after
+        scaling. Convergence norms are reported in the **unscaled** problem
+        space — magnitudes are restored via ``delta_inv``, ``delta_b_inv``,
+        ``cost_scaling_inv`` from the preconditioner.
+
+        Residual formulas (scaled space):
+
+            res_nr.x    = -(P*x + c + A^T*y + G^T*(z_u - z_l)
+                            + x_b_scaling*(z_bu - z_bl))
+            res_nr.y    = -(A*x - b)
+            res_nr.z_l  =   G*x[idx_hl] - s_l - h_l[idx_hl]
+            res_nr.z_u  = -G*x[idx_hu] - s_u + h_u[idx_hu]
+            res_nr.z_bl =   x_b_scaling[idx_xl]*x[idx_xl] - s_bl - x_l[idx_xl]
+            res_nr.z_bu = -(x_b_scaling[idx_xu]*x[idx_xu] + s_bu - x_u[idx_xu])
+
+        Convergence norms (unscaled, infinity norm per batch):
+
+            primal_res     = max over the 5 dual segments of
+                                 ||u_p_seg .* res_nr_seg||_inf
+                             where u_p_seg is the per-segment primal
+                             unscale factor:
+                                 [y]:    delta_inv[:, n : n+p]
+                                 [z_l]:  delta_inv[:, n+p+idx_hl]
+                                 [z_u]:  delta_inv[:, n+p+idx_hu]
+                                 [z_bl]: delta_b_inv[:, idx_xl]
+                                 [z_bu]: delta_b_inv[:, idx_xu]
+
+            dual_res       = cost_scaling_inv * ||delta_inv[:, :n] .* res_nr.x||_inf
+
+        Relative-norm denominators (also unscaled, max over magnitudes
+        that go into the corresponding residual):
+
+            primal_rel     = max( ||u_p_y .* A*x||,
+                                  ||u_p_zl .* G*x[idx_hl]||,
+                                  ||u_p_zu .* G*x[idx_hu]||,
+                                  ||u_p_zl .* s_l||,  ||u_p_zu .* s_u||,
+                                  ||u_p_zbl .* s_bl||, ||u_p_zbu .* s_bu||,
+                                  constraints_rhs_inf_norm_unscaled )
+
+            dual_rel       = cost_scaling_inv * max(
+                                  ||delta_inv[:, :n] .* P*x||,
+                                  ||delta_inv[:, :n] .* c||,
+                                  ||delta_inv[:, :n] .* (A^T*y + G^T*(z_u-z_l)
+                                       + x_b_scaling*(z_bu-z_bl))|| )
+
+            primal_res_rel = primal_res / max(1, primal_rel)
+            dual_res_rel   = dual_res   / max(1, dual_rel)
+
+        Objectives and duality gap (unscaled to original problem space via
+        ``cost_scaling_inv``):
+
+            primal_obj   = ( 0.5 x^T P x + c^T x ) * cost_scaling_inv
+            dual_obj     = -( 0.5 x^T P x + b^T y + h_u^T z_u - h_l^T z_l
+                              + x_u^T z_bu - x_l^T z_bl ) * cost_scaling_inv
+            duality_gap  = |primal_obj - dual_obj|
+            duality_gap_rel
+                         = duality_gap / max(1, cost_scaling_inv *
+                              max_k |w_k|)
+                           where {w_k} is the set of seven obj sub-terms
+                           used above (0.5 x^T P x, c^T x, b^T y, h_u^T z_u,
+                           h_l^T z_l, x_u^T z_bu, x_l^T z_bl).
         """
-        Compute the non-regularized residuals, which reflects the residuals of the KKT conditions excluding the regularization terms in Schwan 2023 paper eq(6)
+        pc      = self._preconditioner
+        data    = self._data
+        result  = self._result
+        res_nr  = self._res_nr
+        info    = result.info
+        wp_stream = wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr)
 
-            res_nr.x = -(P*x + c + A^T*y + G^T*(z_u - z_l) + z_bu - z_bl)  # residual of KKT stationarity
-            res_nr.y = -(A*x - b)                                          # residual of KKT primal feasibility: A*x = b
-            res_nr.z_l = G*x - s_l - hl                                    # residual of KKT primal feasibility: hl <= G*x
-            res_nr.z_u = -G*x - s_u + hu                                   # residual of KKT primal feasibility: G*x <= hu
-            res_nr.z_bu = -(x - s_bu - xu)                                 # residual of KKT primal feasibility: xl <= x
-            res_nr.z_bl = x - s_bl - xl                                    # residual of KKT primal feasibility: x <= xu
+        self._kkt_system.eval_P_x(data, -1., result.x, res_nr.x)
 
-        primal_residual = ||[A*x - b; G*x - s_l - hl; -G*x - s_u + hu; -x + s_bu + xu; x - s_bl - xl]||_inf
-        dual_residual = ||P*x + c + A^T*y + G^T*(z_u - z_l) + z_bu - z_bl||_inf
-
-        primal_residual_norm = ||A*x; b; G*x; h_u; s_u; h_l; s_l; x_l; s_bu; x_u; s_bl||_inf
-        dual_residual_norm = ||P*x; c; A^T*y; G^T*(z_u - z_l) + z_bu - z_bl||_inf
-        
-
-        Also updates the primal and dual objectives and duality gap in self._result.info:
-            - primal_obj = 0.5 x^T P x + c^T x
-            - dual_obj = -0.5 x^T P x - b^T y - h_u^T z_u + h_l^T z_l - x_u^T z_bu + x_l^T z_bl
-        """
-        # cuSPARSE/cuBLAS operations (outside graph capture for now)
-        self._kkt_system.eval_P_x(self._data, -1., self._result.x, self._res_nr.x)
-        # ||unscale_dual_res(P*x)||_inf -> _work_dual_res_norm (will be updated further inside graph)
-        cp.absolute(self._res_nr.x, out=self._work_primals)
-        self._work_primals *= self._unscale_dual_res_factor
-        cp.max(self._work_primals, out=self._work_dual_res_norm, keepdims=True)
-
-        self._kkt_system.eval_A_xn(self._data, -1., self._result.x, self._res_nr.y)  # store -A*x in res_nr.y
-        self._kkt_system.eval_AT_xt(self._data, 1., self._result.y, self._res.x)  # add -A^T*y to res_nr.y
-        # ||unscale_primal_res_eq(A*x)||_inf -> _work_primal_rel_norm (will be updated further inside graph)
-        if self._data.p > 0:
-            cp.absolute(self._res_nr.y, out=self._work_duals[:self._data.p])
-            self._work_duals[:self._data.p] *= self._unscale_primal_res_eq_factor
-            cp.max(self._work_duals[:self._data.p], out=self._work_primal_rel_norm, keepdims=True)
+        if data.p > 0:
+            self._kkt_system.eval_A_xn(data, 1., result.x, self._res.y)
+            self._kkt_system.eval_AT_xt(data, 1., result.y, self._res.x)
         else:
-            self._work_primal_rel_norm.fill(0.)
+            self._res.y.fill(0.)
+            self._res.x.fill(0.)
 
-        self._work_z_1.fill(0.)
-        self._work_z_1[self._data.idx_hu] += self._result.z_u
-        self._work_z_1[self._data.idx_hl] -= self._result.z_l
+        # build work_z_1 (G^T * (z_u_scatter - z_l_scatter))
+        # and self._work_x (x_b_scaling*(z_bu_scatter - z_bl_scattered))
+        wp.launch(
+            kernel=self._prepare_zu_minus_zl_and_zbu_minus_zbl_kernel,
+            dim=(data.batch_size, data.m + data.n),
+            inputs=[
+                result.z_u, result.z_l,
+                result.z_bl, result.z_bu,
+                pc.x_b_scaling,
+                self._kkt_system._inv_idx_hu, self._kkt_system._inv_idx_hl,
+                self._kkt_system._inv_idx_xu, self._kkt_system._inv_idx_xl,
+                self._work_z_1, self._work_x,
+            ],
+            stream=wp_stream,
+        )
 
-        G_x = self._work_z_2 # reuse self._work_z_2 to store G*x
-        GT_zu_minus_zl = self._step.x  # reuse self._step.x as temporary storage
-        self._kkt_system.eval_G_xn(self._data, 1., self._result.x, G_x)
-        self._kkt_system.eval_GT_xt(self._data, 1., self._work_z_1, GT_zu_minus_zl)
+        G_x = self._work_z_2
+        GT_zu_minus_zl = self._step.x
+        if data.m > 0:
+            self._kkt_system.eval_G_xn(data, 1., result.x, G_x)
+            self._kkt_system.eval_GT_xt(data, 1., self._work_z_1, GT_zu_minus_zl)
+        else:
+            G_x.fill(0.)
+            GT_zu_minus_zl.fill(0.)
 
-        # ------------ update primal / dual objectives and duality gap ------------
-        # primal objective: 0.5 x^T P x + c^T x
-        # dual objective is: -0.5 x^T P x - b^T y - h_u^T z_u + h_l^T z_l - x_u^T z_bu + x_l^T z_bl
-
-        # use self._work_reduce to hold intermediate terms for primal and dual objectives:
-        # index |  content
-        #  0    |   0.5 * x^T P x
-        #  1    |   c^T x
-        #  2    |   0.5 * x^T P x (copy of idx 0 for easier reduction)
-        #  3    |   b^T y
-        #  4    |   -h_l^T z_l
-        #  5    |   h_u^T z_u
-        #  6    |   -x_l^T z_bl
-        #  7    |   x_u^T z_bu
-
-        cp.dot(self._res_nr.x, self._result.x, out=self._work_reduce[0:1])
-        self._work_reduce[0:1] *= -0.5  # hold 0.5 * x^T P x
-        cp.dot(self._data.c, self._result.x, out=self._work_reduce[1:2]) # hold c^T x
-
-        cp.multiply(self._work_reduce[0:1], 1., out=self._work_reduce[2:3])  # hold 0.5 * x^T P x
-        cp.dot(self._data.b, self._result.y, out=self._work_reduce[3:4]) # hold b^T y
-        cp.dot(self._data.h_l[self._data.idx_hl], self._result.z_l, out=self._work_reduce[4:5])  # hold h_l^T z_l
-        self._work_reduce[4:5] *= -1.  # hold - h_l^T z_l
-        cp.dot(self._data.h_u[self._data.idx_hu], self._result.z_u, out=self._work_reduce[5:6])  # hold h_u^T z_u
-        cp.dot(self._data.x_l[self._data.idx_xl], self._result.z_bl, out=self._work_reduce[6:7])
-        self._work_reduce[6:7] *= -1.  # hold - x_l^T z_bl
-        cp.dot(self._data.x_u[self._data.idx_xu], self._result.z_bu, out=self._work_reduce[7:8])  # hold x_u^T z_bu
-
-        cp.sum(self._work_reduce[0:2], out=self._result.info.primal_obj, keepdims=True)  # primal_obj = 0.5 x^T P x + c^T x
-        cp.sum(self._work_reduce[2:8], out=self._result.info.dual_obj, keepdims=True)
-        self._result.info.dual_obj *= -1.  # dual_obj = -b^T y - h_u^T z_u + h_l^T z_l - x_u^T z_bu + x_l^T z_bl
-
-        # duality_gap = abs(primal_obj - dual_obj) (in scaled space, then unscale all three)
-        cp.subtract(self._result.info.primal_obj, self._result.info.dual_obj, out=self._result.info.duality_gap)
-
-        # Unscale objectives and duality gap from scaled to original space
-        self._result.info.primal_obj *= self._c_scaling_inv
-        self._result.info.dual_obj *= self._c_scaling_inv
-        self._result.info.duality_gap *= self._c_scaling_inv
-
-        # duality_gap_rel_norm = max(abs(unscaled terms))
-        # Unscale the work_reduce terms before computing duality_gap_rel
-        self._work_reduce *= self._c_scaling_inv
-        cp.abs(self._work_reduce, out=self._work_reduce)
-        cp.max(self._work_reduce[0:8], out=self._result.info.duality_gap_rel, keepdims=True)
-        cp.abs(self._result.info.duality_gap, out=self._result.info.duality_gap)
-        cp.maximum(self._result.info.duality_gap_rel, 1., out=self._result.info.duality_gap_rel)
-        cp.divide(self._result.info.duality_gap, self._result.info.duality_gap_rel, out=self._result.info.duality_gap_rel)
-
-        # ------------ update non-regulerized residuals ------------
-        # res_nr.x = -(P*x + c + A^T*y + G^T*(z_u - z_l) + z_bu - z_bl)
-        # self._res_nr.x is computed as -P*x above
-        self._res_nr.x -= self._data.c
-        self._res_nr.x -= self._res.x  # self._res.x holds A^T*y
-        self._res_nr.x -= GT_zu_minus_zl
-        self._res_nr.x[self._data.idx_xl] += self._data.x_b_scaling[self._data.idx_xl] * self._result.z_bl
-        self._res_nr.x[self._data.idx_xu] -= self._data.x_b_scaling[self._data.idx_xu] * self._result.z_bu
-        
-        # res_nr.y = -(A*x - b)
-        self._res_nr.y += self._data.b
-
-        # res_nr.z_l = G*x - s_l - hl  =>  self._res_nr.z_l[:] = (G_x[self._data.idx_hl] - self._result.s_l - self._data.h_l[self._data.idx_hl])
-        cp.take(G_x, self._data.idx_hl, out=self._res_nr.z_l)
-        cp.subtract(self._res_nr.z_l, self._result.s_l, out=self._res_nr.z_l)
-        cp.subtract(self._res_nr.z_l, self._data.h_l[self._data.idx_hl], out=self._res_nr.z_l)  # TODO: this creates a tmp array, optimize?
-        
-        # res_nr.z_u = -G*x - s_u + hu  =>  self._res_nr.z_u[:] = (-G_x[self._data.idx_hu] - self._result.s_u + self._data.h_u[self._data.idx_hu])
-        cp.take(G_x, self._data.idx_hu, out=self._res_nr.z_u)
-        cp.negative(self._res_nr.z_u, out=self._res_nr.z_u)
-        cp.subtract(self._res_nr.z_u, self._result.s_u, out=self._res_nr.z_u)
-        cp.add(self._res_nr.z_u, self._data.h_u[self._data.idx_hu], out=self._res_nr.z_u)  # TODO: this creates a tmp array, optimize?
-
-        # res_nr.z_bl = x_b_scaling*x - s_bl - xl
-        cp.take(self._result.x, self._data.idx_xl, out=self._res_nr.z_bl)
-        self._res_nr.z_bl *= self._data.x_b_scaling[self._data.idx_xl]
-        cp.subtract(self._res_nr.z_bl, self._result.s_bl, out=self._res_nr.z_bl)
-        cp.subtract(self._res_nr.z_bl, self._data.x_l[self._data.idx_xl], out=self._res_nr.z_bl)
-
-        # res_nr.z_bu = -(x_b_scaling*x + s_bu - xu)
-        cp.take(self._result.x, self._data.idx_xu, out=self._res_nr.z_bu)
-        self._res_nr.z_bu *= self._data.x_b_scaling[self._data.idx_xu]
-        cp.add(self._res_nr.z_bu, self._result.s_bu, out=self._res_nr.z_bu)
-        cp.subtract(self._res_nr.z_bu, self._data.x_u[self._data.idx_xu], out=self._res_nr.z_bu)
-        cp.negative(self._res_nr.z_bu, out=self._res_nr.z_bu)
-
-
-        # ------------ update primal and dual residuals ------------
-        self._result.info.prev_primal_res[:] = self._result.info.primal_res
-        self._result.info.prev_dual_res[:] = self._result.info.dual_res
-
-        self._result.info.primal_res[:] = self._primal_res_nr()
-
-        # primal_rel_norm: update running max (initialized outside graph with ||unscale(A*x)||_inf)
-        # All terms are unscaled before taking norms to match PIQP C++ convergence check.
-        # _work_z_1 is free at this point (only used before graph for cuSPARSE input)
-        if self._data.num_hu > 0:
-            cp.take(G_x, self._data.idx_hu, out=self._work_z_1[:self._data.num_hu])
-            cp.absolute(self._work_z_1[:self._data.num_hu], out=self._work_z_1[:self._data.num_hu])
-            self._work_z_1[:self._data.num_hu] *= self._unscale_primal_res_ineq_hu
-            cp.max(self._work_z_1[:self._data.num_hu], out=self._work_norm_temp, keepdims=True)
-            cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
-
-        if self._data.num_hl > 0:
-            cp.take(G_x, self._data.idx_hl, out=self._work_z_1[:self._data.num_hl])
-            cp.absolute(self._work_z_1[:self._data.num_hl], out=self._work_z_1[:self._data.num_hl])
-            self._work_z_1[:self._data.num_hl] *= self._unscale_primal_res_ineq_hl
-            cp.max(self._work_z_1[:self._data.num_hl], out=self._work_norm_temp, keepdims=True)
-            cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
-
-        if self._data.num_hu > 0:
-            cp.absolute(self._result.s_u, out=self._work_z_1[:self._data.num_hu])
-            self._work_z_1[:self._data.num_hu] *= self._unscale_primal_res_ineq_hu
-            cp.max(self._work_z_1[:self._data.num_hu], out=self._work_norm_temp, keepdims=True)
-            cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
-
-        if self._data.num_hl > 0:
-            cp.absolute(self._result.s_l, out=self._work_z_1[:self._data.num_hl])
-            self._work_z_1[:self._data.num_hl] *= self._unscale_primal_res_ineq_hl
-            cp.max(self._work_z_1[:self._data.num_hl], out=self._work_norm_temp, keepdims=True)
-            cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
-
-        if self._data.num_xu > 0:
-            cp.absolute(self._result.s_bu, out=self._work_z[:self._data.num_xu])
-            self._work_z[:self._data.num_xu] *= self._unscale_primal_res_b_xu
-            cp.max(self._work_z[:self._data.num_xu], out=self._work_norm_temp, keepdims=True)
-            cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
-
-        if self._data.num_xl > 0:
-            cp.absolute(self._result.s_bl, out=self._work_z[:self._data.num_xl])
-            self._work_z[:self._data.num_xl] *= self._unscale_primal_res_b_xl
-            cp.max(self._work_z[:self._data.num_xl], out=self._work_norm_temp, keepdims=True)
-            cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
-
-        cp.maximum(self._work_primal_rel_norm, self._constraints_rhs_inf_norm_unscaled, out=self._work_primal_rel_norm)
-        # Store max(1, primal_rel_norm) for use by _update_residuals_r
-        cp.maximum(self._work_primal_rel_norm, 1., out=self._work_primal_rel_norm)
-        cp.divide(self._result.info.primal_res, self._work_primal_rel_norm, out=self._result.info.primal_res_rel)
-
-        # dual_res_norm: update running max (initialized outside graph with ||unscale(P*x)||_inf)
-        self._result.info.dual_res[:] = self._dual_res_nr()
-
-        # ||unscale_dual_res(c)||_inf
-        cp.absolute(self._data.c, out=self._work_primals)
-        self._work_primals *= self._unscale_dual_res_factor
-        cp.max(self._work_primals, out=self._work_norm_temp, keepdims=True)
-        cp.maximum(self._work_dual_res_norm, self._work_norm_temp, out=self._work_dual_res_norm)
-
-        # ||unscale_dual_res(A^T*y + G^T*(z_u - z_l) + x_b_scaling*(z_bu - z_bl))||_inf
-        self._res.x += GT_zu_minus_zl
-        self._res.x[self._data.idx_xl] -= self._data.x_b_scaling[self._data.idx_xl] * self._result.z_bl
-        self._res.x[self._data.idx_xu] += self._data.x_b_scaling[self._data.idx_xu] * self._result.z_bu
-        cp.absolute(self._res.x, out=self._work_primals)
-        self._work_primals *= self._unscale_dual_res_factor
-        cp.max(self._work_primals, out=self._work_norm_temp, keepdims=True)
-        cp.maximum(self._work_dual_res_norm, self._work_norm_temp, out=self._work_dual_res_norm)
-
-        # store max(1, dual_res_norm) for use by _update_residuals_r
-        cp.maximum(self._work_dual_res_norm, 1., out=self._work_dual_res_norm)
-        cp.divide(self._result.info.dual_res, self._work_dual_res_norm, out=self._result.info.dual_res_rel)
+        wp.launch_tiled(
+            kernel=self._update_residual_nr_kernel,
+            dim=[data.batch_size],
+            inputs=[
+                res_nr.x,            # minus_Px
+                self._res.y,         # A_x = A*x
+                self._res.x,         # AT_y
+                G_x,
+                GT_zu_minus_zl,      # GT_zh_assembled
+                self._work_x,        # zb_assembled = x_b_scaling*(z_bu - z_bl)
+                # Data
+                data.c, data.b, data.h_l, data.h_u, data.x_l, data.x_u,
+                # Result variables
+                result.x, result.y,
+                result.z_l, result.z_u, result.z_bl, result.z_bu,
+                result.s_l, result.s_u, result.s_bl, result.s_bu,
+                # Preconditioner
+                pc.x_b_scaling, pc.cost_scaling_inv,
+                pc.delta_inv, pc.delta_b_inv,
+                self._constraints_rhs_inf_norm_unscaled,
+                # Index maps
+                data.idx_hl, data.idx_hu, data.idx_xl, data.idx_xu,
+                # Residual outputs
+                res_nr.x, res_nr.y,
+                res_nr.z_l, res_nr.z_u, res_nr.z_bl, res_nr.z_bu,
+                # Info outputs
+                info.primal_obj,
+                info.dual_obj,
+                info.duality_gap,
+                info.duality_gap_rel,
+                info.primal_res,
+                info.primal_res_rel,
+                info.dual_res,
+                info.dual_res_rel,
+                info.prev_primal_res,
+                info.prev_dual_res,
+            ],
+            block_dim=256,
+            stream=wp_stream,
+        )
 
     @nvtx.annotate("Solver::_update_residuals_r")
     @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
@@ -899,263 +950,392 @@ class SolverBase:
         # self._res.z_u[:] = self._res_nr.z_u - self._result.info.delta * (self._prox_vars.z_u - self._result.z_u)
         # self._res.z_bl[:] = self._res_nr.z_bl - self._result.info.delta * (self._prox_vars.z_bl - self._result.z_bl)
         # self._res.z_bu[:] = self._res_nr.z_bu - self._result.info.delta * (self._prox_vars.z_bu - self._result.z_bu)
-        USE_WARP_IMPLEMENTATION = True
-        if USE_WARP_IMPLEMENTATION:
-            wp.launch(
-                kernel=self._update_residuals_r_kernel,
-                dim=self._data.n + self._data.p + self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu,
-                inputs=[
-                    self._result.info.rho, self._result.info.delta,
-                    self._res_nr.x, self._res_nr.y, self._res_nr.z_l, self._res_nr.z_u, self._res_nr.z_bl, self._res_nr.z_bu,
-                    self._result.x, self._result.y, self._result.z_l, self._result.z_u, self._result.z_bl, self._result.z_bu,
-                    self._prox_vars.x, self._prox_vars.y, self._prox_vars.z_l, self._prox_vars.z_u, self._prox_vars.z_bl, self._prox_vars.z_bu,
-                    self._res.x, self._res.y, self._res.z_l, self._res.z_u, self._res.z_bl, self._res.z_bu
-                ],
-                device="cuda",
-                stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr)
-            )
-        else:
-            cp.subtract(self._result.x, self._prox_vars.x, out=self._res.x)
-            self._res.x *= self._result.info.rho
-            cp.subtract(self._res_nr.x, self._res.x, out=self._res.x)
-            cp.subtract(self._prox_vars.y, self._result.y, out=self._res.y)
-            self._res.y *= self._result.info.delta
-            cp.subtract(self._res_nr.y, self._res.y, out=self._res.y)
-            cp.subtract(self._prox_vars.z_l, self._result.z_l, out=self._res.z_l)
-            self._res.z_l *= self._result.info.delta
-            cp.subtract(self._res_nr.z_l, self._res.z_l, out=self._res.z_l)
-            cp.subtract(self._prox_vars.z_u, self._result.z_u, out=self._res.z_u)
-            self._res.z_u *= self._result.info.delta
-            cp.subtract(self._res_nr.z_u, self._res.z_u, out=self._res.z_u)
-            cp.subtract(self._prox_vars.z_bl, self._result.z_bl, out=self._res.z_bl)
-            self._res.z_bl *= self._result.info.delta
-            cp.subtract(self._res_nr.z_bl, self._res.z_bl, out=self._res.z_bl)
-            cp.subtract(self._prox_vars.z_bu, self._result.z_bu, out=self._res.z_bu)
-            self._res.z_bu *= self._result.info.delta
-            cp.subtract(self._res_nr.z_bu, self._res.z_bu, out=self._res.z_bu)
-
-        self._result.info.primal_res_reg[:] = self._primal_res_r()
-        # primal_rel_scaling = self._result.info.primal_res / self._result.info.primal_res_rel if self._result.info.primal_res_rel > 0 else 1.
-        # self._result.info.primal_res_reg_rel[:] = self._result.info.primal_res_reg / primal_rel_scaling
-        cp.divide(self._result.info.primal_res, self._result.info.primal_res_rel, out=self._result.info.primal_res_reg_rel)
-        self._result.info.primal_res_reg_rel[:] = cp.where(self._result.info.primal_res_rel > 0,
-                self._result.info.primal_res_reg_rel, cp.asarray(1.0, dtype=self._result.info.primal_res_reg_rel.dtype))
-        cp.divide(self._result.info.primal_res_reg, self._result.info.primal_res_reg_rel, out=self._result.info.primal_res_reg_rel)
-
-        self._result.info.dual_res_reg[:] = self._dual_res_r()
-        # dual_rel_scaling = self._result.info.dual_res / self._result.info.dual_res_rel if self._result.info.dual_res_rel > 0 else 1.
-        # self._result.info.dual_res_reg_rel[:] = self._result.info.dual_res_reg / dual_rel_scaling
-        cp.divide(self._result.info.dual_res, self._result.info.dual_res_rel, out=self._result.info.dual_res_reg_rel)
-        self._result.info.dual_res_reg_rel[:] = cp.where(self._result.info.dual_res_rel > 0,
-                self._result.info.dual_res_reg_rel, cp.asarray(1.0, dtype=self._result.info.dual_res_reg_rel.dtype))
-        cp.divide(self._result.info.dual_res_reg, self._result.info.dual_res_reg_rel, out=self._result.info.dual_res_reg_rel)
-
-        self._result.info.primal_prox_inf[:] = self._primal_prox_inf()
-        self._result.info.primal_prox_inf *= self._result.info.delta
-        self._result.info.dual_prox_inf[:] = self._dual_prox_inf()
-        self._result.info.dual_prox_inf *= self._result.info.rho
-        
-        
+        pc = self._preconditioner
+        wp.launch_tiled(
+            kernel=self._update_residuals_r_kernel,
+            dim=[self._data.batch_size],
+            inputs=[
+                self._result.info.rho, self._result.info.delta,
+                self._res_nr.x, self._res_nr.duals_all,
+                self._result.x, self._result.duals_all,
+                self._prox_vars.x, self._prox_vars.duals_all,
+                self._res.x, self._res.duals_all,
+                pc.dual_res_unscale_factor, pc.primal_res_unscale_factor,
+                self._result.info.primal_res, self._result.info.primal_res_rel,
+                self._result.info.dual_res, self._result.info.dual_res_rel,
+                self._result.info.primal_res_reg, self._result.info.primal_res_reg_rel,
+                self._result.info.dual_res_reg, self._result.info.dual_res_reg_rel,
+                self._result.info.primal_prox_inf, self._result.info.dual_prox_inf,
+            ],
+            block_dim=256,
+            device="cuda",
+            stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+        )
 
     @nvtx.annotate("Solver::_primal_res_nr")
-    def _primal_res_nr(self) -> float:
+    def _primal_res_nr(self):
+        pc = self._preconditioner
+        n, p = self._data.n, self._data.p
         offset = 0
-        self._work_duals[:self._data.p] = self._res_nr.y
-        self._work_duals[:self._data.p] *= self._unscale_primal_res_eq_factor
-        offset += self._data.p
-        self._work_duals[offset : offset+self._data.num_hu] = self._res_nr.z_u
-        self._work_duals[offset : offset+self._data.num_hu] *= self._unscale_primal_res_ineq_hu
+        self._work_duals[:, :p] = self._res_nr.y
+        self._work_duals[:, :p] *= pc.delta_inv[:, n:n + p]
+        offset += p
+        self._work_duals[:, offset:offset+self._data.num_hu] = self._res_nr.z_u
+        self._work_duals[:, offset:offset+self._data.num_hu] *= pc.delta_inv[:, n + p + self._data.idx_hu]
         offset += self._data.num_hu
-        self._work_duals[offset : offset+self._data.num_hl] = self._res_nr.z_l
-        self._work_duals[offset : offset+self._data.num_hl] *= self._unscale_primal_res_ineq_hl
+        self._work_duals[:, offset:offset+self._data.num_hl] = self._res_nr.z_l
+        self._work_duals[:, offset:offset+self._data.num_hl] *= pc.delta_inv[:, n + p + self._data.idx_hl]
         offset += self._data.num_hl
-        self._work_duals[offset : offset+self._data.num_xu] = self._res_nr.z_bu
-        self._work_duals[offset : offset+self._data.num_xu] *= self._unscale_primal_res_b_xu
+        self._work_duals[:, offset:offset+self._data.num_xu] = self._res_nr.z_bu
+        self._work_duals[:, offset:offset+self._data.num_xu] *= pc.delta_b_inv[:, self._data.idx_xu]
         offset += self._data.num_xu
-        self._work_duals[offset : offset+self._data.num_xl] = self._res_nr.z_bl
-        self._work_duals[offset : offset+self._data.num_xl] *= self._unscale_primal_res_b_xl
+        self._work_duals[:, offset:offset+self._data.num_xl] = self._res_nr.z_bl
+        self._work_duals[:, offset:offset+self._data.num_xl] *= pc.delta_b_inv[:, self._data.idx_xl]
         offset += self._data.num_xl
-        cp.absolute(self._work_duals[:offset], out=self._work_duals[:offset])
-        cp.max(self._work_duals[:offset], out=self._work_residual)
+        if offset > 0:
+            cp.absolute(self._work_duals[:, :offset], out=self._work_duals[:, :offset])
+            cp.max(self._work_duals[:, :offset], axis=1, out=self._work_residual)
+        else:
+            self._work_residual.fill(0.)
         return self._work_residual
 
     @nvtx.annotate("Solver::_primal_res_r")
-    def _primal_res_r(self) -> float:
+    def _primal_res_r(self):
+        pc = self._preconditioner
+        n, p = self._data.n, self._data.p
         offset = 0
-        self._work_duals[:self._data.p] = self._res.y
-        self._work_duals[:self._data.p] *= self._unscale_primal_res_eq_factor
-        offset = self._data.p
-        self._work_duals[offset : offset+self._data.num_hu] = self._res.z_u
-        self._work_duals[offset : offset+self._data.num_hu] *= self._unscale_primal_res_ineq_hu
+        self._work_duals[:, :p] = self._res.y
+        self._work_duals[:, :p] *= pc.delta_inv[:, n:n + p]
+        offset = p
+        self._work_duals[:, offset:offset+self._data.num_hu] = self._res.z_u
+        self._work_duals[:, offset:offset+self._data.num_hu] *= pc.delta_inv[:, n + p + self._data.idx_hu]
         offset += self._data.num_hu
-        self._work_duals[offset : offset+self._data.num_hl] = self._res.z_l
-        self._work_duals[offset : offset+self._data.num_hl] *= self._unscale_primal_res_ineq_hl
+        self._work_duals[:, offset:offset+self._data.num_hl] = self._res.z_l
+        self._work_duals[:, offset:offset+self._data.num_hl] *= pc.delta_inv[:, n + p + self._data.idx_hl]
         offset += self._data.num_hl
-        self._work_duals[offset : offset+self._data.num_xu] = self._res.z_bu
-        self._work_duals[offset : offset+self._data.num_xu] *= self._unscale_primal_res_b_xu
+        self._work_duals[:, offset:offset+self._data.num_xu] = self._res.z_bu
+        self._work_duals[:, offset:offset+self._data.num_xu] *= pc.delta_b_inv[:, self._data.idx_xu]
         offset += self._data.num_xu
-        self._work_duals[offset : offset+self._data.num_xl] = self._res.z_bl
-        self._work_duals[offset : offset+self._data.num_xl] *= self._unscale_primal_res_b_xl
+        self._work_duals[:, offset:offset+self._data.num_xl] = self._res.z_bl
+        self._work_duals[:, offset:offset+self._data.num_xl] *= pc.delta_b_inv[:, self._data.idx_xl]
         offset += self._data.num_xl
-        cp.absolute(self._work_duals[:offset], out=self._work_duals[:offset])
-        cp.max(self._work_duals[:offset], out=self._work_residual)
+        if offset > 0:
+            cp.absolute(self._work_duals[:, :offset], out=self._work_duals[:, :offset])
+            cp.max(self._work_duals[:, :offset], axis=1, out=self._work_residual)
+        else:
+            self._work_residual.fill(0.)
         return self._work_residual
-    
+
     @nvtx.annotate("Solver::_dual_res_nr")
-    def _dual_res_nr(self) -> float:
-        # Unscale dual residual before computing inf-norm (matching PIQP C++ dual_res_nr)
+    def _dual_res_nr(self):
+        # Unscale dual residual before computing inf-norm
+        pc = self._preconditioner
+        n = self._data.n
         cp.absolute(self._res_nr.x, out=self._work_primals)
-        self._work_primals *= self._unscale_dual_res_factor
-        cp.max(self._work_primals, out=self._work_residual)
+        self._work_primals *= pc.delta_inv[:, :n]
+        self._work_primals *= pc.cost_scaling_inv[:, None]
+        cp.max(self._work_primals, axis=1, out=self._work_residual)
         return self._work_residual
-    
+
     @nvtx.annotate("Solver::_dual_res_r")
-    def _dual_res_r(self) -> float:
+    def _dual_res_r(self):
+        pc = self._preconditioner
+        n = self._data.n
         cp.absolute(self._res.x, out=self._work_primals)
-        self._work_primals *= self._unscale_dual_res_factor
-        cp.max(self._work_primals, out=self._work_residual)
+        self._work_primals *= pc.delta_inv[:, :n]
+        self._work_primals *= pc.cost_scaling_inv[:, None]
+        cp.max(self._work_primals, axis=1, out=self._work_residual)
         return self._work_residual
     
     @nvtx.annotate("Solver::_primal_prox_inf")
-    def _primal_prox_inf(self) -> float:
-        cp.subtract(self._result.y, self._prox_vars.y, out=self._work_duals[:self._data.p])
-        offset = self._data.p
-        cp.subtract(self._result.z_l, self._prox_vars.z_l, out=self._work_duals[offset : offset+self._data.num_hl])
-        offset += self._data.num_hl
-        cp.subtract(self._result.z_u, self._prox_vars.z_u, out=self._work_duals[offset : offset+self._data.num_hu])
-        offset += self._data.num_hu
-        cp.subtract(self._result.z_bl, self._prox_vars.z_bl, out=self._work_duals[offset : offset+self._data.num_xl])
-        offset += self._data.num_xl
-        cp.subtract(self._result.z_bu, self._prox_vars.z_bu, out=self._work_duals[offset : offset+self._data.num_xu])
-        offset += self._data.num_xu
-        cp.absolute(self._work_duals[:offset], out=self._work_duals[:offset])
-        cp.max(self._work_duals[:offset], out=self._work_residual)
+    def _primal_prox_inf(self):
+        if self._work_duals.shape[1] > 0:
+            cp.subtract(self._result.duals_all, self._prox_vars.duals_all, out=self._work_duals)
+            cp.absolute(self._work_duals, out=self._work_duals)
+            cp.max(self._work_duals, axis=1, out=self._work_residual)
+        else:
+            self._work_residual.fill(0.)
         return self._work_residual
 
     @nvtx.annotate("Solver::_dual_prox_inf")
-    def _dual_prox_inf(self) -> float:
+    def _dual_prox_inf(self):
         cp.subtract(self._result.x, self._prox_vars.x, out=self._work_primals)
         cp.absolute(self._work_primals, out=self._work_primals)
-        cp.max(self._work_primals, out=self._work_residual)
+        cp.max(self._work_primals, axis=1, out=self._work_residual)
         return self._work_residual
     
     @nvtx.annotate("Solver::_update_rho_delta_with_ineq")
     def _update_rho_delta_with_ineq(self) -> None:
-        """Update rho/delta based on residual progress (host-side branching)."""
-        if self._result.info.dual_res < 0.95 * self._result.info.prev_dual_res or \
-            (self._result.info.dual_res < self.settings.eps_abs or self._result.info.dual_res_rel < self.settings.eps_rel) or \
-            (self._result.info.rho == self.settings.reg_finetune_lower_limit and self._result.info.dual_prox_inf < self.settings.infeasibility_threshold):
-            self._prox_vars.x[:] = self._result.x
-            self._result.info.rho[:] = cp.maximum(self._result.info.reg_limit, (1. - self._mu_rate) * self._result.info.rho)
-        else:
-            self._result.info.no_primal_update += 1
-            if self._result.info.iter < 5 or self._result.info.dual_prox_inf < self.settings.infeasibility_threshold:
-                self._result.info.rho[:] = cp.maximum(self._result.info.reg_limit, (1. - 0.666 * self._mu_rate) * self._result.info.rho)
-
-        if self._result.info.primal_res < 0.95 * self._result.info.prev_primal_res or \
-            (self._result.info.primal_res < self.settings.eps_abs or self._result.info.primal_res_rel < self.settings.eps_rel) or \
-            (self._result.info.delta == self.settings.reg_finetune_lower_limit and self._result.info.primal_prox_inf < self.settings.infeasibility_threshold):
-            self._prox_vars.y[:] = self._result.y
-            self._prox_vars.z_l[:] = self._result.z_l
-            self._prox_vars.z_u[:] = self._result.z_u
-            self._prox_vars.z_bu[:] = self._result.z_bu
-            self._prox_vars.z_bl[:] = self._result.z_bl
-            self._result.info.delta[:] = cp.maximum(self._result.info.reg_limit, (1. - self._mu_rate) * self._result.info.delta)
-        else:
-            self._result.info.no_dual_update += 1
-            if self._result.info.iter < 5 or self._result.info.primal_prox_inf < self.settings.infeasibility_threshold:
-                self._result.info.delta[:] = cp.maximum(self._result.info.reg_limit, (1. - 0.666 * self._mu_rate) * self._result.info.delta)
+        info = self._result.info
+        settings = self.settings
+        n = self._data.n
+        num_duals = self._data.p + self._data.num_ineq
+        wp.launch(
+            kernel=self._update_rho_delta_with_ineq_kernel,
+            dim=(self._data.batch_size, n + num_duals),
+            inputs=[
+                info.dual_res, info.prev_dual_res, info.dual_res_rel, info.dual_prox_inf,
+                info.primal_res, info.prev_primal_res, info.primal_res_rel, info.primal_prox_inf,
+                info.reg_limit,
+                info.rho, info.delta,
+                info.no_primal_update, info.no_dual_update,
+                self._result.x, self._prox_vars.x,
+                self._result.duals_all, self._prox_vars.duals_all,
+                settings.eps_abs,
+                settings.eps_rel,
+                settings.reg_finetune_lower_limit,
+                settings.infeasibility_threshold,
+                info.iter[0],
+            ],
+            device="cuda",
+            stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+        )
 
     @nvtx.annotate("Solver::_update_rho_delta_without_ineq")
     def _update_rho_delta_without_ineq(self) -> None:
-        """Update rho/delta based on residual progress (host-side branching)."""
-        if self._result.info.dual_res < 0.95 * self._result.info.prev_dual_res or \
-            self._result.info.dual_res < self.settings.eps_abs or \
-                self._result.info.dual_res_rel < self.settings.eps_rel:                
-            self._prox_vars.x[:] = self._result.x
-            self._result.info.rho[:] = cp.maximum(self._result.info.reg_limit, 0.1 * self._result.info.rho)                
-        else:                
-            self._result.info.no_primal_update += 1
-            if self._result.info.iter < 5 or self._result.info.dual_prox_inf < self.settings.infeasibility_threshold:
-                self._result.info.rho[:] = cp.maximum(self._result.info.reg_limit, 0.5 * self._result.info.rho)
-                    
-        if self._result.info.primal_res < 0.95 * self._result.info.prev_primal_res or \
-            self._result.info.primal_res < self.settings.eps_abs or \
-                self._result.info.primal_res_rel < self.settings.eps_rel:
-            self._prox_vars.y[:] = self._result.y
-            self._result.info.delta[:] = cp.maximum(self._result.info.reg_limit, 0.1 * self._result.info.delta)
-        else:
-            self._result.info.no_dual_update += 1
-            if self._result.info.iter < 5 or self._result.info.primal_prox_inf < self.settings.infeasibility_threshold:
-                self._result.info.delta[:] = cp.maximum(self._result.info.reg_limit, 0.5 * self._result.info.delta)
+        info = self._result.info
+        settings = self.settings
+        n = self._data.n
+        p = self._data.p
+        wp.launch(
+            kernel=self._update_rho_delta_without_ineq_kernel,
+            dim=(self._data.batch_size, n + p),
+            inputs=[
+                info.dual_res, info.prev_dual_res, info.dual_res_rel, info.dual_prox_inf,
+                info.primal_res, info.prev_primal_res, info.primal_res_rel, info.primal_prox_inf,
+                info.reg_limit,
+                info.rho, info.delta,
+                info.no_primal_update, info.no_dual_update,
+                self._result.x, self._prox_vars.x,
+                self._result.y, self._prox_vars.y,
+                settings.eps_abs,
+                settings.eps_rel,
+                settings.infeasibility_threshold,
+                info.iter[0],
+            ],
+            device="cuda",
+            stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+        )
 
+    @nvtx.annotate("Solver::_compute_adjoint")
+    def _compute_adjoint(self, grad: Variables, sol: Variables) -> None:
+        r"""Solve the adjoint KKT system :math:`K^\top \lambda = -\partial L / \partial v`.
 
+        Backend-agnostic: the math operates only on cupy arrays and the
+        cached KKT factor (which every backend's ``_kkt_system`` exposes
+        with a uniform ``solve(..., transpose=True)`` API). Used by every
+        subclass's ``grad()`` to obtain the lambdas; per-backend matrix
+        and vector gradient assembly happens in the caller.
 
-def create_update_residual_r_kernel(n: int, p: int, num_hl: int, num_hu: int, num_xl: int, num_xu: int):
-    """
-    Perform the following operations:
-        self._res.x[:] = self._res_nr.x - self._result.info.rho * (self._result.x - self._prox_vars.x)
-        self._res.y[:] = self._res_nr.y - self._result.info.delta * (self._prox_vars.y - self._result.y)
-        self._res.z_l[:] = self._res_nr.z_l - self._result.info.delta * (self._prox_vars.z_l - self._result.z_l)
-        self._res.z_u[:] = self._res_nr.z_u - self._result.info.delta * (self._prox_vars.z_u - self._result.z_u)
-        self._res.z_bl[:] = self._res_nr.z_bl - self._result.info.delta * (self._prox_vars.z_bl - self._result.z_bl)
-        self._res.z_bu[:] = self._res_nr.z_bu - self._result.info.delta * (self._prox_vars.z_bu - self._result.z_bu)
-    """
-    @wp.kernel
-    def update_residual_r_kernel(
-        rho: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        delta: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        res_nr_x: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        res_nr_y: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        res_nr_z_l: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        res_nr_z_u: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        res_nr_z_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        res_nr_z_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        result_x: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        result_y: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        result_z_l: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        result_z_u: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        result_z_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        result_z_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        prox_var_x: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        prox_var_y: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        prox_var_z_l: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        prox_var_z_u: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        prox_var_z_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        prox_var_z_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        res_r_x: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        res_r_y: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        res_r_z_l: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        res_r_z_u: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        res_r_z_bl: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-        res_r_z_bu: wp.array(dtype=wp.float64),  # pyright: ignore[reportInvalidTypeForm]
-    ):
-        t = wp.tid()
-        n_static = wp.static(n)
-        p_static = wp.static(p)
-        num_hl_static = wp.static(num_hl)
-        num_hu_static = wp.static(num_hu)
-        num_xl_static = wp.static(num_xl)
-        num_xu_static = wp.static(num_xu)
+        Parameters
+        ----------
+        grad : Variables
+            User cotangents :math:`\partial L / \partial v` for every
+            variable group (``x, y, z_u, z_l, z_{bu}, z_{bl}, s_u, s_l,
+            s_{bu}, s_{bl}``). Absent constraint groups have zero-sized
+            fields and the kernel's t-range naturally skips them.
+        sol : Variables
+            **Output.** The adjoint solution :math:`\lambda` is written
+            in-place into ``sol`` with the same field layout as ``grad``.
+            Each ``sol.<field>`` aliases the corresponding lambda.
 
-        if t < n_static:
-            res_r_x[t] = -rho[0] * (result_x[t] - prox_var_x[t]) + res_nr_x[t]
-        elif t < n_static + p_static:
-            idx = t - n_static
-            res_r_y[idx] = delta[0] * (result_y[idx] - prox_var_y[idx]) + res_nr_y[idx]
-        elif t < n_static + p_static + num_hl_static:
-            idx = t - n_static - p_static
-            res_r_z_l[idx] = delta[0] * (result_z_l[idx] - prox_var_z_l[idx]) + res_nr_z_l[idx]
-        elif t < n_static + p_static + num_hl_static + num_hu_static:
-            idx = t - n_static - p_static - num_hl_static
-            res_r_z_u[idx] = delta[0] * (result_z_u[idx] - prox_var_z_u[idx]) + res_nr_z_u[idx]
-        elif t < n_static + p_static + num_hl_static + num_hu_static + num_xl_static:
-            idx = t - n_static - p_static - num_hl_static - num_hu_static
-            res_r_z_bl[idx] = delta[0] * (result_z_bl[idx] - prox_var_z_bl[idx]) + res_nr_z_bl[idx]
-        elif t < n_static + p_static + num_hl_static + num_hu_static + num_xl_static + num_xu_static:
-            idx = t - n_static - p_static - num_hl_static - num_hu_static - num_xl_static
-            res_r_z_bu[idx] = delta[0] * (result_z_bu[idx] - prox_var_z_bu[idx]) + res_nr_z_bu[idx]
-        else:
-            return
+        Notes
+        -----
+        Cotangents in ``grad`` are interpreted in **user (un-scaled)**
+        space. The adjoint KKT system is solved in scaled space when
+        ``preconditioner_iter > 0``, but the scaled-to-user push-back is
+        applied here so that ``sol`` is written in **user space**. The
+        per-backend ``grad()`` only contributes the matrix-gradient
+        push-back on top of that.
 
-    return update_residual_r_kernel
+        Raises
+        ------
+        RuntimeError
+            If :meth:`solve` has not been called yet (no cached KKT factor).
+        """
+        if not getattr(self, "_setup_done", False) or self._result is None:
+            raise RuntimeError(
+                f"{type(self).__name__}.grad() requires a prior solve(); "
+                f"call setup() and solve() before grad()."
+            )
+
+        data = self._data
+        settings = self.settings
+        kkt_system = self._kkt_system
+        precond = self._preconditioner
+        B = data.batch_size
+        n, p = data.n, data.p
+        wp_stream = wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr)
+
+        rhs = self._work_grad_rhs              # Variables pre-allocated in setup (scaled-space RHS)
+
+        # ---- Step 1 (fused): rhs = -grad_v L, scaled to scaled space
+        rhs_total = n + p + 2 * grad.num_ineq
+        wp.launch(
+            kernel=self._backward_assemble_rhs_kernel,
+            dim=(B, rhs_total),
+            inputs=[
+                grad.x, grad.y,
+                grad.z_u, grad.z_l, grad.z_bu, grad.z_bl,
+                grad.s_u, grad.s_l, grad.s_bu, grad.s_bl,
+                data.idx_hu, data.idx_hl, data.idx_xu, data.idx_xl,
+                precond.delta, precond.delta_b,
+                precond.delta_inv, precond.delta_b_inv,
+                precond.cost_scaling_inv,
+                rhs.x, rhs.y,
+                rhs.z_u, rhs.z_l, rhs.z_bu, rhs.z_bl,
+                rhs.s_u, rhs.s_l, rhs.s_bu, rhs.s_bl,
+            ],
+            device="cuda",
+            stream=wp_stream,
+        )
+
+        # ---- Step 2: K^T sol = rhs (reuses cached forward factor).
+        kkt_system.solve(data, precond, settings, rhs, sol, transpose=True)
+
+        # ---- Step 3 (fused): un-scale sol from scaled space to user
+        # space in place.
+        wp.launch(
+            kernel=self._backward_unscale_lhs_kernel,
+            dim=(B, n + p + grad.num_ineq),
+            inputs=[
+                sol.x, sol.y,
+                sol.z_u, sol.z_l, sol.z_bu, sol.z_bl,
+                data.idx_hu, data.idx_hl, data.idx_xu, data.idx_xl,
+                precond.delta, precond.delta_b, precond.cost_scaling,
+            ],
+            device="cuda",
+            stream=wp_stream,
+        )
+
+    def _compute_vector_gradients(self, grad: Variables, sol: Variables) -> None:
+        data = self._data
+        B = data.batch_size
+        wp.launch(
+            kernel=self._backward_compute_vector_grad_kernel,
+            dim=(B, data.n + data.p + data.num_ineq),
+            inputs=[
+                grad.x, grad.y,
+                grad.z_u, grad.z_l, grad.z_bu, grad.z_bl,
+                sol.x, sol.y,
+                sol.z_u, sol.z_l, sol.z_bu, sol.z_bl,
+            ],
+            device="cuda",
+            stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+        )
+
+    @nvtx.annotate("Solver::grad")
+    def backward(self,
+             grad_x=None, grad_y=None,
+             grad_z_u=None, grad_z_l=None, grad_z_bu=None, grad_z_bl=None,
+             grad_s_u=None, grad_s_l=None, grad_s_bu=None, grad_s_bl=None):
+        r"""Compute gradients of an outer scalar :math:`L` w.r.t. problem
+        data, given upstream cotangents on the solution variables.
+
+        Orchestration (backend-agnostic):
+
+        1. Pack the per-field cotangent kwargs into ``self._grad_in``
+           (a pre-allocated ``Variables``); missing kwargs are treated
+           as zeros.
+        2. Solve the adjoint KKT system via :meth:`_compute_adjoint`,
+           producing user-space adjoint vectors.
+        3. Scatter the four active-size lambda groups (``z_u, z_l,
+           z_bu, z_bl``) and the two active-size ineq result groups
+           into full-``m`` / full-``n`` buffers
+           (``self._lam_z*_full``, ``self._z*_full``). Both the dG
+           outer product and the ``dh_*`` / ``dx_*`` vector gradients
+           consume these full-layout buffers.
+        4. Delegate to :meth:`_compute_data_gradients` for backend-
+           specific matrix-gradient assembly + ``Data`` subclass
+           construction.
+
+        Returns the backend's ``Data`` subclass populated with the
+        gradients in user space. Cotangents and returned gradients are
+        interpreted in user (un-scaled) space throughout — the
+        adjoint solve and scatter chain handles all preconditioner
+        bookkeeping internally.
+
+        Raises
+        ------
+        RuntimeError
+            If :meth:`solve` has not been called yet (no cached KKT factor).
+        """
+        if not self.settings.enable_grad:
+            raise RuntimeError("Set enable_grad to True to enable gradient computation.")
+
+        if not getattr(self, "_setup_done", False) or self._result is None:
+            raise RuntimeError(
+                f"{type(self).__name__}.grad() requires a prior solve(); "
+                f"call setup() and solve() before grad()."
+            )
+
+        data = self._data
+        B = data.batch_size
+        wp_stream = wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr)
+
+        # ---- Step 1
+        zeros = self._zero_grad_in
+        pack_total = data.n + data.p + 2 * zeros.num_ineq
+        if pack_total > 0:
+            wp.launch(
+                kernel=self._backward_copy_kernel,
+                dim=(B, pack_total),
+                inputs=[
+                    grad_x    if grad_x    is not None else zeros.x,
+                    grad_y    if grad_y    is not None else zeros.y,
+                    grad_z_u  if grad_z_u  is not None else zeros.z_u,
+                    grad_z_l  if grad_z_l  is not None else zeros.z_l,
+                    grad_z_bu if grad_z_bu is not None else zeros.z_bu,
+                    grad_z_bl if grad_z_bl is not None else zeros.z_bl,
+                    grad_s_u  if grad_s_u  is not None else zeros.s_u,
+                    grad_s_l  if grad_s_l  is not None else zeros.s_l,
+                    grad_s_bu if grad_s_bu is not None else zeros.s_bu,
+                    grad_s_bl if grad_s_bl is not None else zeros.s_bl,
+                    self._grad_in.x,    self._grad_in.y,
+                    self._grad_in.z_u,  self._grad_in.z_l,
+                    self._grad_in.z_bu, self._grad_in.z_bl,
+                    self._grad_in.s_u,  self._grad_in.s_l,
+                    self._grad_in.s_bu, self._grad_in.s_bl,
+                ],
+                device="cuda",
+                stream=wp_stream,
+            )
+
+        # ---- Step 2: adjoint KKT solve
+        self._compute_adjoint(self._grad_in, self._backward_adjoint_vector)
+
+        # ---- Step 3: write into full-layout buffers
+        kkt = self._kkt_system
+        wp.launch(
+            kernel=self._backward_pack_full_layout_kernel,
+            dim=(B, 4 * data.m + 2 * data.n),
+            inputs=[
+                self._backward_adjoint_vector.z_u, self._backward_adjoint_vector.z_l,
+                self._backward_adjoint_vector.z_bu, self._backward_adjoint_vector.z_bl,
+                self._result.z_u, self._result.z_l,
+                kkt._inv_idx_hu, kkt._inv_idx_hl,
+                kkt._inv_idx_xu, kkt._inv_idx_xl,
+                self._lam_zu_full, self._lam_zl_full,
+                self._lam_zbu_full, self._lam_zbl_full,
+                self._zu_full, self._zl_full,
+            ],
+            device="cuda",
+            stream=wp_stream,
+        )
+
+        # ---- Step 4: backend-specific matrix and vector gradient
+        # assembly + Data subclass construction.
+        return self._compute_data_gradients(self._backward_adjoint_vector)
+
+    @abstractmethod
+    def _compute_data_gradients(self, sol_adj: Variables):
+        """Build and return the backend's ``Data`` subclass populated
+        with user-space gradients ``(P, c, A, b, G, h_u, h_l, x_u,
+        x_l)``.
+
+        Implementations read user-space adjoint lambdas from
+        ``sol_adj`` (active-only sizes), the user-space primal/dual
+        solution from ``self._result``, and the pre-scattered full-
+        layout buffers ``self._lam_z*_full`` / ``self._z*_full`` set
+        up by :meth:`grad`'s scatter step.
+        """

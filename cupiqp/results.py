@@ -1,86 +1,170 @@
 import cupy as cp
-from enum import Enum
-from dataclasses import dataclass
+import numpy as np
+from typing import List
+from enum import Enum, IntEnum, auto
+import nvtx
 
 from .data import Data
 
 class Status(Enum):
     PIQP_UNSOLVED = -1
-    PIQP_SOLVED= 0
-    PIQP_MAX_ITER_REACHED= 1
-    PIQP_PRIMAL_INFEASIBLE= 2
-    PIQP_DUAL_INFEASIBLE= 3
-    PIQP_NUMERICAL_ISSUES= 4
+    PIQP_SOLVED = 0
+    PIQP_MAX_ITER_REACHED = 1
+    PIQP_PRIMAL_INFEASIBLE = 2
+    PIQP_DUAL_INFEASIBLE = 3
+    PIQP_NUMERICAL_ISSUES = 4
 
 
 class Variables:
+    """Optimization variables for a batch of B QPs.
+
+    Two contiguous buffers per problem, laid out as::
+
+        _primal_buffer : (B, num_var + num_ineq)  — [x | s_l | s_u | s_bl | s_bu]
+        _dual_buffer   : (B, num_eq + num_ineq)   — [y | z_l | z_u | z_bl | z_bu]
+
+    Individual variable attributes (x, y, s_l, z_u, ...) are zero-copy (B, *) views
+    into these buffers. Properties with custom setters ensure assignments
+    always write in-place to preserve the contiguous layout.
     """
-    Class to hold optimization variables.
-    """
+
     def __init__(self):
         pass
 
-    def init(self, data: Data):
-        self.n = data.n        # Number of primal variables
-        self.p = data.p        # Number of equality constraints
-        self.m = data.m        # Number of inequality constraints
-        
-        self.x = cp.zeros(data.n)            # Primal variables
-        self.y = cp.zeros(data.p)            # Dual variables for equality constraints
-        self.z_u = cp.ones(data.num_hu)      # Dual variables for inequality constraints (upper)
-        self.z_l = cp.ones(data.num_hl)      # Dual variables for inequality constraints (lower)
-        self.z_bl = cp.ones(data.num_xl)     # Dual variables for bound constraints (lower)
-        self.z_bu = cp.ones(data.num_xu)     # Dual variables for bound constraints (upper)
-        self.s_u = cp.ones(data.num_hu)      # Slack variables for inequality constraints (upper)
-        self.s_l = cp.ones(data.num_hl)      # Slack variables for inequality constraints (lower)
-        self.s_bl = cp.ones(data.num_xl)     # Slack variables for bound constraints (lower)
-        self.s_bu = cp.ones(data.num_xu)     # Slack variables for bound constraints (upper)
+    def init(self, data):
+        self._batch_size = data.batch_size
+        self.n = data.n
+        self.p = data.p
+        self.m = data.m
+        self.num_ineq = data.num_hl + data.num_hu + data.num_xl + data.num_xu
+
+        B = self._batch_size
+
+        # Primal buffer: [x | s_l | s_u | s_bl | s_bu]
+        self._primal_buffer = cp.empty((B, data.n + self.num_ineq), dtype=cp.float64)
+        offset = 0
+        self._x = self._primal_buffer[:, offset : offset+data.n]
+        self._s_all = self._primal_buffer[:, data.n:]
+        offset += data.n
+        self._s_l = self._primal_buffer[:, offset : offset+data.num_hl]
+        offset += data.num_hl
+        self._s_u = self._primal_buffer[:, offset : offset+data.num_hu]
+        offset += data.num_hu
+        self._s_bl = self._primal_buffer[:, offset : offset+data.num_xl]
+        offset += data.num_xl
+        self._s_bu = self._primal_buffer[:, offset : offset+data.num_xu]
+
+        # Dual buffer: [y | z_l | z_u | z_bl | z_bu]
+        self._dual_buffer = cp.empty((B, data.p + self.num_ineq), dtype=cp.float64)
+        offset = 0
+        self._y = self._dual_buffer[:, offset : offset+data.p]
+        self._z_all = self._dual_buffer[:, data.p:]
+        offset += data.p
+        self._z_l = self._dual_buffer[:, offset : offset+data.num_hl]
+        offset += data.num_hl
+        self._z_u = self._dual_buffer[:, offset : offset+data.num_hu]
+        offset += data.num_hu
+        self._z_bl = self._dual_buffer[:, offset : offset+data.num_xl]
+        offset += data.num_xl
+        self._z_bu = self._dual_buffer[:, offset : offset+data.num_xu]
+
+    # -- Properties: getters return (batch_size, *) views, setters copy in-place --
+
+    @property
+    def x(self): return self._x
+    @x.setter
+    def x(self, value): self._x[:] = value
+
+    @property
+    def y(self): return self._y
+    @y.setter
+    def y(self, value): self._y[:] = value
+
+    @property
+    def s_all(self): return self._s_all
+    @s_all.setter
+    def s_all(self, value): self._s_all[:] = value
+
+    @property
+    def s_l(self): return self._s_l
+    @s_l.setter
+    def s_l(self, value): self._s_l[:] = value
+
+    @property
+    def s_u(self): return self._s_u
+    @s_u.setter
+    def s_u(self, value): self._s_u[:] = value
+
+    @property
+    def s_bl(self): return self._s_bl
+    @s_bl.setter
+    def s_bl(self, value): self._s_bl[:] = value
+
+    @property
+    def s_bu(self): return self._s_bu
+    @s_bu.setter
+    def s_bu(self, value): self._s_bu[:] = value
+
+    @property
+    def z_all(self): return self._z_all
+    @z_all.setter
+    def z_all(self, value): self._z_all[:] = value
+
+    @property
+    def z_l(self): return self._z_l
+    @z_l.setter
+    def z_l(self, value): self._z_l[:] = value
+
+    @property
+    def z_u(self): return self._z_u
+    @z_u.setter
+    def z_u(self, value): self._z_u[:] = value
+
+    @property
+    def z_bl(self): return self._z_bl
+    @z_bl.setter
+    def z_bl(self, value): self._z_bl[:] = value
+
+    @property
+    def z_bu(self): return self._z_bu
+    @z_bu.setter
+    def z_bu(self, value): self._z_bu[:] = value
+
+    @property
+    def primals_all(self): return self._primal_buffer
+    @primals_all.setter
+    def primals_all(self, value): self._primal_buffer[:] = value
+
+    @property
+    def duals_all(self): return self._dual_buffer
+    @duals_all.setter
+    def duals_all(self, value): self._dual_buffer[:] = value
+
+    @property
+    def batch_size(self) -> int:
+        return self._batch_size
 
     def all_finite(self) -> bool:
-        return (cp.isfinite(self.x).all() and
-                cp.isfinite(self.y).all() and
-                cp.isfinite(self.z_u).all() and
-                cp.isfinite(self.z_l).all() and
-                cp.isfinite(self.z_bl).all() and
-                cp.isfinite(self.z_bu).all() and
-                cp.isfinite(self.s_u).all() and
-                cp.isfinite(self.s_l).all() and
-                cp.isfinite(self.s_bl).all() and
-                cp.isfinite(self.s_bu).all())
+        """Test purpose only"""
+        return bool(
+            cp.isfinite(self._primal_buffer).all() and
+            cp.isfinite(self._dual_buffer).all()
+        )
 
     @property
     def buffer_ptr(self) -> tuple:
-        """
-        Returns a tuple of memory addresses of the underlying arrays.
-        Used for CUDA graph caching keys.
-        """
+        """Memory addresses for CUDA graph cache keys."""
         return (
-            self.x.data.ptr,
-            self.y.data.ptr,
-            self.z_u.data.ptr,
-            self.z_l.data.ptr,
-            self.z_bu.data.ptr,
-            self.z_bl.data.ptr,
-            self.s_u.data.ptr,
-            self.s_l.data.ptr,
-            self.s_bu.data.ptr,
-            self.s_bl.data.ptr
+            self._primal_buffer.data.ptr,
+            self._dual_buffer.data.ptr,
         )
-    
+
     def allclose(self, other: 'Variables', rtol: float = 1e-8, atol: float = 1e-8) -> bool:
-        return (cp.allclose(self.x, other.x, rtol=rtol, atol=atol) and
-                cp.allclose(self.y, other.y, rtol=rtol, atol=atol) and
-                cp.allclose(self.z_u, other.z_u, rtol=rtol, atol=atol) and
-                cp.allclose(self.z_l, other.z_l, rtol=rtol, atol=atol) and
-                cp.allclose(self.z_bl, other.z_bl, rtol=rtol, atol=atol) and
-                cp.allclose(self.z_bu, other.z_bu, rtol=rtol, atol=atol) and
-                cp.allclose(self.s_u, other.s_u, rtol=rtol, atol=atol) and
-                cp.allclose(self.s_l, other.s_l, rtol=rtol, atol=atol) and
-                cp.allclose(self.s_bl, other.s_bl, rtol=rtol, atol=atol) and
-                cp.allclose(self.s_bu, other.s_bu, rtol=rtol, atol=atol))
-    
+        return (cp.allclose(self._primal_buffer, other._primal_buffer, rtol=rtol, atol=atol) and
+                cp.allclose(self._dual_buffer, other._dual_buffer, rtol=rtol, atol=atol))
+
     def __str__(self) -> str:
-        return (f"Variables:\n"
+        return (f"Variables (B={self._batch_size}):\n"
             f"  x:    {self.x}\n"
             f"  y:    {self.y}\n"
             f"  z_u:  {self.z_u}\n"
@@ -91,103 +175,137 @@ class Variables:
             f"  s_l:  {self.s_l}\n"
             f"  s_bu: {self.s_bu}\n"
             f"  s_bl: {self.s_bl}")
-    
+
     def to_array(self) -> cp.ndarray:
-        return cp.concatenate((self.x, self.y, self.z_u, self.z_l, self.z_bu, self.z_bl, self.s_u, self.s_l, self.s_bu, self.s_bl))
-    
+        """Test purpose only."""
+        return cp.concatenate((self._primal_buffer, self._dual_buffer), axis=1)
+
     def set_random(self):
         """Testing purpose only: set all variables to random values."""
         cp.random.seed(0)
-        self.x[:] = cp.random.randn(*self.x.shape)
-        self.y[:] = cp.random.randn(*self.y.shape)
-        self.z_u[:] = cp.random.rand(*self.z_u.shape) + 1.0  # ensure positivity
-        self.z_l[:] = cp.random.rand(*self.z_l.shape) + 1.0
-        self.z_bu[:] = cp.random.rand(*self.z_bu.shape) + 1.0
-        self.z_bl[:] = cp.random.rand(*self.z_bl.shape) + 1.0
-        self.s_u[:] = cp.random.rand(*self.s_u.shape) + 1.0
-        self.s_l[:] = cp.random.rand(*self.s_l.shape) + 1.0
-        self.s_bu[:] = cp.random.rand(*self.s_bu.shape) + 1.0
-        self.s_bl[:] = cp.random.rand(*self.s_bl.shape) + 1.0
-    
-@dataclass
-class Info:
-    status: Status = Status.PIQP_UNSOLVED
+        self._x[:] = cp.random.randn(*self._x.shape)
+        self._y[:] = cp.random.randn(*self._y.shape)
+        self._z_u[:] = cp.random.rand(*self._z_u.shape) + 1.0  # ensure positiveness
+        self._z_l[:] = cp.random.rand(*self._z_l.shape) + 1.0
+        self._z_bu[:] = cp.random.rand(*self._z_bu.shape) + 1.0
+        self._z_bl[:] = cp.random.rand(*self._z_bl.shape) + 1.0
+        self._s_u[:] = cp.random.rand(*self._s_u.shape) + 1.0
+        self._s_l[:] = cp.random.rand(*self._s_l.shape) + 1.0
+        self._s_bu[:] = cp.random.rand(*self._s_bu.shape) + 1.0
+        self._s_bl[:] = cp.random.rand(*self._s_bl.shape) + 1.0
 
-    iter: int = 0
-    rho: cp.ndarray = None # using array to allow in-place updates without CUDA graph cache misses
-    delta: cp.ndarray = None
-    mu: cp.ndarray = None
-    sigma: cp.ndarray = None
-    primal_step: cp.ndarray = None
-    dual_step: cp.ndarray = None
-    
-    primal_res: cp.ndarray = None
-    primal_res_rel: cp.ndarray = None
-    dual_res: cp.ndarray = None
-    dual_res_rel: cp.ndarray = None
-    
-    primal_res_reg: cp.ndarray = None
-    primal_res_reg_rel: cp.ndarray = None  # relative primal residual with regularization
-    dual_res_reg: cp.ndarray = None
-    dual_res_reg_rel: cp.ndarray = None
-    
-    primal_prox_inf: cp.ndarray = None
-    dual_prox_inf: cp.ndarray = None
-    
-    prev_primal_res: cp.ndarray = None  # primal residual from previous iteration
-    prev_dual_res: cp.ndarray = None  # dual residual from previous iteration
-    
-    primal_obj: cp.ndarray = None
-    dual_obj: cp.ndarray = None
-    duality_gap: cp.ndarray = None      # duality gap
-    duality_gap_rel: cp.ndarray = None  # relative duality gap
-    
-    factor_retires: int = 0
-    reg_limit: cp.ndarray = None
-    no_primal_update: int = 0  # dual infeasibility detection counter
-    no_dual_update: int = 0    # primal infeasibility detection counter
-    
-    setup_time: cp.ndarray = None
-    update_time: cp.ndarray = None
-    solve_time: cp.ndarray = None
-    kkt_factor_time: cp.ndarray = None
-    kkt_solve_time: cp.ndarray = None
-    run_time: cp.ndarray = None
+class InfoIdx(IntEnum):
+    """Index mapping for the contiguous Info scalar buffer."""
+    def _generate_next_value_(name, start, count, last_values):
+        return count   # 0, 1, 2, ...
+
+    rho = auto()
+    delta = auto()
+    mu = auto()
+    sigma = auto()
+    primal_step = auto()
+    dual_step = auto()
+    primal_res = auto()
+    primal_res_rel = auto()
+    dual_res = auto()
+    dual_res_rel = auto()
+    primal_res_reg = auto()
+    primal_res_reg_rel = auto()
+    dual_res_reg = auto()
+    dual_res_reg_rel = auto()
+    primal_prox_inf = auto()
+    dual_prox_inf = auto()
+    prev_primal_res = auto()
+    prev_dual_res = auto()
+    primal_obj = auto()
+    dual_obj = auto()
+    duality_gap = auto()
+    duality_gap_rel = auto()
+    reg_limit = auto()
+    setup_time = auto()
+    update_time = auto()
+    solve_time = auto()
+    kkt_factor_time = auto()
+    kkt_solve_time = auto()
+    run_time = auto()
+
+class Info:
+    """Per-problem solver info — ``(B, num_fields)`` GPU buffer.
+
+    Each problem independently tracks rho, delta, mu, residuals, etc.
+    For B=1 this is a ``(1, num_fields)`` buffer.
+    """
+
+    # Auto-generate properties from InfoIdx: getter returns (B,) view,
+    # setter copies in-place.
+    for idx in InfoIdx:
+        def _make(i=idx):
+            def getter(self):
+                return self._buffer[:, i]
+            def setter(self, value):
+                self._buffer[:, i] = value
+            return property(getter, setter)
+        locals()[idx.name] = _make()
+    del idx, _make
+
+    def __init__(self, batch_size: int = 1):
+        self._batch_size = batch_size
+        self._status_value = np.full(batch_size, Status.PIQP_UNSOLVED.value, dtype=np.int32)
+        self.iter = np.zeros(batch_size, dtype=np.int32)
+        self.factor_retires = np.zeros(batch_size, dtype=np.int32)
+        # Per-batch "no update" counters live on device (int32). Source of truth;
+        # the rho/delta kernels reset on improved, increment on stagnated.
+        # to_host() syncs them into the InfoHost mirror once per IPM iteration.
+        self.no_primal_update = cp.zeros(batch_size, dtype=cp.int32)
+        self.no_dual_update = cp.zeros(batch_size, dtype=cp.int32)
+
+    def init(self):
+        self._buffer = cp.zeros((self._batch_size, len(InfoIdx)), dtype=cp.float64)
+
+    @property
+    def status(self) -> List[Status]:
+        """Per-problem status as a list of Status enums."""
+        return [Status(v) for v in self._status_value]
+
+    @nvtx.annotate("Info:to_host")
+    def to_host(self, info_host: 'InfoHost'):
+        cp.asnumpy(self._buffer, out=info_host._buffer)
+        cp.asnumpy(self.no_primal_update, out=info_host.no_primal_update)
+        cp.asnumpy(self.no_dual_update,   out=info_host.no_dual_update)
+
+    @property
+    def batch_size(self) -> int:
+        return self._batch_size
+
+
+class InfoHost:
+    """
+    A mirror of Info on the host side (CPU). The purpose is to fetch all device-side info to host all at once, instead of multiple time to reduce overhead.
+
+    Each property returns a ``(B,)`` NumPy array.
+    """
+    __slots__ = ('_buffer', '_batch_size', 'no_primal_update', 'no_dual_update')
+
+    for _idx in InfoIdx:
+        locals()[_idx.name] = property(lambda self, i=_idx: self._buffer[:, i])
+    del _idx
+
+    def __init__(self, batch_size: int = 1):
+        self._batch_size = batch_size
+        self._buffer = np.empty((batch_size, len(InfoIdx)), dtype=np.float64)
+        self.no_primal_update = np.zeros(batch_size, dtype=np.int32)
+        self.no_dual_update = np.zeros(batch_size, dtype=np.int32)
+
 
 
 class Result(Variables):
-    def __init__(self):
+    """Combined variables + per-problem info."""
+    def __init__(self, batch_size: int = 1):
         super().__init__()
-        self.info = Info()
+        self.info = Info(batch_size)
 
-    def init(self, data: Data):
+    def init(self, data):
+        assert data.batch_size == self.info.batch_size, \
+            f"batch_size mismatch: Result({self.info.batch_size}) vs data({data.batch_size})"
         super().init(data)
-        self.info.rho = cp.zeros(1, dtype=cp.float64)
-        self.info.delta = cp.zeros(1, dtype=cp.float64)
-        self.info.mu = cp.zeros(1, dtype=cp.float64)
-        self.info.sigma = cp.zeros(1, dtype=cp.float64)
-        self.info.primal_step = cp.zeros(1, dtype=cp.float64)
-        self.info.dual_step = cp.zeros(1, dtype=cp.float64)
-        self.info.primal_res = cp.zeros(1, dtype=cp.float64)
-        self.info.primal_res_rel = cp.zeros(1, dtype=cp.float64)
-        self.info.dual_res = cp.zeros(1, dtype=cp.float64)
-        self.info.dual_res_rel = cp.zeros(1, dtype=cp.float64)
-        self.info.primal_res_reg = cp.zeros(1, dtype=cp.float64)
-        self.info.primal_res_reg_rel = cp.zeros(1, dtype=cp.float64)
-        self.info.dual_res_reg = cp.zeros(1, dtype=cp.float64)
-        self.info.dual_res_reg_rel = cp.zeros(1, dtype=cp.float64)
-        self.info.primal_prox_inf = cp.zeros(1, dtype=cp.float64)
-        self.info.dual_prox_inf = cp.zeros(1, dtype=cp.float64)
-        self.info.prev_primal_res = cp.zeros(1, dtype=cp.float64)
-        self.info.prev_dual_res = cp.zeros(1, dtype=cp.float64)
-        self.info.primal_obj = cp.zeros(1, dtype=cp.float64)
-        self.info.dual_obj = cp.zeros(1, dtype=cp.float64)
-        self.info.duality_gap = cp.zeros(1, dtype=cp.float64)
-        self.info.duality_gap_rel = cp.zeros(1, dtype=cp.float64)
-        self.info.reg_limit = cp.zeros(1, dtype=cp.float64)
-        self.info.setup_time = cp.zeros(1, dtype=cp.float64)
-        self.info.update_time = cp.zeros(1, dtype=cp.float64)
-        self.info.solve_time = cp.zeros(1, dtype=cp.float64)
-        self.info.kkt_factor_time = cp.zeros(1, dtype=cp.float64)
-        self.info.kkt_solve_time = cp.zeros(1, dtype=cp.float64)
-        self.info.run_time = cp.zeros(1, dtype=cp.float64)
+        self.info.init()

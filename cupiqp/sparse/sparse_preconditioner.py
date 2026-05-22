@@ -1,117 +1,141 @@
-import cupy as cp
-from cupyx.scipy.sparse import csr_matrix, linalg as sparse_la
+from typing import Optional
 
-from ..data import Data
+import cupy as cp
+import warp as wp
+
+from .sparse_data import SparseData
 from ..preconditioner import RuizEquilibration
+from .batched_csr import BatchedCsrMatrix
+from .sparse_preconditioner_kernels import (
+    create_sparse_scale_matrices_kernel,
+    create_sparse_compute_kkt_norms_kernel,
+)
 
 
 class SparseRuizEquilibration(RuizEquilibration):
-    """Ruiz equilibration for sparse (CSR) matrix backends."""
+    """Ruiz equilibration for the sparse CSR backend.
 
-    def eval_P_row_inf_norms(self, P: csr_matrix, out: cp.ndarray):
-        out[:] = sparse_la.norm(P, ord=cp.inf, axis=1)
+    After the ``SparseData`` refactor, ``data.P`` / ``data.A`` / ``data.G``
+    are always :class:`BatchedCsrMatrix` instances (B = 1 is just a 1-batch
+    batched matrix), so this class only has a single batched code path —
+    no ``isinstance(P, list)`` branching.
 
-    def eval_A_row_inf_norms(self, A: csr_matrix, out: cp.ndarray):
-        out[:] = sparse_la.norm(A, ord=cp.inf, axis=1)
+    All in-place scaling and norm computations act on the shared
+    ``(B, nnz)`` values buffer via ``M.data`` (zero-copy), and on the
+    shared ``indptr`` / ``indices`` via ``M.indptr`` / ``M.indices``.
+    """
 
-    def eval_A_col_inf_norms(self, A: csr_matrix, out: cp.ndarray):
-        out[:] = sparse_la.norm(A, ord=cp.inf, axis=0)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._sparse_scale_matrices_kernel = create_sparse_scale_matrices_kernel(self.n, self.p, self.m)
+        self._sparse_compute_row_inf_norm_kernel, self._sparse_compute_col_inf_norm_kernel = \
+            create_sparse_compute_kkt_norms_kernel(self.n, self.p, self.m)
 
-    def eval_G_row_inf_norms(self, G: csr_matrix, out: cp.ndarray):
-        out[:] = sparse_la.norm(G, ord=cp.inf, axis=1)
-
-    def eval_G_col_inf_norms(self, G: csr_matrix, out: cp.ndarray):
-        out[:] = sparse_la.norm(G, ord=cp.inf, axis=0)
-
-    def _scale_matrices(self, data: Data,
-                        d_x: cp.ndarray, d_y: cp.ndarray, d_z: cp.ndarray):
-        self._csr_row_scale(data._P, d_x)
-        self._csr_col_scale(data._P, d_x)
-        data._c *= d_x
-
-        if self.p > 0:
-            self._csr_row_scale(data._A, d_y)
-            self._csr_col_scale(data._A, d_x)
-        if self.m > 0:
-            self._csr_row_scale(data._G, d_z)
-            self._csr_col_scale(data._G, d_x)
-
-    def _apply_cost_scaling(self, data: Data):
-        P_norms = self._csr_utri_symmetric_col_inf_norms(data._P)
-        gamma = float(cp.mean(P_norms))
-        gamma = self._limit_scaling_scalar(gamma)
-        gamma = max(gamma, float(cp.max(cp.abs(data._c))))
-        gamma = self._limit_scaling_scalar(gamma)
-        gamma = 1.0 / gamma
-        data._P.data *= gamma
-        data._c *= gamma
-        self.c_scaling *= gamma
-
-    def _unscale_matrices(self, data: Data,
-                          d_x_inv: cp.ndarray, d_y_inv: cp.ndarray, d_z_inv: cp.ndarray):
-        c_inv = float(self._c_scaling_inv)
-
-        data._P.data *= c_inv
-        self._csr_row_scale(data._P, d_x_inv)
-        self._csr_col_scale(data._P, d_x_inv)
-        data._c *= c_inv * d_x_inv
-
-        if self.p > 0:
-            self._csr_row_scale(data._A, d_y_inv)
-            self._csr_col_scale(data._A, d_x_inv)
-        if self.m > 0:
-            self._csr_row_scale(data._G, d_z_inv)
-            self._csr_col_scale(data._G, d_x_inv)
-
-    def _apply_stored_scaling(self, data: Data,
-                              d_x: cp.ndarray, d_y: cp.ndarray, d_z: cp.ndarray):
-        c = float(self.c_scaling)
-
-        data._P.data *= c
-        self._csr_row_scale(data._P, d_x)
-        self._csr_col_scale(data._P, d_x)
-        data._c *= c * d_x
-
-        if self.p > 0:
-            self._csr_row_scale(data._A, d_y)
-            self._csr_col_scale(data._A, d_x)
-        if self.m > 0:
-            self._csr_row_scale(data._G, d_z)
-            self._csr_col_scale(data._G, d_x)
-
+        self._ones = cp.ones(self.B, dtype=cp.float64)
 
     # ------------------------------------------------------------------
-    # CSR helpers
+    # 3-hook backend API
+    # ------------------------------------------------------------------
+
+    def compute_kkt_norms(self, data: SparseData,
+                          d_iter: cp.ndarray, d_b_iter: cp.ndarray):
+        rows_max = max(self.n, self.p, self.m)
+        if rows_max == 0:
+            return
+        stream = wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr)
+        wp.launch(
+            kernel=self._sparse_compute_row_inf_norm_kernel,
+            dim=(self.B, rows_max),
+            inputs=[
+                data.P.data, data.P.indptr,
+                data.A.data, data.A.indptr,
+                data.G.data, data.G.indptr,
+                self._x_b_scaling, d_iter, d_b_iter,
+            ],
+            device="cuda", stream=stream,
+        )
+        
+        nnz_max = max(int(data.A.nnz), int(data.G.nnz))
+        if nnz_max > 0 and (self.p > 0 or self.m > 0):
+            wp.launch(
+                kernel=self._sparse_compute_col_inf_norm_kernel,
+                dim=(self.B, nnz_max),
+                inputs=[
+                    data.A.data, data.A.indices,
+                    data.G.data, data.G.indices,
+                    d_iter,
+                ],
+                device="cuda", stream=stream,
+            )
+
+    def scale_matrices(self, data: SparseData,
+                       d_x: cp.ndarray, d_y: cp.ndarray, d_z: cp.ndarray,
+                       cost_scaling_factor: Optional[cp.ndarray] = None):
+        cost_factor = cost_scaling_factor if cost_scaling_factor is not None else self._ones
+        rows_max = max(self.n, self.p, self.m)
+        if rows_max == 0:
+            return
+        wp.launch(
+            kernel=self._sparse_scale_matrices_kernel,
+            dim=(self.B, rows_max),
+            inputs=[
+                data.P.data, data.P.indptr, data.P.indices,
+                data.A.data, data.A.indptr, data.A.indices,
+                data.G.data, data.G.indptr, data.G.indices,
+                data.c, d_x, d_y, d_z, cost_factor,
+            ],
+            device="cuda",
+            stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+        )
+
+    def apply_cost_scaling(self, data: SparseData):
+        P_norms = self._batched_utri_symmetric_col_inf_norms(data.P)  # (B, n)
+        gamma = cp.mean(P_norms, axis=1)                                # (B,)
+        gamma = cp.clip(gamma, self.min_scaling, self.max_scaling)
+        c_norm = cp.max(cp.abs(data.c), axis=1)                        # (B,)
+        gamma = cp.maximum(gamma, c_norm)
+        gamma = cp.clip(gamma, self.min_scaling, self.max_scaling)
+        gamma = 1.0 / gamma                                             # (B,)
+        data.P.data[:] *= gamma[:, None]
+        data.c[:] *= gamma[:, None]
+        self._cost_scaling *= gamma
+
+    # ------------------------------------------------------------------
+    # Batched CSR primitives — operate on a BatchedCsrMatrix's shared
+    # sparsity + (B, nnz) values buffer
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _csr_row_scale(M, d):
-        if M.shape[0] == 0 or M.nnz == 0:
+    def _row_indices_from_indptr(indptr: cp.ndarray, nnz: int) -> cp.ndarray:
+        """nnz-length array mapping each CSR entry to its row index."""
+        if nnz == 0:
+            return cp.zeros(0, dtype=cp.int32)
+        nz = cp.arange(nnz, dtype=cp.int32)
+        return cp.searchsorted(indptr[1:], nz, side='right').astype(cp.int32)
+
+    def _batched_row_inf_norms(self, M: BatchedCsrMatrix, out: cp.ndarray):
+        """Row inf-norms: out[b, r] = max_j |M[b, r, j]|. out shape: (B, rows)."""
+        out.fill(0.0)
+        if M.nnz == 0 or M.rows == 0:
             return
-        nz_indices = cp.arange(M.nnz, dtype=cp.int32)
-        row_indices = cp.searchsorted(M.indptr[1:], nz_indices, side='right')
-        M.data *= d[row_indices]
+        row_idx = self._row_indices_from_indptr(M.indptr, M.nnz)
+        cp.maximum.at(out, (slice(None), row_idx), cp.abs(M.data))
 
-    @staticmethod
-    def _csr_col_scale(M, d):
-        if M.nnz == 0:
+    def _batched_col_inf_norms(self, M: BatchedCsrMatrix, out: cp.ndarray):
+        """Column inf-norms: out[b, c] = max_i |M[b, i, c]|. out shape: (B, cols)."""
+        out.fill(0.0)
+        if M.nnz == 0 or M.cols == 0:
             return
-        M.data *= d[M.indices]
+        cp.maximum.at(out, (slice(None), M.indices), cp.abs(M.data))
 
-    @staticmethod
-    def _csr_row_inf_norms(M):
-        if M.shape[0] == 0 or M.nnz == 0:
-            return cp.zeros(M.shape[0], dtype=cp.float64)
-        return cp.asarray(abs(M).max(axis=1).toarray()).ravel()
-
-    @staticmethod
-    def _csr_col_inf_norms(M):
-        if M.shape[1] == 0 or M.nnz == 0:
-            return cp.zeros(M.shape[1], dtype=cp.float64)
-        return cp.asarray(abs(M).max(axis=0).toarray()).ravel()
-
-    @classmethod
-    def _csr_utri_symmetric_col_inf_norms(cls, P):
+    def _batched_utri_symmetric_col_inf_norms(self, P: BatchedCsrMatrix) -> cp.ndarray:
+        """For a symmetric P stored as upper triangle only, per-batch column
+        inf-norms treat missing lower-triangle entries via row/col max."""
+        B, n = P.batch_size, P.rows
         if P.nnz == 0:
-            return cp.zeros(P.shape[0], dtype=cp.float64)
-        return cp.maximum(cls._csr_row_inf_norms(P), cls._csr_col_inf_norms(P))
+            return cp.zeros((B, n), dtype=cp.float64)
+        row = cp.empty((B, n), dtype=cp.float64)
+        col = cp.empty((B, n), dtype=cp.float64)
+        self._batched_row_inf_norms(P, row)
+        self._batched_col_inf_norms(P, col)
+        return cp.maximum(row, col)

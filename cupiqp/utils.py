@@ -3,6 +3,46 @@ import functools
 import cupy as cp
 
 
+def is_cuda_array(m) -> bool:
+    """True iff ``m`` exposes the ``__cuda_array_interface__`` protocol.
+
+    A single, framework-agnostic test for "GPU-resident dense ndarray".
+    All of these are accepted:
+
+    * :class:`cupy.ndarray`
+    * dense CUDA :class:`torch.Tensor` (``layout == torch.strided``)
+    * JAX CUDA array
+    * :class:`numba.cuda.devicearray.DeviceNDArray`
+
+    Anything CPU-only (numpy, CPU torch, CPU JAX) doesn't expose
+    ``__cuda_array_interface__`` and is rejected — cupiqp is GPU-only
+    and never silently does a host-to-device copy.
+
+    Two robustness guards make this safe to call on user inputs:
+
+    * :class:`torch.sparse_csr_tensor` *defines* ``__cuda_array_interface__``
+      as a property that **raises** :class:`RuntimeError` on access (an
+      ATen quirk), so we exclude non-strided torch tensors before probing.
+    * The ``try``/``except`` around the property access catches errors
+      other than :class:`AttributeError` — torch sparse CSR is the
+      concrete case we've observed, but any library could plausibly
+      define ``__cuda_array_interface__`` as a lazy property that
+      raises (e.g., :class:`NotImplementedError` on a CPU backend, or
+      :class:`RuntimeError` on a buggy implementation). Treating those
+      as "not a CUDA array" is the right behavior.
+    """
+    try:
+        import torch
+        if isinstance(m, torch.Tensor) and m.layout != torch.strided:
+            return False
+    except ImportError:
+        pass
+    try:
+        return m.__cuda_array_interface__ is not None
+    except (AttributeError, RuntimeError, NotImplementedError):
+        return False
+
+
 def cuda_graph_capture(key: Optional[Callable] = None, enable: Optional[Callable] = None):
     """Decorator that caches a method's GPU operations as a CUDA graph.
 
