@@ -3,7 +3,7 @@ from typing import Any, Optional
 import cupy as cp
 import warp as wp
 
-from ..data import Data
+from ..data import Data, _to_warp
 from ..typedef import PIQP_INF
 
 
@@ -28,35 +28,6 @@ def _ensure_2d(array: wp.array) -> wp.array:
     return array
 
 
-def _to_warp(src: Any, copy: bool = True,
-             dtype=wp.float64, device: str = "cuda") -> wp.array:
-    """Wrap a GPU array (cupy, torch CUDA, jax GPU) as a warp array.
-
-    The source must expose ``__cuda_array_interface__``. CPU inputs (numpy,
-    torch CPU, jax CPU) are rejected — silently H2D-copying them here would
-    hide the fact that the caller is feeding host data into a GPU solver.
-
-    copy=True (default): allocate a fresh ``dtype`` buffer on ``device`` and
-        D2D-memcpy the source in. Safe — caller can mutate the source without
-        affecting the returned array. cupy's slice-assign coerces dtype if it
-        differs from ``dtype``.
-    copy=False: zero-copy adoption via DLPack. The returned warp array views
-        the source memory; mutating one mutates the other. ``dtype`` and
-        ``device`` are advisory — the result inherits both from the source.
-        Caller must ensure the source is contiguous and outlives the view.
-    """
-    if not hasattr(src, '__cuda_array_interface__'):
-        raise TypeError(
-            f"Expected a GPU array exposing __cuda_array_interface__; "
-            f"got {type(src).__name__}. "
-        )
-    if not copy:
-        return wp.from_dlpack(src)
-    src = cp.asarray(src)
-    out = wp.empty(src.shape, dtype=dtype, device=device)
-    if src.size > 0:
-        cp.asarray(out)[:] = src
-    return out
 
 
 class DenseData(Data):

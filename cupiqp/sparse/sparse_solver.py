@@ -150,7 +150,8 @@ class SparseSolver(SolverBase):
         _check_dense_vector("h_l", h_l)
         _check_dense_vector("x_u", x_u)
         _check_dense_vector("x_l", x_l)
-        return SparseData(P, c, A, b, G, h_u, h_l, x_u, x_l)
+        return SparseData(dtype=self.dtype, device=self._device).init(
+            P, c, A, b, G, h_u, h_l, x_u, x_l)
 
     def _init_preconditioner(self):
         return SparseRuizEquilibration(
@@ -174,22 +175,24 @@ class SparseSolver(SolverBase):
             # warp kernel's index type (consistent with idx_hu etc.).
             P_csr = d._P
             nnz_P = int(P_csr.nnz)
+            P_indptr_cp = cp.asarray(P_csr.indptr)
             self._p_rows = (cp.searchsorted(
-                P_csr.indptr,
-                cp.arange(nnz_P, dtype=P_csr.indptr.dtype),
+                P_indptr_cp,
+                cp.arange(nnz_P, dtype=P_indptr_cp.dtype),
                 side="right",
             ) - 1).astype(cp.int32)
-            p_indices_for_kernel = P_csr.indices.astype(cp.int32)
+            p_indices_for_kernel = cp.asarray(P_csr.indices).astype(cp.int32)
 
             if d.p > 0:
                 A_csr = d._A
                 nnz_A = int(A_csr.nnz)
+                A_indptr_cp = cp.asarray(A_csr.indptr)
                 self._a_rows = (cp.searchsorted(
-                    A_csr.indptr,
-                    cp.arange(nnz_A, dtype=A_csr.indptr.dtype),
+                    A_indptr_cp,
+                    cp.arange(nnz_A, dtype=A_indptr_cp.dtype),
                     side="right",
                 ) - 1).astype(cp.int32)
-                a_indices_for_kernel = A_csr.indices.astype(cp.int32)
+                a_indices_for_kernel = cp.asarray(A_csr.indices).astype(cp.int32)
             else:
                 nnz_A = 0
                 self._a_rows = cp.empty(0, dtype=cp.int32)
@@ -198,12 +201,13 @@ class SparseSolver(SolverBase):
             if d.m > 0:
                 G_csr = d._G
                 nnz_G = int(G_csr.nnz)
+                G_indptr_cp = cp.asarray(G_csr.indptr)
                 self._g_rows = (cp.searchsorted(
-                    G_csr.indptr,
-                    cp.arange(nnz_G, dtype=G_csr.indptr.dtype),
+                    G_indptr_cp,
+                    cp.arange(nnz_G, dtype=G_indptr_cp.dtype),
                     side="right",
                 ) - 1).astype(cp.int32)
-                g_indices_for_kernel = G_csr.indices.astype(cp.int32)
+                g_indices_for_kernel = cp.asarray(G_csr.indices).astype(cp.int32)
             else:
                 nnz_G = 0
                 self._g_rows = cp.empty(0, dtype=cp.int32)
@@ -302,7 +306,7 @@ class SparseSolver(SolverBase):
         dx_u = self._dx_u_buf       if data.num_xu > 0 else None
         dx_l = self._lam_zbl_full   if data.num_xl > 0 else None
 
-        return SparseData(
+        return SparseData(dtype=self.dtype, device=self._device).init(
             P=dP, c=dc,
             A=dA, b=db,
             G=dG, h_u=dh_u, h_l=dh_l,

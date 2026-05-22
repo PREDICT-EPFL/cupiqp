@@ -2,10 +2,12 @@ import ctypes
 import ctypes.util
 from typing import Union
 import cupy as cp
+import warp as wp
 from cupyx.scipy.sparse import spmatrix, csr_matrix, csc_matrix, coo_matrix
 from cupy.cuda import cusparse
 import cupy.cuda.runtime as rt
 
+from ..dense.cublas_wrappers import array_ptr, array_is_c_contiguous
 from .batched_csr import BatchedCsrMatrix
 
 # ---------------------------------------------------------------------------
@@ -232,8 +234,8 @@ class SingleSparseMatVecProduct:
 
     def __call__(
         self,
-        x: cp.ndarray,  # shape (n,)
-        y: cp.ndarray,  # shape (m,)
+        x: wp.array,  # shape (n,)
+        y: wp.array,  # shape (m,)
         alpha: float = 1.0,
         beta: float = 0.0,
         stream_ptr: int = None,
@@ -245,8 +247,8 @@ class SingleSparseMatVecProduct:
 
         _alpha = ctypes.c_double(alpha)
         _beta = ctypes.c_double(beta)
-        _cusparse_lib.cusparseDnVecSetValues(self._x_desc, x.data.ptr)
-        _cusparse_lib.cusparseDnVecSetValues(self._y_desc, y.data.ptr)
+        _cusparse_lib.cusparseDnVecSetValues(self._x_desc, array_ptr(x))
+        _cusparse_lib.cusparseDnVecSetValues(self._y_desc, array_ptr(y))
         
         status = _cusparse_lib.cusparseSpMV(
             self._cusparse_handle,
@@ -258,7 +260,7 @@ class SingleSparseMatVecProduct:
             self._y_desc,
             self._compute_type,
             self._alg,
-            self._buffer.data.ptr,
+            array_ptr(self._buffer),
         )
         if status != 0:
             raise RuntimeError(f"cusparseSpMV failed with status {status}")
@@ -344,8 +346,10 @@ class BatchedSparseMatVecProduct:
 
     def _setup_big_diag_matrix(self):
         B, rows, cols, nnz = self._mats.batch_size, self._mats.rows, self._mats.cols, self._mats.nnz
-        indptr = self._mats.indptr       # (rows+1,)
-        indices = self._mats.indices     # (nnz,)
+        # cupy views of the warp-backed CSR buffers — zero-copy via CAI.
+        indptr = cp.asarray(self._mats.indptr)       # (rows+1,)
+        indices = cp.asarray(self._mats.indices)     # (nnz,)
+        data_cp = cp.asarray(self._mats.data)        # (B, nnz)
 
         # ---- block-diagonal indptr ((B*rows + 1,)): big[b*rows+r] = b*nnz + indptr[r]
         batch_nnz = cp.arange(B, dtype=indptr.dtype) * nnz
@@ -360,7 +364,7 @@ class BatchedSparseMatVecProduct:
         big_mat_indices = (indices[None, :] + batch_col[:, None]).reshape(-1)
 
         # ---- block-diagonal values: a zero-copy view into mats.data
-        big_mat_data = self._mats.data.reshape(-1)
+        big_mat_data = data_cp.reshape(-1)
 
         self._block_diag_mat = csr_matrix(
             (big_mat_data, big_mat_indices, big_mat_indptr),
@@ -417,8 +421,8 @@ class BatchedSparseMatVecProduct:
 
     def __call__(
         self,
-        x: cp.ndarray,
-        y: cp.ndarray,
+        x: wp.array,
+        y: wp.array,
         alpha: float = 1.0,
         beta: float = 0.0,
         stream_ptr: int = None,
@@ -441,28 +445,28 @@ class BatchedSparseMatVecProduct:
         B = self._batch_size
         xk, yk = self._x_vec_len, self._y_vec_len
         itemsize = 8  # float64
-        x_contig = x.flags['C_CONTIGUOUS']
-        y_contig = y.flags['C_CONTIGUOUS']
+        x_contig = array_is_c_contiguous(x)
+        y_contig = array_is_c_contiguous(y)
 
         if x_contig:
-            _cusparse_lib.cusparseDnVecSetValues(self._x_desc, x.data.ptr)
+            _cusparse_lib.cusparseDnVecSetValues(self._x_desc, array_ptr(x))
         else:
             # Copy x (non-contig) into the contiguous internal x_buf so the
             # descriptor's expected layout matches memory. One D->D 2D copy.
             rt.memcpy2DAsync(
-                self._x_buf.data.ptr,  # dst: start of internal packed buffer
-                xk * itemsize,         # dpitch: bytes between dst rows (tight)
-                x.data.ptr,            # src: caller's (possibly strided) buffer
-                x.strides[0],          # spitch: bytes between src rows (row stride)
-                xk * itemsize,         # width: bytes copied per row (xk float64s)
-                B,                     # height: number of rows (batches)
-                3,                     # kind: cudaMemcpyDeviceToDevice
-                stream_ptr,            # stream
+                array_ptr(self._x_buf),  # dst: start of internal packed buffer
+                xk * itemsize,           # dpitch: bytes between dst rows (tight)
+                array_ptr(x),            # src: caller's (possibly strided) buffer
+                x.strides[0],            # spitch: bytes between src rows (row stride)
+                xk * itemsize,           # width: bytes copied per row (xk float64s)
+                B,                       # height: number of rows (batches)
+                3,                       # kind: cudaMemcpyDeviceToDevice
+                stream_ptr,              # stream
             )
-            _cusparse_lib.cusparseDnVecSetValues(self._x_desc, self._x_buf.data.ptr)
+            _cusparse_lib.cusparseDnVecSetValues(self._x_desc, array_ptr(self._x_buf))
 
         if y_contig:
-            _cusparse_lib.cusparseDnVecSetValues(self._y_desc, y.data.ptr)
+            _cusparse_lib.cusparseDnVecSetValues(self._y_desc, array_ptr(y))
         else:
             if beta != 0.0:
                 # cuSPARSE reads y before writing when beta != 0, so we must
@@ -470,16 +474,16 @@ class BatchedSparseMatVecProduct:
                 # otherwise the read would see stale contents left over from
                 # a previous call.
                 rt.memcpy2DAsync(
-                    self._y_buf.data.ptr,  # dst: internal packed y buffer
-                    yk * itemsize,         # dpitch: tight yk*8 bytes per row
-                    y.data.ptr,            # src: caller's y buffer
-                    y.strides[0],          # spitch: caller's row stride
-                    yk * itemsize,         # width: bytes copied per row
-                    B,                     # height: number of batches
-                    3,                     # kind: cudaMemcpyDeviceToDevice
-                    stream_ptr,            # stream
+                    array_ptr(self._y_buf),  # dst: internal packed y buffer
+                    yk * itemsize,           # dpitch: tight yk*8 bytes per row
+                    array_ptr(y),            # src: caller's y buffer
+                    y.strides[0],            # spitch: caller's row stride
+                    yk * itemsize,           # width: bytes copied per row
+                    B,                       # height: number of batches
+                    3,                       # kind: cudaMemcpyDeviceToDevice
+                    stream_ptr,              # stream
                 )
-            _cusparse_lib.cusparseDnVecSetValues(self._y_desc, self._y_buf.data.ptr)
+            _cusparse_lib.cusparseDnVecSetValues(self._y_desc, array_ptr(self._y_buf))
 
         status = _cusparse_lib.cusparseSpMV(
             self._cusparse_handle,
@@ -491,7 +495,7 @@ class BatchedSparseMatVecProduct:
             self._y_desc,
             self._compute_type,
             self._alg,
-            self._buffer.data.ptr,
+            array_ptr(self._buffer),
         )
         if status != 0:
             raise RuntimeError(f"cusparseSpMV failed with status {status}")
@@ -500,14 +504,14 @@ class BatchedSparseMatVecProduct:
             # Copy the SpMV result back out: internal packed y_buf -> caller's
             # strided y. Same shape as the input stage, direction reversed.
             rt.memcpy2DAsync(
-                y.data.ptr,            # dst: caller's (strided) y buffer
-                y.strides[0],          # dpitch: caller's row stride in bytes
-                self._y_buf.data.ptr,  # src: internal packed y buffer
-                yk * itemsize,         # spitch: tight yk*8 bytes per row
-                yk * itemsize,         # width: bytes copied per row
-                B,                     # height: number of batches
-                3,                     # kind: cudaMemcpyDeviceToDevice
-                stream_ptr,            # stream
+                array_ptr(y),            # dst: caller's (strided) y buffer
+                y.strides[0],            # dpitch: caller's row stride in bytes
+                array_ptr(self._y_buf),  # src: internal packed y buffer
+                yk * itemsize,           # spitch: tight yk*8 bytes per row
+                yk * itemsize,           # width: bytes copied per row
+                B,                       # height: number of batches
+                3,                       # kind: cudaMemcpyDeviceToDevice
+                stream_ptr,              # stream
             )
 
     def __del__(self):

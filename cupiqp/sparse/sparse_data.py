@@ -1,8 +1,9 @@
 from typing import Any, Optional
 import cupy as cp
+import warp as wp
 from cupyx.scipy.sparse import csr_matrix
 
-from ..data import Data
+from ..data import Data, _to_warp
 from ..typedef import PIQP_INF
 from .batched_csr import BatchedCsrMatrix
 
@@ -29,6 +30,12 @@ def _is_torch_sparse_csr(obj) -> bool:
 class SparseData(Data):
     """Sparse data structure for batched QP problems.
 
+    Two-phase construction (mirrors :class:`DenseData`):
+        ``SparseData(dtype=wp.float64, device="cuda")`` stores config only;
+        ``init(P, c, A, b, G, h_u, h_l, x_u, x_l)`` accepts the user inputs
+        and copies them into fresh warp buffers (dense vectors) plus a
+        :class:`BatchedCsrMatrix` (sparse matrices).
+
     Matrices ``P``, ``A``, ``G`` are stored internally as
     :class:`BatchedCsrMatrix` instances — one shared ``indptr``/``indices``
     pair plus a packed ``(B, nnz)`` values buffer. Callers may pass any of
@@ -40,24 +47,31 @@ class SparseData(Data):
     * ``list[cupy csr_matrix]`` sharing the same sparsity pattern
     * a single cupy ``csr_matrix`` (B = 1)
 
-    Whatever the input, the normalized storage is a ``BatchedCsrMatrix``
-    accessible via ``self.P`` / ``self.A`` / ``self.G``. Dense vectors
-    (``c``, ``b``, ``h_l``, ``h_u``, ``x_l``, ``x_u``) carry a leading
-    batch dimension ``(B, k)``.
+    Dense vectors (``c``, ``b``, ``h_l``, ``h_u``, ``x_l``, ``x_u``) carry
+    a leading batch dimension ``(B, k)`` and are stored as warp arrays.
+    Each must be a GPU-resident array exposing
+    ``__cuda_array_interface__``; CPU inputs are rejected.
     """
 
-    def __init__(
+    def __init__(self, dtype=wp.float64, device: str = "cuda"):
+        super().__init__(dtype=dtype, device=device)
+
+    def init(
         self,
         P: SparseMatrixInput,
-        c: cp.ndarray,
+        c: Any,
         A: Optional[SparseMatrixInput] = None,
-        b: Optional[cp.ndarray] = None,
+        b: Optional[Any] = None,
         G: Optional[SparseMatrixInput] = None,
-        h_u: Optional[cp.ndarray] = None,
-        h_l: Optional[cp.ndarray] = None,
-        x_u: Optional[cp.ndarray] = None,
-        x_l: Optional[cp.ndarray] = None,
+        h_u: Optional[Any] = None,
+        h_l: Optional[Any] = None,
+        x_u: Optional[Any] = None,
+        x_l: Optional[Any] = None,
     ):
+        """Populate storage from user inputs."""
+
+        dtype, device = self._dtype, self._device
+
         # -- P (determines B and n) -------------------------------------
         self._P = self._to_batched_csr(P, "P")
         B = self._P.batch_size
@@ -68,7 +82,7 @@ class SparseData(Data):
         self._n = n
 
         # -- c -----------------------------------------------------------
-        self._c = self._to_batched_vec(c, B, n, "c")
+        self._c = self._to_batched_vec(c, B, n, "c", dtype, device)
 
         # -- A, b --------------------------------------------------------
         if A is not None and b is not None:
@@ -81,10 +95,10 @@ class SparseData(Data):
                 raise ValueError(
                     f"A.cols ({self._A.cols}) != n ({n})"
                 )
-            self._b = self._to_batched_vec(b, B, self._A.rows, "b")
+            self._b = self._to_batched_vec(b, B, self._A.rows, "b", dtype, device)
         else:
             self._A = self._empty_batched_csr(B, 0, n)
-            self._b = cp.zeros((B, 0), dtype=cp.float64)
+            self._b = wp.zeros((B, 0), dtype=dtype, device=device)
 
         # -- G, h_u, h_l ------------------------------------------------
         if G is not None:
@@ -101,12 +115,17 @@ class SparseData(Data):
             self._G = self._empty_batched_csr(B, 0, n)
 
         m = self._G.rows
-        self._h_u = self._to_batched_vec(h_u, B, m, "h_u") if h_u is not None else cp.zeros((B, 0), dtype=cp.float64)
-        self._h_l = self._to_batched_vec(h_l, B, m, "h_l") if h_l is not None else cp.zeros((B, 0), dtype=cp.float64)
-        self._x_u = self._to_batched_vec(x_u, B, n, "x_u") if x_u is not None else cp.zeros((B, 0), dtype=cp.float64)
-        self._x_l = self._to_batched_vec(x_l, B, n, "x_l") if x_l is not None else cp.zeros((B, 0), dtype=cp.float64)
+        self._h_u = (self._to_batched_vec(h_u, B, m, "h_u", dtype, device) if h_u is not None
+                    else wp.zeros((B, 0), dtype=dtype, device=device))
+        self._h_l = (self._to_batched_vec(h_l, B, m, "h_l", dtype, device) if h_l is not None
+                    else wp.zeros((B, 0), dtype=dtype, device=device))
+        self._x_u = (self._to_batched_vec(x_u, B, n, "x_u", dtype, device) if x_u is not None
+                    else wp.zeros((B, 0), dtype=dtype, device=device))
+        self._x_l = (self._to_batched_vec(x_l, B, n, "x_l", dtype, device) if x_l is not None
+                    else wp.zeros((B, 0), dtype=dtype, device=device))
 
         self._finalize()
+        return self
 
     # ------------------------------------------------------------------
     # Properties
@@ -204,21 +223,26 @@ class SparseData(Data):
 
     @staticmethod
     def _to_batched_vec(
-        v: cp.ndarray, B: int, k: int, name: str
-    ) -> cp.ndarray:
-        """Ensure *v* has shape ``(B, k)``."""
-        v = cp.asarray(v, dtype=cp.float64)
+        v: Any, B: int, k: int, name: str, dtype, device: str,
+    ) -> wp.array:
+        """Reshape, broadcast, and copy ``v`` into a fresh ``(B, k)`` warp
+        array. Input must be GPU-resident (CAI-exposing)."""
+        if not hasattr(v, '__cuda_array_interface__'):
+            raise TypeError(
+                f"{name} must be a GPU array exposing __cuda_array_interface__; "
+                f"got {type(v).__name__}."
+            )
+        v = cp.asarray(v)
         if v.ndim == 1:
             v = v.reshape(1, -1)
         if v.shape[0] == 1 and B > 1:
-            # broadcast_to + .copy() already produces an owned buffer.
-            return cp.broadcast_to(v, (B, v.shape[1])).copy()
+            v = cp.broadcast_to(v, (B, v.shape[1]))
         if v.shape[0] != B:
             raise ValueError(
                 f"{name} batch size ({v.shape[0]}) != expected ({B})"
             )
-        # Copy so the solver owns the buffer (preconditioner mutates in place).
-        return v.copy()
+        # _to_warp allocates a fresh warp buffer and copies the source in.
+        return _to_warp(v, copy=True, dtype=dtype, device=device)
 
     # ------------------------------------------------------------------
     # Overrides for batched CSR storage
@@ -234,20 +258,22 @@ class SparseData(Data):
         m = self.m
         if m == 0:
             return
+        h_l_cp = cp.asarray(self._h_l)
+        h_u_cp = cp.asarray(self._h_u)
         # Bound structure is consistent across the batch — check batch 0
-        free = (self._h_l[0] <= -PIQP_INF) & (self._h_u[0] >= PIQP_INF)
+        free = (h_l_cp[0] <= -PIQP_INF) & (h_u_cp[0] >= PIQP_INF)
         if not bool(cp.any(free)):
             return
         # Zero the values for each free row across all batches (sparsity stays).
-        indptr_host = cp.asnumpy(self._G.indptr)
+        indptr_host = cp.asnumpy(cp.asarray(self._G.indptr))
         free_idx = cp.asnumpy(cp.where(free)[0])
-        g_data = self._G.data  # (B, nnz) view
+        g_data = cp.asarray(self._G.data)  # cupy view of (B, nnz) warp buffer
         for i in free_idx:
             start, end = int(indptr_host[i]), int(indptr_host[i + 1])
             if end > start:
                 g_data[:, start:end] = 0.0
-        self._h_l[:, free] = -1.0
-        self._h_u[:, free] = 1.0
+        h_l_cp[:, free] = -1.0
+        h_u_cp[:, free] = 1.0
 
     # ------------------------------------------------------------------
     # In-place setters
@@ -277,38 +303,38 @@ class SparseData(Data):
     def set_P(self, value: SparseMatrixInput, check: bool = True):
         self._set_matrix_values(self._P, value, check, "P")
 
-    def set_c(self, value: cp.ndarray, check: bool = True):
+    def set_c(self, value, check: bool = True):
         if check and value.shape != self._c.shape:
             raise ValueError(f"c shape mismatch: expected {self._c.shape}, got {value.shape}")
-        self._c[:] = value
+        cp.asarray(self._c)[:] = value
 
     def set_A(self, value: SparseMatrixInput, check: bool = True):
         self._set_matrix_values(self._A, value, check, "A")
 
-    def set_b(self, value: cp.ndarray, check: bool = True):
+    def set_b(self, value, check: bool = True):
         if check and value.shape != self._b.shape:
             raise ValueError(f"b shape mismatch: expected {self._b.shape}, got {value.shape}")
-        self._b[:] = value
+        cp.asarray(self._b)[:] = value
 
     def set_G(self, value: SparseMatrixInput, check: bool = True):
         self._set_matrix_values(self._G, value, check, "G")
 
-    def set_h_l(self, value: cp.ndarray, check: bool = True):
+    def set_h_l(self, value, check: bool = True):
         if check and value.shape != self._h_l.shape:
             raise ValueError(f"h_l shape mismatch: expected {self._h_l.shape}, got {value.shape}")
-        self._h_l[:] = value
+        cp.asarray(self._h_l)[:] = value
 
-    def set_h_u(self, value: cp.ndarray, check: bool = True):
+    def set_h_u(self, value, check: bool = True):
         if check and value.shape != self._h_u.shape:
             raise ValueError(f"h_u shape mismatch: expected {self._h_u.shape}, got {value.shape}")
-        self._h_u[:] = value
+        cp.asarray(self._h_u)[:] = value
 
-    def set_x_l(self, value: cp.ndarray, check: bool = True):
+    def set_x_l(self, value, check: bool = True):
         if check and value.shape != self._x_l.shape:
             raise ValueError(f"x_l shape mismatch: expected {self._x_l.shape}, got {value.shape}")
-        self._x_l[:] = value
+        cp.asarray(self._x_l)[:] = value
 
-    def set_x_u(self, value: cp.ndarray, check: bool = True):
+    def set_x_u(self, value, check: bool = True):
         if check and value.shape != self._x_u.shape:
             raise ValueError(f"x_u shape mismatch: expected {self._x_u.shape}, got {value.shape}")
-        self._x_u[:] = value
+        cp.asarray(self._x_u)[:] = value

@@ -13,6 +13,40 @@ module-level ctypes setup; every wrapper function uses a clean name.
 import ctypes
 import ctypes.util
 
+import warp as wp
+
+
+# ---------------------------------------------------------------------------
+# Array-API helpers (accept either cupy.ndarray or warp.array)
+# ---------------------------------------------------------------------------
+def array_ptr(arr) -> int:
+    """Device pointer for cupy (``.data.ptr``) or warp (``.ptr``) arrays."""
+    return arr.data.ptr if hasattr(arr, "data") else arr.ptr
+
+
+def array_itemsize(arr) -> int:
+    """Bytes per element for cupy (``.itemsize``) or warp arrays."""
+    if hasattr(arr, "itemsize"):
+        return arr.itemsize
+    return wp.types.type_size_in_bytes(arr.dtype)
+
+
+def array_is_f_contiguous(arr) -> bool:
+    """True if column-major. Cupy: ``.flags["F_CONTIGUOUS"]``; warp: derive from strides."""
+    if hasattr(arr, "flags"):
+        return arr.flags["F_CONTIGUOUS"]
+    if arr.ndim < 2:
+        return True
+    item = array_itemsize(arr)
+    return arr.strides[0] == item and arr.strides[1] == arr.shape[0] * item
+
+
+def array_is_c_contiguous(arr) -> bool:
+    """True if row-major. Cupy: ``.flags["C_CONTIGUOUS"]``; warp: ``.is_contiguous``."""
+    if hasattr(arr, "flags"):
+        return arr.flags["C_CONTIGUOUS"]
+    return bool(arr.is_contiguous)
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -234,7 +268,7 @@ def dgemv(handle, mat, x, y, transa=False, alpha=1.0, beta=0.0):
         Host scalars baked into the graph node at capture time.
     """
     rows, cols = mat.shape
-    if mat.flags["F_CONTIGUOUS"]:
+    if array_is_f_contiguous(mat):
         m, n, lda = rows, cols, rows
         op = OP_N if not transa else OP_T
     else:
@@ -246,9 +280,9 @@ def dgemv(handle, mat, x, y, transa=False, alpha=1.0, beta=0.0):
 
     _dgemv(
         handle, op, m, n,
-        ctypes.addressof(_alpha), mat.data.ptr, lda,
-        x.data.ptr, 1,
-        ctypes.addressof(_beta), y.data.ptr, 1,
+        ctypes.addressof(_alpha), array_ptr(mat), lda,
+        array_ptr(x), 1,
+        ctypes.addressof(_beta), array_ptr(y), 1,
     )
 
 
@@ -372,10 +406,10 @@ def dgemm_strided_batched(handle, A, B, C,
     ldc_blas = C.shape[2]  # C_cm has cC leading rows
 
     # NOTE: use actual array strides to support non-contiguous views
-    # strides[0] means how many bytes to move to the next axis of this array (here [0] means batch). For double, itemsize is always 8 bytes 
-    strideA_blas = B.strides[0] // B.itemsize
-    strideB_blas = A.strides[0] // A.itemsize
-    strideC_blas = C.strides[0] // C.itemsize
+    # strides[0] means how many bytes to move to the next axis of this array (here [0] means batch). For double, itemsize is always 8 bytes
+    strideA_blas = B.strides[0] // array_itemsize(B)
+    strideB_blas = A.strides[0] // array_itemsize(A)
+    strideC_blas = C.strides[0] // array_itemsize(C)
 
     _alpha = ctypes.c_double(alpha)
     _beta = ctypes.c_double(beta)
@@ -385,10 +419,10 @@ def dgemm_strided_batched(handle, A, B, C,
         op_b_cm, op_a_cm,
         m_blas, n_blas, k_blas,
         ctypes.addressof(_alpha),
-        B.data.ptr, lda_blas, strideA_blas,
-        A.data.ptr, ldb_blas, strideB_blas,
+        array_ptr(B), lda_blas, strideA_blas,
+        array_ptr(A), ldb_blas, strideB_blas,
         ctypes.addressof(_beta),
-        C.data.ptr, ldc_blas, strideC_blas,
+        array_ptr(C), ldc_blas, strideC_blas,
         batch,
     )
 
@@ -416,9 +450,12 @@ def dgemv_strided_batched(handle, mat, x, y,
     alpha, beta : float
         Host scalars.
     """
+    import cupy as cp
     batch = mat.shape[0]
-    x3 = x.reshape(batch, x.shape[1], 1)
-    y3 = y.reshape(batch, y.shape[1], 1)
+    # Wrap with cp.asarray to accept warp arrays and to handle reshape of
+    # non-contiguous slice views (warp arrays disallow it; cupy supports it).
+    x3 = cp.asarray(x).reshape((batch, x.shape[1], 1))
+    y3 = cp.asarray(y).reshape((batch, y.shape[1], 1))
     dgemm_strided_batched(handle, mat, x3, y3,
                           transa=transa, alpha=alpha, beta=beta)
 

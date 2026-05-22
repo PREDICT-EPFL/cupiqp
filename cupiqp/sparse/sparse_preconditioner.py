@@ -96,8 +96,8 @@ class SparseRuizEquilibration(RuizEquilibration):
         gamma = cp.maximum(gamma, c_norm)
         gamma = cp.clip(gamma, self.min_scaling, self.max_scaling)
         gamma = 1.0 / gamma                                             # (B,)
-        data.P.data[:] *= gamma[:, None]
-        data.c[:] *= gamma[:, None]
+        cp.asarray(data.P.data)[:] *= gamma[:, None]
+        cp.asarray(data.c)[:] *= gamma[:, None]
         self._cost_scaling *= gamma
 
     # ------------------------------------------------------------------
@@ -118,15 +118,15 @@ class SparseRuizEquilibration(RuizEquilibration):
         out.fill(0.0)
         if M.nnz == 0 or M.rows == 0:
             return
-        row_idx = self._row_indices_from_indptr(M.indptr, M.nnz)
-        cp.maximum.at(out, (slice(None), row_idx), cp.abs(M.data))
+        row_idx = self._row_indices_from_indptr(cp.asarray(M.indptr), M.nnz)
+        cp.maximum.at(out, (slice(None), row_idx), cp.abs(cp.asarray(M.data)))
 
     def _batched_col_inf_norms(self, M: BatchedCsrMatrix, out: cp.ndarray):
         """Column inf-norms: out[b, c] = max_i |M[b, i, c]|. out shape: (B, cols)."""
         out.fill(0.0)
         if M.nnz == 0 or M.cols == 0:
             return
-        cp.maximum.at(out, (slice(None), M.indices), cp.abs(M.data))
+        cp.maximum.at(out, (slice(None), cp.asarray(M.indices)), cp.abs(cp.asarray(M.data)))
 
     def _batched_utri_symmetric_col_inf_norms(self, P: BatchedCsrMatrix) -> cp.ndarray:
         """For a symmetric P stored as upper triangle only, per-batch column

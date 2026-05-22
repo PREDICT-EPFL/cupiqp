@@ -25,6 +25,8 @@ class SparseKKTSolver(KKTSolverBase):
         super().__init__()
         B = data.batch_size
         self._batch_size = B
+        self._device = data._device
+        self._dtype = data._dtype
         n, p, m = data.n, data.p, data.m
 
         # -- Build KKT structure from the first problem's sparsity ------
@@ -42,6 +44,8 @@ class SparseKKTSolver(KKTSolverBase):
             indices=kkt_template.indices,
             indptr=kkt_template.indptr,
             data=init_data,
+            dtype=self._dtype,
+            device=self._device,
         )
 
         # -- Diagonal indices (shared — same structure) -----------------
@@ -73,7 +77,7 @@ class SparseKKTSolver(KKTSolverBase):
         P0_rows, P0_cols = csr_row_indices(P0), P0.indices
         self._indices_of_Pdata_containing_nonzero_diag_entry = cp.where(P0_rows == P0_cols)[0]
         self._cols_of_P_containing_nonzero_diag_entry = P0.indices[self._indices_of_Pdata_containing_nonzero_diag_entry]
-        self._P_diag = cp.zeros((B, n), dtype=cp.float64)
+        self._P_diag = wp.zeros((B, n), dtype=self._dtype, device=self._device)
         self._refresh_P_diag_buffer(data._P)
 
         # -- Block-to-KKT index maps (shared) --------------------------
@@ -117,7 +121,7 @@ class SparseKKTSolver(KKTSolverBase):
             raise RuntimeError("Sparse direct solver planning failed.")
 
     def _refresh_P_diag_buffer(self, P: BatchedCsrMatrix):
-        self._P_diag[:, self._cols_of_P_containing_nonzero_diag_entry] = P.data[:, self._indices_of_Pdata_containing_nonzero_diag_entry]
+        cp.asarray(self._P_diag)[:, self._cols_of_P_containing_nonzero_diag_entry] = cp.asarray(P.data)[:, self._indices_of_Pdata_containing_nonzero_diag_entry]
 
     def __del__(self):
         solver = getattr(self, "_lin_sys_solver", None)
@@ -166,12 +170,13 @@ class SparseKKTSolver(KKTSolverBase):
 
     def _scatter_P_A_G(self, data: SparseData, update_P: bool, update_A: bool, update_G: bool) -> None:
         """Vectorized scatter of P / A / G values into the (B, kkt_nnz) buffer."""
+        kkt_data_cp = cp.asarray(self._kkt_mats.data)
         if update_P:
-            self._kkt_mats.data[:, self._P_indices] = data._P.data
+            kkt_data_cp[:, self._P_indices] = cp.asarray(data._P.data)
         if update_A:
-            self._kkt_mats.data[:, self._A_indices] = data._A.data
+            kkt_data_cp[:, self._A_indices] = cp.asarray(data._A.data)
         if update_G:
-            self._kkt_mats.data[:, self._G_indices] = data._G.data
+            kkt_data_cp[:, self._G_indices] = cp.asarray(data._G.data)
 
     def update_data(self, data: SparseData, update_P: bool, update_A: bool, update_G: bool) -> None:
         """Update the sparse KKT matrices when P, A, or G values change.
@@ -210,6 +215,14 @@ class SparseKKTSolver(KKTSolverBase):
 
         `rhs_*` and `delta_*` should have shape (B, *) where B is the batch size.
         """
+        # Accept warp arrays via __cuda_array_interface__; keeps .data.ptr / .strides usable.
+        rhs_x = cp.asarray(rhs_x)
+        rhs_y = cp.asarray(rhs_y)
+        rhs_z = cp.asarray(rhs_z)
+        delta_x = cp.asarray(delta_x)
+        delta_y = cp.asarray(delta_y)
+        delta_z = cp.asarray(delta_z)
+
         stream_ptr = cp.cuda.get_current_stream().ptr
         n, p, m = data.n, data.p, data.m
         B = self._batch_size

@@ -40,9 +40,8 @@ class MultistageData(Data):
         x_u: Optional[BlockVec] = None,
         x_l: Optional[BlockVec] = None,
     ):
-        # NOTE: we intentionally do NOT call super().__init__() — base ``Data``
-        # is abstract; we build the (B, k) flat views ourselves and then call
-        # ``self._finalize()`` to share the base preprocessing.
+        # Initialize dtype/device on the base so _init_h_l/u/x_l/u find them.
+        super().__init__()
 
         B = P.batch_size
         block_size = P.block_size
