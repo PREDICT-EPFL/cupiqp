@@ -11,6 +11,18 @@ class Data(ABC):
     For single-problem inputs, ``B = 1``.
     """
 
+    def __init__(self, dtype=cp.float64, device: str = "cuda"):
+        self._dtype = dtype
+        self._device = device
+
+    @property
+    def dtype(self):
+        return self._dtype
+
+    @property
+    def device(self) -> str:
+        return self._device
+
     @abstractmethod
     def _disable_inf_constraints(self):
         """Zero out G rows where both h_l and h_u are infinite."""
@@ -88,7 +100,7 @@ class Data(ABC):
         else:
             self._idx_hl = cp.empty((0,), dtype=cp.int32)
             if self._h_l.shape[-1] == 0:
-                self._h_l = -2 * PIQP_INF * cp.ones((B, m), dtype=cp.float64)
+                self._h_l = -2 * PIQP_INF * cp.ones((B, m), dtype=self._dtype)
 
     def _init_h_u(self):
         B, m = self._batch_size, self.m
@@ -99,7 +111,7 @@ class Data(ABC):
         else:
             self._idx_hu = cp.empty((0,), dtype=cp.int32)
             if self._h_u.shape[-1] == 0:
-                self._h_u = 2 * PIQP_INF * cp.ones((B, m), dtype=cp.float64)
+                self._h_u = 2 * PIQP_INF * cp.ones((B, m), dtype=self._dtype)
 
     def _init_x_l(self):
         n = self._n
@@ -109,7 +121,7 @@ class Data(ABC):
             self._idx_xl = cp.where(mask0)[0].astype(cp.int32)
         else:
             self._idx_xl = cp.empty((0,), dtype=cp.int32)
-            self._x_l = -2 * PIQP_INF * cp.ones((self._batch_size, n), dtype=cp.float64)
+            self._x_l = -2 * PIQP_INF * cp.ones((self._batch_size, n), dtype=self._dtype)
 
     def _init_x_u(self):
         n = self._n
@@ -119,7 +131,7 @@ class Data(ABC):
             self._idx_xu = cp.where(mask0)[0].astype(cp.int32)
         else:
             self._idx_xu = cp.empty((0,), dtype=cp.int32)
-            self._x_u = 2 * PIQP_INF * cp.ones((self._batch_size, n), dtype=cp.float64)
+            self._x_u = 2 * PIQP_INF * cp.ones((self._batch_size, n), dtype=self._dtype)
 
     @staticmethod
     def _validate_bound_consistency(bounds: cp.ndarray, threshold: float,

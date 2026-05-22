@@ -13,11 +13,13 @@ class BatchedCsrMatrix:
         indptr: Sequence[int],
         data: cp.ndarray,
         shape: Optional[Tuple[int, int]] = None,
+        dtype=cp.float64,
     ):
         if not batch_size > 0:
             raise ValueError("batch_size must be a positive integer.")
 
-        data_cp = cp.asarray(data, dtype=cp.float64)
+        self._dtype = dtype
+        data_cp = cp.asarray(data, dtype=dtype)
         try:
             if shape is None:
                 self._template_matrix = csr_matrix((data_cp[0], indices, indptr))
@@ -39,7 +41,7 @@ class BatchedCsrMatrix:
             raise ValueError(
                 f"data must have shape ({batch_size}, {self._nnz}), got {data_cp.shape}."
             )
-        self.data = cp.empty((batch_size, self._nnz), dtype=cp.float64)
+        self.data = cp.empty((batch_size, self._nnz), dtype=dtype)
         self.data[:] = data_cp
 
     # TODO: consider not allocate self.data but directly point to the provided data. Also, change update_data() as a setter to point to new data
@@ -50,7 +52,7 @@ class BatchedCsrMatrix:
         Copies element-wise into ``self.data`` — preserves the buffer's
         device pointer, so any cuSPARSE descriptor built on it stays valid.
         """
-        new_data_cp = cp.asarray(new_data, dtype=cp.float64)
+        new_data_cp = cp.asarray(new_data, dtype=self._dtype)
         if new_data_cp.shape != (self._batch_size, self._nnz):
             raise ValueError(
                 f"new_data must have shape ({self._batch_size}, {self._nnz}); "
@@ -59,7 +61,7 @@ class BatchedCsrMatrix:
         self.data[:] = new_data_cp
 
     @classmethod
-    def from_torch_sparse_csr_tensor(cls, tensor) -> "BatchedCsrMatrix":
+    def from_torch_sparse_csr_tensor(cls, tensor, dtype=cp.float64) -> "BatchedCsrMatrix":
         """Build a ``BatchedCsrMatrix`` from a batched torch ``sparse_csr_tensor``.
 
         ``tensor`` must be 3-D with shape ``(B, M, N)``, in ``torch.sparse_csr``
@@ -101,7 +103,7 @@ class BatchedCsrMatrix:
         indices = cp.from_dlpack(col[0].contiguous()).astype(cp.int32, copy=False)
         data = cp.from_dlpack(values.contiguous())
 
-        return cls(batch_size=B, indices=indices, indptr=indptr, data=data)
+        return cls(batch_size=B, indices=indices, indptr=indptr, data=data, dtype=dtype)
 
     @property
     def batch_size(self) -> int: return self._batch_size

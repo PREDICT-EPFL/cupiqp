@@ -27,11 +27,11 @@ class SparseRuizEquilibration(RuizEquilibration):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._sparse_scale_matrices_kernel = create_sparse_scale_matrices_kernel(self.n, self.p, self.m)
+        self._sparse_scale_matrices_kernel = create_sparse_scale_matrices_kernel(self.n, self.p, self.m, dtype=self._dtype)
         self._sparse_compute_row_inf_norm_kernel, self._sparse_compute_col_inf_norm_kernel = \
-            create_sparse_compute_kkt_norms_kernel(self.n, self.p, self.m)
+            create_sparse_compute_kkt_norms_kernel(self.n, self.p, self.m, dtype=self._dtype)
 
-        self._ones = cp.ones(self.B, dtype=cp.float64)
+        self._ones = cp.ones(self.B, dtype=self._dtype)
 
     # ------------------------------------------------------------------
     # 3-hook backend API

@@ -1,7 +1,9 @@
 import warp as wp
+from ..utils import to_warp_dtype
 
 
 def create_block_tridiag_diaad_kernel(block_size: int, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     """``diag(A[b]) += x[b]`` for each batch b. A is block-tridiagonal.
 
     Launch with ``dim=(B, num_blocks * block_size)``.
@@ -21,6 +23,7 @@ def create_block_tridiag_diaad_kernel(block_size: int, dtype=wp.float64):
 
 
 def create_block_tridiag_gead_kernel(num_blocks: int, block_size: int, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     """``B[b] += alpha[b] * A[b]`` for each batch b. Both A and B are block-tridiag.
 
     ``alpha`` is a per-batch scaling array of shape ``(B,)``.
@@ -45,6 +48,7 @@ def create_block_tridiag_gead_kernel(num_blocks: int, block_size: int, dtype=wp.
 
 
 def create_block_bidiag_gemv_n_kernel(num_blocks: int, rows_of_blocks: int, cols_of_blocks: int, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     """``y[b] = alpha * A[b] * x[b] + beta * y[b]``, A block lower bidiagonal.
 
     A has N+1 block rows, N block columns.
@@ -67,7 +71,7 @@ def create_block_bidiag_gemv_n_kernel(num_blocks: int, rows_of_blocks: int, cols
         if block_row > N:
             return
 
-        acc = wp.float64(0.0)
+        acc = dtype(0.0)
 
         if block_row < N:
             for j in range(c):
@@ -84,6 +88,7 @@ def create_block_bidiag_gemv_n_kernel(num_blocks: int, rows_of_blocks: int, cols
 
 
 def create_block_bidiag_gemv_t_kernel(num_blocks: int, rows_of_blocks: int, cols_of_blocks: int, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     """``z[b] = alpha * A[b]^T * y[b] + beta * z[b]``, A block lower bidiagonal.
 
     A^T has N block rows (cols of A), N+1 block columns (rows of A).
@@ -106,7 +111,7 @@ def create_block_bidiag_gemv_t_kernel(num_blocks: int, rows_of_blocks: int, cols
         if k >= N:
             return
 
-        acc = wp.float64(0.0)
+        acc = dtype(0.0)
 
         # D_k^T * y[k]
         for p in range(r):
@@ -123,6 +128,7 @@ def create_block_bidiag_gemv_t_kernel(num_blocks: int, rows_of_blocks: int, cols
 
 
 def create_block_tridiag_gemv_kernel(num_blocks: int, block_size: int, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     """``z[b] = alpha * P[b] * x[b] + beta * z[b]``, P symmetric block-tridiagonal.
 
     Launch with ``dim=(B, num_blocks, block_size)``.
@@ -143,7 +149,7 @@ def create_block_tridiag_gemv_kernel(num_blocks: int, block_size: int, dtype=wp.
         if k >= N:
             return
 
-        acc = wp.float64(0.0)
+        acc = dtype(0.0)
 
         # P_D[k] * x[k]
         for j in range(d):
@@ -186,7 +192,8 @@ class DenseBlocks:
         return new
 
 
-def create_block_syrk_kernel(num_blocks: int, rows_of_blocks: int, cols_of_blocks: int):
+def create_block_syrk_kernel(num_blocks: int, rows_of_blocks: int, cols_of_blocks: int, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     """Batched block-tridiagonal SYRK: ``C[b] = alpha * A[b]^T A[b] + beta * C[b]``.
 
     A is block lower bidiagonal::
@@ -206,19 +213,19 @@ def create_block_syrk_kernel(num_blocks: int, rows_of_blocks: int, cols_of_block
     """
     @wp.kernel
     def block_syrk_kernel(
-        alpha: wp.float64,
-        A_D: wp.array4d(dtype=wp.float64),        # type: ignore   (B, N, r, c)
-        A_E: wp.array4d(dtype=wp.float64),        # type: ignore   (B, N, r, c)
-        beta: wp.float64,
-        C_D: wp.array4d(dtype=wp.float64),        # type: ignore   (B, N, c, c)
-        C_E: wp.array4d(dtype=wp.float64),        # type: ignore   (B, N-1, c, c)
+        alpha: dtype,
+        A_D: wp.array4d(dtype=dtype),        # type: ignore   (B, N, r, c)
+        A_E: wp.array4d(dtype=dtype),        # type: ignore   (B, N, r, c)
+        beta: dtype,
+        C_D: wp.array4d(dtype=dtype),        # type: ignore   (B, N, c, c)
+        C_E: wp.array4d(dtype=dtype),        # type: ignore   (B, N-1, c, c)
     ):
         b, k, i, j = wp.tid()
         N = wp.static(num_blocks)
         r = wp.static(rows_of_blocks)
 
         # Diagonal: alpha*(D^T D + E^T E)
-        acc_diag = wp.float64(0.0)
+        acc_diag = dtype(0.0)
         for p in range(r):
             acc_diag += A_D[b, k, p, i] * A_D[b, k, p, j]
             acc_diag += A_E[b, k, p, i] * A_E[b, k, p, j]
@@ -226,7 +233,7 @@ def create_block_syrk_kernel(num_blocks: int, rows_of_blocks: int, cols_of_block
 
         # Lower off-diagonal: alpha * D_{k+1}^T E_k
         if k < N - 1:
-            acc_off = wp.float64(0.0)
+            acc_off = dtype(0.0)
             for p in range(r):
                 acc_off += A_D[b, k + 1, p, i] * A_E[b, k, p, j]
             C_E[b, k, i, j] = alpha * acc_off + beta * C_E[b, k, i, j]
@@ -234,7 +241,8 @@ def create_block_syrk_kernel(num_blocks: int, rows_of_blocks: int, cols_of_block
     return block_syrk_kernel
 
 
-def create_weighted_block_syrk_kernel(num_blocks: int, rows_of_blocks: int, cols_of_blocks: int):
+def create_weighted_block_syrk_kernel(num_blocks: int, rows_of_blocks: int, cols_of_blocks: int, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
     """Batched weighted block SYRK: ``C[b] = alpha * A[b]^T diag(w[b]) A[b] + beta * C[b]``.
 
     Same block-bidiagonal structure as ``create_block_syrk_kernel``, but each
@@ -244,19 +252,19 @@ def create_weighted_block_syrk_kernel(num_blocks: int, rows_of_blocks: int, cols
     """
     @wp.kernel
     def weighted_block_syrk_kernel(
-        alpha: wp.float64,
-        A_D: wp.array4d(dtype=wp.float64),        # type: ignore   (B, N, r, c)
-        A_E: wp.array4d(dtype=wp.float64),        # type: ignore   (B, N, r, c)
-        w: wp.array2d(dtype=wp.float64),          # type: ignore   (B, (N+1)*r)
-        beta: wp.float64,
-        C_D: wp.array4d(dtype=wp.float64),        # type: ignore   (B, N, c, c)
-        C_E: wp.array4d(dtype=wp.float64),        # type: ignore   (B, N-1, c, c)
+        alpha: dtype,
+        A_D: wp.array4d(dtype=dtype),        # type: ignore   (B, N, r, c)
+        A_E: wp.array4d(dtype=dtype),        # type: ignore   (B, N, r, c)
+        w: wp.array2d(dtype=dtype),          # type: ignore   (B, (N+1)*r)
+        beta: dtype,
+        C_D: wp.array4d(dtype=dtype),        # type: ignore   (B, N, c, c)
+        C_E: wp.array4d(dtype=dtype),        # type: ignore   (B, N-1, c, c)
     ):
         b, k, i, j = wp.tid()
         N = wp.static(num_blocks)
         r = wp.static(rows_of_blocks)
 
-        acc_diag = wp.float64(0.0)
+        acc_diag = dtype(0.0)
         for p in range(r):
             w_dk = w[b, k * r + p]
             w_ek = w[b, (k + 1) * r + p]
@@ -265,7 +273,7 @@ def create_weighted_block_syrk_kernel(num_blocks: int, rows_of_blocks: int, cols
         C_D[b, k, i, j] = alpha * acc_diag + beta * C_D[b, k, i, j]
 
         if k < N - 1:
-            acc_off = wp.float64(0.0)
+            acc_off = dtype(0.0)
             for p in range(r):
                 w_kp1 = w[b, (k + 1) * r + p]
                 acc_off += w_kp1 * A_D[b, k + 1, p, i] * A_E[b, k, p, j]

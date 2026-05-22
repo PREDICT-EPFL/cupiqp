@@ -94,30 +94,31 @@ class SolverBase(ABC):
         self._prox_vars.init(self._data)
 
         self._kkt_system.init(self._data, self.settings)
-        self._info_host = InfoHost(B)
+        self._info_host = InfoHost(B, dtype=self._data.dtype)
 
-        self._work_z_1 = cp.empty((data.batch_size, data.m))  # used to store intermediate results in _update_residuals_nr
-        self._work_z_2 = cp.empty((data.batch_size, data.m))  # used to store intermediate results in _update_residuals_nr
+        self._dtype = self._data.dtype
+        self._work_z_1 = cp.empty((data.batch_size, data.m), dtype=self._dtype)  # used to store intermediate results in _update_residuals_nr
+        self._work_z_2 = cp.empty((data.batch_size, data.m), dtype=self._dtype)  # used to store intermediate results in _update_residuals_nr
 
-        self._work_z = cp.empty((data.batch_size, data.num_ineq))  # used in _calculate_step to hold all concatenated slack or dual steps / results
-        self._work_s = cp.empty((data.batch_size, data.num_ineq))  # used in _calculate_step to hold all concatenated slack or dual steps / results
-        self._work_primals = cp.empty((data.batch_size, data.n))
-        self._work_duals = cp.empty((data.batch_size, data.p + data.num_ineq))  # used to hold the concatenated dual variables for computing the residuals in _update_residuals_nr
-        self._work_residual = cp.empty((data.batch_size, ))
-        self._work_reduce = cp.empty((data.batch_size, 8))  # used to hold the intermediate results of the reductions related to s_l, s_u, s_bl, s_bu and z_l, z_u, z_bl, z_bu
-        
+        self._work_z = cp.empty((data.batch_size, data.num_ineq), dtype=self._dtype)  # used in _calculate_step to hold all concatenated slack or dual steps / results
+        self._work_s = cp.empty((data.batch_size, data.num_ineq), dtype=self._dtype)  # used in _calculate_step to hold all concatenated slack or dual steps / results
+        self._work_primals = cp.empty((data.batch_size, data.n), dtype=self._dtype)
+        self._work_duals = cp.empty((data.batch_size, data.p + data.num_ineq), dtype=self._dtype)  # used to hold the concatenated dual variables for computing the residuals in _update_residuals_nr
+        self._work_residual = cp.empty((data.batch_size, ), dtype=self._dtype)
+        self._work_reduce = cp.empty((data.batch_size, 8), dtype=self._dtype)  # used to hold the intermediate results of the reductions related to s_l, s_u, s_bl, s_bu and z_l, z_u, z_bl, z_bu
+
         self._init_warp_kernels()
 
-        self._work_x = cp.empty((B, self._data.n), dtype=cp.float64)
+        self._work_x = cp.empty((B, self._data.n), dtype=self._dtype)
 
-        self._tau_device = cp.empty(1, dtype=cp.float64)
+        self._tau_device = cp.empty(1, dtype=self._dtype)
         self._tau_device[0] = self.settings.tau  # device copy used by warp kernels
         self._tau_host = float(self.settings.tau)  # host cache -- only H2D when tau actually changes
 
         # Pre-allocated (B,) buffers for CUDA-graph-safe norm computations in _update_residuals_nr / _update_residuals_r
-        self._work_primal_rel_norm = cp.empty(B, dtype=cp.float64)  # running max of primal relative norm terms
-        self._work_dual_res_norm = cp.empty(B, dtype=cp.float64)    # running max of dual residual norm terms
-        self._work_norm_temp = cp.empty(B, dtype=cp.float64)        # temp (B,) for individual norm results
+        self._work_primal_rel_norm = cp.empty(B, dtype=self._dtype)  # running max of primal relative norm terms
+        self._work_dual_res_norm = cp.empty(B, dtype=self._dtype)    # running max of dual residual norm terms
+        self._work_norm_temp = cp.empty(B, dtype=self._dtype)        # temp (B,) for individual norm results
 
         # Working variables for implicit differentiation
         self._work_grad_rhs = Variables()
@@ -138,19 +139,19 @@ class SolverBase(ABC):
         # Full-layout scatter buffers feeding the matrix and vector
         # gradient assemblies. ineq groups live in length-m; bound
         # groups live in length-n.
-        self._lam_zu_full  = cp.empty((B, data.m), dtype=cp.float64)
-        self._lam_zl_full  = cp.empty((B, data.m), dtype=cp.float64)
-        self._lam_zbu_full = cp.empty((B, data.n), dtype=cp.float64)
-        self._lam_zbl_full = cp.empty((B, data.n), dtype=cp.float64)
-        self._zu_full      = cp.empty((B, data.m), dtype=cp.float64)
-        self._zl_full      = cp.empty((B, data.m), dtype=cp.float64)
+        self._lam_zu_full  = cp.empty((B, data.m), dtype=self._dtype)
+        self._lam_zl_full  = cp.empty((B, data.m), dtype=self._dtype)
+        self._lam_zbu_full = cp.empty((B, data.n), dtype=self._dtype)
+        self._lam_zbl_full = cp.empty((B, data.n), dtype=self._dtype)
+        self._zu_full      = cp.empty((B, data.m), dtype=self._dtype)
+        self._zl_full      = cp.empty((B, data.m), dtype=self._dtype)
 
         self._enable_iterative_refinement = self.settings.iterative_refinement_always_enabled
 
         # Unscaled-RHS inf-norm. When preconditioner_iter == 0 the stored
         # factors are identity, so this reduces to the inf-norm of the user-
         # space b / h_l/u / x_l/u — same answer, single code path.
-        self._constraints_rhs_inf_norm_unscaled = cp.zeros(B, dtype=cp.float64)
+        self._constraints_rhs_inf_norm_unscaled = cp.zeros(B, dtype=self._dtype)
         self._preconditioner.compute_constraints_rhs_inf_norm_unscaled(
             self._data, self._constraints_rhs_inf_norm_unscaled,
         )
@@ -569,38 +570,45 @@ class SolverBase(ABC):
             self._boundary_shift_kernel = create_boundary_shift_kernel(
                 self._data.num_hl, self._data.num_hu,
                 self._data.num_xl, self._data.num_xu,
-            )
-            self._prepare_predictor_step_kernel = create_prepare_predictor_step_kernel()
-            self._prepare_corrector_step_kernel = create_prepare_corrector_step_kernel()
+                dtype=self._data.dtype
+                )
+            self._prepare_predictor_step_kernel = create_prepare_predictor_step_kernel(dtype=self._data.dtype)
+            self._prepare_corrector_step_kernel = create_prepare_corrector_step_kernel(dtype=self._data.dtype)
             self._update_vars_after_corrector_step_kernel = create_update_vars_after_corrector_step_kernel(
                 n_primal=self._data.n + self._data.num_ineq, n_dual=self._data.p + self._data.num_ineq,
-            )
+                dtype=self._data.dtype
+                )
 
         # Tile-based kernels
         self._update_residuals_r_kernel = create_update_residuals_r_kernel(
             self._data.n, self._data.p,
             int(self._data.num_hu), int(self._data.num_hl),
             int(self._data.num_xu), int(self._data.num_xl),
-        )
+            dtype=self._data.dtype
+            )
         self._prepare_zu_minus_zl_and_zbu_minus_zbl_kernel = create_prepare_zu_minus_zl_and_zbu_minus_zbl_kernel(
             self._data.m, self._data.n,
-        )
+            dtype=self._data.dtype
+            )
         self._update_residual_nr_kernel = create_update_residual_nr_kernel(
             self._data.n, self._data.p, self._data.m,
             self._data.num_hl, self._data.num_hu, self._data.num_xl, self._data.num_xu,
-        )
+            dtype=self._data.dtype
+            )
         if self._data.num_ineq > 0:
-            self._calculate_sigma_kernel = create_calculate_sigma_kernel(self._data.num_ineq)
-            self._calculate_step_kernel = create_calculate_step_kernel(self._data.num_ineq)
-            self._calculate_mu_kernel = create_calculate_mu_kernel(self._data.num_ineq)
+            self._calculate_sigma_kernel = create_calculate_sigma_kernel(self._data.num_ineq, dtype=self._data.dtype)
+            self._calculate_step_kernel = create_calculate_step_kernel(self._data.num_ineq, dtype=self._data.dtype)
+            self._calculate_mu_kernel = create_calculate_mu_kernel(self._data.num_ineq, dtype=self._data.dtype)
             self._update_rho_delta_with_ineq_kernel = create_update_rho_delta_with_ineq_kernel(
                 self._data.n, self._data.p + self._data.num_ineq,
-            )
+                dtype=self._data.dtype
+                )
         else:
-            self._run_full_newton_step_kernel = create_run_full_newton_step_kernel(self._data.n, self._data.p)
+            self._run_full_newton_step_kernel = create_run_full_newton_step_kernel(self._data.n, self._data.p, dtype=self._data.dtype)
             self._update_rho_delta_without_ineq_kernel = create_update_rho_delta_without_ineq_kernel(
                 self._data.n, self._data.p,
-            )
+                dtype=self._data.dtype
+                )
 
         # Adjoint/backward-pass kernels
         if self.settings.enable_grad:
@@ -609,20 +617,15 @@ class SolverBase(ABC):
             nxu, nxl = self._data.num_xu, self._data.num_xl
             precond_on = self.settings.preconditioner_iter > 0
             self._backward_assemble_rhs_kernel = create_backward_assemble_rhs_kernel(
-                n, p, nhu, nhl, nxu, nxl, precond_on,
-            )
+                n, p, nhu, nhl, nxu, nxl, precond_on, dtype=self._data.dtype)
             self._backward_unscale_lhs_kernel = create_backward_unscale_lhs_kernel(
-                n, p, nhu, nhl, nxu, nxl, precond_on,
-            )
+                n, p, nhu, nhl, nxu, nxl, precond_on, dtype=self._data.dtype)
             self._backward_compute_vector_grad_kernel = create_backward_compute_vector_grad_kernel(
-                n, p, nhu, nhl, nxu, nxl,
-            )
+                n, p, nhu, nhl, nxu, nxl, dtype=self._data.dtype)
             self._backward_pack_full_layout_kernel = create_backward_pack_full_layout_kernel(
-                self._data.m, n,
-            )
+                self._data.m, n, dtype=self._data.dtype)
             self._backward_copy_kernel = create_backward_copy_kernel(
-                n, p, nhu, nhl, nxu, nxl,
-            )
+                n, p, nhu, nhl, nxu, nxl, dtype=self._data.dtype)
 
     @nvtx.annotate("Solver::_run_full_newton_step")
     def _run_full_newton_step(self):

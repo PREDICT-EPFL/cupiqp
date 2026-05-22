@@ -35,11 +35,9 @@ class MultistageRuizEquilibration(RuizEquilibration):
         self._N, self._d, self._rows_A, self._rows_G = N, d, rows_A, rows_G
 
         self._multistage_scale_matrices_kernel = create_multistage_scale_matrices_kernel(
-            N, d, rows_A, rows_G,
-        )
+            N, d, rows_A, rows_G, dtype=self._dtype)
         self._multistage_compute_kkt_norms_kernel = create_multistage_compute_kkt_norms_kernel(
-            N, d, rows_A, rows_G,
-        )
+            N, d, rows_A, rows_G, dtype=self._dtype)
 
 
         self._dummy_4d = wp.zeros((self.B, 1, 1, 1), dtype=wp.float64, device='cuda')
@@ -51,7 +49,7 @@ class MultistageRuizEquilibration(RuizEquilibration):
         self._G_E = data.G.E if self.m > 0 else self._dummy_4d
         self._c = data.c
 
-        self._ones = cp.ones(self.B, dtype=cp.float64)
+        self._ones = cp.ones(self.B, dtype=self._dtype)
 
     # ------------------------------------------------------------------
     # 3-hook backend API

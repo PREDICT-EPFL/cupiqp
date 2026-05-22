@@ -149,8 +149,14 @@ class SingleSparseMatVecProduct:
             else cusparse.CUSPARSE_OPERATION_NON_TRANSPOSE
         )
 
-        # ---- data type ----
-        self._compute_type = rt.CUDA_R_64F
+        # ---- data type — pick to match the matrix's element dtype ----
+        mat_dtype = self._mat.dtype
+        if mat_dtype == cp.float32:
+            self._compute_type = rt.CUDA_R_32F
+            self._np_dtype = cp.float32
+        else:
+            self._compute_type = rt.CUDA_R_64F
+            self._np_dtype = cp.float64
 
         # ---- sparse matrix descriptor (reuses mat's existing device memory) ----
         self._mat_desc = self._create_mat_desc(self._mat, self._compute_type)
@@ -161,15 +167,17 @@ class SingleSparseMatVecProduct:
         else:
             x_size, y_size = self._mat.shape[1], self._mat.shape[0]
 
-        dummy_x = cp.empty(x_size, dtype=cp.float64)
-        dummy_y = cp.empty(y_size, dtype=cp.float64)
+        dummy_x = cp.empty(x_size, dtype=self._np_dtype)
+        dummy_y = cp.empty(y_size, dtype=self._np_dtype)
         self._x_desc = cusparse.createDnVec(x_size, dummy_x.data.ptr, self._compute_type)
         self._y_desc = cusparse.createDnVec(y_size, dummy_y.data.ptr, self._compute_type)
 
         # ---- workspace buffer (allocated once; size is independent of scalars) ----
         self._alg = cusparse.CUSPARSE_MV_ALG_DEFAULT
-        _alpha_placeholder = ctypes.c_double(1.0)
-        _beta_placeholder = ctypes.c_double(0.0)
+        # Alpha/beta scalar type must match compute_type (32F → float, 64F → double).
+        self._c_scalar = ctypes.c_float if self._np_dtype == cp.float32 else ctypes.c_double
+        _alpha_placeholder = self._c_scalar(1.0)
+        _beta_placeholder = self._c_scalar(0.0)
         buf_size = cusparse.spMV_bufferSize(
             self._cusparse_handle,
             self._op,
@@ -243,8 +251,8 @@ class SingleSparseMatVecProduct:
             stream_ptr = cp.cuda.get_current_stream().ptr
         _cusparse_lib.cusparseSetStream(self._cusparse_handle, stream_ptr)
 
-        _alpha = ctypes.c_double(alpha)
-        _beta = ctypes.c_double(beta)
+        _alpha = self._c_scalar(alpha)
+        _beta = self._c_scalar(beta)
         _cusparse_lib.cusparseDnVecSetValues(self._x_desc, x.data.ptr)
         _cusparse_lib.cusparseDnVecSetValues(self._y_desc, y.data.ptr)
         
@@ -372,7 +380,16 @@ class BatchedSparseMatVecProduct:
 
         # ---- cuSPARSE setup ------------------------------------------
         self._cusparse_handle = _create_cusparse_handle()
-        self._compute_type = rt.CUDA_R_64F
+        # data type — pick to match the matrix's element dtype.
+        mat_dtype = self._block_diag_mat.dtype
+        if mat_dtype == cp.float32:
+            self._compute_type = rt.CUDA_R_32F
+            self._np_dtype = cp.float32
+            self._c_scalar = ctypes.c_float
+        else:
+            self._compute_type = rt.CUDA_R_64F
+            self._np_dtype = cp.float64
+            self._c_scalar = ctypes.c_double
         self._op = (
             cusparse.CUSPARSE_OPERATION_TRANSPOSE
             if self._transa
@@ -393,14 +410,14 @@ class BatchedSparseMatVecProduct:
         # non-contiguous (B, k) views (e.g. column slices of a wider buffer).
         x_size = B * self._x_vec_len
         y_size = B * self._y_vec_len
-        self._x_buf = cp.empty(x_size, dtype=cp.float64)
-        self._y_buf = cp.empty(y_size, dtype=cp.float64)
+        self._x_buf = cp.empty(x_size, dtype=self._np_dtype)
+        self._y_buf = cp.empty(y_size, dtype=self._np_dtype)
         self._x_desc = cusparse.createDnVec(x_size, self._x_buf.data.ptr, self._compute_type)
         self._y_desc = cusparse.createDnVec(y_size, self._y_buf.data.ptr, self._compute_type)
 
         # Workspace size is independent of the alpha/beta scalars.
-        _alpha_placeholder = ctypes.c_double(1.0)
-        _beta_placeholder = ctypes.c_double(0.0)
+        _alpha_placeholder = self._c_scalar(1.0)
+        _beta_placeholder = self._c_scalar(0.0)
         buf_size = cusparse.spMV_bufferSize(
             self._cusparse_handle,
             self._op,
@@ -435,12 +452,12 @@ class BatchedSparseMatVecProduct:
             stream_ptr = cp.cuda.get_current_stream().ptr
         _cusparse_lib.cusparseSetStream(self._cusparse_handle, stream_ptr)
 
-        _alpha = ctypes.c_double(alpha)
-        _beta = ctypes.c_double(beta)
+        _alpha = self._c_scalar(alpha)
+        _beta = self._c_scalar(beta)
 
         B = self._batch_size
         xk, yk = self._x_vec_len, self._y_vec_len
-        itemsize = 8  # float64
+        itemsize = self._x_buf.itemsize  # 4 for f32, 8 for f64
         x_contig = x.flags['C_CONTIGUOUS']
         y_contig = y.flags['C_CONTIGUOUS']
 

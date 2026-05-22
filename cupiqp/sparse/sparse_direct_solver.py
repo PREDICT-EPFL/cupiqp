@@ -61,8 +61,10 @@ class SparseDirectSolver(ABC):
         # for in-place factorization and solves. Callers may update the
         # values in place between solves but must not reallocate the
         # underlying buffer (e.g. swap BatchedCsrMatrix.data for a new array).
-        self._rhs = cp.empty((self._batch_size, self._dim), dtype=cp.float64)
-        self._sol = cp.empty((self._batch_size, self._dim), dtype=cp.float64)
+        # rhs/sol must match the matrix dtype — cuDSS rejects a dtype mismatch.
+        dtype = matrix.data.dtype
+        self._rhs = cp.empty((self._batch_size, self._dim), dtype=dtype)
+        self._sol = cp.empty((self._batch_size, self._dim), dtype=dtype)
 
     @nvtx.annotate("SparseDirectSolver::plan")
     @abstractmethod
@@ -174,7 +176,7 @@ class CudssSparseDirectSolver(SparseDirectSolver):
         if batch_size == 1:
             cudss_bindings.matrix_set_values(self._cudss_x, self._sol.data.ptr)
         else:
-            row_bytes = self._dim * 8
+            row_bytes = self._dim * self._sol.itemsize
             ptrs = np.array([self._sol.data.ptr + i * row_bytes
                              for i in range(batch_size)], dtype=np.uint64)
             self._sol_ptrs_dev = cp.array(ptrs)  # prevent GC — descriptor holds this pointer

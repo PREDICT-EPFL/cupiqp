@@ -150,7 +150,9 @@ class SparseSolver(SolverBase):
         _check_dense_vector("h_l", h_l)
         _check_dense_vector("x_u", x_u)
         _check_dense_vector("x_l", x_l)
-        return SparseData(P, c, A, b, G, h_u, h_l, x_u, x_l)
+        data = SparseData(dtype=self.settings.dtype, device=self.settings.device)
+        data.init(P, c, A, b, G, h_u, h_l, x_u, x_l)
+        return data
 
     def _init_preconditioner(self):
         return SparseRuizEquilibration(
@@ -158,6 +160,7 @@ class SparseSolver(SolverBase):
             self._data.idx_xl, self._data.idx_xu,
             self._data.idx_hl, self._data.idx_hu,
             use_warp_tile_kernels=True,
+            dtype=self._data.dtype,
         )
 
     def setup(self, P, c, A=None, b=None, G=None,
@@ -168,10 +171,11 @@ class SparseSolver(SolverBase):
         if self.settings.enable_grad:
             d = self._data
             B = d.batch_size
+            dtype = d.dtype
 
-            # Row indices for each nnz position (CSR-to-COO). All
-            # row/col index arrays are cast to int32 to match the
-            # warp kernel's index type (consistent with idx_hu etc.).
+            # Row indices for each nnz position (CSR-to-COO). All row/col
+            # index arrays are cast to int32 to match the warp kernel's
+            # index type (consistent with idx_hu etc.).
             P_csr = d._P
             nnz_P = int(P_csr.nnz)
             self._p_rows = (cp.searchsorted(
@@ -179,7 +183,7 @@ class SparseSolver(SolverBase):
                 cp.arange(nnz_P, dtype=P_csr.indptr.dtype),
                 side="right",
             ) - 1).astype(cp.int32)
-            p_indices_for_kernel = P_csr.indices.astype(cp.int32)
+            self._p_indices_arr = P_csr.indices.astype(cp.int32)
 
             if d.p > 0:
                 A_csr = d._A
@@ -189,11 +193,11 @@ class SparseSolver(SolverBase):
                     cp.arange(nnz_A, dtype=A_csr.indptr.dtype),
                     side="right",
                 ) - 1).astype(cp.int32)
-                a_indices_for_kernel = A_csr.indices.astype(cp.int32)
+                self._a_indices_arr = A_csr.indices.astype(cp.int32)
             else:
                 nnz_A = 0
                 self._a_rows = cp.empty(0, dtype=cp.int32)
-                a_indices_for_kernel = cp.empty(0, dtype=cp.int32)
+                self._a_indices_arr = cp.empty(0, dtype=cp.int32)
 
             if d.m > 0:
                 G_csr = d._G
@@ -203,51 +207,70 @@ class SparseSolver(SolverBase):
                     cp.arange(nnz_G, dtype=G_csr.indptr.dtype),
                     side="right",
                 ) - 1).astype(cp.int32)
-                g_indices_for_kernel = G_csr.indices.astype(cp.int32)
+                self._g_indices_arr = G_csr.indices.astype(cp.int32)
             else:
                 nnz_G = 0
                 self._g_rows = cp.empty(0, dtype=cp.int32)
-                g_indices_for_kernel = cp.empty(0, dtype=cp.int32)
-
-            # Stash kernel-input arrays so _compute_data_gradients can
-            # find them without recomputing per call.
-            self._p_indices_arr = p_indices_for_kernel
-            self._a_indices_arr = a_indices_for_kernel
-            self._g_indices_arr = g_indices_for_kernel
+                self._g_indices_arr = cp.empty(0, dtype=cp.int32)
 
             # Eager-compile the fused sparse data-gradients kernel.
             self._sparse_data_gradients_kernel = create_sparse_data_gradients_kernel(
-                nnz_P, nnz_A, nnz_G, d.p, d.m, d.n,
-            )
+                nnz_P, nnz_A, nnz_G, d.p, d.m, d.n, dtype=dtype)
 
-            # Pre-allocate output buffers. Shape-zero rows are valid
-            # cupy arrays; the kernel's corresponding dispatch range
-            # collapses to 0 threads.
-            self._dP_values_buf = cp.empty((B, nnz_P), dtype=cp.float64)
-            self._dA_values_buf = cp.empty((B, nnz_A), dtype=cp.float64)
-            self._dG_values_buf = cp.empty((B, nnz_G), dtype=cp.float64)
-            self._db_buf        = cp.empty((B, d.p),  dtype=cp.float64)
-            self._dh_u_buf      = cp.empty((B, d.m),  dtype=cp.float64)
-            self._dx_u_buf      = cp.empty((B, d.n),  dtype=cp.float64)
+            # Pre-allocate the gradient SparseData. The matrix
+            # BatchedCsrMatrix views share the forward sparsity (same
+            # indices/indptr); their values buffers become the kernel-
+            # output targets. Vector grads (c, h_l, x_l) are filled via
+            # slice-assign in :meth:`_compute_data_gradients`.
+            P_grad_csr = BatchedCsrMatrix(
+                B, P_csr.indices, P_csr.indptr, cp.zeros((B, nnz_P), dtype=dtype),
+                shape=(P_csr.rows, P_csr.cols), dtype=dtype,
+            )
+            A_grad_csr = (BatchedCsrMatrix(
+                B, A_csr.indices, A_csr.indptr, cp.zeros((B, nnz_A), dtype=dtype),
+                shape=(A_csr.rows, A_csr.cols), dtype=dtype,
+            ) if d.p > 0 else None)
+            G_grad_csr = (BatchedCsrMatrix(
+                B, G_csr.indices, G_csr.indptr, cp.zeros((B, nnz_G), dtype=dtype),
+                shape=(G_csr.rows, G_csr.cols), dtype=dtype,
+            ) if d.m > 0 else None)
+            self._grad_data = SparseData(dtype=dtype, device=self.settings.device)
+            self._grad_data.init(
+                P=P_grad_csr,
+                c=cp.zeros((B, d.n), dtype=dtype),
+                A=A_grad_csr,
+                b=cp.zeros((B, d.p), dtype=dtype) if d.p > 0 else None,
+                G=G_grad_csr,
+                h_u=cp.zeros((B, d.m), dtype=dtype) if d.num_hu > 0 else None,
+                h_l=cp.zeros((B, d.m), dtype=dtype) if d.num_hl > 0 else None,
+                x_u=cp.zeros((B, d.n), dtype=dtype) if d.num_xu > 0 else None,
+                x_l=cp.zeros((B, d.n), dtype=dtype) if d.num_xl > 0 else None,
+            )
+            # Kernel value-buffer inputs. SparseData._A / _G are always
+            # allocated (empty BatchedCsr placeholders when the
+            # corresponding block is absent), so their ``.data`` is always
+            # a (B, nnz_*) array matching the compiled kernel signature.
+            self._grad_P_values = self._grad_data._P.data
+            self._grad_A_values = self._grad_data._A.data
+            self._grad_G_values = self._grad_data._G.data
 
     def _compute_data_gradients(self, adjoint_vector: Variables) -> SparseData:
-        r"""Build a :class:`SparseData` populated with user-space
-        gradients on the same sparsity pattern as the original
-        problem matrices, via a single fused warp launch.
+        r"""Populate ``self._grad_data`` in place and return it.
 
-        Matrix gradients are gathered directly at each structural
-        nonzero (``O(B · nnz)``) rather than materialising the full
-        outer product. ``dP, dA, dG, db, dh_u, dx_u`` are written to
-        pre-allocated buffers (see :meth:`setup`); ``dc, dh_l, dx_l``
-        are direct aliases of ``sol_adj.x``, ``self._lam_zl_full``,
-        ``self._lam_zbl_full``. All inputs are user-space.
+        Matrix gradients are gathered directly at each structural nonzero
+        (``O(B · nnz)``) rather than materialising the full outer product
+        — written into ``self._grad_data._P/_A/_G.data``. Vector grads
+        ``c``, ``h_l``, ``x_l`` are copies of ``adjoint_vector.x``,
+        ``self._lam_zl_full``, ``self._lam_zbl_full``.
+
+        Returns the same instance on every call; its buffers are
+        overwritten by the next backward.
         """
         data = self._data
-        B    = data.batch_size
+        grad_data = self._grad_data
+        B = data.batch_size
         total = (
-            self._dP_values_buf.shape[1]
-            + self._dA_values_buf.shape[1]
-            + self._dG_values_buf.shape[1]
+            grad_data._P.nnz + grad_data._A.nnz + grad_data._G.nnz
             + data.p + data.m + data.n
         )
         if total > 0:
@@ -263,48 +286,17 @@ class SparseSolver(SolverBase):
                     self._p_rows, self._p_indices_arr,
                     self._a_rows, self._a_indices_arr,
                     self._g_rows, self._g_indices_arr,
-                    self._dP_values_buf, self._dA_values_buf, self._dG_values_buf,
-                    self._db_buf, self._dh_u_buf, self._dx_u_buf,
+                    self._grad_P_values, self._grad_A_values, self._grad_G_values,
+                    grad_data._b, grad_data._h_u, grad_data._x_u,
                 ],
                 device="cuda",
                 stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
             )
 
-        # Wrap the matrix-grad value buffers in BatchedCsrMatrix on
-        # the original sparsity patterns. Vector grads are aliases or
-        # the negated buffers written by the kernel.
-        P_csr = data._P
-        dP = BatchedCsrMatrix(
-            B, P_csr.indices, P_csr.indptr, self._dP_values_buf,
-            shape=(P_csr.rows, P_csr.cols),
-        )
-        if data.p > 0:
-            A_csr = data._A
-            dA = BatchedCsrMatrix(
-                B, A_csr.indices, A_csr.indptr, self._dA_values_buf,
-                shape=(A_csr.rows, A_csr.cols),
-            )
-        else:
-            dA = None
-        if data.m > 0:
-            G_csr = data._G
-            dG = BatchedCsrMatrix(
-                B, G_csr.indices, G_csr.indptr, self._dG_values_buf,
-                shape=(G_csr.rows, G_csr.cols),
-            )
-        else:
-            dG = None
+        grad_data._c[:] = adjoint_vector.x
+        if data.num_hl > 0:
+            grad_data._h_l[:] = self._lam_zl_full
+        if data.num_xl > 0:
+            grad_data._x_l[:] = self._lam_zbl_full
 
-        dc   = adjoint_vector.x
-        db   = self._db_buf         if data.p      > 0 else None
-        dh_u = self._dh_u_buf       if data.num_hu > 0 else None
-        dh_l = self._lam_zl_full    if data.num_hl > 0 else None
-        dx_u = self._dx_u_buf       if data.num_xu > 0 else None
-        dx_l = self._lam_zbl_full   if data.num_xl > 0 else None
-
-        return SparseData(
-            P=dP, c=dc,
-            A=dA, b=db,
-            G=dG, h_u=dh_u, h_l=dh_l,
-            x_u=dx_u, x_l=dx_l,
-        )
+        return grad_data

@@ -30,32 +30,33 @@ class DenseKKTSolver(KKTSolverBase):
         n, p, m = data.n, data.p, data.m
         B = data.batch_size
         self._batch_size = B
+        self._dtype = data.dtype
 
         # Pre-allocated workspace — all (B, ...) shapes
-        self._delta = cp.empty(B, dtype=cp.float64)
-        self._delta_inv = cp.empty(B, dtype=cp.float64)
-        self._z_reg_inv = cp.empty((B, m), dtype=cp.float64) if m > 0 else cp.empty((B, 0), dtype=cp.float64)
-        self._z_reg_inv_sqrt = cp.empty((B, m), dtype=cp.float64) if m > 0 else cp.empty((B, 0), dtype=cp.float64)
-        self._kkt_mat = cp.empty((B, n, n), dtype=cp.float64)
-        self._AtA = cp.empty((B, n, n), dtype=cp.float64) if p > 0 else cp.zeros((B, 0, 0), dtype=cp.float64)
-        self._G_scaled = cp.empty((B, m, n), dtype=cp.float64) if m > 0 else cp.zeros((B, 0, 0), dtype=cp.float64)
-        self._work_n_AT = cp.empty((B, n), dtype=cp.float64) if p > 0 else cp.empty((B, 0), dtype=cp.float64)
-        self._work_n_GT = cp.empty((B, n), dtype=cp.float64) if m > 0 else cp.empty((B, 0), dtype=cp.float64)
+        self._delta = cp.empty(B, dtype=self._dtype)
+        self._delta_inv = cp.empty(B, dtype=self._dtype)
+        self._z_reg_inv = cp.empty((B, m), dtype=self._dtype) if m > 0 else cp.empty((B, 0), dtype=self._dtype)
+        self._z_reg_inv_sqrt = cp.empty((B, m), dtype=self._dtype) if m > 0 else cp.empty((B, 0), dtype=self._dtype)
+        self._kkt_mat = cp.empty((B, n, n), dtype=self._dtype)
+        self._AtA = cp.empty((B, n, n), dtype=self._dtype) if p > 0 else cp.zeros((B, 0, 0), dtype=self._dtype)
+        self._G_scaled = cp.empty((B, m, n), dtype=self._dtype) if m > 0 else cp.zeros((B, 0, 0), dtype=self._dtype)
+        self._work_n_AT = cp.empty((B, n), dtype=self._dtype) if p > 0 else cp.empty((B, 0), dtype=self._dtype)
+        self._work_n_GT = cp.empty((B, n), dtype=self._dtype) if m > 0 else cp.empty((B, 0), dtype=self._dtype)
 
-        self._update_kkt_kernel, self._update_kkt_kernel_launch_dim = create_update_kkt_kernel(n, p, m)
-        self._solve_pre_cholesky_kernel = create_solve_pre_cholesky_kernel(p, m)
-        self._solve_post_cholesky_kernel = create_solve_post_cholesky_kernel(p, m)
+        self._update_kkt_kernel, self._update_kkt_kernel_launch_dim = create_update_kkt_kernel(n, p, m, dtype=self._dtype)
+        self._solve_pre_cholesky_kernel = create_solve_pre_cholesky_kernel(p, m, dtype=self._dtype)
+        self._solve_post_cholesky_kernel = create_solve_post_cholesky_kernel(p, m, dtype=self._dtype)
 
         self._cublas_handle = cublas_create_handle()
 
         if B > 1:
-            self._cholesky_solver = BatchedCholeskyInplaceSolver(n, B, cp.float64)
+            self._cholesky_solver = BatchedCholeskyInplaceSolver(n, B, dtype=self._dtype)
             self._gemv = lambda handle, mat, x, y, transa, alpha, beta: \
                 dgemv_strided_batched(handle, mat, x, y, transa=transa, alpha=alpha, beta=beta)
             self._syrk = lambda handle, A, C, alpha, beta: dgemm_strided_batched(
                 handle, A, A, C, transa=True, transb=False, alpha=alpha, beta=beta)
         else:
-            self._cholesky_solver = CholeskyInplaceSolver(n, cp.float64)
+            self._cholesky_solver = CholeskyInplaceSolver(n, dtype=self._dtype)
             self._gemv = lambda handle, mat, x, y, transa=False, alpha=1.0, beta=0.0: \
                 dgemv(handle, mat[0], x[0], y[0], transa=transa, alpha=alpha, beta=beta)
             # dsyrk exploits symmetry; A is (1, k, n), C is (1, n, n)

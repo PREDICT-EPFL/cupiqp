@@ -72,24 +72,26 @@ class KKTSystem:
         self._batch_size = data.batch_size
         B = self._batch_size
         n, p, m = data.n, data.p, data.m
+        self._dtype = data.dtype
+        self._device = data.device
 
         # Per-problem regularization
-        self._rho = cp.empty(B, dtype=cp.float64)
-        self._delta = cp.empty(B, dtype=cp.float64)
-        self._x_reg = cp.empty((B, n), dtype=cp.float64)
-        self._z_reg = cp.empty((B, m), dtype=cp.float64)
+        self._rho = cp.empty(B, dtype=self._dtype)
+        self._delta = cp.empty(B, dtype=self._dtype)
+        self._x_reg = cp.empty((B, n), dtype=self._dtype)
+        self._z_reg = cp.empty((B, m), dtype=self._dtype)
 
         # used to store the rhs of the condensed KKT system (per problem)
-        # K_condensed * [dx; dy; dz] = [rhs_x_bar; rhs_y_bar; rhs_z_bar], 
+        # K_condensed * [dx; dy; dz] = [rhs_x_bar; rhs_y_bar; rhs_z_bar],
         # where K_condensed is the condensed KKT matrix after eliminating duals of inequalities and box constraints and all slacks.
         # Since eliminating slacks and duals does not change rhs_y, we only need to store rhs_x_bar and rhs_z_bar.
 
-        self._rhs_x_bar = cp.empty((B, n), dtype=cp.float64)
-        self._rhs_z_bar = cp.empty((B, m), dtype=cp.float64) if m > 0 else cp.empty((B, 0), dtype=cp.float64)
+        self._rhs_x_bar = cp.empty((B, n), dtype=self._dtype)
+        self._rhs_z_bar = cp.empty((B, m), dtype=self._dtype) if m > 0 else cp.empty((B, 0), dtype=self._dtype)
 
         # Work buffers
-        self._work_x = cp.empty((B, n), dtype=cp.float64)
-        self._work_z = cp.empty((B, m), dtype=cp.float64) if m > 0 else cp.empty((B, 0), dtype=cp.float64)
+        self._work_x = cp.empty((B, n), dtype=self._dtype)
+        self._work_z = cp.empty((B, m), dtype=self._dtype) if m > 0 else cp.empty((B, 0), dtype=self._dtype)
 
         # KKT solver backend
         if settings.kkt_solver == "dense_cholesky":
@@ -108,66 +110,66 @@ class KKTSystem:
         num_ineq = data.num_hl + data.num_hu + data.num_xl + data.num_xu
         hl, hu, xl, xu = data.num_hl, data.num_hu, data.num_xl, data.num_xu
         # Store slack values at current iteration
-        self._m_s_all = cp.zeros((B, num_ineq), dtype=cp.float64)
+        self._m_s_all = cp.zeros((B, num_ineq), dtype=self._dtype)
         self._m_s_l = self._m_s_all[:, :hl]
         self._m_s_u = self._m_s_all[:, hl:hl+hu]
         self._m_s_bl = self._m_s_all[:, hl+hu:hl+hu+xl]
         self._m_s_bu = self._m_s_all[:, hl+hu+xl:hl+hu+xl+xu]
 
         # Store 1/z values at current iteration
-        self._m_z_inv_all = cp.zeros((B, num_ineq), dtype=cp.float64)
+        self._m_z_inv_all = cp.zeros((B, num_ineq), dtype=self._dtype)
         self._m_z_l_inv = self._m_z_inv_all[:, :hl]
         self._m_z_u_inv = self._m_z_inv_all[:, hl:hl+hu]
         self._m_z_bl_inv = self._m_z_inv_all[:, hl+hu:hl+hu+xl]
         self._m_z_bu_inv = self._m_z_inv_all[:, hl+hu+xl:hl+hu+xl+xu]
 
         # Store 1/(s/z + delta) used in factor and solve
-        self._w_delta_inv_all = cp.zeros((B, num_ineq), dtype=cp.float64)
+        self._w_delta_inv_all = cp.zeros((B, num_ineq), dtype=self._dtype)
         self._w_l_delta_inv = self._w_delta_inv_all[:, :hl]
         self._w_u_delta_inv = self._w_delta_inv_all[:, hl:hl+hu]
         self._w_bl_delta_inv = self._w_delta_inv_all[:, hl+hu:hl+hu+xl]
         self._w_bu_delta_inv = self._w_delta_inv_all[:, hl+hu+xl:hl+hu+xl+xu]
 
         # Updated rhs after eliminating slacks
-        self._updated_rhs_z_all = cp.zeros((B, num_ineq), dtype=cp.float64)
+        self._updated_rhs_z_all = cp.zeros((B, num_ineq), dtype=self._dtype)
         self._updated_rhs_z_l = self._updated_rhs_z_all[:, :hl]
         self._updated_rhs_z_u = self._updated_rhs_z_all[:, hl:hl+hu]
         self._updated_rhs_z_bl = self._updated_rhs_z_all[:, hl+hu:hl+hu+xl]
         self._updated_rhs_z_bu = self._updated_rhs_z_all[:, hl+hu+xl:hl+hu+xl+xu]
 
         # Pre-allocated buffers for condensed KKT iterative refinement
-        self._iter_refine_error_xyz = cp.zeros((B, n + p + m), dtype=cp.float64)
-        self._iter_refine_delta_xyz = cp.zeros((B, n + p + m), dtype=cp.float64)
+        self._iter_refine_error_xyz = cp.zeros((B, n + p + m), dtype=self._dtype)
+        self._iter_refine_delta_xyz = cp.zeros((B, n + p + m), dtype=self._dtype)
 
         # Create Warp kernels
-        self._update_regulerization_step_1_kernel = create_update_regularizations_step_1_kernel()
-        self._update_regulerization_step_2_kernel = create_update_regularizations_step_2_kernel(n, m)
-        self._eliminate_slacks_kernel = create_eliminate_slacks_kernel()
-        self._eliminate_slacks_transposed_kernel = create_eliminate_slacks_transposed_kernel()
-        self._eliminate_duals_kernel = create_eliminate_duals_kernel(n, m)
-        self._recover_duals_kernel = create_recover_duals_kernel(data.num_hu, data.num_hl, data.num_xu, data.num_xl)
-        self._recover_slacks_kernel = create_recover_slacks_kernel()
-        self._recover_slacks_transposed_kernel = create_recover_slacks_transposed_kernel()
+        self._update_regulerization_step_1_kernel = create_update_regularizations_step_1_kernel(dtype=self._dtype)
+        self._update_regulerization_step_2_kernel = create_update_regularizations_step_2_kernel(n, m, dtype=self._dtype)
+        self._eliminate_slacks_kernel = create_eliminate_slacks_kernel(dtype=self._dtype)
+        self._eliminate_slacks_transposed_kernel = create_eliminate_slacks_transposed_kernel(dtype=self._dtype)
+        self._eliminate_duals_kernel = create_eliminate_duals_kernel(n, m, dtype=self._dtype)
+        self._recover_duals_kernel = create_recover_duals_kernel(data.num_hu, data.num_hl, data.num_xu, data.num_xl, dtype=self._dtype)
+        self._recover_slacks_kernel = create_recover_slacks_kernel(dtype=self._dtype)
+        self._recover_slacks_transposed_kernel = create_recover_slacks_transposed_kernel(dtype=self._dtype)
 
         # Precompute inverse index maps for gather-pattern kernels.
         # inv_idx_xu[j] = i such that idx_xu[i] == j, or -1 if variable j has no upper bound.
-        _build_inv_idx_kernel = create_build_inverse_index_kernel()
-        self._inv_idx_xu = wp.full(n, value=-1, dtype=wp.int32, device="cuda")
-        self._inv_idx_xl = wp.full(n, value=-1, dtype=wp.int32, device="cuda")
-        self._inv_idx_hu = wp.full(m, value=-1, dtype=wp.int32, device="cuda") if m > 0 else wp.zeros(0, dtype=wp.int32, device="cuda")
-        self._inv_idx_hl = wp.full(m, value=-1, dtype=wp.int32, device="cuda") if m > 0 else wp.zeros(0, dtype=wp.int32, device="cuda")
+        _build_inv_idx_kernel = create_build_inverse_index_kernel(dtype=self._dtype)
+        self._inv_idx_xu = wp.full(n, value=-1, dtype=wp.int32, device=self._device)
+        self._inv_idx_xl = wp.full(n, value=-1, dtype=wp.int32, device=self._device)
+        self._inv_idx_hu = wp.full(m, value=-1, dtype=wp.int32, device=self._device) if m > 0 else wp.zeros(0, dtype=wp.int32, device=self._device)
+        self._inv_idx_hl = wp.full(m, value=-1, dtype=wp.int32, device=self._device) if m > 0 else wp.zeros(0, dtype=wp.int32, device=self._device)
         if data.num_xu > 0:
             wp.launch(_build_inv_idx_kernel, dim=data.num_xu,
-                      inputs=[data.idx_xu, self._inv_idx_xu], device="cuda")
+                      inputs=[data.idx_xu, self._inv_idx_xu], device=self._device)
         if data.num_xl > 0:
             wp.launch(_build_inv_idx_kernel, dim=data.num_xl,
-                      inputs=[data.idx_xl, self._inv_idx_xl], device="cuda")
+                      inputs=[data.idx_xl, self._inv_idx_xl], device=self._device)
         if data.num_hu > 0:
             wp.launch(_build_inv_idx_kernel, dim=data.num_hu,
-                      inputs=[data.idx_hu, self._inv_idx_hu], device="cuda")
+                      inputs=[data.idx_hu, self._inv_idx_hu], device=self._device)
         if data.num_hl > 0:
             wp.launch(_build_inv_idx_kernel, dim=data.num_hl,
-                      inputs=[data.idx_hl, self._inv_idx_hl], device="cuda")
+                      inputs=[data.idx_hl, self._inv_idx_hl], device=self._device)
 
     @property
     def batch_size(self) -> int:
@@ -208,7 +210,7 @@ class KKTSystem:
                 inputs=[vars.s_all, vars.z_all,
                         self._m_s_all, self._m_z_inv_all, self._w_delta_inv_all,
                         delta],
-                device="cuda",
+                device=self._device,
                 stream=wp_stream,
             )
             wp.launch(
@@ -228,7 +230,7 @@ class KKTSystem:
                     self._w_l_delta_inv,
                     self._z_reg,
                 ],
-                device="cuda",
+                device=self._device,
                 stream=wp_stream,
             )
         else:
@@ -323,7 +325,7 @@ class KKTSystem:
                 dim=(B, data.num_ineq),
                 inputs=[rhs.z_all, rhs.s_all, self._m_s_all, self._m_z_inv_all,
                         self._updated_rhs_z_all],
-                device="cuda",
+                device=self._device,
                 stream=wp_stream,
             )
         else:
@@ -332,7 +334,7 @@ class KKTSystem:
                 kernel=self._eliminate_slacks_kernel,
                 dim=(B, data.num_ineq),
                 inputs=[rhs.z_all, rhs.s_all, self._m_z_inv_all, self._updated_rhs_z_all],
-                device="cuda",
+                device=self._device,
                 stream=wp_stream,
             )
 
@@ -352,7 +354,7 @@ class KKTSystem:
                 self._z_reg,
                 self._rhs_z_bar,
             ],
-            device="cuda",
+            device=self._device,
             stream=wp_stream,
         )
 
@@ -411,7 +413,7 @@ class KKTSystem:
                     data.idx_xu, self._w_bu_delta_inv, self._m_z_bu_inv, rhs.z_bu, rhs.s_bu, lhs.z_bu,
                     data.idx_xl, self._w_bl_delta_inv, self._m_z_bl_inv, rhs.z_bl, rhs.s_bl, lhs.z_bl,
                     preconditioner.x_b_scaling],
-                device="cuda",
+                device=self._device,
                 stream=wp_stream,
             )
             if transpose:
@@ -420,7 +422,7 @@ class KKTSystem:
                     kernel=self._recover_slacks_transposed_kernel,
                     dim=(B, data.num_ineq),
                     inputs=[rhs.s_all, lhs.z_all, self._m_z_inv_all, lhs.s_all],
-                    device="cuda",
+                    device=self._device,
                     stream=wp_stream,
                 )
             else:
@@ -429,7 +431,7 @@ class KKTSystem:
                     kernel=self._recover_slacks_kernel,
                     dim=(B, data.num_ineq),
                     inputs=[rhs.s_all, lhs.z_all, self._m_s_all, self._m_z_inv_all, lhs.s_all],
-                    device="cuda",
+                    device=self._device,
                     stream=wp_stream,
                 )
 

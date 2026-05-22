@@ -39,9 +39,10 @@ class Variables:
         self.num_ineq = data.num_hl + data.num_hu + data.num_xl + data.num_xu
 
         B = self._batch_size
+        dtype = data.dtype
 
         # Primal buffer: [x | s_l | s_u | s_bl | s_bu]
-        self._primal_buffer = cp.empty((B, data.n + self.num_ineq), dtype=cp.float64)
+        self._primal_buffer = cp.empty((B, data.n + self.num_ineq), dtype=dtype)
         offset = 0
         self._x = self._primal_buffer[:, offset : offset+data.n]
         self._s_all = self._primal_buffer[:, data.n:]
@@ -55,7 +56,7 @@ class Variables:
         self._s_bu = self._primal_buffer[:, offset : offset+data.num_xu]
 
         # Dual buffer: [y | z_l | z_u | z_bl | z_bu]
-        self._dual_buffer = cp.empty((B, data.p + self.num_ineq), dtype=cp.float64)
+        self._dual_buffer = cp.empty((B, data.p + self.num_ineq), dtype=dtype)
         offset = 0
         self._y = self._dual_buffer[:, offset : offset+data.p]
         self._z_all = self._dual_buffer[:, data.p:]
@@ -259,8 +260,8 @@ class Info:
         self.no_primal_update = cp.zeros(batch_size, dtype=cp.int32)
         self.no_dual_update = cp.zeros(batch_size, dtype=cp.int32)
 
-    def init(self):
-        self._buffer = cp.zeros((self._batch_size, len(InfoIdx)), dtype=cp.float64)
+    def init(self, dtype=cp.float64):
+        self._buffer = cp.zeros((self._batch_size, len(InfoIdx)), dtype=dtype)
 
     @property
     def status(self) -> List[Status]:
@@ -290,9 +291,9 @@ class InfoHost:
         locals()[_idx.name] = property(lambda self, i=_idx: self._buffer[:, i])
     del _idx
 
-    def __init__(self, batch_size: int = 1):
+    def __init__(self, batch_size: int = 1, dtype=np.float64):
         self._batch_size = batch_size
-        self._buffer = np.empty((batch_size, len(InfoIdx)), dtype=np.float64)
+        self._buffer = np.empty((batch_size, len(InfoIdx)), dtype=dtype)
         self.no_primal_update = np.zeros(batch_size, dtype=np.int32)
         self.no_dual_update = np.zeros(batch_size, dtype=np.int32)
 
@@ -308,4 +309,4 @@ class Result(Variables):
         assert data.batch_size == self.info.batch_size, \
             f"batch_size mismatch: Result({self.info.batch_size}) vs data({data.batch_size})"
         super().init(data)
-        self.info.init()
+        self.info.init(dtype=data.dtype)

@@ -36,16 +36,20 @@ class DenseData(Data):
     Inputs are normalized via ``_to_cupy`` — see its docstring for the zero-
     copy paths and the CPU-tensor error behavior.
     """
-    def __init__(self,
-                 P: DenseInput,
-                 c: DenseInput,
-                 A: Optional[DenseInput] = None,
-                 b: Optional[DenseInput] = None,
-                 G: Optional[DenseInput] = None,
-                 h_u: Optional[DenseInput] = None,
-                 h_l: Optional[DenseInput] = None,
-                 x_u: Optional[DenseInput] = None,
-                 x_l: Optional[DenseInput] = None):
+    def __init__(self, dtype=cp.float64, device: str = "cuda"):
+        super().__init__(dtype=dtype, device=device)
+
+    def init(self,
+             P: DenseInput,
+             c: DenseInput,
+             A: Optional[DenseInput] = None,
+             b: Optional[DenseInput] = None,
+             G: Optional[DenseInput] = None,
+             h_u: Optional[DenseInput] = None,
+             h_l: Optional[DenseInput] = None,
+             x_u: Optional[DenseInput] = None,
+             x_l: Optional[DenseInput] = None):
+        """Allocate and populate buffers from user inputs. Returns self for chaining."""
 
         # --- validate and store P, c ---
         P = _ensure_3d(cp.asarray(P))
@@ -65,8 +69,8 @@ class DenseData(Data):
         self._batch_size = B
         self._n = n
 
-        self._P = P.astype(cp.float64, copy=True)
-        self._c = c.astype(cp.float64, copy=True)
+        self._P = P.astype(self._dtype, copy=True)
+        self._c = c.astype(self._dtype, copy=True)
 
         # --- equality constraints ---
         if A is not None and b is not None:
@@ -82,11 +86,11 @@ class DenseData(Data):
                 raise ValueError("Row mismatch between A and b.")
             if A.shape[2] != n:
                 raise ValueError("Column mismatch between A and P.")
-            self._A = A.astype(cp.float64, copy=True)
-            self._b = b.astype(cp.float64, copy=True)
+            self._A = A.astype(self._dtype, copy=True)
+            self._b = b.astype(self._dtype, copy=True)
         else:
-            self._A = cp.zeros((B, 0, n), dtype=cp.float64)
-            self._b = cp.zeros((B, 0), dtype=cp.float64)
+            self._A = cp.zeros((B, 0, n), dtype=self._dtype)
+            self._b = cp.zeros((B, 0), dtype=self._dtype)
 
         # --- inequality constraints ---
         if G is not None:
@@ -106,11 +110,11 @@ class DenseData(Data):
                 h_u = _ensure_2d(cp.asarray(h_u))
                 if h_u.shape != (B, m):
                     raise ValueError(f"h_u must have shape ({B}, {m}), got {h_u.shape}")
-            self._G = G.astype(cp.float64, copy=True)
+            self._G = G.astype(self._dtype, copy=True)
         else:
             if h_u is not None or h_l is not None:
                 raise ValueError("h_l and h_u must be None when G is None.")
-            self._G = cp.zeros((B, 0, n), dtype=cp.float64)
+            self._G = cp.zeros((B, 0, n), dtype=self._dtype)
 
         self._h_u = self._as_batched_vec(h_u)
         self._h_l = self._as_batched_vec(h_l)
@@ -130,8 +134,8 @@ class DenseData(Data):
 
     def _as_batched_vec(self, v: Optional[cp.ndarray]) -> cp.ndarray:
         if v is not None:
-            return v.astype(cp.float64, copy=True)
-        return cp.zeros((self._batch_size, 0), dtype=cp.float64)
+            return v.astype(self._dtype, copy=True)
+        return cp.zeros((self._batch_size, 0), dtype=self._dtype)
 
     def _disable_inf_constraints(self):
         """Zero out G rows where both h_l and h_u are infinite (fully free)."""

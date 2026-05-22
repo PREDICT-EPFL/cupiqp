@@ -204,12 +204,14 @@ class RuizEquilibration(PreconditionerBase):
                  max_scaling: float = 1e4,
                  convergence_tol: float = 1e-3,
                  use_warp_tile_kernels: bool = True,
+                 dtype=cp.float64,
                  ):
         self._use_warp_tile_kernels = use_warp_tile_kernels
         self.B = B
         self.n = n
         self.p = p
         self.m = m
+        self._dtype = dtype
 
         self._idx_xl = idx_xl
         self._idx_xu = idx_xu
@@ -221,16 +223,16 @@ class RuizEquilibration(PreconditionerBase):
         self.convergence_tol = convergence_tol
 
         # Combined scaling: (B, n+p+m) — delta[:, :n] for x, delta[:, n:n+p] for y, etc.
-        self._delta = cp.ones((B, n + p + m), dtype=cp.float64)
-        self._delta_inv = cp.ones((B, n + p + m), dtype=cp.float64)
+        self._delta = cp.ones((B, n + p + m), dtype=dtype)
+        self._delta_inv = cp.ones((B, n + p + m), dtype=dtype)
 
         # Box constraint scaling: (B, n)
-        self._delta_b = cp.ones((B, n), dtype=cp.float64)
-        self._delta_b_inv = cp.ones((B, n), dtype=cp.float64)
+        self._delta_b = cp.ones((B, n), dtype=dtype)
+        self._delta_b_inv = cp.ones((B, n), dtype=dtype)
 
         # Cost scaling: (B,)
-        self._cost_scaling = cp.ones(B, dtype=cp.float64)
-        self._cost_scaling_inv = cp.ones(B, dtype=cp.float64)
+        self._cost_scaling = cp.ones(B, dtype=dtype)
+        self._cost_scaling_inv = cp.ones(B, dtype=dtype)
 
         # Pre-combined residual unscaling factors — materialized once per
         # Ruiz update in _refresh_unscale_factors(). The solver's
@@ -254,12 +256,12 @@ class RuizEquilibration(PreconditionerBase):
         #             [z_bl]: delta_b_inv[:, idx_xl]           (gather)
         #             [z_bu]: delta_b_inv[:, idx_xu]           (gather)
         num_duals = p + idx_hl.size + idx_hu.size + idx_xl.size + idx_xu.size
-        self._dual_res_unscale_factor = cp.ones((B, n), dtype=cp.float64)
-        self._primal_res_unscale_factor = cp.ones((B, num_duals), dtype=cp.float64)
+        self._dual_res_unscale_factor = cp.ones((B, n), dtype=dtype)
+        self._primal_res_unscale_factor = cp.ones((B, num_duals), dtype=dtype)
 
         # x_b_scaling: (B, n) — 1 for bounded variables, 0 for unbounded.
         # Bound structure is shared across batch, so init is the same for all b.
-        self._x_b_scaling_init = cp.zeros((B, n), dtype=cp.float64)
+        self._x_b_scaling_init = cp.zeros((B, n), dtype=dtype)
         bounded = cp.zeros(n, dtype=bool)
         if idx_xl.size > 0:
             bounded[idx_xl] = True
@@ -269,26 +271,27 @@ class RuizEquilibration(PreconditionerBase):
         self._x_b_scaling = cp.copy(self._x_b_scaling_init)
 
         # Per-iteration workspace: (B, n+p+m) and (B, n)
-        self._delta_iter = cp.empty((B, n + p + m), dtype=cp.float64)
-        self._delta_b_iter = cp.empty((B, n), dtype=cp.float64)
+        self._delta_iter = cp.empty((B, n + p + m), dtype=dtype)
+        self._delta_b_iter = cp.empty((B, n), dtype=dtype)
 
-        self._work_n = cp.empty((B, n), dtype=cp.float64)
+        self._work_n = cp.empty((B, n), dtype=dtype)
 
         # Precompile warp kernels (one specialization per (n, p, m,
         # min_scaling, max_scaling) tuple).
         self._clamp_and_rsqrt_kernel = create_clamp_and_rsqrt_kernel(
-            n, p, m, min_scaling, max_scaling,
+            n, p, m, min_scaling, max_scaling, dtype=self._dtype,
         )
-        self._accumulate_deltas_kernel = create_accumulate_deltas_kernel(n, p, m)
+        self._accumulate_deltas_kernel = create_accumulate_deltas_kernel(n, p, m, dtype=self._dtype)
         # Gate the tile-factory call — calling it triggers shape-specialized
         # warp tile codegen. ``LargeProblemSolver`` constructs this class
         # with ``use_warp_kernels=False`` to skip the compile entirely; the
         # cupy fallback at the launch site is used instead.
         if use_warp_tile_kernels:
-            self._conv_check_kernel = create_ruiz_conv_check_kernel(n, p, m)
+            self._conv_check_kernel = create_ruiz_conv_check_kernel(n, p, m, dtype=self._dtype)
             self._compute_rhs_inf_norm_unscaled_kernel = (
                 create_compute_constraints_rhs_inf_norm_unscaled_kernel(
                     n, p, m, idx_hl.size, idx_hu.size, idx_xl.size, idx_xu.size,
+                    dtype=self._dtype,
                 )
             )
         else:
@@ -296,12 +299,13 @@ class RuizEquilibration(PreconditionerBase):
             self._compute_rhs_inf_norm_unscaled_kernel = None
         self._calc_scaling_inv_and_scale_bounds_kernel = create_calc_scaling_inv_and_scale_bounds_kernel(
             n, p, m, idx_hl.size, idx_hu.size, idx_xl.size, idx_xu.size,
+            dtype=self._dtype,
         )
-        self._scale_bounds_kernel = create_scale_bounds_kernel(n, p, m)
-        self._unscale_bounds_kernel = create_unscale_bounds_kernel(n, p, m)
+        self._scale_bounds_kernel = create_scale_bounds_kernel(n, p, m, dtype=self._dtype)
+        self._unscale_bounds_kernel = create_unscale_bounds_kernel(n, p, m, dtype=self._dtype)
 
         # (2B,) buffer for per-batch (max_d, max_db) pairs — cp.max gives global.
-        self._conv_buf = cp.empty(2 * B, dtype=cp.float64)
+        self._conv_buf = cp.empty(2 * B, dtype=dtype)
 
     # ------------------------------------------------------------------
     # State accessors

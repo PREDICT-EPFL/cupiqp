@@ -1,8 +1,14 @@
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
+
+import cupy as cp
+
 
 @dataclass
 class Settings:
+    dtype: Any = cp.float64
+    device: str = "cuda"
+
     rho_init: float = 1e-6
     delta_init: float = 1e-4
 

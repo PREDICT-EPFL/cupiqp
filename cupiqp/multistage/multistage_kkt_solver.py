@@ -30,9 +30,10 @@ class MultistageKKTSolver(KKTSolverBase):
         self._batch_size = B
         self._block_size = d
         self.num_stages = N
+        dtype = data.dtype
 
-        self._delta_inv = cp.zeros(B, dtype=cp.float64)
-        self._z_reg_inv = cp.zeros((B, data.m), dtype=cp.float64)
+        self._delta_inv = cp.zeros(B, dtype=dtype)
+        self._z_reg_inv = cp.zeros((B, data.m), dtype=dtype)
 
         # ---- Block-tridiag KKT storage (always 4-D) ----
         self._kkt_diag_blocks = wp.zeros((B, N, d, d), dtype=wp.float64, device="cuda")
@@ -61,13 +62,13 @@ class MultistageKKTSolver(KKTSolverBase):
         )
 
         # Workspace for matvec-then-scale steps in solve().
-        self._work_n = cp.empty((B, data.n), dtype=cp.float64)
+        self._work_n = cp.empty((B, data.n), dtype=dtype)
 
         # Precompute A^T A as block-tridiagonal (A is fixed across iterations).
         if data.p > 0:
             self._AtA_diag = wp.zeros((B, N, d, d), dtype=wp.float64, device="cuda")
             self._AtA_offdiag = wp.zeros((B, N - 1, d, d), dtype=wp.float64, device="cuda")
-            self._eval_AT_A_kernel = create_block_syrk_kernel(N, data._A.rows_of_blocks, d)
+            self._eval_AT_A_kernel = create_block_syrk_kernel(N, data._A.rows_of_blocks, d, dtype=dtype)
             wp.launch(
                 kernel=self._eval_AT_A_kernel,
                 dim=(B, N, d, d),
@@ -93,18 +94,18 @@ class MultistageKKTSolver(KKTSolverBase):
         self._update_kkt_kernel = create_update_kkt_kernel(
             num_blocks=N, block_size=d,
             p=data.p, m=data.m, rows_of_G=rows_of_G_for_kkt,
-        )
+            dtype=dtype)
 
         # ---- matvec kernels ----
-        self._eval_P_x_kernel = create_block_tridiag_gemv_kernel(N, d, wp.float64)
+        self._eval_P_x_kernel = create_block_tridiag_gemv_kernel(N, d, dtype=dtype)
 
         if data.p > 0:
-            self._eval_A_xn_kernel = create_block_bidiag_gemv_n_kernel(N, data._A.rows_of_blocks, d, wp.float64)
-            self._eval_AT_xt_kernel = create_block_bidiag_gemv_t_kernel(N, data._A.rows_of_blocks, d, wp.float64)
+            self._eval_A_xn_kernel = create_block_bidiag_gemv_n_kernel(N, data._A.rows_of_blocks, d, dtype=dtype)
+            self._eval_AT_xt_kernel = create_block_bidiag_gemv_t_kernel(N, data._A.rows_of_blocks, d, dtype=dtype)
 
         if data.m > 0:
-            self._eval_G_xn_kernel = create_block_bidiag_gemv_n_kernel(N, data._G.rows_of_blocks, d, wp.float64)
-            self._eval_GT_xt_kernel = create_block_bidiag_gemv_t_kernel(N, data._G.rows_of_blocks, d, wp.float64)
+            self._eval_G_xn_kernel = create_block_bidiag_gemv_n_kernel(N, data._G.rows_of_blocks, d, dtype=dtype)
+            self._eval_GT_xt_kernel = create_block_bidiag_gemv_t_kernel(N, data._G.rows_of_blocks, d, dtype=dtype)
 
     def update_data(self, data: MultistageData, update_P: bool, update_A: bool, update_G: bool):
         if update_A and data.p > 0:

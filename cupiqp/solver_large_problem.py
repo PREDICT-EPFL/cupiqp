@@ -37,12 +37,12 @@ class LargeProblemSolverBase(SolverBase):
             self._boundary_shift_kernel = create_boundary_shift_kernel(
                 self._data.num_hl, self._data.num_hu,
                 self._data.num_xl, self._data.num_xu,
-            )
-            self._prepare_predictor_step_kernel = create_prepare_predictor_step_kernel()
-            self._prepare_corrector_step_kernel = create_prepare_corrector_step_kernel()
+                dtype=self._data.dtype)
+            self._prepare_predictor_step_kernel = create_prepare_predictor_step_kernel(dtype=self._data.dtype)
+            self._prepare_corrector_step_kernel = create_prepare_corrector_step_kernel(dtype=self._data.dtype)
             self._update_vars_after_corrector_step_kernel = create_update_vars_after_corrector_step_kernel(
                 n_primal=self._data.n + self._data.num_ineq, n_dual=self._data.p + self._data.num_ineq,
-            )
+                dtype=self._data.dtype)
 
     @nvtx.annotate("LargeProblemSolverBase::_run_full_newton_step")
     def _run_full_newton_step(self):

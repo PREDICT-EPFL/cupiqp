@@ -28,7 +28,10 @@ class MultistageData(Data):
     reflect the new values.
     """
 
-    def __init__(
+    def __init__(self, dtype=cp.float64, device: str = "cuda"):
+        super().__init__(dtype=dtype, device=device)
+
+    def init(
         self,
         P: BlockTridiagMat,
         c: BlockVec,
@@ -40,9 +43,7 @@ class MultistageData(Data):
         x_u: Optional[BlockVec] = None,
         x_l: Optional[BlockVec] = None,
     ):
-        # NOTE: we intentionally do NOT call super().__init__() — base ``Data``
-        # is abstract; we build the (B, k) flat views ourselves and then call
-        # ``self._finalize()`` to share the base preprocessing.
+        """Allocate and populate buffers from user inputs. Returns self for chaining."""
 
         B = P.batch_size
         block_size = P.block_size
@@ -77,7 +78,7 @@ class MultistageData(Data):
         elif A is None and b is None:
             self._A = None
             self._b_blk = None
-            self._b = cp.zeros((B, 0), dtype=cp.float64)
+            self._b = cp.zeros((B, 0), dtype=self._dtype)
         else:
             raise ValueError("A and b must both be provided or both be None")
 
@@ -101,7 +102,7 @@ class MultistageData(Data):
                 raise ValueError("h_u and h_l must be None when G is None")
             self._G = None
             self._h_u_blk = self._h_l_blk = None
-            self._h_u = self._h_l = cp.zeros((B, 0), dtype=cp.float64)
+            self._h_u = self._h_l = cp.zeros((B, 0), dtype=self._dtype)
 
         # ---- x_u, x_l (box constraints) ----
         if x_u is not None:
@@ -113,7 +114,7 @@ class MultistageData(Data):
                 )
         else:
             self._x_u_block = None
-            self._x_u = cp.zeros((B, 0), dtype=cp.float64)
+            self._x_u = cp.zeros((B, 0), dtype=self._dtype)
 
         if x_l is not None:
             self._x_l_block = x_l.clone()
@@ -124,13 +125,13 @@ class MultistageData(Data):
                 )
         else:
             self._x_l_block = None
-            self._x_l = cp.zeros((B, 0), dtype=cp.float64)
+            self._x_l = cp.zeros((B, 0), dtype=self._dtype)
 
         # Hand off to the shared post-init: builds bound index sets,
         # constraints-RHS inf-norm, etc., all assuming (B, k) shapes — which
         # we now match.
         self._finalize()
-        self._x_b_scaling = cp.ones((B, n), dtype=cp.float64)
+        self._x_b_scaling = cp.ones((B, n), dtype=self._dtype)
 
         # Cache flat dlpack views for allocation-free in-place update paths
         # — these point directly into the Warp block-data buffers.

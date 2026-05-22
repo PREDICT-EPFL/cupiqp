@@ -25,21 +25,19 @@ class DenseRuizEquilibration(RuizEquilibration):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._dense_compute_kkt_norms_kernel = create_dense_compute_kkt_norms_kernel(
-            self.n, self.p, self.m,
-        )
-        self._dense_scale_P_c_kernel = create_dense_scale_P_and_c_kernel(self.n)
+            self.n, self.p, self.m, dtype=self._dtype)
+        self._dense_scale_P_c_kernel = create_dense_scale_P_and_c_kernel(self.n, dtype=self._dtype)
         if self.p > 0:
-            self._dense_scale_A_kernel = create_dense_scale_A_or_G_kernel(self.p, self.n)
+            self._dense_scale_A_kernel = create_dense_scale_A_or_G_kernel(self.p, self.n, dtype=self._dtype)
         if self.m > 0:
-            self._dense_scale_G_kernel = create_dense_scale_A_or_G_kernel(self.m, self.n)
+            self._dense_scale_G_kernel = create_dense_scale_A_or_G_kernel(self.m, self.n, dtype=self._dtype)
         # (B,)-ones buffer used when scale_matrices is called with cost_scaling_factor=None.
-        self._cost_factor_ones = cp.ones(self.B, dtype=cp.float64)
+        self._cost_factor_ones = cp.ones(self.B, dtype=self._dtype)
 
         self._dense_compute_gamma_kernel = create_dense_compute_gamma_kernel(
-            self.n, self.min_scaling, self.max_scaling,
-        )
-        self._dense_apply_gamma_kernel = create_dense_apply_gamma_kernel(self.n)
-        self._gamma_buf = cp.empty(self.B, dtype=cp.float64)
+            self.n, self.min_scaling, self.max_scaling, dtype=self._dtype)
+        self._dense_apply_gamma_kernel = create_dense_apply_gamma_kernel(self.n, dtype=self._dtype)
+        self._gamma_buf = cp.empty(self.B, dtype=self._dtype)
 
     # ------------------------------------------------------------------
     # 3-hook backend API

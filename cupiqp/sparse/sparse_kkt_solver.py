@@ -26,6 +26,7 @@ class SparseKKTSolver(KKTSolverBase):
         B = data.batch_size
         self._batch_size = B
         n, p, m = data.n, data.p, data.m
+        self._dtype = data.dtype
 
         # -- Build KKT structure from the first problem's sparsity ------
         P0, A0, G0 = data.P[0], data.A[0], data.G[0]
@@ -35,13 +36,14 @@ class SparseKKTSolver(KKTSolverBase):
         # which owns a contiguous (B, kkt_nnz) values buffer and shares a
         # single indices/indptr pair across batches. The initial values are
         # broadcast from the template.
-        init_data = cp.empty((B, kkt_template.nnz), dtype=cp.float64)
+        init_data = cp.empty((B, kkt_template.nnz), dtype=self._dtype)
         init_data[:] = kkt_template.data
         self._kkt_mats = BatchedCsrMatrix(
             batch_size=B,
             indices=kkt_template.indices,
             indptr=kkt_template.indptr,
             data=init_data,
+            dtype=self._dtype,
         )
 
         # -- Diagonal indices (shared — same structure) -----------------
@@ -50,7 +52,7 @@ class SparseKKTSolver(KKTSolverBase):
         self._diag_y_indices = single_kkt_diag_idx[n:n+p]
         self._diag_z_indices = single_kkt_diag_idx[n+p:n+p+m]
 
-        self._update_kkt_diag_kernel = create_update_kkt_diag_kernel(n, p, m)
+        self._update_kkt_diag_kernel = create_update_kkt_diag_kernel(n, p, m, dtype=self._dtype)
 
         # -- P-diagonal CSR indices (for vectorized P diag extraction) --
         # P may have zero diagonal entries that are not stored in the CSR.
@@ -73,7 +75,7 @@ class SparseKKTSolver(KKTSolverBase):
         P0_rows, P0_cols = csr_row_indices(P0), P0.indices
         self._indices_of_Pdata_containing_nonzero_diag_entry = cp.where(P0_rows == P0_cols)[0]
         self._cols_of_P_containing_nonzero_diag_entry = P0.indices[self._indices_of_Pdata_containing_nonzero_diag_entry]
-        self._P_diag = cp.zeros((B, n), dtype=cp.float64)
+        self._P_diag = cp.zeros((B, n), dtype=self._dtype)
         self._refresh_P_diag_buffer(data._P)
 
         # -- Block-to-KKT index maps (shared) --------------------------
@@ -214,25 +216,26 @@ class SparseKKTSolver(KKTSolverBase):
         n, p, m = data.n, data.p, data.m
         B = self._batch_size
         dim = n + p + m  # cuDSS rhs/sol row length
+        itemsize = self._lin_sys_solver.rhs.itemsize  # dtype-dependent (4 for f32, 8 for f64)
         rhs_ptr = self._lin_sys_solver.rhs.data.ptr
 
         # Assemble [rhs_x | rhs_y | rhs_z] into solver's (B, dim) rhs buffer.
         # Each source may have a different row stride (non-contiguous view),
         # so we use memcpy2DAsync to scatter each block into the right columns.
         cp.cuda.runtime.memcpy2DAsync(
-            rhs_ptr, dim * 8,
+            rhs_ptr, dim * itemsize,
             rhs_x.data.ptr, rhs_x.strides[0],
-            n * 8, B, 3, stream_ptr)
+            n * itemsize, B, 3, stream_ptr)
         if p > 0:
             cp.cuda.runtime.memcpy2DAsync(
-                rhs_ptr + n * 8, dim * 8,
+                rhs_ptr + n * itemsize, dim * itemsize,
                 rhs_y.data.ptr, rhs_y.strides[0],
-                p * 8, B, 3, stream_ptr)
+                p * itemsize, B, 3, stream_ptr)
         if m > 0:
             cp.cuda.runtime.memcpy2DAsync(
-                rhs_ptr + (n + p) * 8, dim * 8,
+                rhs_ptr + (n + p) * itemsize, dim * itemsize,
                 rhs_z.data.ptr, rhs_z.strides[0],
-                m * 8, B, 3, stream_ptr)
+                m * itemsize, B, 3, stream_ptr)
 
         self._lin_sys_solver.solve(cuda_stream=stream_ptr)
 
@@ -240,18 +243,18 @@ class SparseKKTSolver(KKTSolverBase):
         sol_ptr = self._lin_sys_solver.sol.data.ptr
         cp.cuda.runtime.memcpy2DAsync(
             delta_x.data.ptr, delta_x.strides[0],
-            sol_ptr, dim * 8,
-            n * 8, B, 3, stream_ptr)
+            sol_ptr, dim * itemsize,
+            n * itemsize, B, 3, stream_ptr)
         if p > 0:
             cp.cuda.runtime.memcpy2DAsync(
                 delta_y.data.ptr, delta_y.strides[0],
-                sol_ptr + n * 8, dim * 8,
-                p * 8, B, 3, stream_ptr)
+                sol_ptr + n * itemsize, dim * itemsize,
+                p * itemsize, B, 3, stream_ptr)
         if m > 0:
             cp.cuda.runtime.memcpy2DAsync(
                 delta_z.data.ptr, delta_z.strides[0],
-                sol_ptr + (n + p) * 8, dim * 8,
-                m * 8, B, 3, stream_ptr)
+                sol_ptr + (n + p) * itemsize, dim * itemsize,
+                m * itemsize, B, 3, stream_ptr)
 
     @nvtx.annotate("SparseKKTSolver::eval_P_x")
     def eval_P_x(self, data: SparseData, alpha: float, x: cp.ndarray, z: cp.ndarray):

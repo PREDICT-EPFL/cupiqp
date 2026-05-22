@@ -46,7 +46,10 @@ class SparseData(Data):
     batch dimension ``(B, k)``.
     """
 
-    def __init__(
+    def __init__(self, dtype=cp.float64, device: str = "cuda"):
+        super().__init__(dtype=dtype, device=device)
+
+    def init(
         self,
         P: SparseMatrixInput,
         c: cp.ndarray,
@@ -58,8 +61,10 @@ class SparseData(Data):
         x_u: Optional[cp.ndarray] = None,
         x_l: Optional[cp.ndarray] = None,
     ):
+        dtype = self._dtype
+
         # -- P (determines B and n) -------------------------------------
-        self._P = self._to_batched_csr(P, "P")
+        self._P = self._to_batched_csr(P, "P", dtype=dtype)
         B = self._P.batch_size
         if self._P.rows != self._P.cols:
             raise ValueError("P must be square.")
@@ -68,11 +73,11 @@ class SparseData(Data):
         self._n = n
 
         # -- c -----------------------------------------------------------
-        self._c = self._to_batched_vec(c, B, n, "c")
+        self._c = self._to_batched_vec(c, B, n, "c", dtype=dtype)
 
         # -- A, b --------------------------------------------------------
         if A is not None and b is not None:
-            self._A = self._to_batched_csr(A, "A")
+            self._A = self._to_batched_csr(A, "A", dtype=dtype)
             if self._A.batch_size != B:
                 raise ValueError(
                     f"A batch size ({self._A.batch_size}) != P batch size ({B})"
@@ -81,14 +86,14 @@ class SparseData(Data):
                 raise ValueError(
                     f"A.cols ({self._A.cols}) != n ({n})"
                 )
-            self._b = self._to_batched_vec(b, B, self._A.rows, "b")
+            self._b = self._to_batched_vec(b, B, self._A.rows, "b", dtype=dtype)
         else:
-            self._A = self._empty_batched_csr(B, 0, n)
-            self._b = cp.zeros((B, 0), dtype=cp.float64)
+            self._A = self._empty_batched_csr(B, 0, n, dtype=dtype)
+            self._b = cp.zeros((B, 0), dtype=dtype)
 
         # -- G, h_u, h_l ------------------------------------------------
         if G is not None:
-            self._G = self._to_batched_csr(G, "G")
+            self._G = self._to_batched_csr(G, "G", dtype=dtype)
             if self._G.batch_size != B:
                 raise ValueError(
                     f"G batch size ({self._G.batch_size}) != P batch size ({B})"
@@ -98,13 +103,13 @@ class SparseData(Data):
                     f"G.cols ({self._G.cols}) != n ({n})"
                 )
         else:
-            self._G = self._empty_batched_csr(B, 0, n)
+            self._G = self._empty_batched_csr(B, 0, n, dtype=dtype)
 
         m = self._G.rows
-        self._h_u = self._to_batched_vec(h_u, B, m, "h_u") if h_u is not None else cp.zeros((B, 0), dtype=cp.float64)
-        self._h_l = self._to_batched_vec(h_l, B, m, "h_l") if h_l is not None else cp.zeros((B, 0), dtype=cp.float64)
-        self._x_u = self._to_batched_vec(x_u, B, n, "x_u") if x_u is not None else cp.zeros((B, 0), dtype=cp.float64)
-        self._x_l = self._to_batched_vec(x_l, B, n, "x_l") if x_l is not None else cp.zeros((B, 0), dtype=cp.float64)
+        self._h_u = self._to_batched_vec(h_u, B, m, "h_u", dtype=dtype) if h_u is not None else cp.zeros((B, 0), dtype=dtype)
+        self._h_l = self._to_batched_vec(h_l, B, m, "h_l", dtype=dtype) if h_l is not None else cp.zeros((B, 0), dtype=dtype)
+        self._x_u = self._to_batched_vec(x_u, B, n, "x_u", dtype=dtype) if x_u is not None else cp.zeros((B, 0), dtype=dtype)
+        self._x_l = self._to_batched_vec(x_l, B, n, "x_l", dtype=dtype) if x_l is not None else cp.zeros((B, 0), dtype=dtype)
 
         self._finalize()
 
@@ -125,7 +130,7 @@ class SparseData(Data):
     # ------------------------------------------------------------------
 
     @classmethod
-    def _to_batched_csr(cls, mat: SparseMatrixInput, name: str) -> BatchedCsrMatrix:
+    def _to_batched_csr(cls, mat: SparseMatrixInput, name: str, dtype=cp.float64) -> BatchedCsrMatrix:
         """Normalize any accepted matrix input form to ``BatchedCsrMatrix``."""
         # Already a BatchedCsrMatrix — reuse the shared sparsity pattern but
         # clone the values buffer so the solver (preconditioner) can mutate
@@ -137,38 +142,41 @@ class SparseData(Data):
                 indptr=mat.indptr,
                 data=mat.data,  # BatchedCsrMatrix.__init__ allocates + copies
                 shape=(mat.rows, mat.cols),
+                dtype=dtype,
             )
 
         # torch.sparse_csr_tensor (2-D single or 3-D batched).
         if _is_torch_sparse_csr(mat):
-            return cls._from_torch_sparse_csr(mat, name)
+            return cls._from_torch_sparse_csr(mat, name, dtype=dtype)
 
         # List/tuple of cupy csr_matrix — stack per-batch data.
         if isinstance(mat, (list, tuple)):
             if len(mat) == 0:
                 raise ValueError(f"{name} cannot be an empty list.")
-            mats = [csr_matrix(m, dtype=cp.float64) for m in mat]
+            mats = [csr_matrix(m, dtype=dtype) for m in mat]
             tpl = mats[0]  # template matrix
             if tpl.nnz == 0:
-                data = cp.empty((len(mats), 0), dtype=cp.float64)
+                data = cp.empty((len(mats), 0), dtype=dtype)
             else:
                 data = cp.stack([m.data for m in mats])
             return BatchedCsrMatrix(
                 len(mats), tpl.indices, tpl.indptr, data, shape=tpl.shape,
+                dtype=dtype,
             )
 
         # Single cupy csr_matrix (or convertible) — wrap as B = 1.
-        single = csr_matrix(mat, dtype=cp.float64)
+        single = csr_matrix(mat, dtype=dtype)
         if single.nnz == 0:
-            data = cp.empty((1, 0), dtype=cp.float64)
+            data = cp.empty((1, 0), dtype=dtype)
         else:
             data = single.data.reshape(1, -1)
         return BatchedCsrMatrix(
             1, single.indices, single.indptr, data, shape=single.shape,
+            dtype=dtype,
         )
 
     @staticmethod
-    def _from_torch_sparse_csr(tensor, name: str) -> BatchedCsrMatrix:
+    def _from_torch_sparse_csr(tensor, name: str, dtype=cp.float64) -> BatchedCsrMatrix:
         """Wrap a torch.sparse_csr_tensor into a BatchedCsrMatrix.
 
         Handles both 2-D (single) and 3-D (batched) tensors. In both
@@ -176,7 +184,7 @@ class SparseData(Data):
         the pattern is read from batch 0 only).
         """
         if tensor.dim() == 3:
-            return BatchedCsrMatrix.from_torch_sparse_csr_tensor(tensor)
+            return BatchedCsrMatrix.from_torch_sparse_csr_tensor(tensor, dtype=dtype)
         if tensor.dim() != 2:
             raise ValueError(
                 f"{name} torch.sparse_csr_tensor must be 2-D or 3-D; "
@@ -187,27 +195,28 @@ class SparseData(Data):
         indptr = cp.from_dlpack(tensor.crow_indices().contiguous()).astype(cp.int32, copy=False)
         indices = cp.from_dlpack(tensor.col_indices().contiguous()).astype(cp.int32, copy=False)
         values = cp.from_dlpack(tensor.values().contiguous())
-        data = values.reshape(1, -1) if values.size > 0 else cp.empty((1, 0), dtype=cp.float64)
+        data = values.reshape(1, -1) if values.size > 0 else cp.empty((1, 0), dtype=dtype)
         rows, cols = int(tensor.shape[0]), int(tensor.shape[1])
-        return BatchedCsrMatrix(1, indices, indptr, data, shape=(rows, cols))
+        return BatchedCsrMatrix(1, indices, indptr, data, shape=(rows, cols), dtype=dtype)
 
     @staticmethod
-    def _empty_batched_csr(B: int, rows: int, cols: int) -> BatchedCsrMatrix:
+    def _empty_batched_csr(B: int, rows: int, cols: int, dtype=cp.float64) -> BatchedCsrMatrix:
         """Placeholder for an omitted matrix block — (B, rows, cols), nnz = 0."""
         return BatchedCsrMatrix(
             batch_size=B,
             indices=cp.empty(0, dtype=cp.int32),
             indptr=cp.zeros(rows + 1, dtype=cp.int32),
-            data=cp.empty((B, 0), dtype=cp.float64),
+            data=cp.empty((B, 0), dtype=dtype),
             shape=(rows, cols),
+            dtype=dtype,
         )
 
     @staticmethod
     def _to_batched_vec(
-        v: cp.ndarray, B: int, k: int, name: str
+        v: cp.ndarray, B: int, k: int, name: str, dtype=cp.float64,
     ) -> cp.ndarray:
         """Ensure *v* has shape ``(B, k)``."""
-        v = cp.asarray(v, dtype=cp.float64)
+        v = cp.asarray(v, dtype=dtype)
         if v.ndim == 1:
             v = v.reshape(1, -1)
         if v.shape[0] == 1 and B > 1:
@@ -255,7 +264,7 @@ class SparseData(Data):
 
     def _set_matrix_values(self, target: BatchedCsrMatrix, value: SparseMatrixInput, check: bool, name: str):
         """Common helper for set_P / set_A / set_G."""
-        new = self._to_batched_csr(value, name)
+        new = self._to_batched_csr(value, name, dtype=self._dtype)
         if check:
             if new.batch_size != target.batch_size:
                 raise ValueError(
