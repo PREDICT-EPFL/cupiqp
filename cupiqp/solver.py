@@ -51,6 +51,7 @@ class SolverBase(ABC):
         self._prox_vars = Variables()  # used to store the proximal variables
         self._kkt_system = KKTSystem()
         self._preconditioner = None
+        self._setup_done = False
 
     @property
     def settings(self) -> Settings:
@@ -61,7 +62,11 @@ class SolverBase(ABC):
         self._settings = value
 
     @property
-    def result(self):
+    def data(self) -> Data:
+        return self._data
+
+    @property
+    def result(self) -> Result:
         return self._result
     
     @nvtx.annotate("Solver::setup")
