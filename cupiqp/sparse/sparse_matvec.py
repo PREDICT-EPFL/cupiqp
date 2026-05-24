@@ -24,10 +24,13 @@ def _destroy_cusparse_handle(handle):
 # ---------------------------------------------------------------------------
 def _idx_type(arr: cp.ndarray) -> int:
     """Return the cuSPARSE index-type constant matching *arr*'s dtype."""
-    return (
-        cusparse.IndexType.INDEX_32I
-        if arr.dtype == cp.int32
-        else cusparse.IndexType.INDEX_64I
+    if arr.dtype == cp.int32:
+        return cusparse.IndexType.INDEX_32I
+    if arr.dtype == cp.int64:
+        return cusparse.IndexType.INDEX_64I
+    raise TypeError(
+        "Sparse matvec indices must have dtype int32 or int64; "
+        f"got {arr.dtype}."
     )
 
 
@@ -48,16 +51,16 @@ class SingleSparseMatVecProduct:
     pointers and dispatches ``cusparseSpMV`` via ``nvmath.bindings.cusparse``
     — no device allocation, no host-device sync, safe for stream capture.
 
-    Lifetime: the sparse matrix ``mat`` is kept alive through ``self._mat``
-    and the descriptor reuses its device buffers. In-place updates to
-    ``mat.data`` are therefore visible on subsequent calls as long as the
-    underlying allocation is not replaced (e.g. ``mat.data[:] = ...`` is
+    Lifetime: the sparse matrix ``mat`` is kept alive through ``self._mat``.
+    The descriptor owns copies of its index buffers but reuses ``mat.data``.
+    In-place value updates are therefore visible on subsequent calls as long
+    as that value allocation is not replaced (e.g. ``mat.data[:] = ...`` is
     safe; ``mat.data = new_array`` is not).
 
     Parameters
     ----------
     mat : csr_matrix | csc_matrix | coo_matrix
-        The sparse matrix. Device buffers are reused (no copy).
+        The sparse matrix. Values are shared; sparse structure is copied once.
     transa : bool, default False
         If ``True``, compute ``A^T @ x`` instead of ``A @ x``.
 
@@ -99,18 +102,31 @@ class SingleSparseMatVecProduct:
         if mat_dtype == cp.float32:
             self._compute_type = rt.CUDA_R_32F
             self._np_dtype = cp.float32
-        else:
+        elif mat_dtype == cp.float64:
             self._compute_type = rt.CUDA_R_64F
             self._np_dtype = cp.float64
+        else:
+            raise TypeError(
+                f"Sparse matvec supports float32 and float64 matrix data only; "
+                f"got dtype {mat_dtype}."
+            )
 
-        # ---- sparse matrix descriptor (reuses mat's existing device memory) ----
-        self._mat_desc = self._create_mat_desc(self._mat, self._compute_type)
+        # Own descriptor structure while sharing values for in-place updates.
+        # Mutating caller indices cannot invalidate the native access pattern.
+        self._owned_structure = self._copy_structure(self._mat)
+        self._mat_desc = self._create_mat_desc(
+            self._mat, self._compute_type, structure=self._owned_structure,
+        )
+        self._mat_data_ptr = self._mat.data.data.ptr
 
         # ---- dense vector descriptors ----
         if self._transa:
             x_size, y_size = self._mat.shape[0], self._mat.shape[1]
         else:
             x_size, y_size = self._mat.shape[1], self._mat.shape[0]
+        # Frozen at setup; checked against caller-supplied x, y in __call__.
+        self._x_size = x_size
+        self._y_size = y_size
 
         dummy_x = cp.empty(x_size, dtype=self._np_dtype)
         dummy_y = cp.empty(y_size, dtype=self._np_dtype)
@@ -138,42 +154,62 @@ class SingleSparseMatVecProduct:
 
 
     @staticmethod
-    def _create_mat_desc(mat: spmatrix, compute_type: int) -> int:
+    def _copy_structure(mat: spmatrix) -> tuple:
+        """Copy and retain the index buffers used by a cuSPARSE descriptor."""
+        if isinstance(mat, (csr_matrix, csc_matrix)):
+            return (mat.indptr.copy(), mat.indices.copy())
+        if isinstance(mat, coo_matrix):
+            return (mat.row.copy(), mat.col.copy())
+        return ()  # unreachable: _create_mat_desc already rejected the type
+
+    @staticmethod
+    def _create_mat_desc(
+        mat: spmatrix, compute_type: int, structure: tuple = None,
+    ) -> int:
         """Create a cuSPARSE sparse-matrix descriptor for *mat*.
 
-        Supports CSR, CSC, and COO formats.  The descriptor reuses the matrix's
-        existing device memory; no copy is made.
+        Supports CSR, CSC, and COO formats. Values always reuse ``mat.data``.
+        If *structure* is provided, its retained index buffers are used
+        instead of the matrix's caller-owned sparse structure.
         """
         rows, cols = mat.shape
         if isinstance(mat, csr_matrix):
+            indptr, indices = structure or (mat.indptr, mat.indices)
             return cusparse.create_csr(
                 rows, cols, mat.nnz,
-                mat.indptr.data.ptr,
-                mat.indices.data.ptr,
+                indptr.data.ptr,
+                indices.data.ptr,
                 mat.data.data.ptr,
-                _idx_type(mat.indptr),
-                _idx_type(mat.indices),
+                _idx_type(indptr),
+                _idx_type(indices),
                 cusparse.IndexBase.ZERO,
                 compute_type,
             )
         elif isinstance(mat, csc_matrix):
+            indptr, indices = structure or (mat.indptr, mat.indices)
             return cusparse.create_csc(
                 rows, cols, mat.nnz,
-                mat.indptr.data.ptr,
-                mat.indices.data.ptr,
+                indptr.data.ptr,
+                indices.data.ptr,
                 mat.data.data.ptr,
-                _idx_type(mat.indptr),
-                _idx_type(mat.indices),
+                _idx_type(indptr),
+                _idx_type(indices),
                 cusparse.IndexBase.ZERO,
                 compute_type,
             )
         elif isinstance(mat, coo_matrix):
+            row, col = structure or (mat.row, mat.col)
+            row_type = _idx_type(row)
+            if _idx_type(col) != row_type:
+                raise TypeError(
+                    "COO row and column indices must use the same dtype."
+                )
             return cusparse.create_coo(
                 rows, cols, mat.nnz,
-                mat.row.data.ptr,
-                mat.col.data.ptr,
+                row.data.ptr,
+                col.data.ptr,
                 mat.data.data.ptr,
-                _idx_type(mat.row),
+                row_type,
                 cusparse.IndexBase.ZERO,
                 compute_type,
             )
@@ -192,6 +228,28 @@ class SingleSparseMatVecProduct:
         stream_ptr: int = None,
     ) -> None:
         """Execute ``y = alpha * op(A) * x + beta * y``. """
+        # Validate against what cuSPARSE actually needs: a contiguous run
+        # of the right number of elements with the right dtype. We don't
+        # constrain ndim — callers may pass either ``(n,)`` or ``(1, n)``,
+        # both of which present the same flat byte layout to cuSPARSE.
+        if x.size != self._x_size or x.dtype != self._np_dtype or not x.flags.c_contiguous:
+            raise ValueError(
+                f"x: expected {self._x_size} contiguous elements of dtype "
+                f"{self._np_dtype}, got size {x.size} dtype {x.dtype} "
+                f"c_contiguous={x.flags.c_contiguous}"
+            )
+        if y.size != self._y_size or y.dtype != self._np_dtype or not y.flags.c_contiguous:
+            raise ValueError(
+                f"y: expected {self._y_size} contiguous elements of dtype "
+                f"{self._np_dtype}, got size {y.size} dtype {y.dtype} "
+                f"c_contiguous={y.flags.c_contiguous}"
+            )
+        if self._mat.data.data.ptr != self._mat_data_ptr:
+            raise ValueError(
+                "Sparse matrix value buffer has been replaced since construction; "
+                "construct a new operator. In-place value mutation remains safe."
+            )
+
         if stream_ptr is None:
             stream_ptr = cp.cuda.get_current_stream().ptr
         cusparse.set_stream(self._cusparse_handle, stream_ptr)
@@ -324,15 +382,21 @@ class BatchedSparseMatVecProduct:
         # ---- cuSPARSE setup ------------------------------------------
         self._cusparse_handle = _create_cusparse_handle()
         # data type — pick to match the matrix's element dtype.
+        # See SingleSparseMatVecProduct for why the silent fallback is unsafe.
         mat_dtype = self._block_diag_mat.dtype
         if mat_dtype == cp.float32:
             self._compute_type = rt.CUDA_R_32F
             self._np_dtype = cp.float32
             self._c_scalar = ctypes.c_float
-        else:
+        elif mat_dtype == cp.float64:
             self._compute_type = rt.CUDA_R_64F
             self._np_dtype = cp.float64
             self._c_scalar = ctypes.c_double
+        else:
+            raise TypeError(
+                f"Batched sparse matvec supports float32 and float64 matrix "
+                f"data only; got dtype {mat_dtype}."
+            )
         self._op = (
             cusparse.Operation.TRANSPOSE
             if self._transa
@@ -342,6 +406,12 @@ class BatchedSparseMatVecProduct:
         self._mat_desc = SingleSparseMatVecProduct._create_mat_desc(
             self._block_diag_mat, self._compute_type,
         )
+        # Pin the descriptor's value-buffer pointer. ``_block_diag_mat.data``
+        # is a zero-copy reshape of ``self._mats.data``; if the caller does
+        # ``mats.data = new_array`` the reshape view goes stale and so does
+        # the descriptor. We compare current ``self._mats.data.data.ptr``
+        # against this snapshot in __call__ and raise if it has changed.
+        self._mats_data_ptr = self._mats.data.data.ptr
 
         # Per-problem vector lengths (before stacking).
         if self._transa:
@@ -391,18 +461,64 @@ class BatchedSparseMatVecProduct:
         buffers via ``cudaMemcpy2DAsync``; when ``beta != 0`` the current y
         values are also staged in before the call so cuSPARSE reads them.
         """
+        B = self._batch_size
+        xk, yk = self._x_vec_len, self._y_vec_len
+        itemsize = self._x_buf.itemsize  # 4 for f32, 8 for f64
+
+        # Validate caller's arrays. cuSPARSE only needs the right total
+        # element count + dtype; we don't constrain ndim on the contiguous
+        # fast path. For the non-contiguous staging path we additionally
+        # require strict (B, k) shape with stride[-1] == itemsize, and
+        # stride[0] >= row_bytes — the last guard rules out negative pitches
+        # (e.g. x[::-1]) and overlapping rows (as_strided tricks), both of
+        # which would make cudaMemcpy2DAsync read unintended memory.
+        x_contig = x.flags['C_CONTIGUOUS']
+        y_contig = y.flags['C_CONTIGUOUS']
+        x_row_bytes = xk * itemsize
+        y_row_bytes = yk * itemsize
+        if x.size != B * xk or x.dtype != self._np_dtype:
+            raise ValueError(
+                f"x: expected {B * xk} elements of dtype {self._np_dtype}, "
+                f"got size {x.size} dtype {x.dtype}"
+            )
+        if y.size != B * yk or y.dtype != self._np_dtype:
+            raise ValueError(
+                f"y: expected {B * yk} elements of dtype {self._np_dtype}, "
+                f"got size {y.size} dtype {y.dtype}"
+            )
+        if not x_contig:
+            if (x.shape != (B, xk) or x.strides[-1] != itemsize
+                    or x.strides[0] < x_row_bytes):
+                raise ValueError(
+                    f"non-contiguous x must have shape ({B}, {xk}), "
+                    f"stride[-1] == {itemsize} bytes, and stride[0] >= "
+                    f"{x_row_bytes} bytes (non-overlapping, forward rows); "
+                    f"got shape {x.shape} strides {x.strides}"
+                )
+        if not y_contig:
+            if (y.shape != (B, yk) or y.strides[-1] != itemsize
+                    or y.strides[0] < y_row_bytes):
+                raise ValueError(
+                    f"non-contiguous y must have shape ({B}, {yk}), "
+                    f"stride[-1] == {itemsize} bytes, and stride[0] >= "
+                    f"{y_row_bytes} bytes (non-overlapping, forward rows); "
+                    f"got shape {y.shape} strides {y.strides}"
+                )
+        if self._mats.data.data.ptr != self._mats_data_ptr:
+            raise ValueError(
+                "Batched sparse matrix value buffer (``mats.data``) has been "
+                "replaced since construction. The cuSPARSE descriptor still "
+                "references the original buffer; construct a new "
+                "BatchedSparseMatVecProduct with the new matrix. In-place "
+                "mutation (``mats.data[:] = ...``) remains safe."
+            )
+
         if stream_ptr is None:
             stream_ptr = cp.cuda.get_current_stream().ptr
         cusparse.set_stream(self._cusparse_handle, stream_ptr)
 
         _alpha = self._c_scalar(alpha)
         _beta = self._c_scalar(beta)
-
-        B = self._batch_size
-        xk, yk = self._x_vec_len, self._y_vec_len
-        itemsize = self._x_buf.itemsize  # 4 for f32, 8 for f64
-        x_contig = x.flags['C_CONTIGUOUS']
-        y_contig = y.flags['C_CONTIGUOUS']
 
         if x_contig:
             cusparse.dn_vec_set_values(self._x_desc, x.data.ptr)
