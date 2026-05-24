@@ -72,7 +72,7 @@ class CholeskyInplaceSolver:
         cusolver_set_stream(self._cusolver_handle, cp.cuda.get_current_stream().ptr)
         if not cp.dtype(A.dtype).char == self._dtype:
             raise TypeError(f"Input matrix dtype {A.dtype} does not match solver dtype {self._dtype}.")
-        if A.shape[0] != self.n or A.shape[1] != self.n:
+        if A.ndim != 2 or A.shape != (self.n, self.n):
             raise ValueError(f"Shape mismatch. Expected ({self.n}, {self.n}), got {A.shape}")
         
         # Layout Detection
@@ -107,18 +107,34 @@ class CholeskyInplaceSolver:
         if self._factor_ptr is None:
             raise RuntimeError("You must call factorize() before solve().")
 
+        if cp.dtype(B.dtype).char != self._dtype:
+            raise TypeError(
+                f"RHS dtype {B.dtype} does not match solver dtype {self._dtype}."
+            )
+
         # Handle dimensions
         if B.ndim == 1:
+            if B.shape[0] != self.n:
+                raise ValueError(
+                    f"1-D RHS length mismatch. Expected {self.n}, got {B.shape[0]}"
+                )
             nrhs = 1
             ldb = self.n
-        else:
+        elif B.ndim == 2:
             if B.shape[0] != self.n:
                 raise ValueError(f"RHS dimension mismatch. Expected rows {self.n}, got {B.shape[0]}")
             nrhs = B.shape[1]
             ldb = self.n
+            if nrhs > 1 and not B.flags.f_contiguous:
+                raise ValueError(
+                    "A 2-D RHS with multiple columns must be Fortran-contiguous "
+                    "because cuSOLVER reads it in column-major order."
+                )
+        else:
+            raise ValueError(f"RHS B must be 1-D or 2-D, got shape {B.shape}.")
 
         if not (B.flags.c_contiguous or B.flags.f_contiguous):
-             raise ValueError("RHS B must be contiguous.")
+            raise ValueError("RHS B must be contiguous.")
 
         self._potrs(
             self._cusolver_handle,
@@ -139,7 +155,8 @@ class BatchedCholeskyInplaceSolver:
     process all B matrices in a single kernel launch.
 
     The batched API takes a device array of pointers (one per matrix).
-    Pointer arrays are cached and rebuilt only when the base address changes.
+    Pointer arrays are cached and rebuilt when the base address changes
+    or when the outer batch stride changes.
 
     Parameters
     ----------
@@ -176,23 +193,24 @@ class BatchedCholeskyInplaceSolver:
         self._dev_info = cp.empty(batch_size, dtype=cp.int32)
         self._dev_info_potrs = cp.empty(1, dtype=cp.int32)
 
-        # Preallocated device pointer arrays and base addresses
+        # Preallocated device pointer arrays and their source-layout keys.
         self._A_ptrs = cp.empty(batch_size, dtype=cp.int64)  # store the pointer to each batch
-        self._A_base_ptr = 0                                 # store the pointer to the whole batch
+        self._A_ptr_key = None
         self._B_ptrs = cp.empty(batch_size, dtype=cp.int64)
-        self._B_base_ptr = 0
+        self._B_ptr_key = None
 
         self._ctx_A = None
         self._ctx_B = None
         self._factorized = False
 
     def _ensure_ptrs(self, arr: cp.ndarray, ptrs: cp.ndarray,
-                     cached_ptr: int) -> int:
-        """Rebuild a device pointer array if the base address changed.
+                     cached_key: tuple) -> tuple:
+        """Rebuild pointers if the base address or batch stride changed.
 
-        Returns the (possibly updated) base pointer for caching.
+        Returns the current source-layout key for caching.
         """
-        if arr.data.ptr != cached_ptr:
+        key = (arr.data.ptr, arr.strides[0])
+        if key != cached_key:
             _fill_ptrs_kernel = cp.ElementwiseKernel(
                 'int64 base, int64 stride',
                 'int64 out',
@@ -201,7 +219,7 @@ class BatchedCholeskyInplaceSolver:
             )
             _fill_ptrs_kernel(cp.int64(arr.data.ptr),
                               cp.int64(arr.strides[0]), ptrs)
-        return arr.data.ptr
+        return key
 
     def __del__(self):
         handle = getattr(self, "_cusolver_handle", None)
@@ -225,11 +243,35 @@ class BatchedCholeskyInplaceSolver:
         Parameters
         ----------
         A : cp.ndarray, shape ``(batch_size, n, n)``
-            Overwritten with Cholesky factors.
+            Overwritten with Cholesky factors. Each ``(n, n)`` matrix
+            must be C-contiguous internally (i.e. ``A[i]`` is
+            C-contiguous); the outer batch stride may be arbitrary —
+            the per-matrix pointer kernel uses ``strides[0]`` directly,
+            which supports views like ``big[:, :n, :n]`` where rows of
+            matrices skip past trailing padding.
         """
         cusolver_set_stream(self._cusolver_handle,
                             cp.cuda.get_current_stream().ptr)
-        self._A_base_ptr = self._ensure_ptrs(A, self._A_ptrs, self._A_base_ptr)
+
+        if cp.dtype(A.dtype).char != self._dtype:
+            raise TypeError(
+                f"Input matrix dtype {A.dtype} does not match solver dtype {self._dtype}."
+            )
+        if A.shape != (self._batch_size, self._n, self._n):
+            raise ValueError(
+                f"A shape mismatch. Expected ({self._batch_size}, {self._n}, "
+                f"{self._n}), got {tuple(A.shape)}."
+            )
+        # Each (n, n) block must be C-contiguous so cuSOLVER reads it with
+        # ``lda = n``. The outer batch stride is free; ``_ensure_ptrs``
+        # uses ``A.strides[0]`` directly.
+        if self._batch_size > 0 and not A[0].flags.c_contiguous:
+            raise ValueError(
+                "Each (n, n) matrix in A must be C-contiguous; "
+                f"got strides {A.strides} with itemsize {A.dtype.itemsize}."
+            )
+
+        self._A_ptr_key = self._ensure_ptrs(A, self._A_ptrs, self._A_ptr_key)
         self._ctx_A = A
 
         self._potrf_batched(
@@ -249,15 +291,36 @@ class BatchedCholeskyInplaceSolver:
 
         Parameters
         ----------
-        B : cp.ndarray, shape ``(batch_size, n)``
-            Overwritten with the solution.
+        B : cp.ndarray, shape ``(batch_size, n)``, row-contiguous with arbitrary outer batch stride
+            Overwritten with the solution. Single-RHS-per-batch only —
+            the underlying ``potrsBatched`` call is invoked with
+            ``nrhs = 1``; pass each column separately if you need
+            multi-RHS.
         """
         cusolver_set_stream(self._cusolver_handle,
                             cp.cuda.get_current_stream().ptr)
         if not self._factorized:
             raise RuntimeError("You must call factorize() before solve().")
 
-        self._B_base_ptr = self._ensure_ptrs(B, self._B_ptrs, self._B_base_ptr)
+        if cp.dtype(B.dtype).char != self._dtype:
+            raise TypeError(
+                f"RHS dtype {B.dtype} does not match solver dtype {self._dtype}."
+            )
+        if B.shape != (self._batch_size, self._n):
+            raise ValueError(
+                f"B shape mismatch. Expected ({self._batch_size}, {self._n}), "
+                f"got {tuple(B.shape)}."
+            )
+        # Each row (length n) must be contiguous; the outer batch stride
+        # is free (``_ensure_ptrs`` uses ``B.strides[0]`` directly, which
+        # supports views like ``buf[:, :n]``).
+        if self._batch_size > 0 and not B[0].flags.c_contiguous:
+            raise ValueError(
+                "Each row of B must be contiguous; "
+                f"got strides {B.strides} with itemsize {B.dtype.itemsize}."
+            )
+
+        self._B_ptr_key = self._ensure_ptrs(B, self._B_ptrs, self._B_ptr_key)
         self._ctx_B = B
 
         self._potrs_batched(
