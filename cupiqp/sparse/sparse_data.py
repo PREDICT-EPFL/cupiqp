@@ -76,6 +76,8 @@ class SparseData(Data):
         self._c = self._to_batched_vec(c, B, n, "c", dtype=dtype)
 
         # -- A, b --------------------------------------------------------
+        if (A is None) != (b is None):
+            raise ValueError("A and b must either both be provided or both be None.")
         if A is not None and b is not None:
             self._A = self._to_batched_csr(A, "A", dtype=dtype)
             if self._A.batch_size != B:
@@ -93,6 +95,8 @@ class SparseData(Data):
 
         # -- G, h_u, h_l ------------------------------------------------
         if G is not None:
+            if h_l is None and h_u is None:
+                raise ValueError("Either h_l or h_u must be provided when G is given.")
             self._G = self._to_batched_csr(G, "G", dtype=dtype)
             if self._G.batch_size != B:
                 raise ValueError(
@@ -103,6 +107,8 @@ class SparseData(Data):
                     f"G.cols ({self._G.cols}) != n ({n})"
                 )
         else:
+            if h_u is not None or h_l is not None:
+                raise ValueError("h_l and h_u must be None when G is None.")
             self._G = self._empty_batched_csr(B, 0, n, dtype=dtype)
 
         m = self._G.rows
@@ -219,9 +225,17 @@ class SparseData(Data):
         v = cp.asarray(v, dtype=dtype)
         if v.ndim == 1:
             v = v.reshape(1, -1)
+        elif v.ndim != 2:
+            raise ValueError(
+                f"{name} must have shape ({B}, {k}) or ({k},), got {v.shape}"
+            )
+        if v.shape[1] != k:
+            raise ValueError(
+                f"{name} width mismatch: expected {k}, got {v.shape[1]}"
+            )
         if v.shape[0] == 1 and B > 1:
             # broadcast_to + .copy() already produces an owned buffer.
-            return cp.broadcast_to(v, (B, v.shape[1])).copy()
+            return cp.broadcast_to(v, (B, k)).copy()
         if v.shape[0] != B:
             raise ValueError(
                 f"{name} batch size ({v.shape[0]}) != expected ({B})"
@@ -262,8 +276,50 @@ class SparseData(Data):
     # In-place setters
     # ------------------------------------------------------------------
 
-    def _set_matrix_values(self, target: BatchedCsrMatrix, value: SparseMatrixInput, check: bool, name: str):
-        """Common helper for set_P / set_A / set_G."""
+    @staticmethod
+    def _same_sparsity_pattern(
+        target: BatchedCsrMatrix,
+        new: BatchedCsrMatrix,
+        value: SparseMatrixInput,
+    ) -> bool:
+        """Compare CSR structure values, including supplied batch members."""
+        same = (
+            cp.array_equal(new.indices, target.indices)
+            & cp.array_equal(new.indptr, target.indptr)
+        )
+        if isinstance(value, (list, tuple)):
+            for mat in value[1:]:
+                same &= (
+                    cp.array_equal(mat.indices, target.indices)
+                    & cp.array_equal(mat.indptr, target.indptr)
+                )
+        elif _is_torch_sparse_csr(value) and value.dim() == 3:
+            indices = cp.from_dlpack(value.col_indices().contiguous()).astype(
+                target.indices.dtype, copy=False
+            )
+            indptr = cp.from_dlpack(value.crow_indices().contiguous()).astype(
+                target.indptr.dtype, copy=False
+            )
+            same &= (
+                cp.array_equal(indices, cp.broadcast_to(target.indices, indices.shape))
+                & cp.array_equal(indptr, cp.broadcast_to(target.indptr, indptr.shape))
+            )
+        return bool(same)
+
+    def _set_matrix_values(
+        self,
+        target: BatchedCsrMatrix,
+        value: SparseMatrixInput,
+        check: bool,
+        name: str,
+    ):
+        """Common helper for set_P / set_A / set_G.
+
+        When ``check`` is true, compare actual CSR ``indices`` / ``indptr``
+        values. Resolving that device-side comparison to a Python decision
+        synchronizes the update path. When ``check`` is false, the caller
+        must preserve the existing sparsity pattern.
+        """
         new = self._to_batched_csr(value, name, dtype=self._dtype)
         if check:
             if new.batch_size != target.batch_size:
@@ -280,6 +336,11 @@ class SparseData(Data):
                 raise ValueError(
                     f"{name} shape mismatch: expected ({target.rows}, {target.cols}), "
                     f"got ({new.rows}, {new.cols})"
+                )
+            if not self._same_sparsity_pattern(target, new, value):
+                raise ValueError(
+                    f"{name} sparsity pattern differs from setup(): "
+                    "indices/indptr values must be unchanged."
                 )
         target.update_data(new.data)
 
