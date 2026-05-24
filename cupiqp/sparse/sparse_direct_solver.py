@@ -26,9 +26,8 @@ class SparseDirectSolver(ABC):
 
     * a ``cupyx.scipy.sparse.csr_matrix`` (B = 1) — dispatched to nvmath's
       non-batched ``DirectSolver``; or
-    * a ``BatchedCsrMatrix`` (B ≥ 1) — dispatched to nvmath's explicit-
-      batching ``DirectSolver`` by materializing per-batch ``csr_matrix``
-      views on top of the batched values buffer.
+    * a ``BatchedCsrMatrix`` (B >= 1) — dispatched through cuDSS uniform
+      batching: one CSR structure with a packed per-batch values buffer.
     """
 
     def __init__(self, matrix: Union[csr_matrix, BatchedCsrMatrix]):
@@ -38,19 +37,17 @@ class SparseDirectSolver(ABC):
             self._batch_size = 1
             self._dim = matrix.shape[0]
             self._mat = matrix
-            self._mat_list = None
+            self._mat_view = matrix
         elif isinstance(matrix, BatchedCsrMatrix):
             if matrix.rows != matrix.cols:
                 raise ValueError("All matrices must be square.")
             self._batch_size = matrix.batch_size
             self._dim = matrix.rows
             self._mat = matrix
-            # Per-batch csr_matrix views required by nvmath's batched API.
-            # Each view shares indices/indptr with the BatchedCsrMatrix and
-            # its .data points into the shared (B, nnz) values buffer, so
-            # in-place updates via matrix.data[:, k] = ... are visible to
-            # the solver automatically.
-            self._mat_list = [matrix[b] for b in range(self._batch_size)]
+            # A view of the first matrix supplies the common CSR structure.
+            # Its data pointer starts the packed (B, nnz) values buffer used
+            # by cuDSS uniform batching.
+            self._mat_view = matrix[0]
         else:
             raise TypeError(
                 "matrix must be a csr_matrix or BatchedCsrMatrix; got "
@@ -111,8 +108,6 @@ class CudssSparseDirectSolver(SparseDirectSolver):
     def __init__(self, matrix: Union[csr_matrix, BatchedCsrMatrix], use_deterministic_mode: bool = False, **cudss_kwargs):
         super().__init__(matrix)
         batch_size = self._batch_size
-        self._rhs_list = [self._rhs[i] for i in range(self._rhs.shape[0])]  # list of views
-        self._sol_list = [self._sol[i] for i in range(self._sol.shape[0])]  # list of views
 
         # setup cuDSS solver
         opts = DirectSolverOptions(
@@ -122,27 +117,23 @@ class CudssSparseDirectSolver(SparseDirectSolver):
         )
         exe = ExecutionCUDA()  # Optional: ExecutionCUDA(). NOTE: hybrid mode seems more numerically stable
 
-        if batch_size == 1:
-            # Non-batched nvmath DirectSolver. ``self._mat`` is the raw
-            # csr_matrix when the user passed one directly, or None +
-            # self._mat_list[0] when a BatchedCsrMatrix with B=1 was passed.
-            a_single = self._mat if self._mat_list is None else self._mat_list[0]
-            self._cudss_solver = DirectSolver(
-                a=a_single,
-                b=self._rhs[0],
-                options=opts,
-                execution=exe,
-                stream=cp.cuda.get_current_stream().ptr,
-            )
-        else:
-            # Explicit-batching nvmath DirectSolver. ``self._mat_list`` is a
-            # list of csr_matrix views on top of the BatchedCsrMatrix.
-            self._cudss_solver = DirectSolver(
-                a=self._mat_list,
-                b=self._rhs_list,
-                options=opts,
-                execution=exe,
-                stream=cp.cuda.get_current_stream().ptr,
+        # cuDSS uniform batching uses normal matrix descriptors whose value
+        # buffers contain all systems consecutively. ``_mat_view`` and
+        # ``_rhs[0]`` each point at the start of packed contiguous storage.
+        self._cudss_solver = DirectSolver(
+            a=self._mat_view,
+            b=self._rhs[0],
+            options=opts,
+            execution=exe,
+            stream=cp.cuda.get_current_stream().ptr,
+        )
+        if batch_size > 1:
+            ubatch_size = np.array([batch_size], dtype=np.int32)
+            cudss_bindings.config_set(
+                self._cudss_solver.config_ptr,
+                cudss_bindings.ConfigParam.UBATCH_SIZE,
+                ubatch_size.ctypes.data,
+                ubatch_size.dtype.itemsize,
             )
         self._cudss_solver.plan_config.reordering_algorithm = DirectSolverAlgType.ALG_DEFAULT
         self._cudss_solver.solution_config.ir_num_steps = 0  # NOTE: iterative refinement steps, to be tuned
@@ -172,16 +163,18 @@ class CudssSparseDirectSolver(SparseDirectSolver):
         self._cudss_x      = self._cudss_solver.x_ptr
         self._cudss_b      = self._cudss_solver.b_ptr
 
-        # Point x-descriptor at our pre-allocated _sol buffer (done once).
-        if batch_size == 1:
-            cudss_bindings.matrix_set_values(self._cudss_x, self._sol.data.ptr)
-        else:
-            row_bytes = self._dim * self._sol.itemsize
-            ptrs = np.array([self._sol.data.ptr + i * row_bytes
-                             for i in range(batch_size)], dtype=np.uint64)
-            self._sol_ptrs_dev = cp.array(ptrs)  # prevent GC — descriptor holds this pointer
-            cudss_bindings.matrix_set_batch_values(
-                self._cudss_x, self._sol_ptrs_dev.data.ptr)
+        # Uniform batching advances within these packed parent buffers; bind
+        # them explicitly rather than relying on first-row view pointers.
+        if isinstance(self._mat, BatchedCsrMatrix):
+            cudss_bindings.matrix_set_csr_pointers(
+                self._cudss_a,
+                self._mat.indptr.data.ptr,
+                0,
+                self._mat.indices.data.ptr,
+                self._mat.data.data.ptr,
+            )
+        cudss_bindings.matrix_set_values(self._cudss_b, self._rhs.data.ptr)
+        cudss_bindings.matrix_set_values(self._cudss_x, self._sol.data.ptr)
 
     def __del__(self):
         cudss_solver = getattr(self, "_cudss_solver", None)
@@ -210,9 +203,6 @@ class CudssSparseDirectSolver(SparseDirectSolver):
             # cp.cuda.get_current_stream().synchronize()
 
             if self._batch_size > 1:
-                # explicit batching returns a tuple of FactorizationInfo
-                if isinstance(fac_info, tuple):
-                    return all(fi.info == 0 for fi in fac_info)
                 return fac_info.info == 0
 
             # NOTE: this causes a D2H synchronization, which can be inefficient. More importantly, this prevents us from capturing cuda graphs.
