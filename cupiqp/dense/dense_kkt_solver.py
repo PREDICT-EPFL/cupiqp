@@ -12,8 +12,6 @@ from .dense_kkt_solver_kernels import (
 )
 from .cublas_wrappers import (
     cublas_set_stream, cublas_create_handle, cublas_destroy_handle,
-    dgemv, dsyrk, cublas_set_stream,
-    dgemm_strided_batched, dgemv_strided_batched,
 )
 
 
@@ -49,18 +47,36 @@ class DenseKKTSolver(KKTSolverBase):
 
         self._cublas_handle = cublas_create_handle()
 
+        # Lazy-import the right cuBLAS precision variant based on the data
+        # dtype. Picking the symbol once at init means the per-call lambdas
+        # below have zero precision-dispatch overhead.
+        if self._dtype == "float32":
+            from .cublas_wrappers import (
+                sgemv as _gemv_fn,
+                ssyrk as _syrk_fn,
+                sgemm_strided_batched as _gemm_strided_fn,
+                sgemv_strided_batched as _gemv_strided_fn,
+            )
+        else:
+            from .cublas_wrappers import (
+                dgemv as _gemv_fn,
+                dsyrk as _syrk_fn,
+                dgemm_strided_batched as _gemm_strided_fn,
+                dgemv_strided_batched as _gemv_strided_fn,
+            )
+
         if B > 1:
             self._cholesky_solver = BatchedCholeskyInplaceSolver(n, B, dtype=self._dtype)
             self._gemv = lambda handle, mat, x, y, transa, alpha, beta: \
-                dgemv_strided_batched(handle, mat, x, y, transa=transa, alpha=alpha, beta=beta)
-            self._syrk = lambda handle, A, C, alpha, beta: dgemm_strided_batched(
+                _gemv_strided_fn(handle, mat, x, y, transa=transa, alpha=alpha, beta=beta)
+            self._syrk = lambda handle, A, C, alpha, beta: _gemm_strided_fn(
                 handle, A, A, C, transa=True, transb=False, alpha=alpha, beta=beta)
         else:
             self._cholesky_solver = CholeskyInplaceSolver(n, dtype=self._dtype)
             self._gemv = lambda handle, mat, x, y, transa=False, alpha=1.0, beta=0.0: \
-                dgemv(handle, mat[0], x[0], y[0], transa=transa, alpha=alpha, beta=beta)
-            # dsyrk exploits symmetry; A is (1, k, n), C is (1, n, n)
-            self._syrk = lambda handle, A, C, alpha, beta: dsyrk(
+                _gemv_fn(handle, mat[0], x[0], y[0], transa=transa, alpha=alpha, beta=beta)
+            # syrk exploits symmetry; A is (1, k, n), C is (1, n, n)
+            self._syrk = lambda handle, A, C, alpha, beta: _syrk_fn(
                 handle, 1, 0, A.shape[-1], A.shape[-2],  # FILL_UPPER, OP_N, n, k
                 alpha, A.data.ptr, A.shape[-1], beta, C.data.ptr, C.shape[-1])
 

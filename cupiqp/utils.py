@@ -1,12 +1,13 @@
 from typing import Any, Callable, Optional
 import functools
 import cupy as cp
+import numpy as np
 import warp as wp
 
 
 def to_warp_dtype(dtype: Any):
     try:
-        return wp.dtype_from_numpy(dtype)
+        return wp.dtype_from_numpy(np.dtype(dtype))
     except Exception:
         return dtype
 

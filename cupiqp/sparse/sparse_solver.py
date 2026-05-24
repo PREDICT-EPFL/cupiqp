@@ -2,6 +2,8 @@ import cupy as cp
 import warp as wp
 
 from ..results import Variables
+from typing import Literal
+
 from ..settings import Settings
 from ..solver import SolverBase
 from ..utils import is_cuda_array
@@ -128,8 +130,8 @@ class SparseSolver(SolverBase):
     >>> s.solve()
     """
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, dtype: Literal["float32", "float64"] = "float64"):
+        super().__init__(dtype=dtype)
         self._settings.kkt_solver = "sparse_ldlt"
 
     @SolverBase.settings.setter

@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Optional, Any
+from typing import Optional, Any, Literal
 
 import numpy as np
 import cupy as cp
@@ -41,8 +41,12 @@ wp.init()
 class SolverBase(ABC):
     """Abstract base for the cuPIQP solver."""
 
-    def __init__(self):
-        self._settings = Settings()
+    def __init__(self, dtype: Literal["float32", "float64"] = "float64"):
+        if dtype not in ("float32", "float64"):
+            raise ValueError(
+                f"Solver dtype must be 'float32' or 'float64'; got {dtype!r}."
+            )
+        self._settings = Settings.for_dtype(dtype)
         self._data: Data = None
         self._result = Result()    # store the values of primal, dual and slack variables of current iteration, and other information
         self._step = Variables()   # used to store the step direction of primal and dual variables
