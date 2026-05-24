@@ -55,6 +55,7 @@ class SolverBase(ABC):
         self._prox_vars = Variables()  # used to store the proximal variables
         self._kkt_system = KKTSystem()
         self._preconditioner = None
+        self._setup_done = False
 
     @property
     def settings(self) -> Settings:
@@ -70,6 +71,13 @@ class SolverBase(ABC):
     
     @nvtx.annotate("Solver::setup")
     def setup(self, P, c, A=None, b=None, G=None, h_u=None, h_l=None, x_u=None, x_l=None):
+        """Initialize this solver instance."""
+        if self._setup_done:
+            raise RuntimeError(
+                "setup() may only be called once per solver instance; "
+                "create a new solver instance to set up a different problem."
+            )
+
         # Detect if user provided batched (3D P) or non-batched (2D P) data.
         # DenseData auto-unsqueezes non-batched to (1, ...) internally,
         # but we track this so solve() returns the right type.
