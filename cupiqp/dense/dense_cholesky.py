@@ -1,69 +1,24 @@
-import ctypes
-import ctypes.util
 import cupy as cp
 from cupy_backends.cuda.libs import cublas, cusolver
+from nvmath.bindings import cusolverDn
 
 
 # ---------------------------------------------------------------------------
-# Load cuSOLVER shared library for handle management
+# Handle/stream management via nvmath-python.
 # ---------------------------------------------------------------------------
-def _load_cusolver_lib() -> ctypes.CDLL:
-    try:
-        import cupy.cuda.runtime as rt
-        major = rt.runtimeGetVersion() // 1000
-        try:
-            return ctypes.CDLL(f"libcusolver.so.{major}")
-        except OSError:
-            pass
-    except Exception:
-        pass
-    for name in ("libcusolver.so", "cusolver"):
-        try:
-            return ctypes.CDLL(name)
-        except OSError:
-            continue
-    lib_path = ctypes.util.find_library("cusolver")
-    if lib_path:
-        return ctypes.CDLL(lib_path)
-    raise RuntimeError("Could not find cuSOLVER shared library")
-
-
-_cusolver_lib = _load_cusolver_lib()
-
-_cusolver_dn_create = _cusolver_lib.cusolverDnCreate
-_cusolver_dn_create.restype = ctypes.c_int
-_cusolver_dn_create.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
-
-_cusolver_dn_destroy = _cusolver_lib.cusolverDnDestroy
-_cusolver_dn_destroy.restype = ctypes.c_int
-_cusolver_dn_destroy.argtypes = [ctypes.c_void_p]
-
-_cusolver_dn_set_stream = _cusolver_lib.cusolverDnSetStream
-_cusolver_dn_set_stream.restype = ctypes.c_int
-_cusolver_dn_set_stream.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-
-
 def cusolver_create_handle():
     """Create a new cuSOLVER dense handle."""
-    handle = ctypes.c_void_p()
-    status = _cusolver_dn_create(ctypes.byref(handle))
-    if status != 0:
-        raise RuntimeError(f"cusolverDnCreate failed with status {status}")
-    return handle.value
+    return cusolverDn.create()
 
 
 def cusolver_destroy_handle(handle):
     """Destroy a cuSOLVER dense handle."""
-    status = _cusolver_dn_destroy(handle)
-    if status != 0:
-        raise RuntimeError(f"cusolverDnDestroy failed with status {status}")
+    cusolverDn.destroy(handle)
 
 
 def cusolver_set_stream(handle, stream_ptr):
     """Associate a CUDA stream with the cuSOLVER handle."""
-    status = _cusolver_dn_set_stream(handle, stream_ptr)
-    if status != 0:
-        raise RuntimeError(f"cusolverDnSetStream failed with status {status}")
+    cusolverDn.set_stream(handle, stream_ptr)
 
 
 class CholeskyInplaceSolver:

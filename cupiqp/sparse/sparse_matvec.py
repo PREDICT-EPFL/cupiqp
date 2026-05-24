@@ -1,77 +1,22 @@
 import ctypes
-import ctypes.util
 from typing import Union
 import cupy as cp
 from cupyx.scipy.sparse import spmatrix, csr_matrix, csc_matrix, coo_matrix
-from cupy.cuda import cusparse
 import cupy.cuda.runtime as rt
+from nvmath.bindings import cusparse
 
 from .batched_csr import BatchedCsrMatrix
 
+
 # ---------------------------------------------------------------------------
-# Load cuSPARSE shared library once (module level) for graph-safe direct calls
+# Graph-safe cuSPARSE entry points via nvmath-python.
 # ---------------------------------------------------------------------------
-def _load_cusparse_lib():
-    """Load the cuSPARSE shared library via ctypes."""
-    for name in ("libcusparse.so.12", "libcusparse.so", "cusparse"):
-        try:
-            return ctypes.CDLL(name)
-        except OSError:
-            continue
-    lib_path = ctypes.util.find_library("cusparse")
-    if lib_path:
-        return ctypes.CDLL(lib_path)
-    raise RuntimeError("Could not find cuSPARSE shared library")
-
-
-_cusparse_lib = _load_cusparse_lib()
-
-_cusparse_lib.cusparseSpMV.restype = ctypes.c_int
-_cusparse_lib.cusparseSpMV.argtypes = [
-    ctypes.c_void_p,  # handle
-    ctypes.c_int,     # opA
-    ctypes.c_void_p,  # alpha
-    ctypes.c_void_p,  # matA
-    ctypes.c_void_p,  # vecX
-    ctypes.c_void_p,  # beta
-    ctypes.c_void_p,  # vecY
-    ctypes.c_int,     # computeType
-    ctypes.c_int,     # alg
-    ctypes.c_void_p,  # externalBuffer
-]
-
-# cusparseStatus_t cusparseDnVecSetValues(dnVecDescr, values)
-_cusparse_lib.cusparseDnVecSetValues.restype = ctypes.c_int
-_cusparse_lib.cusparseDnVecSetValues.argtypes = [
-    ctypes.c_void_p,  # dnVecDescr
-    ctypes.c_void_p,  # values
-]
-
-# cusparseStatus_t cusparseSetStream(cusparseHandle_t handle, cudaStream_t streamId)
-_cusparse_lib.cusparseSetStream.restype = ctypes.c_int
-_cusparse_lib.cusparseSetStream.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-
-# cusparseStatus_t cusparseCreate(cusparseHandle_t *handle)
-_cusparse_lib.cusparseCreate.restype = ctypes.c_int
-_cusparse_lib.cusparseCreate.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
-
-# cusparseStatus_t cusparseDestroy(cusparseHandle_t handle)
-_cusparse_lib.cusparseDestroy.restype = ctypes.c_int
-_cusparse_lib.cusparseDestroy.argtypes = [ctypes.c_void_p]
-
-
 def _create_cusparse_handle():
-    handle = ctypes.c_void_p()
-    status = _cusparse_lib.cusparseCreate(ctypes.byref(handle))
-    if status != 0:
-        raise RuntimeError(f"cusparseCreate failed with status {status}")
-    return handle.value
+    return cusparse.create()
 
 
 def _destroy_cusparse_handle(handle):
-    status = _cusparse_lib.cusparseDestroy(handle)
-    if status != 0:
-        raise RuntimeError(f"cusparseDestroy failed with status {status}")
+    cusparse.destroy(handle)
 
 
 # ---------------------------------------------------------------------------
@@ -80,9 +25,9 @@ def _destroy_cusparse_handle(handle):
 def _idx_type(arr: cp.ndarray) -> int:
     """Return the cuSPARSE index-type constant matching *arr*'s dtype."""
     return (
-        cusparse.CUSPARSE_INDEX_32I
+        cusparse.IndexType.INDEX_32I
         if arr.dtype == cp.int32
-        else cusparse.CUSPARSE_INDEX_64I
+        else cusparse.IndexType.INDEX_64I
     )
 
 
@@ -100,8 +45,8 @@ class SingleSparseMatVecProduct:
     adds per-call overhead. This class pre-allocates the cuSPARSE handle,
     the sparse- and dense-vector descriptors, and the workspace buffer at
     construction time. ``__call__`` then only rebinds the dense-vector
-    pointers and dispatches ``cusparseSpMV`` via a direct ctypes call —
-    no device allocation, no host-device sync, safe for stream capture.
+    pointers and dispatches ``cusparseSpMV`` via ``nvmath.bindings.cusparse``
+    — no device allocation, no host-device sync, safe for stream capture.
 
     Lifetime: the sparse matrix ``mat`` is kept alive through ``self._mat``
     and the descriptor reuses its device buffers. In-place updates to
@@ -144,9 +89,9 @@ class SingleSparseMatVecProduct:
 
         # ---- operation ----
         self._op = (
-            cusparse.CUSPARSE_OPERATION_TRANSPOSE
+            cusparse.Operation.TRANSPOSE
             if self._transa
-            else cusparse.CUSPARSE_OPERATION_NON_TRANSPOSE
+            else cusparse.Operation.NON_TRANSPOSE
         )
 
         # ---- data type — pick to match the matrix's element dtype ----
@@ -169,16 +114,16 @@ class SingleSparseMatVecProduct:
 
         dummy_x = cp.empty(x_size, dtype=self._np_dtype)
         dummy_y = cp.empty(y_size, dtype=self._np_dtype)
-        self._x_desc = cusparse.createDnVec(x_size, dummy_x.data.ptr, self._compute_type)
-        self._y_desc = cusparse.createDnVec(y_size, dummy_y.data.ptr, self._compute_type)
+        self._x_desc = cusparse.create_dn_vec(x_size, dummy_x.data.ptr, self._compute_type)
+        self._y_desc = cusparse.create_dn_vec(y_size, dummy_y.data.ptr, self._compute_type)
 
         # ---- workspace buffer (allocated once; size is independent of scalars) ----
-        self._alg = cusparse.CUSPARSE_MV_ALG_DEFAULT
+        self._alg = cusparse.SpMVAlg.DEFAULT
         # Alpha/beta scalar type must match compute_type (32F → float, 64F → double).
         self._c_scalar = ctypes.c_float if self._np_dtype == cp.float32 else ctypes.c_double
         _alpha_placeholder = self._c_scalar(1.0)
         _beta_placeholder = self._c_scalar(0.0)
-        buf_size = cusparse.spMV_bufferSize(
+        buf_size = cusparse.sp_mv_buffer_size(
             self._cusparse_handle,
             self._op,
             ctypes.addressof(_alpha_placeholder),
@@ -201,35 +146,35 @@ class SingleSparseMatVecProduct:
         """
         rows, cols = mat.shape
         if isinstance(mat, csr_matrix):
-            return cusparse.createCsr(
+            return cusparse.create_csr(
                 rows, cols, mat.nnz,
                 mat.indptr.data.ptr,
                 mat.indices.data.ptr,
                 mat.data.data.ptr,
                 _idx_type(mat.indptr),
                 _idx_type(mat.indices),
-                cusparse.CUSPARSE_INDEX_BASE_ZERO,
+                cusparse.IndexBase.ZERO,
                 compute_type,
             )
         elif isinstance(mat, csc_matrix):
-            return cusparse.createCsc(
+            return cusparse.create_csc(
                 rows, cols, mat.nnz,
                 mat.indptr.data.ptr,
                 mat.indices.data.ptr,
                 mat.data.data.ptr,
                 _idx_type(mat.indptr),
                 _idx_type(mat.indices),
-                cusparse.CUSPARSE_INDEX_BASE_ZERO,
+                cusparse.IndexBase.ZERO,
                 compute_type,
             )
         elif isinstance(mat, coo_matrix):
-            return cusparse.createCoo(
+            return cusparse.create_coo(
                 rows, cols, mat.nnz,
                 mat.row.data.ptr,
                 mat.col.data.ptr,
                 mat.data.data.ptr,
                 _idx_type(mat.row),
-                cusparse.CUSPARSE_INDEX_BASE_ZERO,
+                cusparse.IndexBase.ZERO,
                 compute_type,
             )
         else:
@@ -249,14 +194,14 @@ class SingleSparseMatVecProduct:
         """Execute ``y = alpha * op(A) * x + beta * y``. """
         if stream_ptr is None:
             stream_ptr = cp.cuda.get_current_stream().ptr
-        _cusparse_lib.cusparseSetStream(self._cusparse_handle, stream_ptr)
+        cusparse.set_stream(self._cusparse_handle, stream_ptr)
 
         _alpha = self._c_scalar(alpha)
         _beta = self._c_scalar(beta)
-        _cusparse_lib.cusparseDnVecSetValues(self._x_desc, x.data.ptr)
-        _cusparse_lib.cusparseDnVecSetValues(self._y_desc, y.data.ptr)
-        
-        status = _cusparse_lib.cusparseSpMV(
+        cusparse.dn_vec_set_values(self._x_desc, x.data.ptr)
+        cusparse.dn_vec_set_values(self._y_desc, y.data.ptr)
+
+        cusparse.sp_mv(
             self._cusparse_handle,
             self._op,
             ctypes.addressof(_alpha),
@@ -268,20 +213,18 @@ class SingleSparseMatVecProduct:
             self._alg,
             self._buffer.data.ptr,
         )
-        if status != 0:
-            raise RuntimeError(f"cusparseSpMV failed with status {status}")
 
     def __del__(self):
         try:
-            cusparse.destroyDnVec(self._x_desc)
+            cusparse.destroy_dn_vec(self._x_desc)
         except Exception:
             pass
         try:
-            cusparse.destroyDnVec(self._y_desc)
+            cusparse.destroy_dn_vec(self._y_desc)
         except Exception:
             pass
         try:
-            cusparse.destroySpMat(self._mat_desc)
+            cusparse.destroy_sp_mat(self._mat_desc)
         except Exception:
             pass
 
@@ -317,7 +260,7 @@ class BatchedSparseMatVecProduct:
     Graph safety mirrors ``SingleSparseMatVecProduct``: every cuSPARSE
     descriptor and the workspace buffer are allocated once in ``__init__``;
     ``__call__`` only rebinds dense-vector pointers and dispatches
-    ``cusparseSpMV`` via a direct ctypes call.
+    ``cusparseSpMV`` via ``nvmath.bindings.cusparse``.
 
     Parameters
     ----------
@@ -391,11 +334,11 @@ class BatchedSparseMatVecProduct:
             self._np_dtype = cp.float64
             self._c_scalar = ctypes.c_double
         self._op = (
-            cusparse.CUSPARSE_OPERATION_TRANSPOSE
+            cusparse.Operation.TRANSPOSE
             if self._transa
-            else cusparse.CUSPARSE_OPERATION_NON_TRANSPOSE
+            else cusparse.Operation.NON_TRANSPOSE
         )
-        self._alg = cusparse.CUSPARSE_MV_ALG_DEFAULT
+        self._alg = cusparse.SpMVAlg.DEFAULT
         self._mat_desc = SingleSparseMatVecProduct._create_mat_desc(
             self._block_diag_mat, self._compute_type,
         )
@@ -412,13 +355,13 @@ class BatchedSparseMatVecProduct:
         y_size = B * self._y_vec_len
         self._x_buf = cp.empty(x_size, dtype=self._np_dtype)
         self._y_buf = cp.empty(y_size, dtype=self._np_dtype)
-        self._x_desc = cusparse.createDnVec(x_size, self._x_buf.data.ptr, self._compute_type)
-        self._y_desc = cusparse.createDnVec(y_size, self._y_buf.data.ptr, self._compute_type)
+        self._x_desc = cusparse.create_dn_vec(x_size, self._x_buf.data.ptr, self._compute_type)
+        self._y_desc = cusparse.create_dn_vec(y_size, self._y_buf.data.ptr, self._compute_type)
 
         # Workspace size is independent of the alpha/beta scalars.
         _alpha_placeholder = self._c_scalar(1.0)
         _beta_placeholder = self._c_scalar(0.0)
-        buf_size = cusparse.spMV_bufferSize(
+        buf_size = cusparse.sp_mv_buffer_size(
             self._cusparse_handle,
             self._op,
             ctypes.addressof(_alpha_placeholder),
@@ -427,7 +370,7 @@ class BatchedSparseMatVecProduct:
             ctypes.addressof(_beta_placeholder),
             self._y_desc,
             self._compute_type,
-            cusparse.CUSPARSE_MV_ALG_DEFAULT,
+            self._alg,
         )
         self._buffer = cp.empty(max(buf_size, 1), dtype=cp.uint8)
 
@@ -450,7 +393,7 @@ class BatchedSparseMatVecProduct:
         """
         if stream_ptr is None:
             stream_ptr = cp.cuda.get_current_stream().ptr
-        _cusparse_lib.cusparseSetStream(self._cusparse_handle, stream_ptr)
+        cusparse.set_stream(self._cusparse_handle, stream_ptr)
 
         _alpha = self._c_scalar(alpha)
         _beta = self._c_scalar(beta)
@@ -462,7 +405,7 @@ class BatchedSparseMatVecProduct:
         y_contig = y.flags['C_CONTIGUOUS']
 
         if x_contig:
-            _cusparse_lib.cusparseDnVecSetValues(self._x_desc, x.data.ptr)
+            cusparse.dn_vec_set_values(self._x_desc, x.data.ptr)
         else:
             # Copy x (non-contig) into the contiguous internal x_buf so the
             # descriptor's expected layout matches memory. One D->D 2D copy.
@@ -476,10 +419,10 @@ class BatchedSparseMatVecProduct:
                 3,                     # kind: cudaMemcpyDeviceToDevice
                 stream_ptr,            # stream
             )
-            _cusparse_lib.cusparseDnVecSetValues(self._x_desc, self._x_buf.data.ptr)
+            cusparse.dn_vec_set_values(self._x_desc, self._x_buf.data.ptr)
 
         if y_contig:
-            _cusparse_lib.cusparseDnVecSetValues(self._y_desc, y.data.ptr)
+            cusparse.dn_vec_set_values(self._y_desc, y.data.ptr)
         else:
             if beta != 0.0:
                 # cuSPARSE reads y before writing when beta != 0, so we must
@@ -496,9 +439,9 @@ class BatchedSparseMatVecProduct:
                     3,                     # kind: cudaMemcpyDeviceToDevice
                     stream_ptr,            # stream
                 )
-            _cusparse_lib.cusparseDnVecSetValues(self._y_desc, self._y_buf.data.ptr)
+            cusparse.dn_vec_set_values(self._y_desc, self._y_buf.data.ptr)
 
-        status = _cusparse_lib.cusparseSpMV(
+        cusparse.sp_mv(
             self._cusparse_handle,
             self._op,
             ctypes.addressof(_alpha),
@@ -510,8 +453,6 @@ class BatchedSparseMatVecProduct:
             self._alg,
             self._buffer.data.ptr,
         )
-        if status != 0:
-            raise RuntimeError(f"cusparseSpMV failed with status {status}")
 
         if not y_contig:
             # Copy the SpMV result back out: internal packed y_buf -> caller's
@@ -529,15 +470,15 @@ class BatchedSparseMatVecProduct:
 
     def __del__(self):
         try:
-            cusparse.destroyDnVec(self._x_desc)
+            cusparse.destroy_dn_vec(self._x_desc)
         except Exception:
             pass
         try:
-            cusparse.destroyDnVec(self._y_desc)
+            cusparse.destroy_dn_vec(self._y_desc)
         except Exception:
             pass
         try:
-            cusparse.destroySpMat(self._mat_desc)
+            cusparse.destroy_sp_mat(self._mat_desc)
         except Exception:
             pass
 
