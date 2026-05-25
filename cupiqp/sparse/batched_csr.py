@@ -5,7 +5,7 @@ from cupyx.scipy.sparse import csr_matrix
 
 
 class UniformBatchedCsrMatrix:
-    """Batched storage of CSR matrices with the same sparsity."""
+    """Batched CSR storage with one shared sparsity pattern."""
     def __init__(
         self,
         batch_size: int,
@@ -64,35 +64,56 @@ class UniformBatchedCsrMatrix:
     def from_torch_sparse_csr_tensor(
         cls, tensor, dtype=cp.float64, validate_shared_sparsity: bool = True,
     ) -> "UniformBatchedCsrMatrix":
-        """Build a ``BatchedCsrMatrix`` from a batched torch ``sparse_csr_tensor``.
+        """Build a uniform batched CSR matrix from a torch CSR tensor.
 
-        ``tensor`` must be 3-D with shape ``(B, M, N)``, in ``torch.sparse_csr``
-        layout, residing on a CUDA device. Every batch is expected to share the
-        same sparsity pattern; by default this is checked before the shared
-        ``indptr``/``indices`` are read from batch 0. The per-batch ``values``
-        (shape ``(B, nnz)``) become the ``data`` buffer.
+        ``tensor`` may be 2-D with shape ``(M, N)`` or 3-D with shape
+        ``(B, M, N)``. For 3-D inputs, every batch must share one CSR
+        pattern; by default this is checked before using the first batch's
+        ``indptr`` / ``indices`` as the shared structure.
 
-        Device-side data is moved zero-copy via DLPack.
+        Device-side input buffers are imported via DLPack before values are
+        copied into solver-owned storage.
         """
         import torch  # local import to avoid a hard dependency on torch
 
         if not isinstance(tensor, torch.Tensor):
-            raise TypeError(
-                f"Expected a torch.Tensor, got {type(tensor).__name__}."
-            )
+            raise TypeError(f"Expected a torch.Tensor, got {type(tensor).__name__}.")
         if tensor.layout != torch.sparse_csr:
+            raise ValueError(f"Expected torch.sparse_csr layout, got {tensor.layout}.")
+        if tensor.dim() not in (2, 3):
             raise ValueError(
-                f"Expected torch.sparse_csr layout, got {tensor.layout}."
-            )
-        if tensor.dim() != 3:
-            raise ValueError(
-                "Expected a 3-D batched sparse CSR tensor of shape (B, M, N); "
+                "Expected a sparse CSR tensor of shape (M, N) or (B, M, N); "
                 f"got shape {tuple(tensor.shape)}."
             )
         if not tensor.is_cuda:
             raise ValueError("tensor must reside on a CUDA device.")
 
-        B = tensor.shape[0]
+        if tensor.dim() == 2:
+            rows, cols = int(tensor.shape[0]), int(tensor.shape[1])
+            indptr = cp.from_dlpack(tensor.crow_indices().contiguous()).astype(
+                cp.int32, copy=False,
+            )
+            indices = cp.from_dlpack(tensor.col_indices().contiguous()).astype(
+                cp.int32, copy=False,
+            )
+            values = cp.from_dlpack(tensor.values().contiguous())
+            data = values.reshape(1, -1)
+            return cls(
+                batch_size=1,
+                indices=indices,
+                indptr=indptr,
+                data=data,
+                shape=(rows, cols),
+                dtype=dtype,
+            )
+
+        B, rows, cols = (
+            int(tensor.shape[0]), int(tensor.shape[1]), int(tensor.shape[2])
+        )
+        if B < 1:
+            raise ValueError(
+                "A batched sparse CSR tensor must contain at least one matrix."
+            )
         crow = tensor.crow_indices()   # (B, M+1)
         col = tensor.col_indices()     # (B, nnz)
         values = tensor.values()       # (B, nnz)
@@ -117,7 +138,14 @@ class UniformBatchedCsrMatrix:
         indices = cp.from_dlpack(col[0].contiguous()).astype(cp.int32, copy=False)
         data = cp.from_dlpack(values.contiguous())
 
-        return cls(batch_size=B, indices=indices, indptr=indptr, data=data, dtype=dtype)
+        return cls(
+            batch_size=B,
+            indices=indices,
+            indptr=indptr,
+            data=data,
+            shape=(rows, cols),
+            dtype=dtype,
+        )
 
     @property
     def batch_size(self) -> int: return self._batch_size
