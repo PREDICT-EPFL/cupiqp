@@ -60,6 +60,125 @@ class UniformBatchedCsrMatrix:
             )
         self.data[:] = new_data_cp
 
+    @staticmethod
+    def is_torch_sparse_csr_tensor(obj) -> bool:
+        """Return whether *obj* is a Torch CSR tensor."""
+        if not (hasattr(obj, "layout") and hasattr(obj, "crow_indices")
+                and hasattr(obj, "values")):
+            return False
+        try:
+            import torch
+        except ImportError:
+            return False
+        return isinstance(obj, torch.Tensor) and obj.layout == torch.sparse_csr
+
+    @classmethod
+    def from_input(
+        cls,
+        matrix,
+        dtype=cp.float64,
+        validate_shared_sparsity: bool = True,
+    ) -> "UniformBatchedCsrMatrix":
+        """Normalize one accepted sparse input form to uniform batched CSR."""
+        if isinstance(matrix, cls):
+            return cls(
+                batch_size=matrix.batch_size,
+                indices=matrix.indices,
+                indptr=matrix.indptr,
+                data=matrix.data,
+                shape=(matrix.rows, matrix.cols),
+                dtype=dtype,
+            )
+        if cls.is_torch_sparse_csr_tensor(matrix):
+            return cls.from_torch_sparse_csr_tensor(
+                matrix,
+                dtype=dtype,
+                validate_shared_sparsity=validate_shared_sparsity,
+            )
+        if isinstance(matrix, (list, tuple)):
+            return cls.from_cupy_csr_matrix_sequence(
+                matrix,
+                dtype=dtype,
+                validate_shared_sparsity=validate_shared_sparsity,
+            )
+        return cls.from_cupy_csr_matrix(matrix, dtype=dtype)
+
+    @classmethod
+    def from_cupy_csr_matrix(cls, matrix, dtype=cp.float64) -> "UniformBatchedCsrMatrix":
+        """Build a one-batch matrix from a CuPy CSR or convertible input."""
+        matrix = csr_matrix(matrix, dtype=dtype)
+        return cls(
+            batch_size=1,
+            indices=matrix.indices,
+            indptr=matrix.indptr,
+            data=matrix.data.reshape(1, -1),
+            shape=matrix.shape,
+            dtype=dtype,
+        )
+
+    @classmethod
+    def from_cupy_csr_matrix_sequence(
+        cls,
+        matrices: Sequence[csr_matrix],
+        dtype=cp.float64,
+        validate_shared_sparsity: bool = True,
+    ) -> "UniformBatchedCsrMatrix":
+        """Build from a non-empty list or tuple of uniform CuPy CSR matrices."""
+        if not isinstance(matrices, (list, tuple)) or len(matrices) == 0:
+            raise ValueError("matrices must be a non-empty list or tuple of CuPy csr matrices.")
+        matrices = [csr_matrix(matrix, dtype=dtype) for matrix in matrices]
+        template = matrices[0]
+        if validate_shared_sparsity:
+            cls._require_uniform_sparsity(matrices)
+        data = (
+            cp.stack([matrix.data for matrix in matrices])
+            if template.nnz > 0 else cp.empty((len(matrices), 0), dtype=dtype)
+            )
+        return cls(
+            batch_size=len(matrices),
+            indices=template.indices,
+            indptr=template.indptr,
+            data=data,
+            shape=template.shape,
+            dtype=dtype,
+        )
+    
+    @staticmethod
+    def _require_uniform_sparsity(matrices: Sequence[csr_matrix]) -> None:
+        """Raise unless all CSR matrices share one shape and structure."""
+        template = matrices[0]
+        error = "All matrices must share the same CSR sparsity pattern."
+        if any(
+            matrix.shape != template.shape or matrix.nnz != template.nnz
+            for matrix in matrices[1:]
+        ):
+            raise ValueError(error)
+        if len(matrices) == 1:
+            return
+
+        indices = cp.stack([matrix.indices for matrix in matrices[1:]])
+        indptr = cp.stack([matrix.indptr for matrix in matrices[1:]])
+        same = (
+            cp.array_equal(indices, cp.broadcast_to(template.indices, indices.shape))
+            & cp.array_equal(indptr, cp.broadcast_to(template.indptr, indptr.shape))
+        )
+        if not bool(same):
+            raise ValueError(error)
+
+    @classmethod
+    def empty(
+        cls, batch_size: int, rows: int, cols: int, dtype=cp.float64,
+    ) -> "UniformBatchedCsrMatrix":
+        """Build an empty uniform CSR matrix batch with a declared shape."""
+        return cls(
+            batch_size=batch_size,
+            indices=cp.empty(0, dtype=cp.int32),
+            indptr=cp.zeros(rows + 1, dtype=cp.int32),
+            data=cp.empty((batch_size, 0), dtype=dtype),
+            shape=(rows, cols),
+            dtype=dtype,
+        )
+
     @classmethod
     def from_torch_sparse_csr_tensor(
         cls, tensor, dtype=cp.float64, validate_shared_sparsity: bool = True,

@@ -1,6 +1,5 @@
 from typing import Any, Optional
 import cupy as cp
-from cupyx.scipy.sparse import csr_matrix
 
 from ..data import Data
 from ..typedef import PIQP_INF
@@ -8,39 +7,26 @@ from .batched_csr import UniformBatchedCsrMatrix
 
 
 # Type alias for the accepted matrix input forms.
-# - For batched (B > 1): BatchedCsrMatrix, 3-D torch.sparse_csr_tensor, or List[cupy csr_matrix].
+# - For batched (B > 1): UniformBatchedCsrMatrix, 3-D torch.sparse_csr_tensor, or List[cupy csr_matrix].
 # - For single (B = 1): cupy csr_matrix or 2-D torch.sparse_csr_tensor.
 SparseMatrixInput = Any
-
-
-def _is_torch_sparse_csr(obj) -> bool:
-    """Duck-typed check for a torch.sparse_csr_tensor without importing torch
-    at module load.  We only touch ``torch`` when needed."""
-    if not (hasattr(obj, "layout") and hasattr(obj, "crow_indices")
-            and hasattr(obj, "values")):
-        return False
-    try:
-        import torch
-    except ImportError:
-        return False
-    return isinstance(obj, torch.Tensor) and obj.layout == torch.sparse_csr
 
 
 class SparseData(Data):
     """Sparse data structure for batched QP problems.
 
     Matrices ``P``, ``A``, ``G`` are stored internally as
-    :class:`BatchedCsrMatrix` instances — one shared ``indptr``/``indices``
+    :class:`UniformBatchedCsrMatrix` instances — one shared ``indptr``/``indices``
     pair plus a packed ``(B, nnz)`` values buffer. Callers may pass any of
     the following for each matrix:
 
-    * :class:`BatchedCsrMatrix` (used as-is, zero extra packing)
+    * :class:`UniformBatchedCsrMatrix` (already has a uniform structure)
     * ``torch.sparse_csr_tensor`` — 3-D ``(B, M, N)`` for batched,
       2-D ``(M, N)`` for single
     * ``list[cupy csr_matrix]`` sharing the same sparsity pattern
     * a single cupy ``csr_matrix`` (B = 1)
 
-    Whatever the input, the normalized storage is a ``BatchedCsrMatrix``
+    Whatever the input, the normalized storage is a ``UniformBatchedCsrMatrix``
     accessible via ``self.P`` / ``self.A`` / ``self.G``. Dense vectors
     (``c``, ``b``, ``h_l``, ``h_u``, ``x_l``, ``x_u``) carry a leading
     batch dimension ``(B, k)``.
@@ -64,7 +50,9 @@ class SparseData(Data):
         dtype = self._dtype
 
         # -- P (determines B and n) -------------------------------------
-        self._P = self._to_batched_csr(P, "P", dtype=dtype)
+        self._P = UniformBatchedCsrMatrix.from_input(
+            P, dtype=dtype, validate_shared_sparsity=True,
+        )
         B = self._P.batch_size
         if self._P.rows != self._P.cols:
             raise ValueError("P must be square.")
@@ -79,7 +67,9 @@ class SparseData(Data):
         if (A is None) != (b is None):
             raise ValueError("A and b must either both be provided or both be None.")
         if A is not None and b is not None:
-            self._A = self._to_batched_csr(A, "A", dtype=dtype)
+            self._A = UniformBatchedCsrMatrix.from_input(
+                A, dtype=dtype, validate_shared_sparsity=True,
+            )
             if self._A.batch_size != B:
                 raise ValueError(
                     f"A batch size ({self._A.batch_size}) != P batch size ({B})"
@@ -90,14 +80,16 @@ class SparseData(Data):
                 )
             self._b = self._to_batched_vec(b, B, self._A.rows, "b", dtype=dtype)
         else:
-            self._A = self._empty_batched_csr(B, 0, n, dtype=dtype)
+            self._A = UniformBatchedCsrMatrix.empty(B, 0, n, dtype=dtype)
             self._b = cp.zeros((B, 0), dtype=dtype)
 
         # -- G, h_u, h_l ------------------------------------------------
         if G is not None:
             if h_l is None and h_u is None:
                 raise ValueError("Either h_l or h_u must be provided when G is given.")
-            self._G = self._to_batched_csr(G, "G", dtype=dtype)
+            self._G = UniformBatchedCsrMatrix.from_input(
+                G, dtype=dtype, validate_shared_sparsity=True,
+            )
             if self._G.batch_size != B:
                 raise ValueError(
                     f"G batch size ({self._G.batch_size}) != P batch size ({B})"
@@ -109,7 +101,7 @@ class SparseData(Data):
         else:
             if h_u is not None or h_l is not None:
                 raise ValueError("h_l and h_u must be None when G is None.")
-            self._G = self._empty_batched_csr(B, 0, n, dtype=dtype)
+            self._G = UniformBatchedCsrMatrix.empty(B, 0, n, dtype=dtype)
 
         m = self._G.rows
         self._h_u = self._to_batched_vec(h_u, B, m, "h_u", dtype=dtype) if h_u is not None else cp.zeros((B, 0), dtype=dtype)
@@ -132,90 +124,8 @@ class SparseData(Data):
         return self._G.rows
 
     # ------------------------------------------------------------------
-    # Input normalization
+    # Vector normalization
     # ------------------------------------------------------------------
-
-    @classmethod
-    def _to_batched_csr(cls, mat: SparseMatrixInput, name: str, dtype=cp.float64) -> UniformBatchedCsrMatrix:
-        """Normalize any accepted matrix input form to ``BatchedCsrMatrix``."""
-        # Already a BatchedCsrMatrix — reuse the shared sparsity pattern but
-        # clone the values buffer so the solver (preconditioner) can mutate
-        # without touching the caller's matrix.
-        if isinstance(mat, UniformBatchedCsrMatrix):
-            return UniformBatchedCsrMatrix(
-                batch_size=mat.batch_size,
-                indices=mat.indices,
-                indptr=mat.indptr,
-                data=mat.data,  # BatchedCsrMatrix.__init__ allocates + copies
-                shape=(mat.rows, mat.cols),
-                dtype=dtype,
-            )
-
-        # torch.sparse_csr_tensor (2-D single or 3-D batched).
-        if _is_torch_sparse_csr(mat):
-            return cls._from_torch_sparse_csr(mat, name, dtype=dtype)
-
-        # List/tuple of cupy csr_matrix — stack per-batch data.
-        if isinstance(mat, (list, tuple)):
-            if len(mat) == 0:
-                raise ValueError(f"{name} cannot be an empty list.")
-            mats = [csr_matrix(m, dtype=dtype) for m in mat]
-            tpl = mats[0]  # template matrix
-            if tpl.nnz == 0:
-                data = cp.empty((len(mats), 0), dtype=dtype)
-            else:
-                data = cp.stack([m.data for m in mats])
-            return UniformBatchedCsrMatrix(
-                len(mats), tpl.indices, tpl.indptr, data, shape=tpl.shape,
-                dtype=dtype,
-            )
-
-        # Single cupy csr_matrix (or convertible) — wrap as B = 1.
-        single = csr_matrix(mat, dtype=dtype)
-        if single.nnz == 0:
-            data = cp.empty((1, 0), dtype=dtype)
-        else:
-            data = single.data.reshape(1, -1)
-        return UniformBatchedCsrMatrix(
-            1, single.indices, single.indptr, data, shape=single.shape,
-            dtype=dtype,
-        )
-
-    @staticmethod
-    def _from_torch_sparse_csr(tensor, name: str, dtype=cp.float64) -> UniformBatchedCsrMatrix:
-        """Wrap a torch.sparse_csr_tensor into a BatchedCsrMatrix.
-
-        Handles both 2-D (single) and 3-D (batched) tensors. In both
-        cases the per-batch sparsity pattern is assumed shared (for 3-D
-        the pattern is read from batch 0 only).
-        """
-        if tensor.dim() == 3:
-            return UniformBatchedCsrMatrix.from_torch_sparse_csr_tensor(tensor, dtype=dtype)
-        if tensor.dim() != 2:
-            raise ValueError(
-                f"{name} torch.sparse_csr_tensor must be 2-D or 3-D; "
-                f"got shape {tuple(tensor.shape)}."
-            )
-        if not tensor.is_cuda:
-            raise ValueError(f"{name} tensor must reside on a CUDA device.")
-        indptr = cp.from_dlpack(tensor.crow_indices().contiguous()).astype(cp.int32, copy=False)
-        indices = cp.from_dlpack(tensor.col_indices().contiguous()).astype(cp.int32, copy=False)
-        values = cp.from_dlpack(tensor.values().contiguous())
-        data = values.reshape(1, -1) if values.size > 0 else cp.empty((1, 0), dtype=dtype)
-        rows, cols = int(tensor.shape[0]), int(tensor.shape[1])
-        return UniformBatchedCsrMatrix(1, indices, indptr, data, shape=(rows, cols), dtype=dtype)
-
-    @staticmethod
-    def _empty_batched_csr(B: int, rows: int, cols: int, dtype=cp.float64) -> UniformBatchedCsrMatrix:
-        """Placeholder for an omitted matrix block — (B, rows, cols), nnz = 0."""
-        return UniformBatchedCsrMatrix(
-            batch_size=B,
-            indices=cp.empty(0, dtype=cp.int32),
-            indptr=cp.zeros(rows + 1, dtype=cp.int32),
-            data=cp.empty((B, 0), dtype=dtype),
-            shape=(rows, cols),
-            dtype=dtype,
-        )
 
     @staticmethod
     def _to_batched_vec(
@@ -283,26 +193,34 @@ class SparseData(Data):
         value: SparseMatrixInput,
     ) -> bool:
         """Compare CSR structure values, including supplied batch members."""
-        same = (
-            cp.array_equal(new.indices, target.indices)
-            & cp.array_equal(new.indptr, target.indptr)
-        )
         if isinstance(value, (list, tuple)):
-            for mat in value[1:]:
-                same &= (
-                    cp.array_equal(mat.indices, target.indices)
-                    & cp.array_equal(mat.indptr, target.indptr)
-                )
-        elif _is_torch_sparse_csr(value) and value.dim() == 3:
+            if any(
+                mat.shape != (target.rows, target.cols) or mat.nnz != target.nnz
+                for mat in value
+            ):
+                return False
+            indices = cp.stack([mat.indices for mat in value])
+            indptr = cp.stack([mat.indptr for mat in value])
+            same = (
+                cp.array_equal(indices, cp.broadcast_to(target.indices, indices.shape))
+                & cp.array_equal(indptr, cp.broadcast_to(target.indptr, indptr.shape))
+            )
+        elif (UniformBatchedCsrMatrix.is_torch_sparse_csr_tensor(value)
+              and value.dim() == 3):
             indices = cp.from_dlpack(value.col_indices().contiguous()).astype(
                 target.indices.dtype, copy=False
             )
             indptr = cp.from_dlpack(value.crow_indices().contiguous()).astype(
                 target.indptr.dtype, copy=False
             )
-            same &= (
+            same = (
                 cp.array_equal(indices, cp.broadcast_to(target.indices, indices.shape))
                 & cp.array_equal(indptr, cp.broadcast_to(target.indptr, indptr.shape))
+            )
+        else:
+            same = (
+                cp.array_equal(new.indices, target.indices)
+                & cp.array_equal(new.indptr, target.indptr)
             )
         return bool(same)
 
@@ -320,7 +238,11 @@ class SparseData(Data):
         synchronizes the update path. When ``check`` is false, the caller
         must preserve the existing sparsity pattern.
         """
-        new = self._to_batched_csr(value, name, dtype=self._dtype)
+        new = UniformBatchedCsrMatrix.from_input(
+            value,
+            dtype=self._dtype,
+            validate_shared_sparsity=False,
+        )
         if check:
             if new.batch_size != target.batch_size:
                 raise ValueError(
