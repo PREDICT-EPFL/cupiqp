@@ -30,7 +30,7 @@ class SparseKKTSolver(KKTSolverBase):
 
         # -- Build KKT structure from the first problem's sparsity ------
         P0, A0, G0 = data.P[0], data.A[0], data.G[0]
-        kkt_template = self._initialize_kkt_csr(P0, A0, G0)
+        kkt_template = self._initialize_kkt_csr(P0, A0, G0, dtype=self._dtype)
 
         # -- Pack all KKT matrices in the batch into a UniformBatchedCsrMatrix,
         # which owns a contiguous (B, kkt_nnz) values buffer and shares a
@@ -127,7 +127,12 @@ class SparseKKTSolver(KKTSolverBase):
             solver.__del__()
 
     @staticmethod
-    def _initialize_kkt_csr(P: csr_matrix, A: Optional[csr_matrix] = None, G: Optional[csr_matrix] = None) -> csr_matrix:
+    def _initialize_kkt_csr(
+        P: csr_matrix,
+        A: Optional[csr_matrix] = None,
+        G: Optional[csr_matrix] = None,
+        dtype=cp.float64,
+    ) -> csr_matrix:
         """
         Initialize the KKT matrix based on the sparsity of P, A, G.
 
@@ -153,16 +158,16 @@ class SparseKKTSolver(KKTSolverBase):
         P = P.copy()
         A = A.copy() if p else A
         G = G.copy() if m else G
-        In = diags(cp.ones(n, dtype=cp.float64), 0, shape=(n, n), format="csr")
-        Ip = diags(cp.ones(p, dtype=cp.float64), 0, shape=(p, p), format="csr") if p else None
-        Im = diags(cp.ones(m, dtype=cp.float64), 0, shape=(m, m), format="csr") if m else None
+        In = diags(cp.ones(n, dtype=dtype), 0, shape=(n, n), format="csr")
+        Ip = diags(cp.ones(p, dtype=dtype), 0, shape=(p, p), format="csr") if p else None
+        Im = diags(cp.ones(m, dtype=dtype), 0, shape=(m, m), format="csr") if m else None
         # only store lower triangular part (but the full P is still stored)
         # TODO: store the lower triangular part of P only
         kkt = bmat([
                 [P+In, None, None],
                 [A,    Ip,   None],
                 [G,    None, Im],
-            ], format="csr", dtype=cp.float64
+            ], format="csr", dtype=dtype
             )
         return kkt
 

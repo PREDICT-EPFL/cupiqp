@@ -133,9 +133,9 @@ class SparseRuizEquilibration(RuizEquilibration):
         inf-norms treat missing lower-triangle entries via row/col max."""
         B, n = P.batch_size, P.rows
         if P.nnz == 0:
-            return cp.zeros((B, n), dtype=cp.float64)
-        row = cp.empty((B, n), dtype=cp.float64)
-        col = cp.empty((B, n), dtype=cp.float64)
+            return cp.zeros((B, n), dtype=self._dtype)
+        row = cp.empty((B, n), dtype=self._dtype)
+        col = cp.empty((B, n), dtype=self._dtype)
         self._batched_row_inf_norms(P, row)
         self._batched_col_inf_norms(P, col)
         return cp.maximum(row, col)
