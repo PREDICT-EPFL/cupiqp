@@ -4,6 +4,7 @@ import warp as wp
 
 from ..data import Data
 from ..typedef import PIQP_INF
+from ..utils import to_warp_dtype
 from .multistage_utils import BlockTridiagMat, BlockBidiagMat, BlockVec
 
 
@@ -45,6 +46,21 @@ class MultistageData(Data):
     ):
         """Allocate and populate buffers from user inputs. Returns self for chaining."""
 
+        self._require_dtype(P.diag_blocks.data)
+        self._require_dtype(P.off_diag_blocks_lower.data)
+        self._require_dtype(c.data)
+        if A is not None:
+            self._require_dtype(A.D)
+            self._require_dtype(A.E)
+        if b is not None:
+            self._require_dtype(b.data)
+        if G is not None:
+            self._require_dtype(G.D)
+            self._require_dtype(G.E)
+        for bound in (h_u, h_l, x_u, x_l):
+            if bound is not None:
+                self._require_dtype(bound.data)
+
         B = P.batch_size
         block_size = P.block_size
         num_blocks = P.num_diag_blocks
@@ -71,10 +87,10 @@ class MultistageData(Data):
 
         # ---- A, b (equality constraints) ----
         if A is not None and b is not None:
-            self._validate_bidiag(A, block_size, num_blocks, B, "A")
+            self._validate_bidiag(A, block_size, num_blocks, B)
             self._A = A.clone()
             p = (self._A.N + 1) * self._A.rows_of_blocks
-            self._b_blk, self._b = self._init_block_vec(b.clone(), B, p, "b")
+            self._b_blk, self._b = self._init_block_vec(b.clone(), B, p)
         elif A is None and b is None:
             self._A = None
             self._b_blk = None
@@ -84,7 +100,7 @@ class MultistageData(Data):
 
         # ---- G, h_u, h_l (inequality constraints) ----
         if G is not None:
-            self._validate_bidiag(G, block_size, num_blocks, B, "G")
+            self._validate_bidiag(G, block_size, num_blocks, B)
             if h_u is None and h_l is None:
                 raise ValueError(
                     "Either h_l or h_u must be provided when G is given"
@@ -92,10 +108,10 @@ class MultistageData(Data):
             self._G = G.clone()
             m = (self._G.N + 1) * self._G.rows_of_blocks
             self._h_u_blk, self._h_u = self._init_block_vec(
-                h_u.clone() if h_u is not None else None, B, m, "h_u"
+                h_u.clone() if h_u is not None else None, B, m
             )
             self._h_l_blk, self._h_l = self._init_block_vec(
-                h_l.clone() if h_l is not None else None, B, m, "h_l"
+                h_l.clone() if h_l is not None else None, B, m
             )
         else:
             if h_u is not None or h_l is not None:
@@ -240,49 +256,49 @@ class MultistageData(Data):
 
     def set_c(self, value: BlockVec, check: bool = True):
         if check:
-            self._check_same_block_vec(self._c_blk, value, "c")
+            self._check_same_block_vec(self._c_blk, value)
         wp.copy(self._c_blk.data, value.data)
         self._c[:] = self._c_flat_view
 
     def set_A(self, value: BlockBidiagMat, check: bool = True):
         if check:
-            self._check_same_bidiag(self._A, value, "A")
+            self._check_same_bidiag(self._A, value)
         wp.copy(self._A.D, value.D)
         wp.copy(self._A.E, value.E)
 
     def set_b(self, value: BlockVec, check: bool = True):
         if check:
-            self._check_same_block_vec(self._b_blk, value, "b")
+            self._check_same_block_vec(self._b_blk, value)
         wp.copy(self._b_blk.data, value.data)
         self._b[:] = self._b_flat_view
 
     def set_G(self, value: BlockBidiagMat, check: bool = True):
         if check:
-            self._check_same_bidiag(self._G, value, "G")
+            self._check_same_bidiag(self._G, value)
         wp.copy(self._G.D, value.D)
         wp.copy(self._G.E, value.E)
 
     def set_h_l(self, value: BlockVec, check: bool = True):
         if check:
-            self._check_same_block_vec(self._h_l_blk, value, "h_l")
+            self._check_same_block_vec(self._h_l_blk, value)
         wp.copy(self._h_l_blk.data, value.data)
         self._h_l[:] = self._h_l_flat_view
 
     def set_h_u(self, value: BlockVec, check: bool = True):
         if check:
-            self._check_same_block_vec(self._h_u_blk, value, "h_u")
+            self._check_same_block_vec(self._h_u_blk, value)
         wp.copy(self._h_u_blk.data, value.data)
         self._h_u[:] = self._h_u_flat_view
 
     def set_x_l(self, value: BlockVec, check: bool = True):
         if check:
-            self._check_same_block_vec(self._x_l_block, value, "x_l")
+            self._check_same_block_vec(self._x_l_block, value)
         wp.copy(self._x_l_block.data, value.data)
         self._x_l[:] = self._x_l_flat_view
 
     def set_x_u(self, value: BlockVec, check: bool = True):
         if check:
-            self._check_same_block_vec(self._x_u_block, value, "x_u")
+            self._check_same_block_vec(self._x_u_block, value)
         wp.copy(self._x_u_block.data, value.data)
         self._x_u[:] = self._x_u_flat_view
 
@@ -291,55 +307,63 @@ class MultistageData(Data):
         """``(B, num_blocks, rows)`` Warp → ``(B, num_blocks*rows)`` cupy (zero-copy)."""
         return cp.from_dlpack(wp.to_dlpack(bv.data)).reshape(B, -1)
 
+    def _require_dtype(self, array) -> None:
+        expected = to_warp_dtype(self._dtype)
+        if array.dtype != expected:
+            raise TypeError(
+                f"Multistage input must have dtype {expected} for this solver; "
+                f"got {array.dtype}. Construct inputs with dtype={expected}."
+            )
+
     @staticmethod
-    def _validate_bidiag(mat, block_size, num_blocks, batch_size, name):
+    def _validate_bidiag(mat, block_size, num_blocks, batch_size):
         if mat.batch_size != batch_size:
             raise ValueError(
-                f"{name} batch_size ({mat.batch_size}) != P batch_size ({batch_size})"
+                f"BlockBidiagMat batch_size ({mat.batch_size}) != P batch_size ({batch_size})"
             )
         if mat.cols_of_blocks != block_size:
             raise ValueError(
-                f"{name} column block size ({mat.cols_of_blocks}) != P block size ({block_size})"
+                f"BlockBidiagMat column block size ({mat.cols_of_blocks}) != P block size ({block_size})"
             )
         if mat.N != num_blocks:
             raise ValueError(
-                f"{name} column block count ({mat.N}) != P block count ({num_blocks})"
+                f"BlockBidiagMat column block count ({mat.N}) != P block count ({num_blocks})"
             )
 
     @staticmethod
-    def _check_same_bidiag(old, new, name):
+    def _check_same_bidiag(old, new):
         if new.batch_size != old.batch_size:
             raise ValueError(
-                f"{name} batch_size mismatch: got {new.batch_size}, expected {old.batch_size}"
+                f"BlockBidiagMat batch_size mismatch: got {new.batch_size}, expected {old.batch_size}"
             )
         if new.N != old.N:
-            raise ValueError(f"{name} N mismatch: got {new.N}, expected {old.N}")
+            raise ValueError(f"BlockBidiagMat N mismatch: got {new.N}, expected {old.N}")
         if new.rows_of_blocks != old.rows_of_blocks:
             raise ValueError(
-                f"{name} rows_of_blocks mismatch: got {new.rows_of_blocks}, expected {old.rows_of_blocks}"
+                f"BlockBidiagMat rows_of_blocks mismatch: got {new.rows_of_blocks}, expected {old.rows_of_blocks}"
             )
         if new.cols_of_blocks != old.cols_of_blocks:
             raise ValueError(
-                f"{name} cols_of_blocks mismatch: got {new.cols_of_blocks}, expected {old.cols_of_blocks}"
+                f"BlockBidiagMat cols_of_blocks mismatch: got {new.cols_of_blocks}, expected {old.cols_of_blocks}"
             )
 
     @staticmethod
-    def _check_same_block_vec(old, new, name):
+    def _check_same_block_vec(old, new):
         if new.data.shape != old.data.shape:
             raise ValueError(
-                f"{name} shape mismatch: got {tuple(new.data.shape)}, expected {tuple(old.data.shape)}"
+                f"BlockVec shape mismatch: got {tuple(new.data.shape)}, expected {tuple(old.data.shape)}"
             )
 
-    def _init_block_vec(self, bv, batch_size, expected_size, name):
+    def _init_block_vec(self, bv, batch_size, expected_size):
         if bv is None:
             return None, None
         if bv.batch_size != batch_size:
             raise ValueError(
-                f"{name} batch_size ({bv.batch_size}) != P batch_size ({batch_size})"
+                f"BlockVec batch_size ({bv.batch_size}) != P batch_size ({batch_size})"
             )
         flat = self._block_vec_to_flat(bv, batch_size)
         if flat.shape != (batch_size, expected_size):
             raise ValueError(
-                f"{name} flat shape {flat.shape} != expected ({batch_size}, {expected_size})"
+                f"BlockVec flat shape {flat.shape} != expected ({batch_size}, {expected_size})"
             )
         return bv, flat

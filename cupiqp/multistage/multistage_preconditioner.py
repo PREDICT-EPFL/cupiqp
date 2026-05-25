@@ -5,6 +5,7 @@ import warp as wp
 
 from .multistage_data import MultistageData
 from ..preconditioner import RuizEquilibration
+from ..utils import to_warp_dtype
 from .multistage_utils import BlockTridiagMat, BlockBidiagMat
 from .multistage_preconditioner_kernels import (
     create_multistage_scale_matrices_kernel,
@@ -40,7 +41,9 @@ class MultistageRuizEquilibration(RuizEquilibration):
             N, d, rows_A, rows_G, dtype=self._dtype)
 
 
-        self._dummy_4d = wp.zeros((self.B, 1, 1, 1), dtype=wp.float64, device='cuda')
+        self._dummy_4d = wp.zeros(
+            (self.B, 1, 1, 1), dtype=to_warp_dtype(self._dtype), device="cuda"
+        )
         self._P_D = data.P.diag_blocks.data
         self._P_E = data.P.off_diag_blocks_lower.data
         self._A_D = data.A.D if self.p > 0 else self._dummy_4d

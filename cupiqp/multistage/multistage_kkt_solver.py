@@ -9,6 +9,7 @@ from socu.block_tridiag_solver import (
 )
 
 from ..kkt_solver import KKTSolverBase
+from ..utils import to_warp_dtype
 from .multistage_data import MultistageData
 from .multistage_utils import (
     create_block_bidiag_gemv_n_kernel,
@@ -31,16 +32,17 @@ class MultistageKKTSolver(KKTSolverBase):
         self._block_size = d
         self.num_stages = N
         dtype = data.dtype
+        self._wp_dtype = to_warp_dtype(dtype)
 
         self._delta_inv = cp.zeros(B, dtype=dtype)
         self._z_reg_inv = cp.zeros((B, data.m), dtype=dtype)
 
         # ---- Block-tridiag KKT storage (always 4-D) ----
-        self._kkt_diag_blocks = wp.zeros((B, N, d, d), dtype=wp.float64, device="cuda")
+        self._kkt_diag_blocks = wp.zeros((B, N, d, d), dtype=self._wp_dtype, device="cuda")
         self._kkt_offdiag_blocks = wp.zeros(
-            (B, calculate_off_diag_storage_len(N), d, d), dtype=wp.float64, device="cuda"
+            (B, calculate_off_diag_storage_len(N), d, d), dtype=self._wp_dtype, device="cuda"
         )
-        self._kkt_rhs = wp.zeros((B, N, d, 1), dtype=wp.float64, device="cuda")
+        self._kkt_rhs = wp.zeros((B, N, d, 1), dtype=self._wp_dtype, device="cuda")
 
         # CuPy aliases of the Warp arrays — letting us call .fill(0) during
         # CUDA-graph capture without going through ``from_dlpack`` (whose
@@ -54,11 +56,11 @@ class MultistageKKTSolver(KKTSolverBase):
 
         self._cholesky_factor_launch = create_cholesky_factor_launch(
             self._kkt_diag_blocks, self._kkt_offdiag_blocks,
-            device="cuda", dtype=wp.float64, use_cuda_graph=True,
+            device="cuda", dtype=self._wp_dtype, use_cuda_graph=True,
         )
         self._cholesky_solve_launch = create_cholesky_solve_launch(
             self._kkt_diag_blocks, self._kkt_offdiag_blocks, self._kkt_rhs,
-            device="cuda", dtype=wp.float64, use_cuda_graph=True,
+            device="cuda", dtype=self._wp_dtype, use_cuda_graph=True,
         )
 
         # Workspace for matvec-then-scale steps in solve().
@@ -66,20 +68,20 @@ class MultistageKKTSolver(KKTSolverBase):
 
         # Precompute A^T A as block-tridiagonal (A is fixed across iterations).
         if data.p > 0:
-            self._AtA_diag = wp.zeros((B, N, d, d), dtype=wp.float64, device="cuda")
-            self._AtA_offdiag = wp.zeros((B, N - 1, d, d), dtype=wp.float64, device="cuda")
+            self._AtA_diag = wp.zeros((B, N, d, d), dtype=self._wp_dtype, device="cuda")
+            self._AtA_offdiag = wp.zeros((B, N - 1, d, d), dtype=self._wp_dtype, device="cuda")
             self._eval_AT_A_kernel = create_block_syrk_kernel(N, data._A.rows_of_blocks, d, dtype=dtype)
             wp.launch(
                 kernel=self._eval_AT_A_kernel,
                 dim=(B, N, d, d),
                 inputs=[
-                    wp.float64(1.0), data._A.D, data._A.E,
-                    wp.float64(0.0), self._AtA_diag, self._AtA_offdiag,
+                    self._wp_dtype(1.0), data._A.D, data._A.E,
+                    self._wp_dtype(0.0), self._AtA_diag, self._AtA_offdiag,
                 ],
             )
         else:
-            self._AtA_diag = wp.zeros((B, 0, 0, 0), dtype=wp.float64, device="cuda")
-            self._AtA_offdiag = wp.zeros((B, 0, 0, 0), dtype=wp.float64, device="cuda")
+            self._AtA_diag = wp.zeros((B, 0, 0, 0), dtype=self._wp_dtype, device="cuda")
+            self._AtA_offdiag = wp.zeros((B, 0, 0, 0), dtype=self._wp_dtype, device="cuda")
 
         # G placeholders for the fused kernel when m == 0; same elision logic.
         if data.m > 0:
@@ -87,8 +89,8 @@ class MultistageKKTSolver(KKTSolverBase):
             self._kkt_G_E = data._G.E
             rows_of_G_for_kkt = data._G.rows_of_blocks
         else:
-            self._kkt_G_D = wp.zeros((B, 0, 0, 0), dtype=wp.float64, device="cuda")
-            self._kkt_G_E = wp.zeros((B, 0, 0, 0), dtype=wp.float64, device="cuda")
+            self._kkt_G_D = wp.zeros((B, 0, 0, 0), dtype=self._wp_dtype, device="cuda")
+            self._kkt_G_E = wp.zeros((B, 0, 0, 0), dtype=self._wp_dtype, device="cuda")
             rows_of_G_for_kkt = 1
 
         self._update_kkt_kernel = create_update_kkt_kernel(
@@ -114,8 +116,8 @@ class MultistageKKTSolver(KKTSolverBase):
                 kernel=self._eval_AT_A_kernel,
                 dim=(self._batch_size, self.num_stages, self._block_size, self._block_size),
                 inputs=[
-                    wp.float64(1.0), data._A.D, data._A.E,
-                    wp.float64(0.0), self._AtA_diag, self._AtA_offdiag,
+                    self._wp_dtype(1.0), data._A.D, data._A.E,
+                    self._wp_dtype(0.0), self._AtA_diag, self._AtA_offdiag,
                 ],
                 stream=stream,
             )
@@ -182,10 +184,10 @@ class MultistageKKTSolver(KKTSolverBase):
                 kernel=self._eval_AT_xt_kernel,
                 dim=(B, N, d),
                 inputs=[
-                    wp.float64(1.0),
+                    self._wp_dtype(1.0),
                     data._A.D, data._A.E,
                     rhs_y,
-                    wp.float64(0.0),
+                    self._wp_dtype(0.0),
                     self._work_n,
                 ],
             )
@@ -197,10 +199,10 @@ class MultistageKKTSolver(KKTSolverBase):
             wp.launch(
                 kernel=self._eval_GT_xt_kernel, dim=(B, N, d),
                 inputs=[
-                    wp.float64(1.0),
+                    self._wp_dtype(1.0),
                     data._G.D, data._G.E,
                     delta_z,
-                    wp.float64(1.0),
+                    self._wp_dtype(1.0),
                     delta_x,
                 ],
             )
@@ -216,10 +218,10 @@ class MultistageKKTSolver(KKTSolverBase):
                 kernel=self._eval_A_xn_kernel,
                 dim=(B, N + 1, data._A.rows_of_blocks),
                 inputs=[
-                    wp.float64(1.0),
+                    self._wp_dtype(1.0),
                     data._A.D, data._A.E,
                     delta_x,
-                    wp.float64(0.0),
+                    self._wp_dtype(0.0),
                     delta_y,
                 ],
             )
@@ -232,10 +234,10 @@ class MultistageKKTSolver(KKTSolverBase):
                 kernel=self._eval_G_xn_kernel,
                 dim=(B, N + 1, data._G.rows_of_blocks),
                 inputs=[
-                    wp.float64(1.0),
+                    self._wp_dtype(1.0),
                     data._G.D, data._G.E,
                     delta_x,
-                    wp.float64(0.0),
+                    self._wp_dtype(0.0),
                     delta_z,
                 ],
             )
@@ -249,11 +251,11 @@ class MultistageKKTSolver(KKTSolverBase):
             self._eval_P_x_kernel,
             dim=(self._batch_size, self.num_stages, self._block_size),
             inputs=[
-                wp.float64(alpha),
+                self._wp_dtype(alpha),
                 data._P.diag_blocks.data,
                 data._P.off_diag_blocks_lower.data,
                 x,
-                wp.float64(0.0),
+                self._wp_dtype(0.0),
                 z,
             ],
             stream=stream_wp,
@@ -266,10 +268,10 @@ class MultistageKKTSolver(KKTSolverBase):
             self._eval_A_xn_kernel,
             dim=(self._batch_size, self.num_stages + 1, data._A.rows_of_blocks),
             inputs=[
-                wp.float64(alpha_n),
+                self._wp_dtype(alpha_n),
                 data._A.D, data._A.E,
                 xn,
-                wp.float64(0.0),
+                self._wp_dtype(0.0),
                 zn,
             ],
             stream=stream_wp,
@@ -282,10 +284,10 @@ class MultistageKKTSolver(KKTSolverBase):
             self._eval_AT_xt_kernel,
             dim=(self._batch_size, self.num_stages, self._block_size),
             inputs=[
-                wp.float64(alpha_t),
+                self._wp_dtype(alpha_t),
                 data._A.D, data._A.E,
                 xt,
-                wp.float64(0.0),
+                self._wp_dtype(0.0),
                 zt,
             ],
             stream=stream_wp,
@@ -298,10 +300,10 @@ class MultistageKKTSolver(KKTSolverBase):
             self._eval_G_xn_kernel,
             dim=(self._batch_size, self.num_stages + 1, data._G.rows_of_blocks),
             inputs=[
-                wp.float64(alpha_n),
+                self._wp_dtype(alpha_n),
                 data._G.D, data._G.E,
                 xn,
-                wp.float64(0.0),
+                self._wp_dtype(0.0),
                 zn,
             ],
             stream=stream_wp,
@@ -314,10 +316,10 @@ class MultistageKKTSolver(KKTSolverBase):
             self._eval_GT_xt_kernel,
             dim=(self._batch_size, self.num_stages, self._block_size),
             inputs=[
-                wp.float64(alpha_t),
+                self._wp_dtype(alpha_t),
                 data._G.D, data._G.E,
                 xt,
-                wp.float64(0.0),
+                self._wp_dtype(0.0),
                 zt,
             ],
             stream=stream_wp,
