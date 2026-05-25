@@ -63,7 +63,7 @@ def _check_sparse(name: str, m) -> None:
         raise TypeError(
             f"SparseSolver requires {name} to be a GPU CSR sparse matrix "
             f"(cupyx.scipy.sparse.csr_matrix, torch.sparse_csr_tensor on "
-            f"CUDA, list of these, or cupiqp.BatchedCsrMatrix); "
+            f"CUDA, list of these, or UniformBatchedCsrMatrix); "
             f"got {type(m).__name__}. "
             f"cupiqp is GPU-only and CSR-only — convert scipy.sparse via "
             f"cupyx.scipy.sparse.csr_matrix({name}) first, and convert "
@@ -104,7 +104,7 @@ class SparseSolver(SolverBase):
     * :class:`cupyx.scipy.sparse.csr_matrix`
     * :class:`torch.sparse_csr_tensor` on a CUDA device
     * ``list`` / ``tuple`` of any of the above (one per batch element)
-    * :class:`cupiqp.sparse.batched_csr.BatchedCsrMatrix`
+    * :class:`cupiqp.sparse.batched_csr.UniformBatchedCsrMatrix`
 
     cupiqp is GPU-only **and** CSR-only:
 
@@ -220,7 +220,7 @@ class SparseSolver(SolverBase):
                 nnz_P, nnz_A, nnz_G, d.p, d.m, d.n, dtype=dtype)
 
             # Pre-allocate the gradient SparseData. The matrix
-            # BatchedCsrMatrix views share the forward sparsity (same
+            # UniformBatchedCsrMatrix views share the forward sparsity (same
             # indices/indptr); their values buffers become the kernel-
             # output targets. Vector grads (c, h_l, x_l) are filled via
             # slice-assign in :meth:`_compute_data_gradients`.

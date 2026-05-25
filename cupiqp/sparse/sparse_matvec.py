@@ -322,7 +322,7 @@ class BatchedSparseMatVecProduct:
 
     Parameters
     ----------
-    mats : BatchedCsrMatrix
+    mats : UniformBatchedCsrMatrix
         The batched sparse matrices. All batches share the sparsity
         pattern; ``mats.data`` is a packed ``(B, nnz)`` float64 buffer.
     transa : bool, default False

@@ -16,7 +16,7 @@ class SparseRuizEquilibration(RuizEquilibration):
     """Ruiz equilibration for the sparse CSR backend.
 
     After the ``SparseData`` refactor, ``data.P`` / ``data.A`` / ``data.G``
-    are always :class:`BatchedCsrMatrix` instances (B = 1 is just a 1-batch
+    are always :class:`UniformBatchedCsrMatrix` instances (B = 1 is just a 1-batch
     batched matrix), so this class only has a single batched code path —
     no ``isinstance(P, list)`` branching.
 
@@ -101,7 +101,7 @@ class SparseRuizEquilibration(RuizEquilibration):
         self._cost_scaling *= gamma
 
     # ------------------------------------------------------------------
-    # Batched CSR primitives — operate on a BatchedCsrMatrix's shared
+    # Batched CSR primitives — operate on a UniformBatchedCsrMatrix's shared
     # sparsity + (B, nnz) values buffer
     # ------------------------------------------------------------------
 

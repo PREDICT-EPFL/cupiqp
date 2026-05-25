@@ -32,7 +32,7 @@ class SparseKKTSolver(KKTSolverBase):
         P0, A0, G0 = data.P[0], data.A[0], data.G[0]
         kkt_template = self._initialize_kkt_csr(P0, A0, G0)
 
-        # -- Pack all KKT matrices in the batch into a BatchedCsrMatrix,
+        # -- Pack all KKT matrices in the batch into a UniformBatchedCsrMatrix,
         # which owns a contiguous (B, kkt_nnz) values buffer and shares a
         # single indices/indptr pair across batches. The initial values are
         # broadcast from the template.
@@ -91,8 +91,8 @@ class SparseKKTSolver(KKTSolverBase):
 
         # -- SpMV operators: single-matrix path for B=1 (no block-diagonal
         # overhead), batched block-diagonal path for B>1. data.P/A/G are
-        # already BatchedCsrMatrix instances (SparseData normalizes every
-        # accepted input form to BatchedCsrMatrix). --------------------
+        # already UniformBatchedCsrMatrix instances (SparseData normalizes every
+        # accepted input form to UniformBatchedCsrMatrix). ---------------
         if B == 1:
             self._spmv_P = SingleSparseMatVecProduct(data.P[0], transa=False)
             if p > 0:
@@ -111,7 +111,7 @@ class SparseKKTSolver(KKTSolverBase):
                 self._spmv_GT = BatchedSparseMatVecProduct(data.G, transa=True)
 
         # Direct solver (CudssSparseDirectSolver handles B==1 and B>1
-        # internally via the BatchedCsrMatrix)
+        # internally via the UniformBatchedCsrMatrix)
         self._lin_sys_solver = CudssSparseDirectSolver(
             self._kkt_mats, use_deterministic_mode=use_deterministic_mode,
         )
@@ -148,7 +148,7 @@ class SparseKKTSolver(KKTSolverBase):
         # NOTE: cupyx's CSR addition sorts the operand's indices/data buffers
         # *in place* as a side effect (csrgeam pre-condition). ``data.P[0]``
         # is a view that shares its ``indices`` array with the backing
-        # BatchedCsrMatrix, so we must operate on copies here to avoid
+        # UniformBatchedCsrMatrix, so we must operate on copies here to avoid
         # corrupting the shared structure.
         P = P.copy()
         A = A.copy() if p else A

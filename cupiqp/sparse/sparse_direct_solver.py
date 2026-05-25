@@ -26,7 +26,7 @@ class SparseDirectSolver(ABC):
 
     * a ``cupyx.scipy.sparse.csr_matrix`` (B = 1) — dispatched to nvmath's
       non-batched ``DirectSolver``; or
-    * a ``BatchedCsrMatrix`` (B >= 1) — dispatched through cuDSS uniform
+    * a ``UniformBatchedCsrMatrix`` (B >= 1) — dispatched through cuDSS uniform
       batching: one CSR structure with a packed per-batch values buffer.
     """
 
@@ -50,14 +50,14 @@ class SparseDirectSolver(ABC):
             self._mat_view = matrix[0]
         else:
             raise TypeError(
-                "matrix must be a csr_matrix or BatchedCsrMatrix; got "
+                "matrix must be a csr_matrix or UniformBatchedCsrMatrix; got "
                 f"{type(matrix).__name__}."
             )
 
         # NOTE: the direct solver holds pointers into the matrix buffers
         # for in-place factorization and solves. Callers may update the
         # values in place between solves but must not reallocate the
-        # underlying buffer (e.g. swap BatchedCsrMatrix.data for a new array).
+        # underlying buffer (e.g. swap UniformBatchedCsrMatrix.data for a new array).
         # rhs/sol must match the matrix dtype — cuDSS rejects a dtype mismatch.
         dtype = matrix.data.dtype
         self._rhs = cp.empty((self._batch_size, self._dim), dtype=dtype)
