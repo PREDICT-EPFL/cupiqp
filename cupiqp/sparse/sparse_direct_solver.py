@@ -16,7 +16,7 @@ from nvmath.sparse.advanced import (
 )
 from nvmath.bindings import cudss as cudss_bindings
 
-from .batched_csr import BatchedCsrMatrix
+from .batched_csr import UniformBatchedCsrMatrix
 
 
 class SparseDirectSolver(ABC):
@@ -30,7 +30,7 @@ class SparseDirectSolver(ABC):
       batching: one CSR structure with a packed per-batch values buffer.
     """
 
-    def __init__(self, matrix: Union[csr_matrix, BatchedCsrMatrix]):
+    def __init__(self, matrix: Union[csr_matrix, UniformBatchedCsrMatrix]):
         if isinstance(matrix, csr_matrix):
             if matrix.shape[0] != matrix.shape[1]:
                 raise ValueError("Matrix must be square.")
@@ -38,7 +38,7 @@ class SparseDirectSolver(ABC):
             self._dim = matrix.shape[0]
             self._mat = matrix
             self._mat_view = matrix
-        elif isinstance(matrix, BatchedCsrMatrix):
+        elif isinstance(matrix, UniformBatchedCsrMatrix):
             if matrix.rows != matrix.cols:
                 raise ValueError("All matrices must be square.")
             self._batch_size = matrix.batch_size
@@ -105,7 +105,7 @@ class SparseDirectSolver(ABC):
     
 
 class CudssSparseDirectSolver(SparseDirectSolver):
-    def __init__(self, matrix: Union[csr_matrix, BatchedCsrMatrix], use_deterministic_mode: bool = False, **cudss_kwargs):
+    def __init__(self, matrix: Union[csr_matrix, UniformBatchedCsrMatrix], use_deterministic_mode: bool = False, **cudss_kwargs):
         super().__init__(matrix)
         batch_size = self._batch_size
 
@@ -165,7 +165,7 @@ class CudssSparseDirectSolver(SparseDirectSolver):
 
         # Uniform batching advances within these packed parent buffers; bind
         # them explicitly rather than relying on first-row view pointers.
-        if isinstance(self._mat, BatchedCsrMatrix):
+        if isinstance(self._mat, UniformBatchedCsrMatrix):
             cudss_bindings.matrix_set_csr_pointers(
                 self._cudss_a,
                 self._mat.indptr.data.ptr,

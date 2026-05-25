@@ -5,7 +5,7 @@ from cupyx.scipy.sparse import spmatrix, csr_matrix, csc_matrix, coo_matrix
 import cupy.cuda.runtime as rt
 from nvmath.bindings import cusparse
 
-from .batched_csr import BatchedCsrMatrix
+from .batched_csr import UniformBatchedCsrMatrix
 
 
 # ---------------------------------------------------------------------------
@@ -341,7 +341,7 @@ class BatchedSparseMatVecProduct:
 
     def __init__(
         self,
-        mats: BatchedCsrMatrix,
+        mats: UniformBatchedCsrMatrix,
         transa: bool = False,
     ):
         self._batch_size = mats.batch_size

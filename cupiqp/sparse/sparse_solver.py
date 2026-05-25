@@ -7,7 +7,7 @@ from typing import Literal
 from ..settings import Settings
 from ..solver import SolverBase
 from ..utils import is_cuda_array
-from .batched_csr import BatchedCsrMatrix
+from .batched_csr import UniformBatchedCsrMatrix
 from .sparse_data import SparseData
 from .sparse_preconditioner import SparseRuizEquilibration
 from .sparse_solver_kernels import create_sparse_data_gradients_kernel
@@ -43,8 +43,8 @@ def _is_sparse_csr(m) -> bool:
         pass
 
     try:
-        from .batched_csr import BatchedCsrMatrix
-        if isinstance(m, BatchedCsrMatrix):
+        from .batched_csr import UniformBatchedCsrMatrix
+        if isinstance(m, UniformBatchedCsrMatrix):
             return True
     except ImportError:
         pass
@@ -224,15 +224,15 @@ class SparseSolver(SolverBase):
             # indices/indptr); their values buffers become the kernel-
             # output targets. Vector grads (c, h_l, x_l) are filled via
             # slice-assign in :meth:`_compute_data_gradients`.
-            P_grad_csr = BatchedCsrMatrix(
+            P_grad_csr = UniformBatchedCsrMatrix(
                 B, P_csr.indices, P_csr.indptr, cp.zeros((B, nnz_P), dtype=dtype),
                 shape=(P_csr.rows, P_csr.cols), dtype=dtype,
             )
-            A_grad_csr = (BatchedCsrMatrix(
+            A_grad_csr = (UniformBatchedCsrMatrix(
                 B, A_csr.indices, A_csr.indptr, cp.zeros((B, nnz_A), dtype=dtype),
                 shape=(A_csr.rows, A_csr.cols), dtype=dtype,
             ) if d.p > 0 else None)
-            G_grad_csr = (BatchedCsrMatrix(
+            G_grad_csr = (UniformBatchedCsrMatrix(
                 B, G_csr.indices, G_csr.indptr, cp.zeros((B, nnz_G), dtype=dtype),
                 shape=(G_csr.rows, G_csr.cols), dtype=dtype,
             ) if d.m > 0 else None)

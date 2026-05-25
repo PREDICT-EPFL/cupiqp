@@ -4,7 +4,7 @@ from cupyx.scipy.sparse import csr_matrix
 
 
 
-class BatchedCsrMatrix:
+class UniformBatchedCsrMatrix:
     """Batched storage of CSR matrices with the same sparsity."""
     def __init__(
         self,
@@ -61,14 +61,16 @@ class BatchedCsrMatrix:
         self.data[:] = new_data_cp
 
     @classmethod
-    def from_torch_sparse_csr_tensor(cls, tensor, dtype=cp.float64) -> "BatchedCsrMatrix":
+    def from_torch_sparse_csr_tensor(
+        cls, tensor, dtype=cp.float64, validate_shared_sparsity: bool = True,
+    ) -> "UniformBatchedCsrMatrix":
         """Build a ``BatchedCsrMatrix`` from a batched torch ``sparse_csr_tensor``.
 
         ``tensor`` must be 3-D with shape ``(B, M, N)``, in ``torch.sparse_csr``
         layout, residing on a CUDA device. Every batch is expected to share the
-        same sparsity pattern; the shared ``indptr``/``indices`` are read from
-        batch 0 (no cross-batch consistency check — trusted by convention), and
-        the per-batch ``values`` (shape ``(B, nnz)``) become the ``_data`` buffer.
+        same sparsity pattern; by default this is checked before the shared
+        ``indptr``/``indices`` are read from batch 0. The per-batch ``values``
+        (shape ``(B, nnz)``) become the ``data`` buffer.
 
         Device-side data is moved zero-copy via DLPack.
         """
@@ -94,6 +96,18 @@ class BatchedCsrMatrix:
         crow = tensor.crow_indices()   # (B, M+1)
         col = tensor.col_indices()     # (B, nnz)
         values = tensor.values()       # (B, nnz)
+
+        if validate_shared_sparsity and B > 1:
+            crow_all = cp.from_dlpack(crow.contiguous())
+            col_all = cp.from_dlpack(col.contiguous())
+            same = (
+                cp.array_equal(crow_all, cp.broadcast_to(crow_all[0], crow_all.shape))
+                & cp.array_equal(col_all, cp.broadcast_to(col_all[0], col_all.shape))
+            )
+            if not bool(same):
+                raise ValueError(
+                    "All batch matrices must share the same CSR sparsity pattern."
+                )
 
         # Zero-copy views into torch device memory, then dtype-cast as needed.
         # Slicing crow[0] / col[0] picks the shared per-batch pattern; those

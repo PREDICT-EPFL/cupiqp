@@ -5,7 +5,7 @@ import warp as wp
 
 from .sparse_data import SparseData
 from ..preconditioner import RuizEquilibration
-from .batched_csr import BatchedCsrMatrix
+from .batched_csr import UniformBatchedCsrMatrix
 from .sparse_preconditioner_kernels import (
     create_sparse_scale_matrices_kernel,
     create_sparse_compute_kkt_norms_kernel,
@@ -113,7 +113,7 @@ class SparseRuizEquilibration(RuizEquilibration):
         nz = cp.arange(nnz, dtype=cp.int32)
         return cp.searchsorted(indptr[1:], nz, side='right').astype(cp.int32)
 
-    def _batched_row_inf_norms(self, M: BatchedCsrMatrix, out: cp.ndarray):
+    def _batched_row_inf_norms(self, M: UniformBatchedCsrMatrix, out: cp.ndarray):
         """Row inf-norms: out[b, r] = max_j |M[b, r, j]|. out shape: (B, rows)."""
         out.fill(0.0)
         if M.nnz == 0 or M.rows == 0:
@@ -121,14 +121,14 @@ class SparseRuizEquilibration(RuizEquilibration):
         row_idx = self._row_indices_from_indptr(M.indptr, M.nnz)
         cp.maximum.at(out, (slice(None), row_idx), cp.abs(M.data))
 
-    def _batched_col_inf_norms(self, M: BatchedCsrMatrix, out: cp.ndarray):
+    def _batched_col_inf_norms(self, M: UniformBatchedCsrMatrix, out: cp.ndarray):
         """Column inf-norms: out[b, c] = max_i |M[b, i, c]|. out shape: (B, cols)."""
         out.fill(0.0)
         if M.nnz == 0 or M.cols == 0:
             return
         cp.maximum.at(out, (slice(None), M.indices), cp.abs(M.data))
 
-    def _batched_utri_symmetric_col_inf_norms(self, P: BatchedCsrMatrix) -> cp.ndarray:
+    def _batched_utri_symmetric_col_inf_norms(self, P: UniformBatchedCsrMatrix) -> cp.ndarray:
         """For a symmetric P stored as upper triangle only, per-batch column
         inf-norms treat missing lower-triangle entries via row/col max."""
         B, n = P.batch_size, P.rows

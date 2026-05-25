@@ -5,7 +5,7 @@ from cupyx.scipy.sparse import csr_matrix, diags, bmat
 import nvtx
 
 from ..kkt_solver import KKTSolverBase
-from .batched_csr import BatchedCsrMatrix
+from .batched_csr import UniformBatchedCsrMatrix
 from .sparse_data import SparseData
 from .sparse_matvec import SingleSparseMatVecProduct, BatchedSparseMatVecProduct
 from .sparse_direct_solver import CudssSparseDirectSolver
@@ -38,7 +38,7 @@ class SparseKKTSolver(KKTSolverBase):
         # broadcast from the template.
         init_data = cp.empty((B, kkt_template.nnz), dtype=self._dtype)
         init_data[:] = kkt_template.data
-        self._kkt_mats = BatchedCsrMatrix(
+        self._kkt_mats = UniformBatchedCsrMatrix(
             batch_size=B,
             indices=kkt_template.indices,
             indptr=kkt_template.indptr,
@@ -118,7 +118,7 @@ class SparseKKTSolver(KKTSolverBase):
         if not self._lin_sys_solver.plan(cuda_stream=cp.cuda.get_current_stream().ptr):
             raise RuntimeError("Sparse direct solver planning failed.")
 
-    def _refresh_P_diag_buffer(self, P: BatchedCsrMatrix):
+    def _refresh_P_diag_buffer(self, P: UniformBatchedCsrMatrix):
         self._P_diag[:, self._cols_of_P_containing_nonzero_diag_entry] = P.data[:, self._indices_of_Pdata_containing_nonzero_diag_entry]
 
     def __del__(self):

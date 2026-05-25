@@ -4,7 +4,7 @@ from cupyx.scipy.sparse import csr_matrix
 
 from ..data import Data
 from ..typedef import PIQP_INF
-from .batched_csr import BatchedCsrMatrix
+from .batched_csr import UniformBatchedCsrMatrix
 
 
 # Type alias for the accepted matrix input forms.
@@ -136,13 +136,13 @@ class SparseData(Data):
     # ------------------------------------------------------------------
 
     @classmethod
-    def _to_batched_csr(cls, mat: SparseMatrixInput, name: str, dtype=cp.float64) -> BatchedCsrMatrix:
+    def _to_batched_csr(cls, mat: SparseMatrixInput, name: str, dtype=cp.float64) -> UniformBatchedCsrMatrix:
         """Normalize any accepted matrix input form to ``BatchedCsrMatrix``."""
         # Already a BatchedCsrMatrix — reuse the shared sparsity pattern but
         # clone the values buffer so the solver (preconditioner) can mutate
         # without touching the caller's matrix.
-        if isinstance(mat, BatchedCsrMatrix):
-            return BatchedCsrMatrix(
+        if isinstance(mat, UniformBatchedCsrMatrix):
+            return UniformBatchedCsrMatrix(
                 batch_size=mat.batch_size,
                 indices=mat.indices,
                 indptr=mat.indptr,
@@ -165,7 +165,7 @@ class SparseData(Data):
                 data = cp.empty((len(mats), 0), dtype=dtype)
             else:
                 data = cp.stack([m.data for m in mats])
-            return BatchedCsrMatrix(
+            return UniformBatchedCsrMatrix(
                 len(mats), tpl.indices, tpl.indptr, data, shape=tpl.shape,
                 dtype=dtype,
             )
@@ -176,13 +176,13 @@ class SparseData(Data):
             data = cp.empty((1, 0), dtype=dtype)
         else:
             data = single.data.reshape(1, -1)
-        return BatchedCsrMatrix(
+        return UniformBatchedCsrMatrix(
             1, single.indices, single.indptr, data, shape=single.shape,
             dtype=dtype,
         )
 
     @staticmethod
-    def _from_torch_sparse_csr(tensor, name: str, dtype=cp.float64) -> BatchedCsrMatrix:
+    def _from_torch_sparse_csr(tensor, name: str, dtype=cp.float64) -> UniformBatchedCsrMatrix:
         """Wrap a torch.sparse_csr_tensor into a BatchedCsrMatrix.
 
         Handles both 2-D (single) and 3-D (batched) tensors. In both
@@ -190,7 +190,7 @@ class SparseData(Data):
         the pattern is read from batch 0 only).
         """
         if tensor.dim() == 3:
-            return BatchedCsrMatrix.from_torch_sparse_csr_tensor(tensor, dtype=dtype)
+            return UniformBatchedCsrMatrix.from_torch_sparse_csr_tensor(tensor, dtype=dtype)
         if tensor.dim() != 2:
             raise ValueError(
                 f"{name} torch.sparse_csr_tensor must be 2-D or 3-D; "
@@ -203,12 +203,12 @@ class SparseData(Data):
         values = cp.from_dlpack(tensor.values().contiguous())
         data = values.reshape(1, -1) if values.size > 0 else cp.empty((1, 0), dtype=dtype)
         rows, cols = int(tensor.shape[0]), int(tensor.shape[1])
-        return BatchedCsrMatrix(1, indices, indptr, data, shape=(rows, cols), dtype=dtype)
+        return UniformBatchedCsrMatrix(1, indices, indptr, data, shape=(rows, cols), dtype=dtype)
 
     @staticmethod
-    def _empty_batched_csr(B: int, rows: int, cols: int, dtype=cp.float64) -> BatchedCsrMatrix:
+    def _empty_batched_csr(B: int, rows: int, cols: int, dtype=cp.float64) -> UniformBatchedCsrMatrix:
         """Placeholder for an omitted matrix block — (B, rows, cols), nnz = 0."""
-        return BatchedCsrMatrix(
+        return UniformBatchedCsrMatrix(
             batch_size=B,
             indices=cp.empty(0, dtype=cp.int32),
             indptr=cp.zeros(rows + 1, dtype=cp.int32),
@@ -278,8 +278,8 @@ class SparseData(Data):
 
     @staticmethod
     def _same_sparsity_pattern(
-        target: BatchedCsrMatrix,
-        new: BatchedCsrMatrix,
+        target: UniformBatchedCsrMatrix,
+        new: UniformBatchedCsrMatrix,
         value: SparseMatrixInput,
     ) -> bool:
         """Compare CSR structure values, including supplied batch members."""
@@ -308,7 +308,7 @@ class SparseData(Data):
 
     def _set_matrix_values(
         self,
-        target: BatchedCsrMatrix,
+        target: UniformBatchedCsrMatrix,
         value: SparseMatrixInput,
         check: bool,
         name: str,
