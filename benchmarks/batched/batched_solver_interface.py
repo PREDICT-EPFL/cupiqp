@@ -22,12 +22,13 @@ Data shapes:
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Union
 from functools import partial
 import time
 import nvtx
 import numpy as np
 import cupy as cp
+import scipy.sparse as sp_cpu
 import torch
 import jax
 jax.config.update("jax_enable_x64", True)
@@ -46,11 +47,49 @@ SOLVER_COLORS = {
 }
 
 
-
-
+# ---------------------------------------------------------------------------
+# Sparse batched matrix container
+# ---------------------------------------------------------------------------
 @dataclass
-class BatchedQPData:
-    """Batched QP data in numpy arrays."""
+class SparseMatBatch:
+    """A batch of sparse matrices sharing one structural sparsity pattern.
+
+    ``pattern`` is a scipy CSR carrying ``indices`` and ``indptr`` (and a
+    placeholder values array that is ignored — the real per-batch values
+    live in ``values``). ``values`` has shape ``(B, nnz)`` and is aligned
+    to ``pattern.indices`` / ``pattern.indptr``: ``values[b, k]`` is the
+    nonzero at the same CSR slot as ``pattern.data[k]``.
+
+    This mirrors the layout that ``UniformBatchedCsrMatrix`` uses on the
+    device, so converting to/from the cupiqp form is a one-shot transfer
+    with no Python loop over batches.
+    """
+    pattern: sp_cpu.csr_matrix
+    values: np.ndarray   # (B, nnz)
+
+    @property
+    def B(self) -> int:
+        return self.values.shape[0]
+
+    @property
+    def nnz(self) -> int:
+        return self.pattern.nnz
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return self.pattern.shape
+
+
+# ---------------------------------------------------------------------------
+# Batched QP data — dense and sparse storage variants
+# ---------------------------------------------------------------------------
+@dataclass
+class DenseBatchedQPData:
+    """Batched QP data with dense numpy storage.
+
+    Use ``to_sparse()`` to convert to ``SparseBatchedQPData`` when feeding
+    a sparse-natural solver.
+    """
     P: np.ndarray       # (B, n, n)
     c: np.ndarray       # (B, n)
     A: Optional[np.ndarray] = None   # (B, p, n)
@@ -76,6 +115,121 @@ class BatchedQPData:
     @property
     def m(self) -> int:
         return self.G.shape[1] if self.G is not None else 0
+
+    def to_sparse(self) -> "SparseBatchedQPData":
+        """Build a ``SparseBatchedQPData`` view: master CSR pattern from
+        problem 0, per-batch values gathered by direct dense indexing."""
+        return SparseBatchedQPData(
+            P=_extract_sparse_batch(self.P),
+            c=self.c,
+            A=_extract_sparse_batch(self.A) if self.A is not None else None,
+            b=self.b,
+            G=_extract_sparse_batch(self.G) if self.G is not None else None,
+            h_l=self.h_l, h_u=self.h_u,
+            x_l=self.x_l, x_u=self.x_u,
+        )
+
+
+@dataclass
+class SparseBatchedQPData:
+    """Batched QP data with sparse matrix storage (shared sparsity per matrix).
+
+    ``P``, ``A``, ``G`` are ``SparseMatBatch`` (pattern + per-batch values).
+    Vectors stay dense — they have no useful sparsity.
+    """
+    P: SparseMatBatch                          # (n, n) pattern + (B, nnz) values
+    c: np.ndarray                              # (B, n)
+    A: Optional[SparseMatBatch] = None         # (p, n) pattern + (B, A_nnz) values
+    b: Optional[np.ndarray] = None             # (B, p)
+    G: Optional[SparseMatBatch] = None         # (m, n) pattern + (B, G_nnz) values
+    h_l: Optional[np.ndarray] = None           # (B, m)
+    h_u: Optional[np.ndarray] = None           # (B, m)
+    x_l: Optional[np.ndarray] = None           # (B, n)
+    x_u: Optional[np.ndarray] = None           # (B, n)
+
+    @property
+    def B(self) -> int:
+        return self.P.B
+
+    @property
+    def n(self) -> int:
+        return self.P.shape[1]
+
+    @property
+    def p(self) -> int:
+        return self.A.shape[0] if self.A is not None else 0
+
+    @property
+    def m(self) -> int:
+        return self.G.shape[0] if self.G is not None else 0
+
+    def to_dense(self) -> "DenseBatchedQPData":
+        """Materialize ``(B, m, n)`` dense ndarrays by scattering values
+        back into zero-initialized buffers at the master CSR positions."""
+        return DenseBatchedQPData(
+            P=_densify_sparse_batch(self.P),
+            c=self.c,
+            A=_densify_sparse_batch(self.A) if self.A is not None else None,
+            b=self.b,
+            G=_densify_sparse_batch(self.G) if self.G is not None else None,
+            h_l=self.h_l, h_u=self.h_u,
+            x_l=self.x_l, x_u=self.x_u,
+        )
+
+
+def _extract_sparse_batch(arr_3d: np.ndarray) -> SparseMatBatch:
+    """Build a ``SparseMatBatch`` from a ``(B, m, n)`` dense ndarray.
+
+    The master sparsity pattern is the *union* of per-batch nonzero patterns:
+    position ``(r, c)`` is included iff at least one batch element has a
+    nonzero there. This is what scipy's ``csr_matrix(dense)`` would produce
+    if you fed it the element-wise-OR of the absolute values — every
+    nonzero in any batch is preserved, every shared structural zero (a
+    position where *all* batches are zero) is dropped. Then per-batch
+    values at the master positions are gathered in one vectorized step.
+
+    Robustness: this avoids the "batch 0 happens to have a zero where batch
+    1 has a nonzero" silent-corruption case. If you already have a known
+    structural pattern (e.g. from a sparse problem builder), construct the
+    ``SparseMatBatch`` directly instead of round-tripping through dense.
+    """
+    B, m, n = arr_3d.shape
+    # (m, n) bool: True iff any batch has a nonzero at (r, c).
+    mask = np.any(arr_3d != 0.0, axis=0)
+    rows, cols = np.nonzero(mask)   # both already in row-major order
+    # Build a canonical CSR (indices sorted within each row by construction).
+    indptr = np.zeros(m + 1, dtype=np.int32)
+    np.add.at(indptr, rows + 1, 1)
+    indptr = np.cumsum(indptr).astype(np.int32)
+    indices = cols.astype(np.int32)
+    # The template's .data field is a placeholder. Real per-batch values
+    # live in ``values`` below — consumers only read pattern.indices /
+    # pattern.indptr / pattern.shape from the template.
+    template = sp_cpu.csr_matrix(
+        (np.zeros(len(cols), dtype=arr_3d.dtype), indices, indptr),
+        shape=(m, n),
+    )
+    values = arr_3d[:, rows, cols]   # (B, nnz)
+    return SparseMatBatch(pattern=template, values=values)
+
+
+def _densify_sparse_batch(sp_mat: SparseMatBatch) -> np.ndarray:
+    """Materialize a ``(B, m, n)`` dense ndarray from a ``SparseMatBatch``."""
+    m, n = sp_mat.shape
+    rows = np.repeat(
+        np.arange(m, dtype=np.int64), np.diff(sp_mat.pattern.indptr),
+    )
+    cols = sp_mat.pattern.indices
+    out = np.zeros((sp_mat.B, m, n), dtype=sp_mat.values.dtype)
+    out[:, rows, cols] = sp_mat.values
+    return out
+
+
+# Backward-compatibility alias. The original ``BatchedQPData`` name was
+# always dense-only; existing benchmark scripts construct via this alias.
+# New sparse-native benchmarks should construct ``SparseBatchedQPData``
+# directly.
+BatchedQPData = DenseBatchedQPData
 
 
 @dataclass
@@ -196,11 +350,19 @@ class BatchedQPSolver(ABC):
 # ======================================================================
 
 try:
-    from cupiqp import SolverBase
+    from cupiqp import DenseSolver, SparseSolver, MultistageSolver
     from cupiqp import Status as CupiqpStatus
+    from cupiqp.sparse.batched_csr import UniformBatchedCsrMatrix
     _CUPIQP_AVAILABLE = True
+    _CUPIQP_BACKENDS = {
+        'dense_cholesky': DenseSolver,
+        'sparse_ldlt': SparseSolver,
+        'multistage_block_cholesky': MultistageSolver,
+    }
 except ImportError:
     _CUPIQP_AVAILABLE = False
+    _CUPIQP_BACKENDS = {}
+
 
 class CupiqpBatchedSolverBase(BatchedQPSolver):
     """Base class for cuPIQP batched solvers (GPU, CuPy).
@@ -225,8 +387,7 @@ class CupiqpBatchedSolverBase(BatchedQPSolver):
 
     @nvtx.annotate("cupiqp::setup", color=SOLVER_COLORS["cupiqp"])
     def setup(self) -> None:
-        self._solver = SolverBase()
-        self._solver.settings.kkt_solver = self._kkt_solver
+        self._solver = _CUPIQP_BACKENDS[self._kkt_solver]()
         self._solver.settings.preconditioner_iter = 10
         self._solver.settings.max_iter = self.max_iter
         self._solver.settings.eps_abs = self.tol_abs
@@ -265,7 +426,7 @@ class CupiqpDenseBatchedSolver(CupiqpBatchedSolverBase):
     def name(self) -> str:
         return "cupiqp-dense"
 
-    def _to_native(self, data: BatchedQPData) -> dict:
+    def _to_native(self, data: DenseBatchedQPData) -> dict:
         return dict(
             P=cp.array(data.P), c=cp.array(data.c),
             A=cp.array(data.A) if data.A is not None else None,
@@ -279,22 +440,45 @@ class CupiqpDenseBatchedSolver(CupiqpBatchedSolverBase):
 
 
 class CupiqpSparseBatchedSolver(CupiqpBatchedSolverBase):
-    """cuPIQP with sparse direct backend."""
+    """cuPIQP with sparse direct backend.
+
+    Consumes ``SparseBatchedQPData`` natively. If given a ``DenseBatchedQPData``
+    it canonicalizes to sparse first via ``to_sparse()`` — runs outside the
+    timed window in ``_prepare_data``, so the conversion cost is visible to
+    the caller but not counted as solve time.
+    """
     _kkt_solver = 'sparse_ldlt'
 
     @property
     def name(self) -> str:
         return "cupiqp-sparse"
 
-    def _to_native(self, data: BatchedQPData) -> dict:
-        from scipy.sparse import csr_matrix as sp_csr
-        B = data.B
+    @staticmethod
+    def _pack(sp_mat: SparseMatBatch) -> "UniformBatchedCsrMatrix":
+        """Wrap a ``SparseMatBatch`` as a ``UniformBatchedCsrMatrix`` on device.
+
+        Two H2D copies — indices/indptr and the ``(B, nnz)`` values block —
+        no Python loop over batches, no per-batch CSR object construction.
+        """
+        return UniformBatchedCsrMatrix(
+            batch_size=sp_mat.B,
+            indices=cp.asarray(sp_mat.pattern.indices, dtype=cp.int32),
+            indptr=cp.asarray(sp_mat.pattern.indptr, dtype=cp.int32),
+            data=cp.asarray(sp_mat.values),
+            shape=sp_mat.shape,
+        )
+
+    def _to_native(
+        self, data: Union[DenseBatchedQPData, SparseBatchedQPData],
+    ) -> dict:
+        if isinstance(data, DenseBatchedQPData):
+            data = data.to_sparse()
         return dict(
-            P=[sp_csr(data.P[i]) for i in range(B)],
+            P=self._pack(data.P),
             c=cp.array(data.c),
-            A=[sp_csr(data.A[i]) for i in range(B)] if data.A is not None else None,
+            A=self._pack(data.A) if data.A is not None else None,
             b=cp.array(data.b) if data.b is not None else None,
-            G=[sp_csr(data.G[i]) for i in range(B)] if data.G is not None else None,
+            G=self._pack(data.G) if data.G is not None else None,
             h_l=cp.array(data.h_l) if data.h_l is not None else None,
             h_u=cp.array(data.h_u) if data.h_u is not None else None,
             x_l=cp.array(data.x_l) if data.x_l is not None else None,
@@ -344,18 +528,38 @@ class QpaxBatchedSolver(BatchedQPSolver):
         G_parts = []
         h_parts = []
 
+        # qpax / qpth do not tolerate ±inf bounds — they propagate into NaN
+        # through the IPM barrier. Filter rows where the *finite-bound*
+        # pattern is identical across the batch by checking only row 0
+        # (cuPIQP requires the structure to be uniform, so it's enough).
+        def _finite_mask_for_upper(arr):
+            return np.isfinite(arr[0])  # True where the upper bound is finite
+
+        def _finite_mask_for_lower(arr):
+            return np.isfinite(arr[0])
+
         if data.G is not None and data.h_u is not None:
-            G_parts.append(jnp.array(data.G))
-            h_parts.append(jnp.array(data.h_u))
+            mask = _finite_mask_for_upper(data.h_u)
+            if mask.any():
+                G_parts.append(jnp.array(data.G[:, mask, :]))
+                h_parts.append(jnp.array(data.h_u[:, mask]))
         if data.G is not None and data.h_l is not None:
-            G_parts.append(-jnp.array(data.G))
-            h_parts.append(-jnp.array(data.h_l))
+            mask = _finite_mask_for_lower(data.h_l)
+            if mask.any():
+                G_parts.append(-jnp.array(data.G[:, mask, :]))
+                h_parts.append(-jnp.array(data.h_l[:, mask]))
         if data.x_u is not None:
-            G_parts.append(jnp.tile(jnp.eye(n)[None], (B, 1, 1)))
-            h_parts.append(jnp.array(data.x_u))
+            mask = _finite_mask_for_upper(data.x_u)
+            if mask.any():
+                eye_rows = jnp.eye(n)[mask]            # (k, n)
+                G_parts.append(jnp.tile(eye_rows[None], (B, 1, 1)))
+                h_parts.append(jnp.array(data.x_u[:, mask]))
         if data.x_l is not None:
-            G_parts.append(jnp.tile(-jnp.eye(n)[None], (B, 1, 1)))
-            h_parts.append(-jnp.array(data.x_l))
+            mask = _finite_mask_for_lower(data.x_l)
+            if mask.any():
+                eye_rows = jnp.eye(n)[mask]
+                G_parts.append(jnp.tile(-eye_rows[None], (B, 1, 1)))
+                h_parts.append(-jnp.array(data.x_l[:, mask]))
 
         if G_parts:
             self._Gs = jnp.concatenate(G_parts, axis=1)
@@ -429,18 +633,39 @@ class QpthBatchedSolver(BatchedQPSolver):
         G_parts = []
         h_parts = []
 
+        # qpth's IPM barrier propagates ±inf into NaN — drop rows where
+        # the bound is infinite (vacuous constraint). cuPIQP guarantees
+        # uniform finite-bound structure across the batch, so checking
+        # row 0 is sufficient.
+        def _mask_finite(arr):
+            return np.isfinite(arr[0])
+
         if data.G is not None and data.h_u is not None:
-            G_parts.append(torch.tensor(data.G, dtype=torch.float64, device='cuda'))
-            h_parts.append(torch.tensor(data.h_u, dtype=torch.float64, device='cuda'))
+            mask = _mask_finite(data.h_u)
+            if mask.any():
+                G_parts.append(torch.tensor(data.G[:, mask, :], dtype=torch.float64, device='cuda'))
+                h_parts.append(torch.tensor(data.h_u[:, mask], dtype=torch.float64, device='cuda'))
         if data.G is not None and data.h_l is not None:
-            G_parts.append(-torch.tensor(data.G, dtype=torch.float64, device='cuda'))
-            h_parts.append(-torch.tensor(data.h_l, dtype=torch.float64, device='cuda'))
+            mask = _mask_finite(data.h_l)
+            if mask.any():
+                G_parts.append(-torch.tensor(data.G[:, mask, :], dtype=torch.float64, device='cuda'))
+                h_parts.append(-torch.tensor(data.h_l[:, mask], dtype=torch.float64, device='cuda'))
         if data.x_u is not None:
-            G_parts.append(torch.eye(n, dtype=torch.float64, device='cuda').unsqueeze(0).expand(B, -1, -1))
-            h_parts.append(torch.tensor(data.x_u, dtype=torch.float64, device='cuda'))
+            mask = _mask_finite(data.x_u)
+            if mask.any():
+                eye_rows = torch.eye(n, dtype=torch.float64, device='cuda')[
+                    torch.from_numpy(mask).to('cuda')
+                ]
+                G_parts.append(eye_rows.unsqueeze(0).expand(B, -1, -1))
+                h_parts.append(torch.tensor(data.x_u[:, mask], dtype=torch.float64, device='cuda'))
         if data.x_l is not None:
-            G_parts.append(-torch.eye(n, dtype=torch.float64, device='cuda').unsqueeze(0).expand(B, -1, -1))
-            h_parts.append(-torch.tensor(data.x_l, dtype=torch.float64, device='cuda'))
+            mask = _mask_finite(data.x_l)
+            if mask.any():
+                eye_rows = torch.eye(n, dtype=torch.float64, device='cuda')[
+                    torch.from_numpy(mask).to('cuda')
+                ]
+                G_parts.append(-eye_rows.unsqueeze(0).expand(B, -1, -1))
+                h_parts.append(-torch.tensor(data.x_l[:, mask], dtype=torch.float64, device='cuda'))
 
         if G_parts:
             self._G = torch.cat(G_parts, dim=1)
@@ -452,19 +677,42 @@ class QpthBatchedSolver(BatchedQPSolver):
     @nvtx.annotate("qpth::setup", color=SOLVER_COLORS["qpth"])
     def setup(self) -> None:
         self._qp_fn = QPFunction(verbose=0, maxIter=self.max_iter, eps=self.tol_abs, check_Q_spd=False)
+        self._last_x = None
+        self._solve_error: str | None = None
 
     @nvtx.annotate("qpth::solve", color=SOLVER_COLORS["qpth"])
     def solve(self) -> None:
-        with torch.no_grad():
-            self._last_x = self._qp_fn(self._Q, self._p, self._G, self._h, self._A, self._b)
-        torch.cuda.synchronize()
+        # qpth's QPFunction silently returns None on internal failure (most
+        # commonly CUDA OOM at large batches, or singular KKT systems for
+        # specific problems). Catching here means the whole benchmark sweep
+        # keeps running and the failure is recorded as "all unsolved" in
+        # ``_collect_result`` instead of crashing the harness.
+        try:
+            with torch.no_grad():
+                out = self._qp_fn(self._Q, self._p, self._G, self._h, self._A, self._b)
+            torch.cuda.synchronize()
+            if out is None:
+                self._solve_error = "QPFunction returned None"
+            self._last_x = out
+        except Exception as e:
+            self._solve_error = f"{type(e).__name__}: {e}"
+            self._last_x = None
 
     def _collect_result(self) -> BatchedQPResult:
+        B, n = self._data.B, self._data.n
+        if self._last_x is None:
+            return BatchedQPResult(
+                x=np.full((B, n), np.nan, dtype=np.float64),
+                setup_time_ms=0, solve_time_ms=0, solve_times_all=[],
+                n_solved=0, total=B,
+                solver_name=self.name,
+                index_unsolved=list(range(B)),
+            )
         # qpth doesn't expose per-problem convergence or iter count.
         return BatchedQPResult(
             x=self._last_x.cpu().numpy(),
             setup_time_ms=0, solve_time_ms=0, solve_times_all=[],
-            n_solved=-1, total=self._data.B,
+            n_solved=-1, total=B,
             solver_name=self.name,
             index_unsolved=[],
         )
