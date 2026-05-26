@@ -59,6 +59,7 @@ def create_update_vars_after_corrector_step_kernel(n_primal: int, n_dual: int, d
     """
     @wp.kernel
     def update_vars_after_corrector_step_kernel(
+        active_mask:      wp.array(dtype=wp.bool), # type: ignore  (B,)
         primal_step:      wp.array(dtype=dtype),    # type: ignore  (B,)
         dual_step:        wp.array(dtype=dtype),    # type: ignore  (B,)
         step_primals_all: wp.array2d(dtype=dtype),  # type: ignore  (B, n_primal)
@@ -67,6 +68,9 @@ def create_update_vars_after_corrector_step_kernel(n_primal: int, n_dual: int, d
         duals_all:        wp.array2d(dtype=dtype),  # type: ignore  (B, n_dual)   in-out
     ):
         b, t = wp.tid()
+        # only update the problems that are unsolved
+        if not active_mask[b]:
+            return
         n_primal_static = wp.static(n_primal)
         n_dual_static = wp.static(n_dual)
 
@@ -100,6 +104,7 @@ def create_run_full_newton_step_kernel(n: int, p: int, dtype=wp.float64):
     """
     @wp.kernel
     def run_full_newton_step_kernel(
+        active_mask: wp.array(dtype=wp.bool), # (B,)     # type: ignore
         step_x:      wp.array2d(dtype=dtype),  # (B, n)   # type: ignore
         step_y:      wp.array2d(dtype=dtype),  # (B, p)   # type: ignore
         result_x:    wp.array2d(dtype=dtype),  # (B, n)   # type: ignore
@@ -108,6 +113,8 @@ def create_run_full_newton_step_kernel(n: int, p: int, dtype=wp.float64):
         dual_step:   wp.array(dtype=dtype),    # (B,)     # type: ignore
     ):
         b, t = wp.tid()
+        if not active_mask[b]:
+            return
         n_static = wp.static(n)
         p_static = wp.static(p)
 
@@ -801,6 +808,7 @@ def create_update_rho_delta_with_ineq_kernel(n: int, num_duals: int, dtype=wp.fl
     """
     @wp.kernel
     def update_rho_delta_with_ineq_kernel(
+        active_mask:           wp.array(dtype=wp.bool), # type: ignore
         info_dual_res:         wp.array(dtype=dtype),   # type: ignore
         info_prev_dual_res:    wp.array(dtype=dtype),   # type: ignore
         info_dual_res_rel:     wp.array(dtype=dtype),   # type: ignore
@@ -818,17 +826,18 @@ def create_update_rho_delta_with_ineq_kernel(n: int, num_duals: int, dtype=wp.fl
         prox_x:                wp.array2d(dtype=dtype), # type: ignore
         result_duals:          wp.array2d(dtype=dtype), # type: ignore
         prox_duals:            wp.array2d(dtype=dtype), # type: ignore
-        settings_eps_abs:              dtype,
-        settings_eps_rel:              dtype,
-        settings_reg_finetune_lower:   dtype,
-        settings_infeas_thresh:        dtype,
+        settings_eps_abs:              dtype,           # type: ignore
+        settings_eps_rel:              dtype,           # type: ignore
+        settings_reg_finetune_lower:   dtype,           # type: ignore
+        settings_infeas_thresh:        dtype,           # type: ignore
         current_iter:                  wp.int32,
     ):
         b, i = wp.tid()
+        if not active_mask[b]:
+            return
         n_static = wp.static(n)
         num_duals_static = wp.static(num_duals)
         iter_under_5 = (current_iter < wp.int32(5))
-
         dual_improved = (
             (info_dual_res[b] < dtype(0.95) * info_prev_dual_res[b])
             or (info_dual_res[b] < settings_eps_abs)
@@ -893,6 +902,7 @@ def create_update_rho_delta_without_ineq_kernel(n: int, p: int, dtype=wp.float64
     """
     @wp.kernel
     def update_rho_delta_without_ineq_kernel(
+        active_mask:           wp.array(dtype=wp.bool), # type: ignore
         info_dual_res:         wp.array(dtype=dtype),   # type: ignore
         info_prev_dual_res:    wp.array(dtype=dtype),   # type: ignore
         info_dual_res_rel:     wp.array(dtype=dtype),   # type: ignore
@@ -910,16 +920,17 @@ def create_update_rho_delta_without_ineq_kernel(n: int, p: int, dtype=wp.float64
         prox_x:                wp.array2d(dtype=dtype), # type: ignore
         result_y:              wp.array2d(dtype=dtype), # type: ignore
         prox_y:                wp.array2d(dtype=dtype), # type: ignore
-        settings_eps_abs:              dtype,
-        settings_eps_rel:              dtype,
-        settings_infeas_thresh:        dtype,
+        settings_eps_abs:              dtype,           # type: ignore
+        settings_eps_rel:              dtype,           # type: ignore
+        settings_infeas_thresh:        dtype,           # type: ignore
         current_iter:                  wp.int32,
     ):
         b, i = wp.tid()
+        if not active_mask[b]:
+            return
         n_static = wp.static(n)
         p_static = wp.static(p)
         iter_under_5 = (current_iter < wp.int32(5))
-
         dual_improved = (
             (info_dual_res[b] < dtype(0.95) * info_prev_dual_res[b])
             or (info_dual_res[b] < settings_eps_abs)
@@ -991,12 +1002,16 @@ def create_boundary_shift_kernel(num_hl: int, num_hu: int, num_xl: int, num_xu: 
     
     @wp.kernel
     def boundary_shift_kernel(
+        active_mask: wp.array(dtype=wp.bool), # type: ignore  (B,)
         z_hl:  wp.array2d(dtype=dtype),  # type: ignore  (B, num_hl)
         z_hu:  wp.array2d(dtype=dtype),  # type: ignore  (B, num_hu)
         z_bl: wp.array2d(dtype=dtype),   # type: ignore  (B, num_xl)
         z_bu: wp.array2d(dtype=dtype),   # type: ignore  (B, num_xu)
     ):
         b, t = wp.tid()
+        if not active_mask[b]:
+            return
+
         n_hl = wp.static(num_hl)
         n_hu = wp.static(num_hu)
         n_xl = wp.static(num_xl)
@@ -1166,7 +1181,7 @@ def create_backward_unscale_lhs_kernel(
     n: int, p: int,
     num_hu: int, num_hl: int, num_xu: int, num_xl: int,
     precond_on: bool,
-dtype=wp.float64):
+    dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     r"""Step 3 of the backward pass — un-scale ``sol`` (scaled-space
     backsolve output) into user-space lambdas **in place**, in

@@ -107,6 +107,8 @@ class SolverBase(ABC):
 
         self._kkt_system.init(self._data, self.settings)
         self._info_host = InfoHost(B, dtype=self._data.dtype)
+        # Problems in the batch that have terminated must not evolve while other problems continue iterating.
+        self._unsolved_mask = cp.ones(B, dtype=cp.bool_)
 
         self._dtype = self._data.dtype
         self._work_z_1 = cp.empty((data.batch_size, data.m), dtype=self._dtype)  # used to store intermediate results in _update_residuals_nr
@@ -280,6 +282,7 @@ class SolverBase(ABC):
 
     def _solve_impl(self) -> Status:
         self._result.info._status_value[:] = Status.PIQP_UNSOLVED.value
+        self._unsolved_mask.fill(True)
         self._result.info.iter[:] = 0
         self._result.info.reg_limit[:] = self.settings.reg_lower_limit
         # Refresh tau only if the user changed settings.tau between solves because it requires H2D memcpy
@@ -318,6 +321,7 @@ class SolverBase(ABC):
 
         ## ----------- initial iteration --------------
         self._initial_guess()
+        still_unsolved = np.ones(self._data.batch_size, dtype=np.bool_)
 
         ## ---------------------------------------------
         ## ---------- remaining iterations -------------
@@ -343,7 +347,6 @@ class SolverBase(ABC):
                 # All problems keep running until every one has terminated.
                 # ============================================================
                 settings = self.settings
-                still_unsolved = (self._result.info._status_value == Status.PIQP_UNSOLVED.value)  # CPU: numpy bool (B,)
 
                 # convergence check
                 primal_ok = (info_host.primal_res < settings.eps_abs) | (info_host.primal_res_rel < settings.eps_rel)
@@ -352,30 +355,38 @@ class SolverBase(ABC):
                 if settings.check_duality_gap:
                     gap_ok = (info_host.duality_gap < settings.eps_duality_gap_abs) | (info_host.duality_gap_rel < settings.eps_duality_gap_rel)
                     converged &= gap_ok
-                self._result.info._status_value[still_unsolved & converged] = Status.PIQP_SOLVED.value  # CPU write
+                solved = still_unsolved & converged
+                self._result.info._status_value[solved] = Status.PIQP_SOLVED.value  # CPU write
 
                 # primal infeasibility check
-                primal_infeasible = (
+                primal_infeasible = still_unsolved & ~converged & (
                     (info_host.no_dual_update > min(5, settings.reg_finetune_dual_update_threshold)) &
                     (info_host.primal_prox_inf > settings.infeasibility_threshold) &
                     ((info_host.primal_res_reg < settings.eps_abs) | (info_host.primal_res_reg_rel < settings.eps_rel))
                 )
-                self._result.info._status_value[still_unsolved & ~converged & primal_infeasible] = Status.PIQP_PRIMAL_INFEASIBLE.value  # CPU write
+                self._result.info._status_value[primal_infeasible] = Status.PIQP_PRIMAL_INFEASIBLE.value  # CPU write
 
                 # dual infeasibility check
-                dual_infeasible = (
+                dual_infeasible = still_unsolved & ~converged & ~primal_infeasible & (
                     (info_host.no_primal_update > min(5, settings.reg_finetune_primal_update_threshold)) &
                     (info_host.dual_prox_inf > settings.infeasibility_threshold) &
                     ((info_host.dual_res_reg < settings.eps_abs) | (info_host.dual_res_reg_rel < settings.eps_rel))
                 )
-                self._result.info._status_value[still_unsolved & ~converged & ~primal_infeasible & dual_infeasible] = Status.PIQP_DUAL_INFEASIBLE.value  # CPU write
+                self._result.info._status_value[dual_infeasible] = Status.PIQP_DUAL_INFEASIBLE.value  # CPU write
+
+                newly_terminated = solved | primal_infeasible | dual_infeasible
+                mask_changed = np.any(newly_terminated)
+                if mask_changed:
+                    still_unsolved[newly_terminated] = False
 
                 if self.settings.verbose:
                     self._print_iteration_info()
 
-                # exit if all problems have terminated
-                if np.all(self._result.info._status_value != Status.PIQP_UNSOLVED.value):
-                    break
+                if mask_changed:
+                    # No subsequent GPU work is launched when the entire batch is done.
+                    if not np.any(still_unsolved):
+                        break
+                    self._unsolved_mask.set(still_unsolved)
 
                 # avoid getting too close to boundary which can result in a division by zero
                 if self._data.num_ineq > 0:
@@ -385,6 +396,7 @@ class SolverBase(ABC):
                              self._data.num_hl + self._data.num_hu
                              + self._data.num_xl + self._data.num_xu),
                         inputs=[
+                            self._unsolved_mask,
                             self._result.z_l, self._result.z_u,
                             self._result.z_bl, self._result.z_bu,
                         ],
@@ -403,6 +415,7 @@ class SolverBase(ABC):
                      (info_host.reg_limit != self.settings.reg_finetune_lower_limit))
                 )
                 finetune_mask &= (info_host.dual_prox_inf < self.settings.infeasibility_threshold) & (info_host.primal_prox_inf < self.settings.infeasibility_threshold)
+                finetune_mask &= still_unsolved
                 if np.any(finetune_mask):
                     self._result.info.reg_limit[finetune_mask] = self.settings.reg_finetune_lower_limit
                     finetune_mask_dev = cp.asarray(finetune_mask)
@@ -646,6 +659,7 @@ class SolverBase(ABC):
             kernel=self._run_full_newton_step_kernel,
             dim=(self._data.batch_size, self._data.n + self._data.p),
             inputs=[
+                self._unsolved_mask,
                 self._step.x, self._step.y,
                 self._result.x, self._result.y,
                 self._result.info.primal_step, self._result.info.dual_step,
@@ -732,6 +746,7 @@ class SolverBase(ABC):
             kernel=self._update_vars_after_corrector_step_kernel,
             dim=(self._data.batch_size, n_primal + n_dual),
             inputs=[
+                self._unsolved_mask,
                 self._result.info.primal_step,
                 self._result.info.dual_step,
                 self._step.primals_all,
@@ -1089,6 +1104,7 @@ class SolverBase(ABC):
             kernel=self._update_rho_delta_with_ineq_kernel,
             dim=(self._data.batch_size, n + num_duals),
             inputs=[
+                self._unsolved_mask,
                 info.dual_res, info.prev_dual_res, info.dual_res_rel, info.dual_prox_inf,
                 info.primal_res, info.prev_primal_res, info.primal_res_rel, info.primal_prox_inf,
                 info.reg_limit,
@@ -1116,6 +1132,7 @@ class SolverBase(ABC):
             kernel=self._update_rho_delta_without_ineq_kernel,
             dim=(self._data.batch_size, n + p),
             inputs=[
+                self._unsolved_mask,
                 info.dual_res, info.prev_dual_res, info.dual_res_rel, info.dual_prox_inf,
                 info.primal_res, info.prev_primal_res, info.primal_res_rel, info.primal_prox_inf,
                 info.reg_limit,

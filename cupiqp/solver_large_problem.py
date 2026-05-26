@@ -47,10 +47,11 @@ class LargeProblemSolverBase(SolverBase):
     @nvtx.annotate("LargeProblemSolverBase::_run_full_newton_step")
     def _run_full_newton_step(self):
         self._kkt_system.solve(self._data, self._preconditioner, self.settings, self._res, self._step)
-        self._result.info.primal_step[:] = 1.0
-        self._result.info.dual_step[:] = 1.0
-        self._result.x += self._result.info.primal_step[:, None] * self._step.x
-        self._result.y += self._result.info.dual_step[:, None] * self._step.y
+        active = self._unsolved_mask
+        self._result.info.primal_step[:] = cp.where(active, 1.0, self._result.info.primal_step)
+        self._result.info.dual_step[:] = cp.where(active, 1.0, self._result.info.dual_step)
+        self._result.x += active[:, None] * self._step.x
+        self._result.y += active[:, None] * self._step.y
 
     @nvtx.annotate("LargeProblemSolverBase::_calculate_step")
     @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
@@ -383,67 +384,77 @@ class LargeProblemSolverBase(SolverBase):
     def _update_rho_delta_with_ineq(self) -> None:
         info = self._result.info
         settings = self.settings
+        active = self._unsolved_mask
 
         # --- Rho update ---
-        dual_improved = (
+        dual_improved = active & (
             (info.dual_res < 0.95 * info.prev_dual_res) |
             (info.dual_res < settings.eps_abs) | (info.dual_res_rel < settings.eps_rel) |
             ((info.rho == settings.reg_finetune_lower_limit) & (info.dual_prox_inf < settings.infeasibility_threshold))
         )
         rho_fast = cp.maximum(info.reg_limit, 0.1 * info.rho)
         rho_slow = cp.maximum(info.reg_limit, 0.5 * info.rho)
-        rho_slow_decay_ok = (~dual_improved) & ((info.iter[0] < 5) | (info.dual_prox_inf < settings.infeasibility_threshold))
+        rho_slow_decay_ok = active & (~dual_improved) & ((info.iter[0] < 5) | (info.dual_prox_inf < settings.infeasibility_threshold))
         info.rho[:] = cp.where(dual_improved, rho_fast, cp.where(rho_slow_decay_ok, rho_slow, info.rho))
         self._prox_vars.x[:] = cp.where(dual_improved[:, None], self._result.x, self._prox_vars.x)
-        info.no_primal_update += 1
-        info.no_primal_update[dual_improved] = 0
+        info.no_primal_update[:] = cp.where(
+            active, cp.where(dual_improved, 0, info.no_primal_update + 1),
+            info.no_primal_update,
+        )
 
         # --- Delta update ---
-        primal_improved = (
+        primal_improved = active & (
             (info.primal_res < 0.95 * info.prev_primal_res) |
             (info.primal_res < settings.eps_abs) | (info.primal_res_rel < settings.eps_rel) |
             ((info.delta == settings.reg_finetune_lower_limit) & (info.primal_prox_inf < settings.infeasibility_threshold))
         )
         delta_fast = cp.maximum(info.reg_limit, 0.1 * info.delta)
         delta_slow = cp.maximum(info.reg_limit, 0.5 * info.delta)
-        delta_slow_decay_ok = (~primal_improved) & ((info.iter[0] < 5) | (info.primal_prox_inf < settings.infeasibility_threshold))
+        delta_slow_decay_ok = active & (~primal_improved) & ((info.iter[0] < 5) | (info.primal_prox_inf < settings.infeasibility_threshold))
         info.delta[:] = cp.where(primal_improved, delta_fast, cp.where(delta_slow_decay_ok, delta_slow, info.delta))
         self._prox_vars.duals_all[:] = cp.where(primal_improved[:, None], self._result.duals_all, self._prox_vars.duals_all)
-        info.no_dual_update += 1
-        info.no_dual_update[primal_improved] = 0
+        info.no_dual_update[:] = cp.where(
+            active, cp.where(primal_improved, 0, info.no_dual_update + 1),
+            info.no_dual_update,
+        )
 
     @nvtx.annotate("LargeProblemSolverBase::_update_rho_delta_without_ineq")
     def _update_rho_delta_without_ineq(self) -> None:
         info = self._result.info
         settings = self.settings
+        active = self._unsolved_mask
 
         # --- Rho update ---
-        dual_improved = (
+        dual_improved = active & (
             (info.dual_res < 0.95 * info.prev_dual_res) |
             (info.dual_res < settings.eps_abs) |
             (info.dual_res_rel < settings.eps_rel)
         )
         rho_fast = cp.maximum(info.reg_limit, 0.1 * info.rho)
         rho_slow = cp.maximum(info.reg_limit, 0.5 * info.rho)
-        rho_slow_decay_ok = (~dual_improved) & ((info.iter[0] < 5) | (info.dual_prox_inf < settings.infeasibility_threshold))
+        rho_slow_decay_ok = active & (~dual_improved) & ((info.iter[0] < 5) | (info.dual_prox_inf < settings.infeasibility_threshold))
         info.rho[:] = cp.where(dual_improved, rho_fast, cp.where(rho_slow_decay_ok, rho_slow, info.rho))
         self._prox_vars.x[:] = cp.where(dual_improved[:, None], self._result.x, self._prox_vars.x)
-        info.no_primal_update += 1
-        info.no_primal_update[dual_improved] = 0
+        info.no_primal_update[:] = cp.where(
+            active, cp.where(dual_improved, 0, info.no_primal_update + 1),
+            info.no_primal_update,
+        )
 
         # --- Delta update ---
-        primal_improved = (
+        primal_improved = active & (
             (info.primal_res < 0.95 * info.prev_primal_res) |
             (info.primal_res < settings.eps_abs) |
             (info.primal_res_rel < settings.eps_rel)
         )
         delta_fast = cp.maximum(info.reg_limit, 0.1 * info.delta)
         delta_slow = cp.maximum(info.reg_limit, 0.5 * info.delta)
-        delta_slow_decay_ok = (~primal_improved) & ((info.iter[0] < 5) | (info.primal_prox_inf < settings.infeasibility_threshold))
+        delta_slow_decay_ok = active & (~primal_improved) & ((info.iter[0] < 5) | (info.primal_prox_inf < settings.infeasibility_threshold))
         info.delta[:] = cp.where(primal_improved, delta_fast, cp.where(delta_slow_decay_ok, delta_slow, info.delta))
         self._prox_vars.y[:] = cp.where(primal_improved[:, None], self._result.y, self._prox_vars.y)
-        info.no_dual_update += 1
-        info.no_dual_update[primal_improved] = 0
+        info.no_dual_update[:] = cp.where(
+            active, cp.where(primal_improved, 0, info.no_dual_update + 1),
+            info.no_dual_update,
+        )
 
 
 class DenseLargeProblemSolver(LargeProblemSolverBase, DenseSolver):
