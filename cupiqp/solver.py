@@ -262,6 +262,17 @@ class SolverBase(ABC):
 
     def solve(self) -> list:
         if self.settings.verbose:
+            try:
+                from importlib.metadata import version
+                _ver = version("cupiqp")
+            except Exception:
+                _ver = ""
+            _w = 58
+            print("-" * _w)
+            print(f"cuPIQP v{_ver} - GPU-accelerated PIQP solver".strip().center(_w))
+            print("(c) Fenglong Song".center(_w))
+            print("Ecole Polytechnique Federale de Lausanne (EPFL) 2026".center(_w))
+            print("-" * _w)
             if self.settings.kkt_solver == "dense_cholesky":
                 print("dense backend:")
                 print(f"variables n = {self._data.n}")
