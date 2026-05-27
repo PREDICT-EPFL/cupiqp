@@ -69,19 +69,35 @@ cuda13 = ["cupy-cuda13x"]
 #
 #   pip install "cupiqp[cuda13,torch]"   -> enables `from cupiqp.torch_module import ...`
 #   pip install "cupiqp[cuda13,jax]"     -> enables `from cupiqp.jax_module   import ...`
-#   pip install "cupiqp[cuda13,all]"     -> both
 #
 # Version floors are minimum-tested versions, not pins — pick the wheel
 # variant whose CUDA build matches your stack.
 torch = ["torch>=2.4"]
 jax   = ["jax>=0.4", "jaxlib>=0.4"]
-all   = ["torch>=2.4", "jax>=0.4", "jaxlib>=0.4"]
+
+# --- Multistage backend --------------------------------------------------
+# `MultistageSolver` needs `socu` (block-tridiagonal Warp kernels), which is
+# NOT on PyPI yet, so we pull it straight from GitHub via a PEP 508 direct
+# reference:
+#
+#   pip install "cupiqp[cuda13,multistage]"   -> enables MultistageSolver
+#
+# WARNING: a `git+` direct reference makes this project NON-uploadable to PyPI
+# (PyPI rejects direct-URL dependencies, extras included). Before any PyPI
+# release, drop this extra or publish socu to PyPI and pin it as "socu>=x".
+multistage = ["socu @ git+https://github.com/PREDICT-EPFL/socu.git"]
+
+# Everything — differentiable layers + multistage backend:
+#   pip install "cupiqp[cuda13,all]"
+all   = ["torch>=2.4", "jax>=0.4", "jaxlib>=0.4",
+         "socu @ git+https://github.com/PREDICT-EPFL/socu.git"]
 test  = ["pytest>=7"]
 dev   = [
   "pytest>=7",
   "torch>=2.4",
   "jax>=0.4",
   "jaxlib>=0.4",
+  "socu @ git+https://github.com/PREDICT-EPFL/socu.git",
 ]
 
 [project.urls]
