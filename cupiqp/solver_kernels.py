@@ -2,6 +2,108 @@ import warp as wp
 from .utils import to_warp_dtype
 
 
+def create_init_guess_rhs_kernel(n: int, p: int,
+                                 num_hl: int, num_hu: int,
+                                 num_xl: int, num_xu: int,
+                                 dtype=wp.float64):
+    """Initial-RHS assembly for :meth:`Solver._initial_guess`.
+
+    A single launch writes all six res blocks::
+
+        res.x [b, k] = -c   [b, k]                   for k in [0, n)
+        res.y [b, k] =  b   [b, k]                   for k in [0, p)
+        res.z_l [b, k] = -h_l[b, idx_hl[k]]          for k in [0, num_hl)
+        res.z_u [b, k] =  h_u[b, idx_hu[k]]          for k in [0, num_hu)
+        res.z_bl[b, k] = -x_l[b, idx_xl[k]]          for k in [0, num_xl)
+        res.z_bu[b, k] =  x_u[b, idx_xu[k]]          for k in [0, num_xu)
+    """
+    dtype = to_warp_dtype(dtype)
+    n_s   = wp.static(n)
+    p_s   = wp.static(p)
+    nhl_s = wp.static(num_hl)
+    nhu_s = wp.static(num_hu)
+    nxl_s = wp.static(num_xl)
+    nxu_s = wp.static(num_xu)
+
+    off_y   = wp.static(n)                                # start of y block
+    off_zl  = wp.static(n + p)                            # start of z_l
+    off_zu  = wp.static(n + p + num_hl)                   # start of z_u
+    off_zbl = wp.static(n + p + num_hl + num_hu)          # start of z_bl
+    off_zbu = wp.static(n + p + num_hl + num_hu + num_xl) # start of z_bu
+
+    @wp.kernel
+    def init_guess_rhs_kernel(
+        c:      wp.array2d(dtype=dtype),        # type: ignore  (B, n)
+        b_eq:   wp.array2d(dtype=dtype),        # type: ignore  (B, p)
+        h_l:    wp.array2d(dtype=dtype),        # type: ignore  (B, m)
+        h_u:    wp.array2d(dtype=dtype),        # type: ignore  (B, m)
+        x_l:    wp.array2d(dtype=dtype),        # type: ignore  (B, n)
+        x_u:    wp.array2d(dtype=dtype),        # type: ignore  (B, n)
+        idx_hl: wp.array(dtype=wp.int32),       # type: ignore  (num_hl,)
+        idx_hu: wp.array(dtype=wp.int32),       # type: ignore  (num_hu,)
+        idx_xl: wp.array(dtype=wp.int32),       # type: ignore  (num_xl,)
+        idx_xu: wp.array(dtype=wp.int32),       # type: ignore  (num_xu,)
+        res_x:   wp.array2d(dtype=dtype),       # type: ignore  (B, n)   out
+        res_y:   wp.array2d(dtype=dtype),       # type: ignore  (B, p)   out
+        res_zl:  wp.array2d(dtype=dtype),       # type: ignore  (B, num_hl) out
+        res_zu:  wp.array2d(dtype=dtype),       # type: ignore  (B, num_hu) out
+        res_zbl: wp.array2d(dtype=dtype),       # type: ignore  (B, num_xl) out
+        res_zbu: wp.array2d(dtype=dtype),       # type: ignore  (B, num_xu) out
+    ):
+        b, t = wp.tid()
+
+        if t < n_s:
+            res_x[b, t] = -c[b, t]
+        elif t < n_s + p_s:
+            k = t - off_y
+            res_y[b, k] = b_eq[b, k]
+        elif t < n_s + p_s + nhl_s:
+            k = t - off_zl
+            res_zl[b, k] = -h_l[b, idx_hl[k]]
+        elif t < n_s + p_s + nhl_s + nhu_s:
+            k = t - off_zu
+            res_zu[b, k] = h_u[b, idx_hu[k]]
+        elif t < n_s + p_s + nhl_s + nhu_s + nxl_s:
+            k = t - off_zbl
+            res_zbl[b, k] = -x_l[b, idx_xl[k]]
+        elif t < n_s + p_s + nhl_s + nhu_s + nxl_s + nxu_s:
+            k = t - off_zbu
+            res_zbu[b, k] = x_u[b, idx_xu[k]]
+
+    return init_guess_rhs_kernel
+
+
+def create_init_guess_project_to_central_path_kernel(dtype=wp.float64):
+    """Fused central-path projection for :meth:`Solver._initial_guess`.
+
+    c = z - delta_z; z = (c + sqrt(c^2 + 4*mu)) / 2; s = z - c
+    """
+    dtype = to_warp_dtype(dtype)
+
+    @wp.func
+    def project_z_to_central_path(c: dtype, mu: dtype) -> dtype:
+        """Positive root of the central-path quadratic ``z*(z - c) = mu``.
+
+            z = (c + sqrt(c**2 + 4*mu)) / 2
+        """
+        return (c + wp.sqrt(c * c + dtype(4.0) * mu)) * dtype(0.5)
+
+    @wp.kernel
+    def init_guess_project_to_central_path_kernel(
+        delta_z: wp.array2d(dtype=dtype),   # type: ignore  (B, 1)
+        mu:      wp.array(dtype=dtype),     # type: ignore  (B,)
+        z_all:   wp.array2d(dtype=dtype),   # type: ignore  (B, num_ineq) in-out
+        s_all:   wp.array2d(dtype=dtype),   # type: ignore  (B, num_ineq) out
+    ):
+        b, i = wp.tid()
+        c_bi  = z_all[b, i] - delta_z[b, 0]
+        z_new = project_z_to_central_path(c_bi, mu[b])
+        z_all[b, i] = z_new
+        s_all[b, i] = z_new - c_bi
+
+    return init_guess_project_to_central_path_kernel
+
+
 def create_prepare_predictor_step_kernel(dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Fused kernel for the predictor-step RHS assembly:
