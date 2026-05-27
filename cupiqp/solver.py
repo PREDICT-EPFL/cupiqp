@@ -134,31 +134,32 @@ class SolverBase(ABC):
         self._work_dual_res_norm = cp.empty(B, dtype=self._dtype)    # running max of dual residual norm terms
         self._work_norm_temp = cp.empty(B, dtype=self._dtype)        # temp (B,) for individual norm results
 
-        # Working variables for implicit differentiation
-        self._work_grad_rhs = Variables()
-        self._work_grad_rhs.init(self._data)
-        # User cotangent input (caller packs kwargs into this) and the user-space adjoint solution buffer.
-        self._grad_in = Variables()
-        self._grad_in.init(self._data)
-        self._backward_adjoint_vector = Variables()
-        self._backward_adjoint_vector.init(self._data)
-        # Pre-zeroed Variables used as a placeholder for None cotangents
-        # in the fused pack kernel — the kernel can't read None, so
-        # absent kwargs get substituted with the corresponding field of
-        # this zero buffer.
-        self._zero_grad_in = Variables()
-        self._zero_grad_in.init(self._data)
-        self._zero_grad_in._primal_buffer.fill(0.0)
-        self._zero_grad_in._dual_buffer.fill(0.0)
-        # Full-layout scatter buffers feeding the matrix and vector
-        # gradient assemblies. ineq groups live in length-m; bound
-        # groups live in length-n.
-        self._lam_zu_full  = cp.empty((B, data.m), dtype=self._dtype)
-        self._lam_zl_full  = cp.empty((B, data.m), dtype=self._dtype)
-        self._lam_zbu_full = cp.empty((B, data.n), dtype=self._dtype)
-        self._lam_zbl_full = cp.empty((B, data.n), dtype=self._dtype)
-        self._zu_full      = cp.empty((B, data.m), dtype=self._dtype)
-        self._zl_full      = cp.empty((B, data.m), dtype=self._dtype)
+        if self.settings.enable_grad:
+            # Working variables for implicit differentiation
+            self._work_grad_rhs = Variables()
+            self._work_grad_rhs.init(self._data)
+            # User cotangent input (caller packs kwargs into this) and the user-space adjoint solution buffer.
+            self._grad_in = Variables()
+            self._grad_in.init(self._data)
+            self._backward_adjoint_vector = Variables()
+            self._backward_adjoint_vector.init(self._data)
+            # Pre-zeroed Variables used as a placeholder for None cotangents
+            # in the fused pack kernel — the kernel can't read None, so
+            # absent kwargs get substituted with the corresponding field of
+            # this zero buffer.
+            self._zero_grad_in = Variables()
+            self._zero_grad_in.init(self._data)
+            self._zero_grad_in._primal_buffer.fill(0.0)
+            self._zero_grad_in._dual_buffer.fill(0.0)
+            # Full-layout scatter buffers feeding the matrix and vector
+            # gradient assemblies. ineq groups live in length-m; bound
+            # groups live in length-n.
+            self._lam_zu_full  = cp.empty((B, data.m), dtype=self._dtype)
+            self._lam_zl_full  = cp.empty((B, data.m), dtype=self._dtype)
+            self._lam_zbu_full = cp.empty((B, data.n), dtype=self._dtype)
+            self._lam_zbl_full = cp.empty((B, data.n), dtype=self._dtype)
+            self._zu_full      = cp.empty((B, data.m), dtype=self._dtype)
+            self._zl_full      = cp.empty((B, data.m), dtype=self._dtype)
 
         self._enable_iterative_refinement = self.settings.iterative_refinement_always_enabled
 
