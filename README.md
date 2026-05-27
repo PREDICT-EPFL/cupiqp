@@ -32,18 +32,32 @@ where $P \succeq 0$ is positive semidefinite, $x \in \mathbb{R}^n$ is the decisi
 
 ## Installation
 
-**Requirements:** Python ≥ 3.10, an NVIDIA GPU with compute capability ≥ 7.0, and a CUDA 12.x or 13.x driver. Run `nvidia-smi` and read "CUDA Version" from the header to see which one you have.
+### Requirements
 
-### Install from PyPI
+- Python 3.10 or later.
+- Linux with an NVIDIA GPU and a working CUDA driver/runtime stack.
+- A CuPy build compatible with the installed CUDA stack. This repository
+  defines extras for CUDA 12.x and CUDA 13.x.
 
-Pick the extra matching your CUDA version — this pulls the right CuPy wheel along with cuPIQP:
+cuPIQP is not currently published on PyPI. From a local clone, install it
+with one CUDA extra:
 
 ```bash
-pip install "cupiqp[cuda13]"   # CUDA 13.x driver
-pip install "cupiqp[cuda12]"   # CUDA 12.x driver
+git clone https://github.com/PREDICT-EPFL/cupiqp.git
+cd cupiqp
+python -m pip install ".[cuda12]"  # choose for a CUDA 12.x CuPy environment
+# or:
+python -m pip install ".[cuda13]"  # choose for a CUDA 13.x CuPy environment
 ```
 
-To also use the differentiable layer:
+If an appropriate CuPy installation is already present in the environment,
+the base local install is:
+
+```bash
+python -m pip install .
+```
+
+Optional integrations are also installed from the local checkout:
 
 ```bash
 pip install "cupiqp[cuda13,torch]"   # PyTorch integration
@@ -90,7 +104,9 @@ CuPIQP implements the same [Proximal Interior Point](https://doi.org/10.1007/s12
 
 ## Citing
 
-If you use cuPIQP in academic work, please cite the underlying PIQP algorithm paper and this implementation. A BibTeX entry will be provided once the cuPIQP paper is released.
+If you use cuPIQP in academic work, please cite the underlying PIQP algorithm
+paper and this implementation. A BibTeX entry will be provided once a
+cuPIQP-specific publication is available.
 
 ## License
 
