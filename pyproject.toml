@@ -1,0 +1,103 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+
+[project]
+name = "cupiqp"
+version = "0.1.0"
+description = "GPU-accelerated proximal interior-point QP solver (cuPIQP)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "BSD-2-Clause"
+authors = [
+  { name = "Fenglong Song", email = "fenglong.song@epfl.ch" },
+]
+keywords = [
+  "quadratic programming",
+  "optimization",
+  "interior-point method",
+  "gpu",
+  "cuda",
+  "cupy",
+  "warp",
+  "differentiable",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Mathematics",
+]
+
+# Framework-independent runtime dependencies that resolve cleanly from PyPI.
+# CUDA-bound packages (cupy-cuda13x / cuda12x, torch+cuXY, jax-cudaXY) and
+# the internal `socu` package are NOT listed here — install them via your
+# conda env before running `pip install .` (see README for the recipe).
+dependencies = [
+  "numpy>=2.0",
+  "scipy>=1.13",
+  "warp-lang>=1.12",
+  "nvmath-python>=0.7",
+  "nvtx>=0.2",
+]
+
+[project.optional-dependencies]
+# --- CUDA / CuPy ---------------------------------------------------------
+# CuPy ships as separate wheels per CUDA major version (cupy-cuda12x for
+# CUDA 12.x, cupy-cuda13x for CUDA 13.x). Pick the one matching the CUDA
+# version reported by ``nvidia-smi``:
+#
+#   pip install "cupiqp[cuda12]"   -> CUDA 12.x driver/runtime
+#   pip install "cupiqp[cuda13]"   -> CUDA 13.x driver/runtime
+#
+# These are mutually exclusive — installing both will resolve, but only the
+# wheel matching the driver actually loads at runtime.
+cuda12 = ["cupy-cuda12x"]
+cuda13 = ["cupy-cuda13x"]
+
+# --- Differentiable layers ----------------------------------------------
+# The `cupiqp.torch_module` and `cupiqp.jax_module` files are always shipped
+# in the wheel, but they can only be imported when the matching ML framework
+# is installed. These extras pull that framework in so the corresponding
+# module becomes usable:
+#
+#   pip install "cupiqp[cuda13,torch]"   -> enables `from cupiqp.torch_module import ...`
+#   pip install "cupiqp[cuda13,jax]"     -> enables `from cupiqp.jax_module   import ...`
+#   pip install "cupiqp[cuda13,all]"     -> both
+#
+# Version floors are minimum-tested versions, not pins — pick the wheel
+# variant whose CUDA build matches your stack.
+torch = ["torch>=2.4"]
+jax   = ["jax>=0.4", "jaxlib>=0.4"]
+all   = ["torch>=2.4", "jax>=0.4", "jaxlib>=0.4"]
+test  = ["pytest>=7"]
+dev   = [
+  "pytest>=7",
+  "torch>=2.4",
+  "jax>=0.4",
+  "jaxlib>=0.4",
+]
+
+[project.urls]
+Homepage   = "https://github.com/PREDICT-EPFL/cupiqp"
+Repository = "https://github.com/PREDICT-EPFL/cupiqp"
+Issues     = "https://github.com/PREDICT-EPFL/cupiqp/issues"
+
+
+# --- packaging -------------------------------------------------------------
+#
+# The `cupiqp` package and its three KKT-backend subpackages (`cupiqp.dense`,
+# `cupiqp.sparse`, `cupiqp.multistage`) are organized as PEP 420 namespace
+# packages — only the top-level `cupiqp/__init__.py` exists. Setuptools needs
+# `namespaces = true` (the default) to pick them up.
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["cupiqp*"]
+namespaces = true
