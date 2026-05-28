@@ -299,7 +299,7 @@ class SolverBase(ABC):
         return self._solve_impl()
 
     def _solve_impl(self) -> Status:
-        self._result.info._status_value[:] = Status.PIQP_UNSOLVED.value
+        self._result.info._status_value[:] = Status.CUPIQP_UNSOLVED.value
         self._unsolved_mask.fill(True)
         self._result.info.iter[:] = 0
         self._result.info.reg_limit[:] = self.settings.reg_lower_limit
@@ -374,7 +374,7 @@ class SolverBase(ABC):
                     gap_ok = (info_host.duality_gap < settings.eps_duality_gap_abs) | (info_host.duality_gap_rel < settings.eps_duality_gap_rel)
                     converged &= gap_ok
                 solved = still_unsolved & converged
-                self._result.info._status_value[solved] = Status.PIQP_SOLVED.value  # CPU write
+                self._result.info._status_value[solved] = Status.CUPIQP_SOLVED.value  # CPU write
 
                 # primal infeasibility check
                 primal_infeasible = still_unsolved & ~converged & (
@@ -382,7 +382,7 @@ class SolverBase(ABC):
                     (info_host.primal_prox_inf > settings.infeasibility_threshold) &
                     ((info_host.primal_res_reg < settings.eps_abs) | (info_host.primal_res_reg_rel < settings.eps_rel))
                 )
-                self._result.info._status_value[primal_infeasible] = Status.PIQP_PRIMAL_INFEASIBLE.value  # CPU write
+                self._result.info._status_value[primal_infeasible] = Status.CUPIQP_PRIMAL_INFEASIBLE.value  # CPU write
 
                 # dual infeasibility check
                 dual_infeasible = still_unsolved & ~converged & ~primal_infeasible & (
@@ -390,7 +390,7 @@ class SolverBase(ABC):
                     (info_host.dual_prox_inf > settings.infeasibility_threshold) &
                     ((info_host.dual_res_reg < settings.eps_abs) | (info_host.dual_res_reg_rel < settings.eps_rel))
                 )
-                self._result.info._status_value[dual_infeasible] = Status.PIQP_DUAL_INFEASIBLE.value  # CPU write
+                self._result.info._status_value[dual_infeasible] = Status.CUPIQP_DUAL_INFEASIBLE.value  # CPU write
 
                 newly_terminated = solved | primal_infeasible | dual_infeasible
                 mask_changed = np.any(newly_terminated)
@@ -441,7 +441,7 @@ class SolverBase(ABC):
                     self._result.info.no_dual_update[finetune_mask_dev] = 0
 
                 self._update_and_factorize_kkt()
-                if np.any(self._result.info._status_value == Status.PIQP_NUMERICAL_ISSUES.value):
+                if np.any(self._result.info._status_value == Status.CUPIQP_NUMERICAL_ISSUES.value):
                     break
 
                 if self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu == 0:
@@ -455,7 +455,7 @@ class SolverBase(ABC):
                     self._update_rho_delta_with_ineq()
 
         # Mark remaining unsolved as max iter reached
-        self._result.info._status_value[self._result.info._status_value == Status.PIQP_UNSOLVED.value] = Status.PIQP_MAX_ITER_REACHED.value
+        self._result.info._status_value[self._result.info._status_value == Status.CUPIQP_UNSOLVED.value] = Status.CUPIQP_MAX_ITER_REACHED.value
         if self.settings.preconditioner_iter > 0:
             self._preconditioner.unscale_solution(self._result, self._data)
         statuses = self._result.info.status
@@ -567,7 +567,7 @@ class SolverBase(ABC):
             )
         
         else:
-            solved  = B - int((self._result.info._status_value == Status.PIQP_UNSOLVED.value).sum())
+            solved  = B - int((self._result.info._status_value == Status.CUPIQP_UNSOLVED.value).sum())
             counter = f"{solved}/{B}"
             counter_w = max(2 * len(str(B)) + 1, len("solved"))
             print(
@@ -604,8 +604,8 @@ class SolverBase(ABC):
 
         if retries >= self.settings.max_factor_retires:
             # Mark all still-unsolved problems as numerical issues
-            still_unsolved = (self._result.info._status_value == Status.PIQP_UNSOLVED.value)
-            self._result.info._status_value[still_unsolved] = Status.PIQP_NUMERICAL_ISSUES.value
+            still_unsolved = (self._result.info._status_value == Status.CUPIQP_UNSOLVED.value)
+            self._result.info._status_value[still_unsolved] = Status.CUPIQP_NUMERICAL_ISSUES.value
 
     @abstractmethod
     def _init_data(self, P, c, A, b, G, h_u, h_l, x_u, x_l):

@@ -7,12 +7,12 @@ import nvtx
 from .data import Data
 
 class Status(Enum):
-    PIQP_UNSOLVED = -1
-    PIQP_SOLVED = 0
-    PIQP_MAX_ITER_REACHED = 1
-    PIQP_PRIMAL_INFEASIBLE = 2
-    PIQP_DUAL_INFEASIBLE = 3
-    PIQP_NUMERICAL_ISSUES = 4
+    CUPIQP_UNSOLVED = -1
+    CUPIQP_SOLVED = 0
+    CUPIQP_MAX_ITER_REACHED = 1
+    CUPIQP_PRIMAL_INFEASIBLE = 2
+    CUPIQP_DUAL_INFEASIBLE = 3
+    CUPIQP_NUMERICAL_ISSUES = 4
 
 
 class Variables:
@@ -251,7 +251,7 @@ class Info:
 
     def __init__(self, batch_size: int = 1):
         self._batch_size = batch_size
-        self._status_value = np.full(batch_size, Status.PIQP_UNSOLVED.value, dtype=np.int32)
+        self._status_value = np.full(batch_size, Status.CUPIQP_UNSOLVED.value, dtype=np.int32)
         self.iter = np.zeros(batch_size, dtype=np.int32)
         self.factor_retires = np.zeros(batch_size, dtype=np.int32)
         # Per-batch "no update" counters live on device (int32). Source of truth;

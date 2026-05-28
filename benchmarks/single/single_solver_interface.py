@@ -1305,7 +1305,7 @@ class CupiqpSolverMixin(SingleQPSolver):
             n_iter=int(info.iter[0]),
             obj=float(info.primal_obj[0]),
             status=str(status_enum),
-            solved=(status_enum == CupiqpStatus.PIQP_SOLVED),
+            solved=(status_enum == CupiqpStatus.CUPIQP_SOLVED),
         )
 
 

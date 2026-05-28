@@ -401,9 +401,9 @@ class CupiqpBatchedSolverBase(BatchedQPSolver):
 
     def _collect_result(self) -> BatchedQPResult:
         valid_statuses = {
-            CupiqpStatus.PIQP_SOLVED.value,
-            CupiqpStatus.PIQP_PRIMAL_INFEASIBLE.value,
-            CupiqpStatus.PIQP_DUAL_INFEASIBLE.value,
+            CupiqpStatus.CUPIQP_SOLVED.value,
+            CupiqpStatus.CUPIQP_PRIMAL_INFEASIBLE.value,
+            CupiqpStatus.CUPIQP_DUAL_INFEASIBLE.value,
         }
         status_np = cp.asnumpy(self._solver.result.info._status_value)
         idx_unsolved = [i for i, s in enumerate(status_np) if s not in valid_statuses]
