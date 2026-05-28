@@ -15,9 +15,12 @@ def create_build_inverse_index_kernel(dtype=wp.float64):
     return build_inverse_index_kernel
 
 
-def create_update_regularizations_step_1_kernel(dtype=wp.float64):
+def create_update_regularizations_step_1_kernel(num_ineq: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Create kernel operating on contiguous s_all/z_all buffers. Performs:
+
+        self._rho = rho
+        self._delta = delta
 
         self._m_s_u = vars.s_u
         self._m_s_l = vars.s_l
@@ -35,9 +38,14 @@ def create_update_regularizations_step_1_kernel(dtype=wp.float64):
 
         Since s and z are stored contiguously, it becomes:
 
-        m_s_all[b, i]         = vars_s_all[b, i]
-        m_z_inv_all[b, i]     = 1.0 / vars_z_all[b, i]
-        w_delta_inv_all[b, i] = 1.0 / (s * z_inv + delta[b])
+        rho_out[b]            = rho_in[b]                          (when i == 0)
+        delta_out[b]          = delta_in[b]                        (when i == 0)
+        m_s_all[b, i]         = vars_s_all[b, i]                   (when i < num_ineq)
+        m_z_inv_all[b, i]     = 1.0 / vars_z_all[b, i]             (when i < num_ineq)
+        w_delta_inv_all[b, i] = 1.0 / (s * z_inv + delta_in[b])    (when i < num_ineq)
+
+        Launch dim is ``(B, max(num_ineq, 1))`` so that the ``i == 0`` thread
+        always exists to copy rho/delta even when there are no inequalities.
     """
     @wp.kernel
     def update_regularizations_step_1_kernel(
@@ -46,14 +54,22 @@ def create_update_regularizations_step_1_kernel(dtype=wp.float64):
         m_s_all: wp.array2d(dtype=dtype),           # type: ignore
         m_z_inv_all: wp.array2d(dtype=dtype),       # type: ignore
         w_delta_inv_all: wp.array2d(dtype=dtype),   # type: ignore
-        delta: wp.array(dtype=dtype),               # type: ignore
+        rho_in: wp.array(dtype=dtype),              # type: ignore
+        delta_in: wp.array(dtype=dtype),            # type: ignore
+        rho_out: wp.array(dtype=dtype),             # type: ignore
+        delta_out: wp.array(dtype=dtype),           # type: ignore
     ):
         b, i = wp.tid()
-        s = vars_s_all[b, i]
-        z_inv = dtype(1.0) / vars_z_all[b, i]
-        m_s_all[b, i] = s
-        m_z_inv_all[b, i] = z_inv
-        w_delta_inv_all[b, i] = dtype(1.0) / (s * z_inv + delta[b])
+        num_ineq_static = wp.static(num_ineq)
+        if i == 0:
+            rho_out[b] = rho_in[b]
+            delta_out[b] = delta_in[b]
+        if i < num_ineq_static:
+            s = vars_s_all[b, i]
+            z_inv = dtype(1.0) / vars_z_all[b, i]
+            m_s_all[b, i] = s
+            m_z_inv_all[b, i] = z_inv
+            w_delta_inv_all[b, i] = dtype(1.0) / (s * z_inv + delta_in[b])
     return update_regularizations_step_1_kernel
 
 

@@ -142,8 +142,8 @@ class KKTSystem:
         self._iter_refine_delta_xyz = cp.zeros((B, n + p + m), dtype=self._dtype)
 
         # Create Warp kernels
-        self._update_regulerization_step_1_kernel = create_update_regularizations_step_1_kernel(dtype=self._dtype)
-        self._update_regulerization_step_2_kernel = create_update_regularizations_step_2_kernel(n, m, dtype=self._dtype)
+        self._update_regularization_step_1_kernel = create_update_regularizations_step_1_kernel(num_ineq=num_ineq, dtype=self._dtype)
+        self._update_regularization_step_2_kernel = create_update_regularizations_step_2_kernel(n, m, dtype=self._dtype)
         self._eliminate_slacks_kernel = create_eliminate_slacks_kernel(dtype=self._dtype)
         self._eliminate_slacks_transposed_kernel = create_eliminate_slacks_transposed_kernel(dtype=self._dtype)
         self._eliminate_duals_kernel = create_eliminate_duals_kernel(n, m, dtype=self._dtype)
@@ -195,26 +195,23 @@ class KKTSystem:
     @nvtx.annotate("KKTSystem::_update_reg_and_kkt")
     @cuda_graph_capture(key=lambda self, data, preconditioner, delta, rho, vars: (vars.buffer_ptr, delta.data.ptr, rho.data.ptr), enable=lambda self: self._settings.enable_cuda_graph)
     def _update_reg_and_kkt(self, data: Data, preconditioner: PreconditionerBase, delta: cp.ndarray, rho: cp.ndarray, vars: Variables):
-        """Update the regularization terms x_reg and z_reg for the condensed KKT system after eliminating slacks and duals of inequalities and box constraints. 
+        """Update the regularization terms x_reg and z_reg for the condensed KKT system after eliminating slacks and duals of inequalities and box constraints.
         Also update the condensed KKT matrix with the new regularization terms."""
-        self._rho[:] = rho
-        self._delta[:] = delta
-
         USE_WARP_IMPLEMENTATION = True
         B = self._batch_size
         if USE_WARP_IMPLEMENTATION:
             wp_stream = wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr)
             wp.launch(
-                kernel=self._update_regulerization_step_1_kernel,
-                dim=(B, data.num_ineq),
+                kernel=self._update_regularization_step_1_kernel,
+                dim=(B, max(data.num_ineq, 1)),
                 inputs=[vars.s_all, vars.z_all,
                         self._m_s_all, self._m_z_inv_all, self._w_delta_inv_all,
-                        delta],
+                        rho, delta, self._rho, self._delta],
                 device=self._device,
                 stream=wp_stream,
             )
             wp.launch(
-                kernel=self._update_regulerization_step_2_kernel,
+                kernel=self._update_regularization_step_2_kernel,
                 dim=(B, data.n + data.m),
                 inputs=[
                     self._inv_idx_xu,
@@ -224,7 +221,7 @@ class KKTSystem:
                     self._w_bu_delta_inv,
                     self._w_bl_delta_inv,
                     preconditioner.x_b_scaling,
-                    rho,
+                    self._rho,
                     self._x_reg,
                     self._w_u_delta_inv,
                     self._w_l_delta_inv,
@@ -234,15 +231,18 @@ class KKTSystem:
                 stream=wp_stream,
             )
         else:
+            self._rho[:] = rho
+            self._delta[:] = delta
+
             # cache s, 1/z and w = 1/(s/z + delta)
             self._m_s_all[:] = vars.s_all
             cp.reciprocal(vars.z_all, out=self._m_z_inv_all)
             cp.multiply(self._m_s_all, self._m_z_inv_all, out=self._w_delta_inv_all)
-            cp.add(self._w_delta_inv_all, delta[:, None], out=self._w_delta_inv_all)
+            cp.add(self._w_delta_inv_all, self._delta[:, None], out=self._w_delta_inv_all)
             cp.reciprocal(self._w_delta_inv_all, out=self._w_delta_inv_all)
 
             # compute x_reg (B, n) and z_reg (B, m)
-            self._x_reg[:] = rho[:, None]
+            self._x_reg[:] = self._rho[:, None]
             xbs = preconditioner.x_b_scaling  # (B, n)
             if data.num_xu > 0:
                 xbs_xu = xbs[:, data.idx_xu]  # (B, num_xu)
@@ -260,7 +260,7 @@ class KKTSystem:
                 cp.reciprocal(self._z_reg, out=self._z_reg)
 
         # Update KKT matrix
-        self._kkt_solver.update_kkt(data, delta, self._x_reg, self._z_reg)
+        self._kkt_solver.update_kkt(data, self._delta, self._x_reg, self._z_reg)
     
     @nvtx.annotate("KKTSystem::solve")
     def solve(self, data: Data, preconditioner: PreconditionerBase, settings: Settings, rhs: Variables, lhs: Variables,
