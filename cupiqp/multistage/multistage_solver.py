@@ -10,6 +10,7 @@ from .multistage_data import MultistageData
 from .multistage_preconditioner import MultistageRuizEquilibration
 from .multistage_solver_kernels import create_multistage_data_gradients_kernel
 from .multistage_utils import BlockTridiagMat, BlockBidiagMat, BlockVec
+from ..utils import to_warp_dtype
 
 
 def _check_block_tridiag(name: str, m) -> None:
@@ -142,6 +143,7 @@ class MultistageSolver(SolverBase):
             N = d.num_blocks
             d_sz = d.block_size
             dtype = d.dtype
+            wp_dtype = to_warp_dtype(dtype)
 
             r_a = d._A.rows_of_blocks if d.p > 0 else 0
             N_a = d._A.N              if d.p > 0 else 0
@@ -149,24 +151,24 @@ class MultistageSolver(SolverBase):
             N_g = d._G.N              if d.m > 0 else 0
 
             placeholder_P = BlockTridiagMat(
-                num_diag_blocks=N, block_size=d_sz, batch_size=B, dtype=dtype,
+                num_diag_blocks=N, block_size=d_sz, batch_size=B, dtype=wp_dtype,
             )
             placeholder_A = BlockBidiagMat(
-                rows_of_blocks=r_a, cols_of_blocks=d_sz, N=N_a, batch_size=B, dtype=dtype,
+                rows_of_blocks=r_a, cols_of_blocks=d_sz, N=N_a, batch_size=B, dtype=wp_dtype,
             ) if d.p > 0 else None
             placeholder_G = BlockBidiagMat(
-                rows_of_blocks=r_g, cols_of_blocks=d_sz, N=N_g, batch_size=B, dtype=dtype,
+                rows_of_blocks=r_g, cols_of_blocks=d_sz, N=N_g, batch_size=B, dtype=wp_dtype,
             ) if d.m > 0 else None
             # c, x_u, x_l: always (B, n)-sized buffers, matching the original
             # backward-buffer shape regardless of which bound directions are
             # active. The kernel uses index masks (idx_xu / idx_xl) internally.
-            placeholder_c = BlockVec(num_blocks=N, rows=d_sz, batch_size=B, dtype=dtype)
-            placeholder_xu = BlockVec(num_blocks=N, rows=d_sz, batch_size=B, dtype=dtype)
-            placeholder_xl = BlockVec(num_blocks=N, rows=d_sz, batch_size=B, dtype=dtype)
+            placeholder_c = BlockVec(num_blocks=N, rows=d_sz, batch_size=B, dtype=wp_dtype)
+            placeholder_xu = BlockVec(num_blocks=N, rows=d_sz, batch_size=B, dtype=wp_dtype)
+            placeholder_xl = BlockVec(num_blocks=N, rows=d_sz, batch_size=B, dtype=wp_dtype)
             # b, h_u, h_l: presence tied to A / G existing.
-            placeholder_b  = BlockVec(num_blocks=N_a + 1, rows=r_a, batch_size=B, dtype=dtype) if d.p > 0 else None
-            placeholder_hu = BlockVec(num_blocks=N_g + 1, rows=r_g, batch_size=B, dtype=dtype) if d.m > 0 else None
-            placeholder_hl = BlockVec(num_blocks=N_g + 1, rows=r_g, batch_size=B, dtype=dtype) if d.m > 0 else None
+            placeholder_b  = BlockVec(num_blocks=N_a + 1, rows=r_a, batch_size=B, dtype=wp_dtype) if d.p > 0 else None
+            placeholder_hu = BlockVec(num_blocks=N_g + 1, rows=r_g, batch_size=B, dtype=wp_dtype) if d.m > 0 else None
+            placeholder_hl = BlockVec(num_blocks=N_g + 1, rows=r_g, batch_size=B, dtype=wp_dtype) if d.m > 0 else None
 
             self._grad_data = MultistageData(dtype=dtype, device=self.settings.device)
             self._grad_data.init(
@@ -179,7 +181,7 @@ class MultistageSolver(SolverBase):
             # Empty placeholder warp buffers for when A or G are absent —
             # the kernel still needs valid array arguments even though its
             # corresponding dispatch sub-range collapses to size 0.
-            empty_blocks = wp.zeros((B, 0, 0, 0), dtype=dtype, device="cuda")
+            empty_blocks = wp.zeros((B, 0, 0, 0), dtype=wp_dtype, device="cuda")
             g = self._grad_data
             self._grad_dA_D = g._A.D if g._A is not None else empty_blocks
             self._grad_dA_E = g._A.E if g._A is not None else empty_blocks

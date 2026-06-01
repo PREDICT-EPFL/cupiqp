@@ -16,9 +16,9 @@ def create_multistage_data_gradients_kernel(
 
     * ``dP_diag`` (``B, N, d, d``)   — symmetric outer product on each
       stage's diagonal block.
-    * ``dP_offdiag_lower`` (``B, N-1, d, d``) — symmetric outer
-      product on each lower off-diagonal block (the upper off-diag is
-      implicit by symmetry).
+    * ``dP_offdiag_lower`` (``B, N-1, d, d``) — accumulated outer
+      product for each stored lower off-diagonal block and its implicit
+      transposed upper block.
     * ``dA_D, dA_E`` (``B, N_a, r_a, d``) — bidiag outer products for
       ``A`` at the diagonal and sub-diagonal block positions.
     * ``dG_D, dG_E`` (``B, N_g, r_g, d``) — same for ``G``.
@@ -122,13 +122,14 @@ def create_multistage_data_gradients_kernel(
             )
 
         elif t < e1:
-            # dP_offdiag_lower[b, k, i, j] = ½ (λ_x[(k+1)*d+i]·x[k*d+j] + x[(k+1)*d+i]·λ_x[k*d+j])
+            # A stored lower off-diagonal block also parameterizes its
+            # implicit transposed upper block, so both contributions add.
             idx = t - e0
             k = idx // dd_s
             r = idx %  dd_s
             i = r // d_s
             j = r %  d_s
-            dP_offdiag_lower[b, k, i, j] = dtype(0.5) * (
+            dP_offdiag_lower[b, k, i, j] = (
                 lam_x[b, (k + 1) * d_s + i] * res_x[b, k * d_s + j]
                 + res_x[b, (k + 1) * d_s + i] * lam_x[b, k * d_s + j]
             )
