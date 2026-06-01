@@ -24,7 +24,7 @@ where $P \succeq 0$ is positive semidefinite, $x \in \mathbb{R}^n$ is the decisi
 ## Features
 
 - **Native batched solving** — solve $B$ independent QPs in parallel from a single solver instance by stacking inputs along a leading batch axis; the inner kernels operate on `(B, …)` tensors with no Python-side loop. Built for sampling-based control, RL rollouts, and parameter sweeps.
-- **Differentiable** — `cupiqp.torch_module.CupiqpQP` and `cupiqp.jax_module.CupiqpQP` expose the solver as a PyTorch / JAX layer with VJPs via implicit differentiation of the KKT conditions, reusing the condensed factor from the forward pass in the backward.
+- **Differentiable** — efficient computation of the VJPs via implicit differentiation by reusing the condensed factor from the forward solve. Integration into PyTorch and JAX are on the way!
 - **Scales to large QPs** — the same solver handles large sparse and dense QPs, competing with GPU solvers such as cuClarabel, cuOpt, and QOQO-GPU.
 - **Fully GPU-resident solver** — all iterations, KKT factorizations, and linear algebra run on the GPU with very few host–device synchronization during solve.
 - **CUDA Graph capture** — solver iterations are recorded as CUDA graphs and replayed with near-zero kernel-launch overhead.
@@ -57,13 +57,6 @@ the base local install is:
 python -m pip install .
 ```
 
-Optional integrations are also installed from the local checkout:
-
-```bash
-pip install "cupiqp[cuda13,torch]"   # PyTorch integration
-pip install "cupiqp[cuda13,jax]"     # JAX integration
-pip install "cupiqp[cuda13,all]"     # both
-```
 
 ### Verifying the install
 
