@@ -236,6 +236,7 @@ def create_run_full_newton_step_kernel(n: int, p: int, dtype=wp.float64):
 
 def create_calculate_step_kernel(num_ineq: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
+    num_ineq_int = int(num_ineq)
     """Fused block-reduction kernel for step lengths (primal and dual).
 
     For each batch ``b``, computes:
@@ -267,15 +268,15 @@ def create_calculate_step_kernel(num_ineq: int, dtype=wp.float64):
         b, i = wp.tid()
 
         # Primal-step pipeline: alpha_s[b] = tau * min_i(cand_s[i])
-        s_tile = wp.tile_load(s_all[b], shape=num_ineq)
-        ds_tile = wp.tile_load(step_s_all[b], shape=num_ineq)
+        s_tile = wp.tile_load(s_all[b], shape=num_ineq_int)
+        ds_tile = wp.tile_load(step_s_all[b], shape=num_ineq_int)
         cand_s = wp.tile_map(step_candidate, ds_tile, s_tile)
         min_s = wp.tile_min(cand_s)
         wp.tile_store(alpha_s, min_s, offset=b)  # store min_s into the corresponding batch of alpha_s
 
         # Dual-step pipeline: alpha_z[b] = tau * min_i(cand_z[i])
-        z_tile = wp.tile_load(z_all[b], shape=num_ineq)
-        dz_tile = wp.tile_load(step_z_all[b], shape=num_ineq)
+        z_tile = wp.tile_load(z_all[b], shape=num_ineq_int)
+        dz_tile = wp.tile_load(step_z_all[b], shape=num_ineq_int)
         cand_z = wp.tile_map(step_candidate, dz_tile, z_tile)
         min_z = wp.tile_min(cand_z)
         wp.tile_store(alpha_z, min_z, offset=b)  # store min_z into the corresponding batch of alpha_z
@@ -291,6 +292,7 @@ def create_calculate_step_kernel(num_ineq: int, dtype=wp.float64):
 
 def create_calculate_mu_kernel(num_ineq: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
+    num_ineq_int = int(num_ineq)
     """Fused block-reduction kernel for the duality measure mu.
 
     For each batch ``b``, computes:
@@ -312,8 +314,8 @@ def create_calculate_mu_kernel(num_ineq: int, dtype=wp.float64):
         b, tid = wp.tid()
 
         # Per-batch row loads, cooperatively filled by block threads.
-        s_tile = wp.tile_load(s_all[b], shape=num_ineq)
-        z_tile = wp.tile_load(z_all[b], shape=num_ineq)
+        s_tile = wp.tile_load(s_all[b], shape=num_ineq_int)
+        z_tile = wp.tile_load(z_all[b], shape=num_ineq_int)
 
         # Block-wide reduction: sum_i(s*z). Result is a (1,)-tile in shared mem.
         sum_tile = wp.tile_sum(s_tile * z_tile)
@@ -328,6 +330,7 @@ def create_calculate_mu_kernel(num_ineq: int, dtype=wp.float64):
 
 def create_calculate_sigma_kernel(num_ineq: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
+    num_ineq_int = int(num_ineq)
     """Fused block-reduction kernel for the centering parameter sigma.
 
     For each batch ``b``, computes:
@@ -361,10 +364,10 @@ def create_calculate_sigma_kernel(num_ineq: int, dtype=wp.float64):
 
         # Block-wide tile loads + elementwise fuse + reduction. All intermediates
         # stay in registers / shared memory (no DRAM round-trip).
-        s_tile = wp.tile_load(s_all[b], shape=num_ineq)
-        z_tile = wp.tile_load(z_all[b], shape=num_ineq)
-        ds_tile = wp.tile_load(step_s_all[b], shape=num_ineq)
-        dz_tile = wp.tile_load(step_z_all[b], shape=num_ineq)
+        s_tile = wp.tile_load(s_all[b], shape=num_ineq_int)
+        z_tile = wp.tile_load(z_all[b], shape=num_ineq_int)
+        ds_tile = wp.tile_load(step_s_all[b], shape=num_ineq_int)
+        dz_tile = wp.tile_load(step_z_all[b], shape=num_ineq_int)
         prod = (s_tile + alpha_s * ds_tile) * (z_tile + alpha_z * dz_tile)
         sum_tile = wp.tile_sum(prod)  # (1,)-tile, in shared memory
 
@@ -382,7 +385,7 @@ def create_calculate_sigma_kernel(num_ineq: int, dtype=wp.float64):
 
 def create_update_residuals_r_kernel(
     n: int, p: int, num_hu: int, num_hl: int, num_xu: int, num_xl: int,
-dtype=wp.float64):
+    dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Single fused kernel for the whole ``_update_residuals_r`` body.
 
