@@ -36,8 +36,8 @@ where $P \succeq 0$ is positive semidefinite, $x \in \mathbb{R}^n$ is the decisi
 
 - Python 3.10 or later.
 - Linux with an NVIDIA GPU and a working CUDA driver/runtime stack.
-- A CuPy build compatible with the installed CUDA stack. This repository
-  defines extras for CUDA 12.x and CUDA 13.x.
+- CUDA Python packages compatible with the installed CUDA stack. This repository
+  defines extras for CUDA 12.x and CUDA 13.x, including CuPy and nvmath runtime libraries.
 
 cuPIQP is not currently published on PyPI. From a local clone, install it
 with one CUDA extra:
@@ -76,7 +76,7 @@ Pulled automatically by the relevant extras above:
 
 - [CuPy](https://cupy.dev/) — GPU array library (`cupy-cuda12x` or `cupy-cuda13x`).
 - [Warp](https://github.com/NVIDIA/warp) — JIT-compiled CUDA kernels.
-- [nvmath-python](https://developer.nvidia.com/nvmath-python) — cuBLAS / cuSOLVER / cuSPARSE / cuDSS bindings.
+- [nvmath-python](https://developer.nvidia.com/nvmath-python) — cuBLAS / cuSOLVER / cuSPARSE / cuDSS bindings and CUDA runtime packages via the selected CUDA extra.
 - [NVTX](https://github.com/NVIDIA/NVTX) — profiling annotations.
 - [socu](https://github.com/PREDICT-EPFL/socu) — required by the `MultistageSolver` as the linear system solver.
 
