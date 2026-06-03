@@ -51,15 +51,16 @@ dependencies = [
 # --- CUDA / CuPy ---------------------------------------------------------
 # CuPy ships as separate wheels per CUDA major version (cupy-cuda12x for
 # CUDA 12.x, cupy-cuda13x for CUDA 13.x). Pick the one matching the CUDA
-# version reported by ``nvidia-smi``:
+# version reported by ``nvidia-smi``. nvmath-python's CUDA extras provide
+# the matching NVIDIA runtime libraries, including cuDSS for the sparse backend:
 #
 #   pip install "cupiqp[cuda12]"   -> CUDA 12.x driver/runtime
 #   pip install "cupiqp[cuda13]"   -> CUDA 13.x driver/runtime
 #
 # These are mutually exclusive — installing both will resolve, but only the
 # wheel matching the driver actually loads at runtime.
-cuda12 = ["cupy-cuda12x"]
-cuda13 = ["cupy-cuda13x"]
+cuda12 = ["cupy-cuda12x", "nvmath-python[cu12]>=0.9"]
+cuda13 = ["cupy-cuda13x", "nvmath-python[cu13]>=0.9"]
 
 # --- Differentiable layers ----------------------------------------------
 # The `cupiqp.torch_module` and `cupiqp.jax_module` files are always shipped
