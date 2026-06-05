@@ -82,6 +82,7 @@ Pulled automatically by the relevant extras above:
 
 ## Quick Start
 
+Refer to [this simple example](./examples/getting_started.ipynb) to get started.
 
 ## Comparison with PIQP
 
