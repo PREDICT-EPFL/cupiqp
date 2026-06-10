@@ -1,0 +1,137 @@
+site_name: cuPIQP
+site_description: >-
+  GPU-accelerated proximal interior-point solver for convex quadratic programs —
+  batched, differentiable, and scalable on NVIDIA GPUs.
+site_author: Fenglong Song
+site_url: https://predict-epfl.github.io/cupiqp/
+
+repo_name: PREDICT-EPFL/cupiqp
+repo_url: https://github.com/PREDICT-EPFL/cupiqp
+edit_uri: edit/main/docs/
+
+copyright: >-
+  Copyright &copy; 2026 Fenglong Song — Automatic Control Laboratory, EPFL.
+  Released under the BSD-2-Clause license.
+
+theme:
+  name: material
+  language: en
+  icon:
+    repo: fontawesome/brands/github
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.indexes
+    - navigation.footer
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to light mode
+
+markdown_extensions:
+  - abbr
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+      toc_depth: 3
+  - pymdownx.arithmatex:
+      generic: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.keys
+  - pymdownx.snippets
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+extra_javascript:
+  - javascripts/mathjax.js
+  - https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js
+
+# Live-reload the API pages when docstrings in the package change.
+watch:
+  - cupiqp
+
+plugins:
+  - search
+  # API reference generated from docstrings via griffe STATIC analysis
+  # (parses the source AST — never imports cupiqp/CuPy), so it builds on the
+  # CPU-only GitHub Pages runner.
+  - mkdocstrings:
+      default_handler: python
+      handlers:
+        python:
+          paths: ["."]
+          options:
+            # Let overrides without their own docstring (e.g. each backend's
+            # setup()) inherit the base SolverBase docstring.
+            extensions:
+              - griffe_inherited_docstrings
+            docstring_style: numpy
+            docstring_section_style: table
+            show_root_heading: true
+            show_root_full_path: false
+            show_symbol_type_heading: true
+            show_symbol_type_toc: true
+            show_if_no_docstring: false
+            inherited_members: false
+            members_order: source
+            separate_signature: true
+            show_signature_annotations: true
+            merge_init_into_class: true
+            filters: ["!^_"]
+            heading_level: 2
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/PREDICT-EPFL/cupiqp
+    - icon: fontawesome/solid/building-columns
+      link: https://www.epfl.ch
+      name: Automatic Control Laboratory, EPFL
+
+nav:
+  - Home: index.md
+  - Installation: installation.md
+  - Getting Started: getting-started.md
+  - Problem Formulation: problem-formulation.md
+  - User Guide:
+      - Backends: guide/backends.md
+      - Batched Solving: guide/batched.md
+      - Differentiation: guide/differentiation.md
+  - API Reference:
+      - Overview: api/index.md
+      - Solvers: api/solvers.md
+      - Problem Data: api/data.md
+      - Settings & Results: api/settings-results.md

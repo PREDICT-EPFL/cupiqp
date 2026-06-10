@@ -32,36 +32,82 @@ def _check_dense(name: str, m) -> None:
 
 
 class DenseSolver(SolverBase):
-    """Concrete :class:`SolverBase` subclass for the **dense Cholesky**
-    KKT backend.
+    r"""GPU solver for general dense convex quadratic programs that 
+    solves a QP - or a whole batch of QPs - of the form
 
-    ``DenseSolver`` is the type-strict, user-facing entry point for
-    solving QPs whose problem data are **GPU-resident dense arrays**.
-    It rejects non-dense ``P`` / ``A`` / ``G`` inputs (and any non-GPU
-    vectors) with a clear, actionable :class:`TypeError`.
+    $$
+    \begin{aligned}
+    \min_{x}\quad & \tfrac{1}{2}\, x^\top P x + c^\top x \\
+    \text{s.t.}\quad & A x = b, \\
+    & h_l \le G x \le h_u, \\
+    & x_l \le x \le x_u,
+    \end{aligned}
+    $$
 
-    Accepts any object that exposes the
-    `__cuda_array_interface__ <https://numba.readthedocs.io/en/stable/cuda/cuda_array_interface.html>`_
-    protocol — this unifies cupy, dense CUDA :class:`torch.Tensor`, JAX
-    CUDA arrays, numba CUDA device arrays, etc. behind a single check.
+    using the proximal interior-point method, running entirely on the GPU.
 
-    cupiqp is GPU-only. CPU-only arrays (:class:`numpy.ndarray`, CPU
-    torch tensors, CPU JAX arrays) are **rejected** rather than silently
-    copied onto the GPU. Convert to a CUDA array explicitly first if
-    you have CPU data::
+    **Inputs.** ``P``, ``A``, ``G`` and every vector (``c``, ``b``, ``h_l``,
+    ``h_u``, ``x_l``, ``x_u``) must be **dense arrays that live on the GPU**.
+    Any object exposing the ``__cuda_array_interface__`` protocol is
+    accepted - a ``cupy.ndarray``, a CUDA ``torch.Tensor``, a CUDA JAX
+    array, a Numba device array, and so on.
 
-        P_cuda = cupy.asarray(P_numpy)                  # cupy
-        P_cuda = torch.tensor(P_numpy, device="cuda")   # torch
-        s.setup(P=P_cuda, ...)
+    cuPIQP is **GPU-only**: CPU data (``numpy.ndarray``, CPU torch tensors,
+    CPU JAX arrays) is rejected with a ``TypeError`` rather than copied to
+    the device behind your back.
+
+    **Batching.** ``DenseSolver`` is natively batched: solve ``B``
+    independent QPs in a single GPU call by giving every array a leading
+    batch dimension - ``P`` of shape ``(B, n, n)``, ``c`` of shape
+    ``(B, n)``, and so on. A single problem is simply ``B = 1``, and
+    ``solver.result.x`` then has shape ``(B, n)``.
+
+    Parameters
+    ----------
+    dtype : {"float64", "float32"}, default: "float64"
+        Floating-point precision used throughout the solve. ``"float32"``
+        is faster and uses less memory but converges to looser tolerances;
+        the default convergence tolerances are chosen to match the dtype.
 
     Examples
     --------
-    >>> import cupy as cp
-    >>> from cupiqp import DenseSolver
-    >>> P = cp.eye(4); c = cp.zeros(4)
-    >>> s = DenseSolver()
-    >>> s.setup(P=P, c=c)
-    >>> s.solve()
+    A small inequality-constrained QP (one row is one-sided via ``-inf``):
+
+    ```python
+    import cupy as cp
+    from cupiqp import DenseSolver
+
+    P = cp.eye(2)
+    c = cp.array([-1.0, -4.0])
+    G = cp.array([[1.0, 1.0]])      # constrain x1 + x2
+    h_l = cp.array([-cp.inf])       # no lower bound on the row
+    h_u = cp.array([1.0])           # x1 + x2 <= 1
+
+    solver = DenseSolver()
+    solver.setup(P=P, c=c, G=G, h_l=h_l, h_u=h_u)
+    solver.solve()
+
+    print(solver.result.info.status[0].name)    # CUPIQP_SOLVED
+    x = solver.result.x.get()[0]                 # bring the solution to the host
+    ```
+
+    See Also
+    --------
+    SparseSolver: solver for general sparse problems.
+
+    MultistageSolver: structure-exploiting solver for multistage optimization
+        (e.g. optimal-control) problems.
+
+    Notes
+    -----
+    The problem *structure* - array shapes, which constraint blocks are
+    present, and which bounds are finite vs. ``+/-inf`` - is fixed by
+    ``setup`` and can only be set up once per instance. To re-solve with new
+    *numerical* values of the same structure (e.g. a moving target ``b`` in
+    receding-horizon control), call ``update`` and then ``solve`` again,
+    which reuses all GPU allocations; for a different structure, create a
+    new ``DenseSolver``. Solver behaviour (tolerances, verbosity, iteration
+    cap, ...) is configured through ``solver.settings``.
     """
 
     def __init__(self, dtype: Literal["float32", "float64"] = "float64"):

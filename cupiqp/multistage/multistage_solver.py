@@ -59,42 +59,84 @@ def _check_block_vec(name: str, m) -> None:
 
 
 class MultistageSolver(SolverBase):
-    """Concrete :class:`SolverBase` subclass for the **multistage
-    block-Cholesky** KKT backend.
+    r"""GPU solver for multistage (block-structured) convex quadratic
+    programs that solves a QP - or a whole batch of QPs - of the form
 
-    ``MultistageSolver`` is the type-strict, user-facing entry point
-    for QPs whose problem data are pre-built **block-structured**
-    matrices that expose the multistage (e.g. MPC) structure to the
-    KKT solver. It rejects non-block ``P`` / ``A`` / ``G`` inputs with
-    a clear, actionable :class:`TypeError` — generic CSR is not
-    auto-promoted into block form, since if the user has not built the
-    block matrices themselves the multistage solver cannot exploit the
-    structure regardless.
+    $$
+    \begin{aligned}
+    \min_{x}\quad & \tfrac{1}{2}\, x^\top P x + c^\top x \\
+    \text{s.t.}\quad & A x = b, \\
+    & h_l \le G x \le h_u, \\
+    & x_l \le x \le x_u,
+    \end{aligned}
+    $$
 
-    Block-structured storage is used **end-to-end** — matrices and
-    vectors. Accepts:
+    using the proximal interior-point method with a block-Cholesky
+    factorization that exploits block-tridiagonal / block-tridiagonal-arrow
+    KKT structure, running entirely on the GPU. It is built for multistage
+    problems such as optimal control (OCPs / MPC), where that structure
+    arises from the stage-by-stage dynamics and costs.
 
-    * ``P``: :class:`cupiqp.multistage.multistage_utils.BlockTridiagMat`
-    * ``A``, ``G``: :class:`cupiqp.multistage.multistage_utils.BlockBidiagMat`
-      (or ``None``)
-    * ``c``, ``b``, ``h_u``, ``h_l``, ``x_u``, ``x_l``:
-      :class:`cupiqp.multistage.multistage_utils.BlockVec` (or ``None``
-      where the constraint is absent)
+    **Inputs - block-structured, end to end.** Unlike the dense and sparse
+    solvers, ``MultistageSolver`` takes its problem data as pre-built block
+    objects (from ``cupiqp.multistage.multistage_utils``), not arrays or CSR
+    matrices - generic CSR is **not** auto-promoted to block form, because
+    the structure can only be exploited if you build it explicitly:
+
+    * ``P`` : a ``BlockTridiagMat``,
+    * ``A``, ``G`` : a ``BlockBidiagMat`` (or ``None``),
+    * ``c``, ``b``, ``h_l``, ``h_u``, ``x_l``, ``x_u`` : a ``BlockVec``
+      (or ``None`` where the block is absent).
+
+    Only ``P`` and ``c`` are required. As with the other backends, ``+/-inf``
+    entries in the bound blocks mark one-sided or free bounds and are dropped
+    at no numerical cost.
+
+    **Batching.** Build the block objects with ``batch_size=B`` and the
+    solver processes all ``B`` problems in one GPU call; ``B = 1`` is a
+    single problem, and ``solver.result.x`` then has shape ``(B, n)``.
+
+    Parameters
+    ----------
+    dtype : {"float64", "float32"}, default: "float64"
+        Floating-point precision used throughout the solve. ``"float32"``
+        is faster and uses less memory but converges to looser tolerances;
+        the default convergence tolerances are chosen to match the dtype.
 
     Examples
     --------
-    >>> from cupiqp import MultistageSolver
-    >>> from cupiqp.multistage.multistage_utils import (
-    ...     BlockTridiagMat, BlockBidiagMat, BlockVec,
-    ... )
-    >>> P = BlockTridiagMat(num_diag_blocks=N, block_size=d)
-    >>> A = BlockBidiagMat(rows_of_blocks=d, cols_of_blocks=d, N=N)
-    >>> c = BlockVec(num_blocks=N, rows=d)
-    >>> b = BlockVec(num_blocks=N, rows=d)
-    >>> # ... fill block data ...
-    >>> s = MultistageSolver()
-    >>> s.setup(P=P, c=c, A=A, b=b)
-    >>> s.solve()
+    ```python
+    from cupiqp import MultistageSolver
+    from cupiqp.multistage.multistage_utils import (
+        BlockTridiagMat, BlockBidiagMat, BlockVec,
+    )
+
+    P = BlockTridiagMat(num_diag_blocks=N, block_size=d)
+    A = BlockBidiagMat(rows_of_blocks=d, cols_of_blocks=d, N=N)
+    c = BlockVec(num_blocks=N, rows=d)
+    b = BlockVec(num_blocks=N, rows=d)
+    # ... fill block data ...
+
+    s = MultistageSolver()
+    s.setup(P=P, c=c, A=A, b=b)
+    s.solve()
+    ```
+
+    See Also
+    --------
+    DenseSolver: solver for general dense problems.
+
+    SparseSolver: solver for general sparse problems.
+
+    Notes
+    -----
+    Requires the ``socu`` block-solver package (install the ``multistage``
+    extra: ``pip install ".[cuda13,multistage]"``). The problem *structure* -
+    the block sizes and which blocks are present - is fixed by ``setup`` and
+    can only be set up once per instance; to re-solve with new *numerical*
+    values of the same structure, call ``update`` and then ``solve`` again,
+    which reuses all GPU allocations. Solver behaviour (tolerances, verbosity,
+    iteration cap, ...) is configured through ``solver.settings``.
     """
 
     def __init__(self, dtype: Literal["float32", "float64"] = "float64"):
