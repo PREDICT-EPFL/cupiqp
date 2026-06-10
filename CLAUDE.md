@@ -77,3 +77,7 @@ When modifying graph-captured code:
 
 ## Git
 - Never commit and push by yourself. Leave it to me!
+
+## Comments
+- Use only typeable ASCII characters in comments; avoid Unicode symbols, emojis, and special punctuation.
+- When writting docstrings, remember that the docstring are written for users, not developers. They should allow users to understand the purpose and usage of the class or function.
