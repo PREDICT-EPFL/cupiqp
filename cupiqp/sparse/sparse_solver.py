@@ -89,45 +89,121 @@ def _check_dense_vector(name: str, m) -> None:
 
 
 class SparseSolver(SolverBase):
-    """Concrete :class:`SolverBase` subclass for the **sparse LDL^T**
-    KKT backend.
+    r"""GPU solver for convex quadratic programs with **sparse** matrices.
 
-    ``SparseSolver`` is the type-strict, user-facing entry point for
-    solving QPs whose problem data are **GPU-resident sparse matrices
-    in CSR layout**. Vectors (``c, b, h_*, x_*``) must be GPU dense.
-    Anything else — non-CSR sparse layouts, CPU sparse, dense matrices,
-    block-structured matrices — is rejected with a clear, actionable
-    :class:`TypeError`.
+    ``SparseSolver`` solves a QP - or a whole batch of QPs - of the form
 
-    Accepts ``P, A, G`` as **GPU CSR** sparse:
+    $$
+    \begin{aligned}
+    \min_{x}\quad & \tfrac{1}{2}\, x^\top P x + c^\top x \\
+    \text{s.t.}\quad & A x = b, \\
+    & h_l \le G x \le h_u, \\
+    & x_l \le x \le x_u,
+    \end{aligned}
+    $$
 
-    * :class:`cupyx.scipy.sparse.csr_matrix`
-    * :class:`torch.sparse_csr_tensor` on a CUDA device
-    * ``list`` / ``tuple`` of any of the above (one per batch element)
-    * :class:`cupiqp.sparse.batched_csr.UniformBatchedCsrMatrix`
+    using the PIQP proximal interior-point method with a sparse LDL^T
+    factorization, running entirely on the GPU. Pick this solver when the
+    cost matrix ``P`` and the constraint matrices ``A`` and ``G`` are
+    **large and structurally sparse** - it is far more efficient there than
+    ``cupiqp.DenseSolver``. For small, fully dense problems prefer
+    ``DenseSolver``; for block-structured optimal-control problems use
+    ``cupiqp.MultistageSolver``.
 
-    cupiqp is GPU-only **and** CSR-only:
+    The workflow is identical to the dense solver - construct, ``setup``
+    once, then ``solve`` - only the matrices are passed as CSR. Read the
+    solution back from ``solver.result``:
 
-    * CPU sparse formats (:class:`scipy.sparse.csr_matrix`,
-      CPU :class:`torch.sparse_csr_tensor`) are **rejected**. Convert
-      with :class:`cupyx.scipy.sparse.csr_matrix` first.
-    * Non-CSR sparse layouts (CSC, BSR, BSC, COO) are **rejected**.
-      The KKT backend operates on CSR; accepting another layout would
-      require a silent format conversion at setup. Convert explicitly
-      with :meth:`tocsr` first.
+    ```python
+    import cupy as cp
+    from cupyx.scipy.sparse import csr_matrix
+    from cupiqp import SparseSolver
+
+    P = csr_matrix(cp.eye(4))      # GPU CSR
+    c = cp.zeros(4)
+
+    solver = SparseSolver()
+    solver.setup(P=P, c=c)
+    solver.solve()
+
+    x      = solver.result.x              # (B, n) optimal solution
+    status = solver.result.info.status    # one Status per problem
+    ```
+
+    **Inputs - CSR matrices, dense vectors.** ``P``, ``A``, ``G`` must be
+    **GPU sparse matrices in CSR layout**; the vectors (``c``, ``b``,
+    ``h_l``, ``h_u``, ``x_l``, ``x_u``) are dense GPU arrays, exactly as for
+    the dense solver. Accepted matrix types are:
+
+    * ``cupyx.scipy.sparse.csr_matrix`` (a GPU CSR matrix),
+    * a CUDA ``torch.sparse_csr_tensor``,
+    * a ``cupiqp.UniformBatchedCsrMatrix``, or
+    * a ``list`` / ``tuple`` of any of the above - one per batch element.
+
+    Only ``P`` and ``c`` are required; omit (or pass ``None`` for) any
+    constraint block the problem does not have, and mark one-sided
+    inequalities, one-sided box bounds, and free variables with
+    ``+/-cupy.inf`` (those rows are dropped at no numerical cost).
+
+    cuPIQP is **GPU-only and CSR-only**, and never converts formats behind
+    your back:
+
+    * CPU sparse matrices (``scipy.sparse.*``, a CPU
+      ``torch.sparse_csr_tensor``) are rejected - lift them onto the GPU
+      first, e.g. ``cupyx.scipy.sparse.csr_matrix(P_scipy)``.
+    * Non-CSR GPU layouts (CSC, BSR, BSC, COO) are rejected - convert with
+      ``.tocsr()`` before passing.
+
+    **Batching.** Solve ``B`` independent QPs in a single GPU call by
+    passing ``P``, ``A``, ``G`` as **lists of ``B`` CSR matrices that share
+    the same sparsity pattern**, with the vectors stacked along a leading
+    batch dimension (``c`` of shape ``(B, n)``, etc.). A single problem is
+    simply ``B = 1``, and ``solver.result.x`` then has shape ``(B, n)``.
+
+    Parameters
+    ----------
+    dtype : {"float64", "float32"}, default: "float64"
+        Floating-point precision used throughout the solve. ``"float32"``
+        is faster and uses less memory but converges to looser tolerances;
+        the default convergence tolerances are chosen to match the dtype.
 
     Examples
     --------
-    >>> import cupy as cp
-    >>> import scipy.sparse as sp
-    >>> import numpy as np
-    >>> from cupyx.scipy.sparse import csr_matrix as cp_csr
-    >>> from cupiqp import SparseSolver
-    >>> P = cp_csr(sp.csr_matrix(np.eye(4)))   # lift scipy onto the GPU
-    >>> c = cp.zeros(4)
-    >>> s = SparseSolver()
-    >>> s.setup(P=P, c=c)
-    >>> s.solve()
+    A sparse problem assembled on the host with SciPy, then lifted to the
+    GPU:
+
+    ```python
+    import scipy.sparse as sp
+    import cupy as cp
+    from cupyx.scipy.sparse import csr_matrix
+    from cupiqp import SparseSolver
+
+    P = csr_matrix(sp.eye(4, format="csr"))     # lift scipy -> GPU CSR
+    c = cp.zeros(4)
+
+    solver = SparseSolver()
+    solver.setup(P=P, c=c)
+    solver.solve()
+
+    print(solver.result.info.status[0].name)    # CUPIQP_SOLVED
+    ```
+
+    See Also
+    --------
+    DenseSolver : same solver for dense ``P`` / ``A`` / ``G``.
+    MultistageSolver : structure-exploiting backend for block-structured
+        (e.g. optimal-control) problems.
+
+    Notes
+    -----
+    The problem *structure* - array shapes, the **sparsity pattern** of
+    each matrix, which constraint blocks are present, and which bounds are
+    finite vs. ``+/-inf`` - is fixed by ``setup`` and can only be set up
+    once per instance. To re-solve after changing only the *numerical
+    values* (keeping the same sparsity pattern), call ``update`` and then
+    ``solve`` again, which reuses all GPU allocations; for a different
+    structure, create a new ``SparseSolver``. Solver behaviour (tolerances,
+    verbosity, iteration cap, ...) is configured through ``solver.settings``.
     """
 
     def __init__(self, dtype: Literal["float32", "float64"] = "float64"):

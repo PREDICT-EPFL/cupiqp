@@ -61,6 +61,11 @@ class SolverBase(ABC):
 
     @property
     def settings(self) -> Settings:
+        """Solver configuration (a ``Settings`` dataclass).
+
+        Mutate its fields before ``setup()`` or between solves, e.g.
+        ``solver.settings.verbose = True``.
+        """
         return self._settings
 
     @settings.setter
@@ -69,15 +74,68 @@ class SolverBase(ABC):
 
     @property
     def data(self) -> Data:
+        """The problem data built by ``setup()`` (a ``Data`` subclass), or
+        ``None`` before ``setup()`` has been called."""
         return self._data
 
     @property
     def result(self) -> Result:
+        """The latest solution and per-problem info (a ``Result``), populated
+        by ``solve()``."""
         return self._result
     
     @nvtx.annotate("Solver::setup")
     def setup(self, P, c, A=None, b=None, G=None, h_u=None, h_l=None, x_u=None, x_l=None):
-        """Initialize this solver instance."""
+        """Bind the problem data and prepare the solver for ``solve()``.
+
+        Fixes the problem *structure* - array shapes, which constraint
+        blocks are present, the sparsity pattern (sparse backend), and the
+        finite/infinite pattern of the bounds - and allocates all GPU
+        buffers, the KKT system, and the preconditioner. Call this **once**
+        per solver instance, then call ``solve()``.
+
+        Pass a single problem (2D ``P``) or a batch (3D ``P`` with a leading
+        batch axis, or a list of matrices); the batch size is inferred here
+        and sets the shape of the result. Only ``P`` and ``c`` are required;
+        omit (or pass ``None`` for) any absent constraint block, and use
+        ``+/-inf`` entries to mark one-sided inequalities or free bounds.
+
+        Parameters
+        ----------
+        P : GPU array
+            Quadratic cost, shape ``(n, n)`` or batched ``(B, n, n)``. Must
+            be symmetric positive semidefinite. Required.
+        c : GPU array
+            Linear cost, shape ``(n,)`` or ``(B, n)``. Required.
+        A, b : GPU array, optional
+            Equality constraints ``A x = b``; shapes ``(p, n)`` and ``(p,)``
+            (or batched). Omit for no equality constraints.
+        G, h_l, h_u : GPU array, optional
+            Two-sided inequalities ``h_l <= G x <= h_u``; ``G`` is
+            ``(m, n)`` (or batched) and the bounds are ``(m,)``. Use ``-inf``
+            / ``+inf`` entries for one-sided rows.
+        x_l, x_u : GPU array, optional
+            Element-wise box bounds ``x_l <= x <= x_u``, shape ``(n,)`` (or
+            batched). Use ``+/-inf`` for unbounded entries.
+
+        Raises
+        ------
+        RuntimeError
+            If ``setup()`` has already been called on this instance. The
+            structure is fixed after setup - create a new solver for a
+            different structure, or use ``update()`` to change only the
+            numerical values.
+        TypeError
+            If an input is not a GPU array of the kind this backend expects
+            (e.g. a CPU ``numpy`` array, or a dense matrix passed to the
+            sparse backend). See the backend's class docstring for the exact
+            accepted types.
+
+        See Also
+        --------
+        solve : run the solver after setup.
+        update : change numerical data without a full re-setup.
+        """
         if self._setup_done:
             raise RuntimeError(
                 "setup() may only be called once per solver instance; "
@@ -191,18 +249,30 @@ class SolverBase(ABC):
                x_l: Optional[Any] = None,
                check_validity: bool = False,
                ):
-        """Update problem data between solves without a full setup().
+        """Change the numerical problem data, then ``solve()`` again.
 
-        Only numerical values are updated; dimensions and sparsity patterns
-        must remain unchanged.  Call ``solve()`` again after ``update()``.
+        The fast path for re-solving a problem of the **same structure** -
+        for example a moving target ``b`` or a re-linearized ``P`` in
+        receding-horizon control. It reuses every GPU allocation from
+        ``setup()``, so only the values change; shapes, sparsity patterns,
+        which blocks are present, and the finite/infinite bound pattern must
+        stay the same (create a new solver for a structural change).
 
-        Args:
-            check_validity: If True, validate dimensions/sparsity of the new data.
-                   Defaults to False for maximum performance (skips D2H syncs
-                   from sparsity pattern validation in the sparse backend).
-                   The caller must ensure that the finite/infinite bound
-                   structure is unchanged (same indices have finite bounds
-                   as in ``setup()``).
+        Any argument left as ``None`` keeps its current value. After
+        ``update()``, call ``solve()`` to get the new solution.
+
+        Parameters
+        ----------
+        P, c, A, b, G, h_u, h_l, x_u, x_l : GPU array, optional
+            New values for the corresponding problem block. ``None`` (the
+            default) leaves that block unchanged. Must match the original
+            shapes / sparsity pattern set at ``setup()``.
+        check_validity : bool, default: False
+            If ``True``, validate the dimensions and sparsity of the new
+            data. Defaults to ``False`` for speed (validation forces
+            device-to-host syncs in the sparse backend). When ``False``, you
+            must ensure the finite/infinite bound structure is unchanged (the
+            same entries are ``+/-inf`` as at ``setup()``).
         """
         if not self._setup_done:
             raise RuntimeError("Solver not setup yet. Call setup() first.")
@@ -261,6 +331,30 @@ class SolverBase(ABC):
         )
 
     def solve(self) -> list:
+        """Solve the QP set up by ``setup()`` and return the solve status.
+
+        Runs the proximal interior-point iterations on the GPU. The full
+        solution (primal ``x``, dual, and slack variables) and per-problem
+        diagnostics are written to ``solver.result``; this method returns the
+        status for convenience.
+
+        Returns
+        -------
+        Status or list of Status
+            For a single problem, the ``Status``. For a batched ``setup()``,
+            a list of ``B`` of them (one per problem). ``CUPIQP_SOLVED``
+            means the problem converged to tolerance. The list form is always
+            available as ``solver.result.info.status``.
+
+        Notes
+        -----
+        Read the solution from ``solver.result`` after solving - e.g.
+        ``solver.result.x`` (shape ``(B, n)``) and
+        ``solver.result.info.status``. Set ``solver.settings.verbose = True``
+        to print a per-iteration log. After ``setup()`` you may ``solve()``
+        repeatedly, optionally calling ``update()`` in between to change the
+        numerical data.
+        """
         if self.settings.verbose:
             try:
                 from importlib.metadata import version
