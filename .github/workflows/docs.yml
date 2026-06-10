@@ -1,0 +1,63 @@
+name: docs
+
+# Build the MkDocs site and publish it to GitHub Pages.
+#
+# The docs build is CPU-only: MkDocs never imports the cupiqp package (no
+# autodoc), so it runs on a standard GitHub-hosted runner with no GPU/CUDA.
+#
+# One-time repo setup: Settings -> Pages -> "Build and deployment" ->
+# Source: "Deploy from a branch", Branch: "gh-pages" / "/ (root)".
+# `mkdocs gh-deploy` creates and pushes that branch for you.
+
+on:
+  push:
+    branches: [main]
+    # Rebuild only when docs-relevant files change.
+    paths:
+      - "docs/**"
+      - "mkdocs.yml"
+      - "requirements-docs.txt"
+      - ".github/workflows/docs.yml"
+  # Allow manual runs from the Actions tab.
+  workflow_dispatch:
+
+# Let the job push to the gh-pages branch with the default token.
+permissions:
+  contents: write
+
+# Avoid concurrent deploys clobbering each other.
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-deploy:
+    name: build & deploy docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # gh-deploy needs history to update the gh-pages branch
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-docs.txt
+
+      - name: Install docs dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-docs.txt
+
+      # Fail the build on broken nav links / missing pages before deploying.
+      - name: Build (strict)
+        run: mkdocs build --strict
+
+      # Publishes the built site to the gh-pages branch.
+      - name: Deploy to GitHub Pages
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          mkdocs gh-deploy --force --no-history

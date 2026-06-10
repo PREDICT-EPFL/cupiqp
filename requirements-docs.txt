@@ -1,0 +1,13 @@
+# Documentation build dependencies (CPU-only — no CUDA / cupiqp import needed).
+# Install with:  python -m pip install -r requirements-docs.txt
+# Build with:    mkdocs build --strict
+# Preview with:  mkdocs serve
+#
+# mkdocstrings reads docstrings from the cupiqp source via griffe's STATIC
+# analysis (it parses the AST, it does not `import cupiqp`), so the API docs
+# build without a GPU / CuPy installed.
+mkdocs-material>=9.5
+pymdown-extensions>=10.0
+mkdocstrings[python]>=0.26
+griffe-inherited-docstrings>=1.0  # overrides inherit base docstrings (e.g. setup())
+black>=24.0  # lets mkdocstrings pretty-print the generated signatures
