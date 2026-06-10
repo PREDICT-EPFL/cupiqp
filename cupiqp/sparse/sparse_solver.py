@@ -89,9 +89,8 @@ def _check_dense_vector(name: str, m) -> None:
 
 
 class SparseSolver(SolverBase):
-    r"""GPU solver for convex quadratic programs with **sparse** matrices.
-
-    ``SparseSolver`` solves a QP - or a whole batch of QPs - of the form
+    r"""GPU solver for general sparse convex quadratic programs that
+    solves a QP - or a whole batch of QPs - of the form
 
     $$
     \begin{aligned}
@@ -102,48 +101,28 @@ class SparseSolver(SolverBase):
     \end{aligned}
     $$
 
-    using the PIQP proximal interior-point method with a sparse LDL^T
-    factorization, running entirely on the GPU. Pick this solver when the
-    cost matrix ``P`` and the constraint matrices ``A`` and ``G`` are
-    **large and structurally sparse** - it is far more efficient there than
-    ``cupiqp.DenseSolver``. For small, fully dense problems prefer
-    ``DenseSolver``; for block-structured optimal-control problems use
-    ``cupiqp.MultistageSolver``.
-
-    The workflow is identical to the dense solver - construct, ``setup``
-    once, then ``solve`` - only the matrices are passed as CSR. Read the
-    solution back from ``solver.result``:
-
-    ```python
-    import cupy as cp
-    from cupyx.scipy.sparse import csr_matrix
-    from cupiqp import SparseSolver
-
-    P = csr_matrix(cp.eye(4))      # GPU CSR
-    c = cp.zeros(4)
-
-    solver = SparseSolver()
-    solver.setup(P=P, c=c)
-    solver.solve()
-
-    x      = solver.result.x              # (B, n) optimal solution
-    status = solver.result.info.status    # one Status per problem
-    ```
+    using the proximal interior-point method with a sparse LDL^T
+    factorization, running entirely on the GPU. It is built for large,
+    structurally sparse ``P`` / ``A`` / ``G``.
 
     **Inputs - CSR matrices, dense vectors.** ``P``, ``A``, ``G`` must be
     **GPU sparse matrices in CSR layout**; the vectors (``c``, ``b``,
-    ``h_l``, ``h_u``, ``x_l``, ``x_u``) are dense GPU arrays, exactly as for
-    the dense solver. Accepted matrix types are:
+    ``h_l``, ``h_u``, ``x_l``, ``x_u``) are dense GPU arrays. Accepted
+    matrix types are:
 
     * ``cupyx.scipy.sparse.csr_matrix`` (a GPU CSR matrix),
-    * a CUDA ``torch.sparse_csr_tensor``,
-    * a ``cupiqp.UniformBatchedCsrMatrix``, or
-    * a ``list`` / ``tuple`` of any of the above - one per batch element.
+    * a CUDA ``torch.sparse_csr_tensor``, or
+    * a [``UniformBatchedCsrMatrix``][cupiqp.UniformBatchedCsrMatrix] -
+      cuPIQP's own container holding a batch of CSR matrices that share one
+      sparsity pattern (the efficient way to pass a batch).
 
-    Only ``P`` and ``c`` are required; omit (or pass ``None`` for) any
-    constraint block the problem does not have, and mark one-sided
-    inequalities, one-sided box bounds, and free variables with
-    ``+/-cupy.inf`` (those rows are dropped at no numerical cost).
+    A ``list`` / ``tuple`` of ``cupyx.scipy.sparse.csr_matrix`` (one per batch
+    element, all sharing the same sparsity pattern) is also accepted, but
+    **discouraged**: separate matrix objects cannot be organized with the
+    uniform stride that batched linear-algebra routines require, so cuPIQP
+    must copy them into a single contiguous
+    [``UniformBatchedCsrMatrix``][cupiqp.UniformBatchedCsrMatrix] at
+    ``setup``. Build and pass one of those yourself to avoid the copy.
 
     cuPIQP is **GPU-only and CSR-only**, and never converts formats behind
     your back:
@@ -154,11 +133,14 @@ class SparseSolver(SolverBase):
     * Non-CSR GPU layouts (CSC, BSR, BSC, COO) are rejected - convert with
       ``.tocsr()`` before passing.
 
-    **Batching.** Solve ``B`` independent QPs in a single GPU call by
-    passing ``P``, ``A``, ``G`` as **lists of ``B`` CSR matrices that share
-    the same sparsity pattern**, with the vectors stacked along a leading
-    batch dimension (``c`` of shape ``(B, n)``, etc.). A single problem is
-    simply ``B = 1``, and ``solver.result.x`` then has shape ``(B, n)``.
+    **Batching.** Solve ``B`` independent QPs in a single GPU call by passing
+    ``P``, ``A``, ``G`` as a
+    [``UniformBatchedCsrMatrix``][cupiqp.UniformBatchedCsrMatrix] (the
+    preferred, fastest batched input), with the vectors stacked along a
+    leading batch dimension (``c`` of shape ``(B, n)``, etc.). A single
+    problem is simply ``B = 1``, and ``solver.result.x`` then has shape
+    ``(B, n)``. (A ``list`` of per-element CSR matrices also works but is
+    slower - see above.)
 
     Parameters
     ----------
@@ -190,8 +172,9 @@ class SparseSolver(SolverBase):
 
     See Also
     --------
-    DenseSolver : same solver for dense ``P`` / ``A`` / ``G``.
-    MultistageSolver : structure-exploiting backend for block-structured
+    DenseSolver: solver for general dense problems.
+
+    MultistageSolver: structure-exploiting solver for multistage optimization
         (e.g. optimal-control) problems.
 
     Notes

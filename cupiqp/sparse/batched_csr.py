@@ -5,7 +5,50 @@ from cupyx.scipy.sparse import csr_matrix
 
 
 class UniformBatchedCsrMatrix:
-    """Batched CSR storage with one shared sparsity pattern."""
+    """A batch of CSR matrices that share one sparsity pattern.
+
+    A batched extension of cupy's ``cupyx.scipy.sparse.csr_matrix``: where a
+    single CSR matrix stores ``indptr``, ``indices``, and a 1-D ``data`` array
+    of length ``nnz``, this type stores **one shared** ``indptr`` / ``indices``
+    pair plus a **2-D** ``data`` buffer of shape ``(batch_size, nnz)`` - the
+    values of all matrices stacked along a leading batch axis. Every
+    matrix in the batch therefore has the *same* nonzero structure and differs
+    only in its values.
+
+    This is the storage cuPIQP uses internally for batched sparse problems, and
+    the preferred input for solving a batch with ``SparseSolver``: because the
+    values are contiguous with a uniform per-matrix stride, batched sparse
+    linear-algebra routines can sweep the whole batch with no copy (unlike a
+    Python list of separate ``csr_matrix`` objects, which must be copied into
+    this layout first).
+
+
+    Parameters
+    ----------
+    batch_size : int
+        Number of matrices in the batch, ``B`` (must be positive).
+    indices, indptr : sequence of int
+        The shared CSR column-index and row-pointer arrays - the single
+        sparsity pattern used by every matrix in the batch.
+    data : cupy.ndarray
+        Values of shape ``(batch_size, nnz)``: row ``i`` holds the nonzeros of
+        the ``i``-th matrix, laid out against the shared ``indices`` /
+        ``indptr``.
+    shape : tuple of (int, int), optional
+        Dense ``(rows, cols)`` shape of each matrix; inferred from the pattern
+        when omitted.
+    dtype : data-type, default: ``cupy.float64``
+        Value dtype.
+
+    Attributes
+    ----------
+    batch_size, nnz, rows, cols, shape :
+        Batch size ``B``, nonzeros per matrix, and the shared dense shape.
+    indices, indptr : cupy.ndarray
+        The shared CSR sparsity pattern.
+    data : cupy.ndarray
+        The ``(batch_size, nnz)`` values buffer.
+    """
     def __init__(
         self,
         batch_size: int,

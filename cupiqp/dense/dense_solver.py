@@ -32,9 +32,8 @@ def _check_dense(name: str, m) -> None:
 
 
 class DenseSolver(SolverBase):
-    r"""GPU solver for convex quadratic programs with **dense** matrices.
-
-    ``DenseSolver`` solves a QP - or a whole batch of QPs - of the form
+    r"""GPU solver for general dense convex quadratic programs that 
+    solves a QP - or a whole batch of QPs - of the form
 
     $$
     \begin{aligned}
@@ -45,50 +44,17 @@ class DenseSolver(SolverBase):
     \end{aligned}
     $$
 
-    using the PIQP proximal interior-point method, running entirely on the
-    GPU. Pick this solver when the cost matrix ``P`` and the constraint
-    matrices ``A`` and ``G`` are **dense**. For large, structurally sparse
-    problems use ``cupiqp.SparseSolver`` instead; for block-structured
-    optimal-control problems use ``cupiqp.MultistageSolver``.
-
-    Solving is always three steps - construct the solver, ``setup`` the
-    problem once, then ``solve``. Read the solution back from
-    ``solver.result``:
-
-    ```python
-    import cupy as cp
-    from cupiqp import DenseSolver
-
-    P = cp.array([[6.0, 0.0],
-                  [0.0, 4.0]])
-    c = cp.array([-1.0, -4.0])
-
-    solver = DenseSolver()
-    solver.setup(P=P, c=c)
-    solver.solve()
-
-    x      = solver.result.x              # (B, n) optimal solution
-    status = solver.result.info.status    # one Status per problem
-    ```
+    using the proximal interior-point method, running entirely on the GPU.
 
     **Inputs.** ``P``, ``A``, ``G`` and every vector (``c``, ``b``, ``h_l``,
     ``h_u``, ``x_l``, ``x_u``) must be **dense arrays that live on the GPU**.
     Any object exposing the ``__cuda_array_interface__`` protocol is
     accepted - a ``cupy.ndarray``, a CUDA ``torch.Tensor``, a CUDA JAX
-    array, a Numba device array, and so on. Only ``P`` and ``c`` are
-    required; omit (or pass ``None`` for) any constraint block the problem
-    does not have. Mark one-sided inequalities, one-sided box bounds, and
-    free variables with ``+/-cupy.inf`` - cuPIQP detects and drops those
-    rows at no numerical cost.
+    array, a Numba device array, and so on.
 
     cuPIQP is **GPU-only**: CPU data (``numpy.ndarray``, CPU torch tensors,
     CPU JAX arrays) is rejected with a ``TypeError`` rather than copied to
-    the device behind your back. Move it to the GPU yourself first:
-
-    ```python
-    P = cp.asarray(P_numpy)                       # with cupy
-    P = torch.as_tensor(P_numpy, device="cuda")   # with torch
-    ```
+    the device behind your back.
 
     **Batching.** ``DenseSolver`` is natively batched: solve ``B``
     independent QPs in a single GPU call by giving every array a leading
@@ -127,8 +93,9 @@ class DenseSolver(SolverBase):
 
     See Also
     --------
-    SparseSolver : same solver for sparse (CSR) ``P`` / ``A`` / ``G``.
-    MultistageSolver : structure-exploiting backend for block-structured
+    SparseSolver: solver for general sparse problems.
+
+    MultistageSolver: structure-exploiting solver for multistage optimization
         (e.g. optimal-control) problems.
 
     Notes

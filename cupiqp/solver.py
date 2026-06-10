@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Optional, Any, Literal
+from typing import Optional, Any, Literal, List
 
 import numpy as np
 import cupy as cp
@@ -96,9 +96,7 @@ class SolverBase(ABC):
 
         Pass a single problem (2D ``P``) or a batch (3D ``P`` with a leading
         batch axis, or a list of matrices); the batch size is inferred here
-        and sets the shape of the result. Only ``P`` and ``c`` are required;
-        omit (or pass ``None`` for) any absent constraint block, and use
-        ``+/-inf`` entries to mark one-sided inequalities or free bounds.
+        and sets the shape of the result.
 
         Parameters
         ----------
@@ -330,7 +328,7 @@ class SolverBase(ABC):
             (G is not None) or preconditioner_did_fresh_ruiz,
         )
 
-    def solve(self) -> list:
+    def solve(self) -> List[Status]:
         """Solve the QP set up by ``setup()`` and return the solve status.
 
         Runs the proximal interior-point iterations on the GPU. The full
