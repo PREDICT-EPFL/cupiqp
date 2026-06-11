@@ -17,16 +17,25 @@
 ## Install from source
 
 cuPIQP is not currently published on PyPI. Clone the repository and install it with the
-CUDA extra that matches the CUDA version reported by `nvidia-smi`:
+CUDA extra that matches the CUDA version reported by `nvidia-smi`. **Pick your CUDA
+version once** in the tabs below — every install command on this page then follows the
+same choice.
 
-```bash
-git clone https://github.com/PREDICT-EPFL/cupiqp.git
-cd cupiqp
+=== "CUDA 12.x"
 
-python -m pip install ".[cuda12]"   # for a CUDA 12.x CuPy environment
-# or:
-python -m pip install ".[cuda13]"   # for a CUDA 13.x CuPy environment
-```
+    ```bash
+    git clone https://github.com/PREDICT-EPFL/cupiqp.git
+    cd cupiqp
+    python -m pip install ".[cuda12]"
+    ```
+
+=== "CUDA 13.x"
+
+    ```bash
+    git clone https://github.com/PREDICT-EPFL/cupiqp.git
+    cd cupiqp
+    python -m pip install ".[cuda13]"
+    ```
 
 If a suitable CuPy installation is already present in your environment, the bare local
 install is enough:
@@ -37,13 +46,14 @@ python -m pip install .
 
 ## Optional extras
 
-The CUDA extra can be combined with feature extras (comma-separated, no spaces):
+cuPIQP ships all three solver backends — **dense, sparse, and multistage** — by
+default, so the plain install above (with the matching CUDA extra) is all you need.
+There is deliberately no separate `multistage` extra. The available install extras are:
 
-| Extra         | Enables                                                              | Example                              |
-| ------------- | ------------------------------------------------------------------- | ------------------------------------ |
-| `cuda12`      | CuPy + nvmath runtime for CUDA 12.x                                 | `pip install ".[cuda12]"`            |
-| `cuda13`      | CuPy + nvmath runtime for CUDA 13.x                                 | `pip install ".[cuda13]"`            |
-| `multistage`  | `MultistageSolver` (pulls [`socu`](https://github.com/PREDICT-EPFL/socu)) | `pip install ".[cuda13,multistage]"` |
+| Extra    | Enables                             |
+| -------- | ----------------------------------- |
+| `cuda12` | CuPy + nvmath runtime for CUDA 12.x |
+| `cuda13` | CuPy + nvmath runtime for CUDA 13.x |
 
 !!! note "Choosing the CUDA extra"
     `cuda12` and `cuda13` are mutually exclusive in practice. Installing both resolves,
@@ -75,7 +85,7 @@ Pulled automatically by the extras above:
   cuSPARSE / cuDSS bindings and CUDA runtime packages via the selected CUDA extra.
 - [NVTX](https://github.com/NVIDIA/NVTX) — profiling annotations.
 - [socu](https://github.com/PREDICT-EPFL/socu) — required by `MultistageSolver` as the
-  block-structured linear-system solver (installed via the `multistage` extra).
+  block-structured linear-system solver (installed by default as a core dependency).
 
 Framework-independent dependencies (`numpy`, `scipy`, `warp-lang`, `nvmath-python`,
 `nvtx`) resolve cleanly from PyPI; the CUDA-bound packages come from the CUDA extras.
