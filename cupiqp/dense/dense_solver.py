@@ -2,10 +2,11 @@ import cupy as cp
 import warp as wp
 
 from ..results import Variables
-from typing import Literal
+from typing import Literal, Optional
 
 from ..settings import Settings
 from ..solver import SolverBase
+from ..typedef import CudaArray
 from ..utils import is_cuda_array
 from .dense_data import DenseData
 from .dense_preconditioner import DenseRuizEquilibration
@@ -121,7 +122,18 @@ class DenseSolver(SolverBase):
         self._settings = value
 
 
-    def _init_data(self, P, c, A, b, G, h_u, h_l, x_u, x_l):
+    def _init_data(
+        self,
+        P: CudaArray,
+        c: CudaArray,
+        A: Optional[CudaArray],
+        b: Optional[CudaArray],
+        G: Optional[CudaArray],
+        h_u: Optional[CudaArray],
+        h_l: Optional[CudaArray],
+        x_u: Optional[CudaArray],
+        x_l: Optional[CudaArray],
+    ) -> DenseData:
         # Every non-None input must be a GPU dense array — matrices and
         # vectors alike. cupiqp does not silently do H2D copies.
         _check_dense("P", P)
@@ -137,7 +149,7 @@ class DenseSolver(SolverBase):
         data.init(P, c, A, b, G, h_u, h_l, x_u, x_l)
         return data
 
-    def _init_preconditioner(self):
+    def _init_preconditioner(self) -> DenseRuizEquilibration:
         return DenseRuizEquilibration(
             self._data.batch_size, self._data.n, self._data.p, self._data.m,
             self._data.idx_xl, self._data.idx_xu,
@@ -146,8 +158,18 @@ class DenseSolver(SolverBase):
             dtype=self._data.dtype,
         )
 
-    def setup(self, P, c, A=None, b=None, G=None,
-              h_u=None, h_l=None, x_u=None, x_l=None):
+    def setup(
+        self,
+        P: CudaArray,
+        c: CudaArray,
+        A: Optional[CudaArray] = None,
+        b: Optional[CudaArray] = None,
+        G: Optional[CudaArray] = None,
+        h_u: Optional[CudaArray] = None,
+        h_l: Optional[CudaArray] = None,
+        x_u: Optional[CudaArray] = None,
+        x_l: Optional[CudaArray] = None,
+    ) -> None:
         super().setup(P, c, A, b, G, h_u, h_l, x_u, x_l)
         if self.settings.enable_grad:
             d = self._data

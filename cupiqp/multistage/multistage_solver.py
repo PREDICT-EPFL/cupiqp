@@ -2,7 +2,7 @@ import cupy as cp
 import warp as wp
 
 from ..results import Variables
-from typing import Literal
+from typing import Literal, Optional
 
 from ..settings import Settings
 from ..solver import SolverBase
@@ -150,7 +150,18 @@ class MultistageSolver(SolverBase):
         self._settings = value
 
 
-    def _init_data(self, P, c, A, b, G, h_u, h_l, x_u, x_l):
+    def _init_data(
+        self,
+        P: BlockTridiagMat,
+        c: BlockVec,
+        A: Optional[BlockBidiagMat],
+        b: Optional[BlockVec],
+        G: Optional[BlockBidiagMat],
+        h_u: Optional[BlockVec],
+        h_l: Optional[BlockVec],
+        x_u: Optional[BlockVec],
+        x_l: Optional[BlockVec],
+    ) -> MultistageData:
         # Multistage uses block-structured storage end-to-end:
         # matrices are BlockTridiag/BlockBidiag, vectors are BlockVec.
         _check_block_tridiag("P", P)
@@ -166,7 +177,7 @@ class MultistageSolver(SolverBase):
         data.init(P, c, A, b, G, h_u, h_l, x_u, x_l)
         return data
 
-    def _init_preconditioner(self):
+    def _init_preconditioner(self) -> MultistageRuizEquilibration:
         return MultistageRuizEquilibration(
             self._data.batch_size, self._data.n, self._data.p, self._data.m,
             self._data.idx_xl, self._data.idx_xu,
@@ -176,8 +187,18 @@ class MultistageSolver(SolverBase):
             dtype=self._data.dtype,
         )
 
-    def setup(self, P, c, A=None, b=None, G=None,
-              h_u=None, h_l=None, x_u=None, x_l=None):
+    def setup(
+        self,
+        P: BlockTridiagMat,
+        c: BlockVec,
+        A: Optional[BlockBidiagMat] = None,
+        b: Optional[BlockVec] = None,
+        G: Optional[BlockBidiagMat] = None,
+        h_u: Optional[BlockVec] = None,
+        h_l: Optional[BlockVec] = None,
+        x_u: Optional[BlockVec] = None,
+        x_l: Optional[BlockVec] = None,
+    ) -> None:
         super().setup(P, c, A, b, G, h_u, h_l, x_u, x_l)
         if self.settings.enable_grad:
             d = self._data
