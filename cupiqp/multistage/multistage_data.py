@@ -74,8 +74,8 @@ class MultistageData(Data):
     ):
         """Allocate and populate buffers from user inputs. Returns self for chaining."""
 
-        self._require_dtype(P.diag_blocks.data)
-        self._require_dtype(P.off_diag_blocks_lower.data)
+        self._require_dtype(P.D)
+        self._require_dtype(P.E)
         self._require_dtype(c.data)
         if A is not None:
             self._require_dtype(A.D)
@@ -261,7 +261,7 @@ class MultistageData(Data):
         d = self.block_size
         N = self.num_blocks
         # (B, N, d, d) — Warp buffer.
-        P_D = cp.from_dlpack(wp.to_dlpack(self._P.diag_blocks.data))
+        P_D = cp.from_dlpack(wp.to_dlpack(self._P.D))
         # cp.diagonal over axes 2, 3 gives (B, N, d) → reshape to (B, N*d).
         diag_P[:] = cp.diagonal(P_D, axis1=2, axis2=3).reshape(B, N * d)
 
@@ -279,8 +279,8 @@ class MultistageData(Data):
                 raise ValueError(
                     f"P block_size mismatch: got {value.block_size}, expected {self._P.block_size}"
                 )
-        wp.copy(self._P.diag_blocks.data, value.diag_blocks.data)
-        wp.copy(self._P.off_diag_blocks_lower.data, value.off_diag_blocks_lower.data)
+        wp.copy(self._P.D, value.D)
+        wp.copy(self._P.E, value.E)
 
     def set_c(self, value: BlockVec, check: bool = True):
         if check:

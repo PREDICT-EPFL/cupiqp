@@ -3,10 +3,10 @@
 Each batched block matrix is represented directly as warp 4D arrays — no
 DLPack bridging is needed inside the kernels:
 
-    P :   diag_blocks.data           (B, N, d, d)      symmetric block-tridiag
-          off_diag_blocks_lower.data (B, N-1, d, d)    upper = lower^T
-    A,G : D                          (B, N, r, d)      block lower-bidiagonal
-          E                          (B, N, r, d)      sub-diagonal blocks
+    P :   D   (B, N, d, d)      symmetric block-tridiag
+          E   (B, N-1, d, d)    upper = lower^T
+    A,G : D   (B, N, r, d)      block lower-bidiagonal
+          E   (B, N, r, d)      sub-diagonal blocks
 
 For absent A or G, the call sites pass small dummy 4D buffers and rely on
 ``wp.static(rows_A > 0)`` / ``wp.static(rows_G > 0)`` guards to dead-code-eliminate
