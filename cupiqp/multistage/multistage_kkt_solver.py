@@ -11,7 +11,7 @@ from socu.block_tridiag_solver import (
 from ..kkt_solver import KKTSolverBase
 from ..utils import to_warp_dtype
 from .multistage_data import MultistageData
-from .multistage_utils import (
+from .multistage_utils_kernels import (
     create_block_bidiag_gemv_n_kernel,
     create_block_bidiag_gemv_t_kernel,
     create_block_tridiag_gemv_kernel,
