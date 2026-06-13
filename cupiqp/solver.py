@@ -606,9 +606,6 @@ class SolverBase(ABC):
 
         self._kkt_system.solve(self._data, self._preconditioner, self.settings, self._res, self._result)  # getting an initial point of _result
 
-        if self.settings.debug:
-            print("Initial point after solving KKT system:", self._result)
-
         if self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu > 0:
             ## ----------- keep z and s non-negative --------------
             # this is according to the IV.A part of Roland Schwan 2023 paper.
@@ -623,9 +620,6 @@ class SolverBase(ABC):
             self._calculate_mu()
             cp.clip(self._result.info.mu, 1e-10, None, out=self._result.info.mu)
 
-            if self.settings.debug:
-                print("Initial mu:", self._result.info.mu)
-
             # put s and z on the central path
             # c = z - delta_z; z = (c + sqrt(c^2 + 4*mu)) / 2; s = z - c
             wp.launch(
@@ -636,9 +630,6 @@ class SolverBase(ABC):
                 device="cuda",
                 stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
             )
-
-            if self.settings.debug:
-                print("self._result:", self._result)
 
             self._calculate_mu()
 
@@ -821,10 +812,6 @@ class SolverBase(ABC):
     def _run_predictor_corrector(self):
         """Predictor-corrector steps + variable update + mu calculation."""
         # ------------------ predictor step ------------------
-        if self.settings.debug:
-            print("before predictor step, result is: ", self._result)
-            print("before predictor step, res is: ", self._res)
-
         # Short derivation:
         # Complementarity (elementwise): s_i * z_i = mu (usually written s * z = mu e).
         # Predictor (affine) aims for the affine step that drives complementarity to zero, so require (s + Δs) ∘ (z + Δz) = 0.
@@ -842,13 +829,7 @@ class SolverBase(ABC):
             stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
         )
 
-        if self.settings.debug:
-            print("predictor step rhs is: res= ", self._res)
-
         self._kkt_system.solve(self._data, self._preconditioner, self.settings, self._res, self._step)
-
-        if self.settings.debug:
-            print("predictor step is:", self._step)
 
         # step in the non-negative orthant
         self._calculate_step()
@@ -873,12 +854,7 @@ class SolverBase(ABC):
             stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
         )
 
-        if self.settings.debug:
-            print("corrector step rhs is: res= ", self._res)
         self._kkt_system.solve(self._data, self._preconditioner, self.settings, self._res, self._step)
-
-        if self.settings.debug:
-            print("corrector step is:", self._step)
 
         # step in the non-negative orthant
         self._calculate_step()
