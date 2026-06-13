@@ -140,11 +140,6 @@ class SolverBase(ABC):
                 "create a new solver instance to set up a different problem."
             )
 
-        # Detect if user provided batched (3D P) or non-batched (2D P) data.
-        # DenseData auto-unsqueezes non-batched to (1, ...) internally,
-        # but we track this so solve() returns the right type.
-        self._user_batched = (hasattr(P, 'ndim') and P.ndim == 3) or (isinstance(P, (list, tuple)) and len(P) > 1)
-
         self._data = self._init_data(P, c, A, b, G, h_u, h_l, x_u, x_l)
         self._preconditioner = self._init_preconditioner()
         if self.settings.preconditioner_iter > 0:
@@ -393,7 +388,7 @@ class SolverBase(ABC):
             print("")
         return self._solve_impl()
 
-    def _solve_impl(self) -> Status:
+    def _solve_impl(self) -> List[Status]:
         self._result.info._status_value[:] = Status.CUPIQP_UNSOLVED.value
         self._unsolved_mask.fill(True)
         self._result.info.iter[:] = 0
@@ -560,10 +555,8 @@ class SolverBase(ABC):
         if self.settings.preconditioner_iter > 0:
             self._preconditioner.unscale_solution(self._result, self._data)
         statuses = self._result.info.status
-        if self._user_batched:
-            return statuses
-        else:
-            return statuses[0]
+        
+        return statuses
 
     @nvtx.annotate("Solver::_initial_guess")
     def _initial_guess(self):
