@@ -402,6 +402,11 @@ class Info:
         """Per-problem status as a list of Status enums."""
         return [Status(v) for v in self._status_value]
 
+    @property
+    def status_value(self) -> np.ndarray:
+        """Per-problem status as a writable (B,) int32 array of Status values."""
+        return self._status_value
+
     @nvtx.annotate("Info:to_host")
     def to_host(self, info_host: 'InfoHost'):
         cp.asnumpy(self._buffer, out=info_host._buffer)
