@@ -404,7 +404,7 @@ class LargeProblemSolverBase(SolverBase):
         )
         rho_fast = cp.maximum(info.reg_limit, 0.1 * info.rho)
         rho_slow = cp.maximum(info.reg_limit, 0.5 * info.rho)
-        rho_slow_decay_ok = active & (~dual_improved) & ((info.iter[0] < 5) | (info.dual_prox_inf < settings.infeasibility_threshold))
+        rho_slow_decay_ok = active & (~dual_improved) & ((self._iter < 5) | (info.dual_prox_inf < settings.infeasibility_threshold))
         info.rho[:] = cp.where(dual_improved, rho_fast, cp.where(rho_slow_decay_ok, rho_slow, info.rho))
         self._prox_vars.x[:] = cp.where(dual_improved[:, None], self._result.x, self._prox_vars.x)
         info.no_primal_update[:] = cp.where(
@@ -420,7 +420,7 @@ class LargeProblemSolverBase(SolverBase):
         )
         delta_fast = cp.maximum(info.reg_limit, 0.1 * info.delta)
         delta_slow = cp.maximum(info.reg_limit, 0.5 * info.delta)
-        delta_slow_decay_ok = active & (~primal_improved) & ((info.iter[0] < 5) | (info.primal_prox_inf < settings.infeasibility_threshold))
+        delta_slow_decay_ok = active & (~primal_improved) & ((self._iter < 5) | (info.primal_prox_inf < settings.infeasibility_threshold))
         info.delta[:] = cp.where(primal_improved, delta_fast, cp.where(delta_slow_decay_ok, delta_slow, info.delta))
         self._prox_vars.duals_all[:] = cp.where(primal_improved[:, None], self._result.duals_all, self._prox_vars.duals_all)
         info.no_dual_update[:] = cp.where(
@@ -442,7 +442,7 @@ class LargeProblemSolverBase(SolverBase):
         )
         rho_fast = cp.maximum(info.reg_limit, 0.1 * info.rho)
         rho_slow = cp.maximum(info.reg_limit, 0.5 * info.rho)
-        rho_slow_decay_ok = active & (~dual_improved) & ((info.iter[0] < 5) | (info.dual_prox_inf < settings.infeasibility_threshold))
+        rho_slow_decay_ok = active & (~dual_improved) & ((self._iter < 5) | (info.dual_prox_inf < settings.infeasibility_threshold))
         info.rho[:] = cp.where(dual_improved, rho_fast, cp.where(rho_slow_decay_ok, rho_slow, info.rho))
         self._prox_vars.x[:] = cp.where(dual_improved[:, None], self._result.x, self._prox_vars.x)
         info.no_primal_update[:] = cp.where(
@@ -458,7 +458,7 @@ class LargeProblemSolverBase(SolverBase):
         )
         delta_fast = cp.maximum(info.reg_limit, 0.1 * info.delta)
         delta_slow = cp.maximum(info.reg_limit, 0.5 * info.delta)
-        delta_slow_decay_ok = active & (~primal_improved) & ((info.iter[0] < 5) | (info.primal_prox_inf < settings.infeasibility_threshold))
+        delta_slow_decay_ok = active & (~primal_improved) & ((self._iter < 5) | (info.primal_prox_inf < settings.infeasibility_threshold))
         info.delta[:] = cp.where(primal_improved, delta_fast, cp.where(delta_slow_decay_ok, delta_slow, info.delta))
         self._prox_vars.y[:] = cp.where(primal_improved[:, None], self._result.y, self._prox_vars.y)
         info.no_dual_update[:] = cp.where(

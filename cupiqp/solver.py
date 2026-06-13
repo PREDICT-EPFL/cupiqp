@@ -394,6 +394,7 @@ class SolverBase(ABC):
         self._result.info._status_value[:] = Status.CUPIQP_UNSOLVED.value
         self._unsolved_mask.fill(True)
         self._result.info.iter[:] = 0
+        self._iter = 0  # global IPM iteration counter (host scalar)
         self._result.info.reg_limit[:] = self.settings.reg_lower_limit
         # Refresh tau only if the user changed settings.tau between solves because it requires H2D memcpy
         if self._tau_host != self.settings.tau:
@@ -438,7 +439,8 @@ class SolverBase(ABC):
         ## ---------------------------------------------
         for iter in range(self.settings.max_iter):
             with nvtx.annotate(f"Solver::ipm_iteration"):
-                self._result.info.iter[:] = iter
+                self._iter = iter
+                self._result.info.iter[still_unsolved] = iter
                 if iter == 0:
                     self._update_residuals_nr()
                     self._result.info.prev_primal_res[:] = self._result.info.primal_res
@@ -644,7 +646,7 @@ class SolverBase(ABC):
 
         if B == 1:
             print(
-                f"{self._result.info.iter[0]:3d}   "
+                f"{self._iter:3d}   "
                 f"{info_host.primal_obj[0]: .5e}   "
                 f"{info_host.dual_obj[0]: .5e}  "
                 f"{info_host.duality_gap[0]: .5e}  "
@@ -663,7 +665,7 @@ class SolverBase(ABC):
             counter = f"{solved}/{B}"
             counter_w = max(2 * len(str(B)) + 1, len("solved"))
             print(
-                f"{self._result.info.iter[0]:>4d}  "
+                f"{self._iter:>4d}  "
                 f"{counter:>{counter_w}}  "
                 f"{info_host.duality_gap.max():>12.5e}  "
                 f"{info_host.primal_res.max():>12.5e}  "
@@ -1240,7 +1242,7 @@ class SolverBase(ABC):
                 settings.eps_rel,
                 settings.reg_finetune_lower_limit,
                 settings.infeasibility_threshold,
-                info.iter[0],
+                wp.int32(self._iter),
             ],
             device="cuda",
             stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
@@ -1267,7 +1269,7 @@ class SolverBase(ABC):
                 settings.eps_abs,
                 settings.eps_rel,
                 settings.infeasibility_threshold,
-                info.iter[0],
+                wp.int32(self._iter),  # self._iter is int64, need to convert to int32
             ],
             device="cuda",
             stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
