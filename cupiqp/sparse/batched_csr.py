@@ -147,14 +147,19 @@ class UniformBatchedCsrMatrix:
         return cls.from_cupy_csr_matrix(matrix, dtype=dtype)
 
     @classmethod
-    def from_cupy_csr_matrix(cls, matrix, dtype=cp.float64) -> "UniformBatchedCsrMatrix":
-        """Build a one-batch matrix from a CuPy CSR or convertible input."""
+    def from_cupy_csr_matrix(cls, matrix, batch_size: int = 1, dtype=cp.float64) -> "UniformBatchedCsrMatrix":
+        """Build a uniform batched CSR matrix from a single CuPy CSR (or convertible) input.
+
+        The sparsity pattern (``indices``/``indptr``) is stored once and shared across the
+        whole batch; the values are replicated into ``batch_size`` identical rows. The
+        default ``batch_size=1`` wraps the input as a one-element batch.
+        """
         matrix = csr_matrix(matrix, dtype=dtype)
         return cls(
-            batch_size=1,
+            batch_size=batch_size,
             indices=matrix.indices,
             indptr=matrix.indptr,
-            data=matrix.data.reshape(1, -1),
+            data=matrix.data.reshape(1, -1) if batch_size == 1 else cp.tile(matrix.data, (batch_size, 1)),
             shape=matrix.shape,
             dtype=dtype,
         )
