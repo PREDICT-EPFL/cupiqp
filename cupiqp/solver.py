@@ -367,16 +367,19 @@ class SolverBase(ABC):
             print("-" * _w)
             if self.settings.kkt_solver == "dense_cholesky":
                 print("dense backend:")
+                print(f"batch size B = {self._data.batch_size}")
                 print(f"variables n = {self._data.n}")
                 print(f"equality constraints p = {self._data.p}")
                 print(f"inequality constraints m = {self._data.m}")
             elif self.settings.kkt_solver == "sparse_ldlt":
                 print("sparse backend:")
+                print(f"batch size B = {self._data.batch_size}")
                 print(f"variables n = {self._data.n}, nnz(P) = {self._data.P.nnz}")
                 print(f"equality constraints p = {self._data.p}, nnz(A) = {self._data.A.nnz}")
                 print(f"inequality constraints m = {self._data.m}, nnz(G) = {self._data.G.nnz}")
             elif self.settings.kkt_solver == "multistage_block_cholesky":
                 print("multistage backend:")
+                print(f"batch size B = {self._data.batch_size}")
                 print(f"variables n = {self._data.n}, num_diag_blocks(P) = {self._data.P.num_diag_blocks}, block_size(P) = ({self._data.P.block_size}, {self._data.P.block_size})")
                 print(f"equality constraints p = {self._data.p}, num_diag_blocks(A) = {self._data.A.N}, block_size(A) = ({self._data.A.rows_of_blocks}, {self._data.A.cols_of_blocks})")
                 print(f"inequality constraints m = {self._data.m}, num_diag_blocks(G) = {self._data.G.N}, block_size(G) = ({self._data.G.rows_of_blocks}, {self._data.G.cols_of_blocks})")
@@ -394,6 +397,7 @@ class SolverBase(ABC):
         self._result.info._status_value[:] = Status.CUPIQP_UNSOLVED.value
         self._unsolved_mask.fill(True)
         self._result.info.iter[:] = 0
+        self._result.info.iter_total = 0
         self._iter = 0  # global IPM iteration counter (host scalar)
         self._result.info.reg_limit[:] = self.settings.reg_lower_limit
         # Refresh tau only if the user changed settings.tau between solves because it requires H2D memcpy
@@ -548,8 +552,11 @@ class SolverBase(ABC):
                     self._update_residuals_nr()
                     self._update_rho_delta_with_ineq()
 
+        self._result.info.iter_total = int(self._iter)
         # Mark remaining unsolved as max iter reached
         self._result.info._status_value[self._result.info._status_value == Status.CUPIQP_UNSOLVED.value] = Status.CUPIQP_MAX_ITER_REACHED.value
+        if self.settings.verbose:
+            self._print_summary()
         if self.settings.preconditioner_iter > 0:
             self._preconditioner.unscale_solution(self._result, self._data)
         statuses = self._result.info.status
@@ -677,6 +684,22 @@ class SolverBase(ABC):
                 f"{info_host.dual_step.min():>6.4f}",
                 flush=True,
             )
+
+    @nvtx.annotate("Solver::_print_summary")
+    def _print_summary(self):
+        statuses = self._result.info.status
+        labels = {
+            "Solved":             Status.CUPIQP_SOLVED,
+            "Max iter reached":   Status.CUPIQP_MAX_ITER_REACHED,
+            "Primal infeasible":  Status.CUPIQP_PRIMAL_INFEASIBLE,
+            "Dual infeasible":    Status.CUPIQP_DUAL_INFEASIBLE,
+            "Numerical issues":   Status.CUPIQP_NUMERICAL_ISSUES,
+        }
+        print(f"\nFinished in {self._result.info.iter_total} iterations", flush=True)
+        for name, status in labels.items():
+            count = statuses.count(status)
+            if count > 0:
+                print(f"  {name + ':':<20} {count}/{len(statuses)}", flush=True)
 
     @nvtx.annotate("Solver::_update_and_factorize_kkt")
     def _update_and_factorize_kkt(self) -> None:

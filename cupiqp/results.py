@@ -252,7 +252,8 @@ class Info:
     def __init__(self, batch_size: int = 1):
         self._batch_size = batch_size
         self._status_value = np.full(batch_size, Status.CUPIQP_UNSOLVED.value, dtype=np.int32)
-        self.iter = np.zeros(batch_size, dtype=np.int32)
+        self.iter = np.zeros(batch_size, dtype=np.int32)  # individual iter counts for each problem in the batch
+        self.iter_total = 0  # total iterations the solver runs for this batch (the slowest problem's count)
         self.factor_retires = np.zeros(batch_size, dtype=np.int32)
         # Per-batch "no update" counters live on device (int32). Source of truth;
         # the rho/delta kernels reset on improved, increment on stagnated.
