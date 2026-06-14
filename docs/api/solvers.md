@@ -1,7 +1,7 @@
 # Solvers
 
 All solver classes share the `setup` / `solve` / `update` workflow and use the same
-[`Settings`](settings-results.md#settings). See
+[`Settings`](settings.md#settings). See
 [Re-solving with new data](../getting-started.md#re-solving-with-new-data) for the
 fixed-structure update pattern and [Differentiation](../guide/differentiation.md) for
 the `backward()` workflow.

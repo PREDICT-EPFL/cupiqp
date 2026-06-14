@@ -8,11 +8,11 @@ KKT factorization and the storage category of your `P` / `A` / `G` inputs.
 | Solver | Matrices `P, A, G` | KKT backend | Use when |
 |---|---|---|---|
 | [`DenseSolver`](#densesolver) | dense `cupy` arrays | dense Cholesky | small-to-medium, dense problems |
-| [`SparseSolver`](#sparsesolver) | `cupyx.scipy.sparse` CSR (or list of CSR) | sparse LDLᵀ (cuDSS) | large, structurally sparse problems |
+| [`SparseSolver`](#sparsesolver) | [`UniformBatchedCsrMatrix`](../api/solvers.md#cupiqp.UniformBatchedCsrMatrix) (or CSR) | sparse LDLᵀ (cuDSS) | large, structurally sparse problems |
 | [`MultistageSolver`](#multistagesolver) | block-structured objects | block Cholesky | block-tridiagonal/-arrow KKT (e.g. OCPs) |
 
 All three accept GPU-resident inputs only and share the same `setup` / `solve` /
-`update` workflow and [`Settings`](../api/settings-results.md). See
+`update` workflow and [`Settings`](../api/settings.md). See
 [Re-solving with new data](../getting-started.md#re-solving-with-new-data) for the
 fixed-structure update pattern.
 
@@ -74,19 +74,35 @@ s.setup(
 s.solve()
 ```
 
-- `P`, `A`, `G` are **GPU CSR** matrices (`cupyx.scipy.sparse.csr_matrix`).
-- For a **batch**, pass `P`, `A`, `G` as **lists of `B` CSR matrices that share the same
-  sparsity pattern**; the vectors are stacked `(B, …)`.
+- `P`, `A`, `G` are **GPU CSR** matrices (`cupyx.scipy.sparse.csr_matrix`); a single CSR
+  is treated as the `B = 1` case.
+- For a **batch**, the preferred input is a
+  [`UniformBatchedCsrMatrix`](../api/solvers.md#cupiqp.UniformBatchedCsrMatrix) —
+  cuPIQP's own container holding `B` matrices that share **one** sparsity pattern, with
+  the values stacked as a `(B, nnz)` array. The vectors are stacked `(B, …)`.
 
 ```python
-s.setup(P=[csr_matrix(P)] * B, c=c_b,
-        A=[csr_matrix(A)] * B, b=b_b,
-        G=[csr_matrix(G)] * B, h_l=h_l_b, h_u=h_u_b)
+from cupiqp import UniformBatchedCsrMatrix
+
+# Pack each shared-pattern matrix into a (B, nnz) batched container.
+# from_cupy_csr_matrix replicates one CSR across the batch; for differing
+# per-problem values, build with the UniformBatchedCsrMatrix(B, indices, indptr,
+# values, shape=...) constructor instead (see Getting Started).
+P_b = UniformBatchedCsrMatrix.from_cupy_csr_matrix(csr_matrix(P), batch_size=B)
+A_b = UniformBatchedCsrMatrix.from_cupy_csr_matrix(csr_matrix(A), batch_size=B)
+G_b = UniformBatchedCsrMatrix.from_cupy_csr_matrix(csr_matrix(G), batch_size=B)
+s.setup(P=P_b, c=c_b, A=A_b, b=b_b, G=G_b, h_l=h_l_b, h_u=h_u_b)
 ```
+
+!!! warning "Avoid passing a raw `list` of `csr_matrix`"
+    `setup` also accepts a plain `list` of `B` CSR matrices that share one pattern, but
+    separate matrix objects lack the uniform stride batched routines need, so cuPIQP must
+    copy them into a `UniformBatchedCsrMatrix` at `setup`. Build and pass one yourself to
+    skip that copy. See [Getting Started](../getting-started.md) for the full example.
 
 !!! tip "Bit-reproducible cuDSS"
     Set `settings.use_deterministic_mode_for_cudss = True` for bit-wise reproducible
-    sparse factorizations (somewhat slower). See [Settings](../api/settings-results.md).
+    sparse factorizations (somewhat slower). See [Settings](../api/settings.md).
 
 ---
 

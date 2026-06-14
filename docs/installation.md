@@ -52,8 +52,8 @@ There is deliberately no separate `multistage` extra. The available install extr
 
 | Extra    | Enables                             |
 | -------- | ----------------------------------- |
-| `cuda12` | CuPy + nvmath runtime for CUDA 12.x |
-| `cuda13` | CuPy + nvmath runtime for CUDA 13.x |
+| `cuda12` | CuPy + nvmath-python runtime for CUDA 12.x |
+| `cuda13` | CuPy + nvmath-python runtime for CUDA 13.x |
 
 !!! note "Choosing the CUDA extra"
     `cuda12` and `cuda13` are mutually exclusive in practice. Installing both resolves,
@@ -72,20 +72,6 @@ solver.setup(P=cp.eye(3), c=cp.zeros(3))
 solver.solve()
 ```
 
-With `verbose = True` you should see the cuPIQP banner followed by the interior-point
-iteration log, ending in a `CUPIQP_SOLVED` status.
+With `verbose = True` you should see the cuPIQP banner followed by the
+per-iteration info, ending in a `CUPIQP_SOLVED` status report.
 
-## Runtime dependencies
-
-Pulled automatically by the extras above:
-
-- [CuPy](https://cupy.dev/) — GPU array library (`cupy-cuda12x` or `cupy-cuda13x`).
-- [Warp](https://github.com/NVIDIA/warp) — JIT-compiled CUDA kernels.
-- [nvmath-python](https://developer.nvidia.com/nvmath-python) — cuBLAS / cuSOLVER /
-  cuSPARSE / cuDSS bindings and CUDA runtime packages via the selected CUDA extra.
-- [NVTX](https://github.com/NVIDIA/NVTX) — profiling annotations.
-- [socu](https://github.com/PREDICT-EPFL/socu) — required by `MultistageSolver` as the
-  block-structured linear-system solver (installed by default as a core dependency).
-
-Framework-independent dependencies (`numpy`, `scipy`, `warp-lang`, `nvmath-python`,
-`nvtx`) resolve cleanly from PyPI; the CUDA-bound packages come from the CUDA extras.

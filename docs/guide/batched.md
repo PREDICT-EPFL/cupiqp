@@ -1,50 +1,83 @@
 # Batched Solving
 
-cuPIQP is **natively batched**. A single solver instance solves `B` independent QPs in
-one batched solver call — the inner kernels operate on `(B, …)` tensors with **no
-Python-side loop** over the batch. This is the feature cuPIQP is built around: sampling-based
-control, RL rollouts, scenario MPC, and parameter sweeps all map directly onto it.
+CuPIQP is **natively batched**. A single solver instance solves `B` independent QPs in
+one solver call. 
 
-A single problem is simply the `B = 1` case.
+## Batch as the leading dimension
 
-## The one rule: batch is the leading axis
+CuPIQP is natively designed to solve batched problems. Therefore, the problem data should be passed as batchl, and every array in the results has **the batch size as its leading dimension**.
 
-Every array's **leading dimension is the batch size** `B`:
+| field |  shape |
+|---|---|
+| `P`, `c` |  `(B, n, n)`, `(B, n)` |
+| `A`, `b` | `(B, p, n)` , `(B, p)` |
+| `G`, `h_l`, `h_u` | `(B, m, n)` , `(B, m)`, `(B, m)` |
+| `x_l`, `x_u` | `(B, n)`, `(B, n)` |
 
-| array | single | batched |
-|---|---|---|
-| `P` | `(n, n)` | `(B, n, n)` |
-| `c`, `x_l`, `x_u` | `(n,)` | `(B, n)` |
-| `A` / `G` | `(p, n)` / `(m, n)` | `(B, p, n)` / `(B, m, n)` |
-| `b`, `h_l`, `h_u` | `(p,)` / `(m,)` | `(B, p)` / `(B, m)` |
 
-The solver detects a batch from the matrix rank (`P.ndim == 3`, or a list of matrices)
-at `setup()` time. `solver.result.x` then has shape `(B, n)` and
-`solver.result.info.status` is a list of `B` `Status` enums — one per problem.
+The solver detects the batch size at `setup()` time from the input shape.
+
+Each problem in the batch carries its own information and converges independently. Read per-problem diagnostics from `solver.result.info` — every field
+is a `(B,)` array. See [Results & Status](../api/results.md).
+
 
 ```python
-dense_solver.setup(P=P_b, c=c_b, A=A_b, b=b_b, G=G_b,
-                   h_l=h_l_b, h_u=h_u_b, x_l=x_l_b, x_u=x_u_b)
-dense_solver.solve()
+solver = DenseSolver()
+solver.setup(
+  P=P_batch,       # 3-dim array, with batch size as leading dim
+  c=c_batch,       # 2-dim array, with batch size as leading dim
+  A=A_batch,       # 3-dim array, with batch size as leading dim
+  b=b_batch,       # 2-dim array, with batch size as leading dim
+  G=G_batch,       # 3-dim array, with batch size as leading dim
+  h_l=h_l_batch,   # 2-dim array, with batch size as leading dim
+  h_u=h_u_batch,   # 2-dim array, with batch size as leading dim
+  x_l=x_l_batch,   # 2-dim array, with batch size as leading dim
+  x_u=x_u_batch,   # 2-dim array, with batch size as leading dim
+  )
+solver.solve()
 
-X = dense_solver.result.x.get()                  # (B, n)
-for i, st in enumerate(dense_solver.result.info.status):
-    print(f"problem {i}: status = {st.name}, x = {X[i]}")
+x_sol = solver.result.x                  # cupy array of shape (B, n)
+status = solver.result.info.status       # list of length B
+for i, st in enumerate(status):
+    print(f"problem {i}: status = {status.name}, x = {x_sol[i]}")
 ```
 
-For the **sparse** backend, pass `P`, `A`, `G` as **lists of `B` CSR matrices that
-share the same sparsity pattern**; the vectors are stacked `(B, …)` like the dense case.
-See [Backends](backends.md#sparsesolver).
+### Single problem case:
 
-## Per-problem solving
+A single problem is simply the `B=1` case. CuPIQP accepts problem data as single problem, i.e., without the batch size dimension.
 
-Each problem in the batch carries its own regularization (`rho`, `delta`), residuals,
-and status, and converges independently. Problems that have already terminated are held
-fixed while the others keep iterating, so a fast-converging problem does not waste work
-once it is solved. Read per-problem diagnostics from `solver.result.info` — every field
-is a `(B,)` array. See [Results & Status](../api/settings-results.md).
+However, cuPIQP internally treat this case as `B=1` and **the returned result still carries the batch size 1 as the leading dimension**.
 
-## Shared structure across the batch
+```python
+P_single = cp.eye(2)                 # 2-dim array, no batch dim
+c_single = cp.ones(2)                # 1-dim array, no batch dim
+A_single = cp.array([[1.0, -2.0]])   # 2-dim array, no batch dim
+b_single = cp.array([1.0])           # 1-dim array, no batch dim
+
+solver = DenseSolver()
+solver.setup(
+  P=P_single, c=c_single,
+  A=A_single, b=b_single
+  )
+solver.solve()
+
+# result.x still carries a leading batch dimension (B, n); here B = 1
+x_sol = solver.result.x[0]
+```
+
+### Sparse problems
+For the **sparse** problems, pass `P`, `A`, `G` as one of the following types:
+- [`cupyx.scipy.sparse.csr_matrix`](https://docs.cupy.dev/en/stable/reference/generated/cupyx.scipy.sparse.csr_matrix.html#cupyx.scipy.sparse.csr_matrix). It only works for batch size 1.
+- List or tuple of `cupyx.scipy.sparse.csr_matrix` objects. However, it is **discouraged** when the batch size is big because this can cause long setup time and low performance.
+- `UniformBatchedCsrMatrix`. This is a class introduced and used internally by cuPIQP itself to represent a batch of sparse CSR matrices with uniform sparsity. It has `indices` and `indptr` attributes which are two `cupy.ndarray` of shape (nnz,) to represent the sparsity pattern. Its `data` attribute is a `cupy.ndarray` of shape (batch_size, nnz) that stores the non-zeros values of all matrices in the batch. We **encourage** users to import it from cuPIQP to store their batched CSR matrices and pass to the `SparseSolver`.
+- [`torch.sparse_csr_tensor`](https://docs.pytorch.org/docs/2.12/generated/torch.sparse_csr_tensor.html), which is the CSR matrix representation in Torch and can express batched CSR matrices. CuPIQP requires that  `crow_indices` and `col_indices` must be identical for all matrices to enforce uniform sparsity.
+
+The vectors $c, b, h_l, h_u, x_l, x_u$ stay stacked `(B, ...)` dense arrays just like the dense case.
+
+See [this example](https://github.com/PREDICT-EPFL/cupiqp/blob/main/examples/getting_started.ipynb) for more details.
+
+
+## Uniform structure across the batch
 
 All problems in a batch share the same **structure**, even though their numerical data
 differ:
@@ -52,36 +85,7 @@ differ:
 - Same shapes `n`, `p`, `m` and (for the sparse backend) the same sparsity pattern.
 - **Same finite/infinite bound pattern.** Every problem in the batch must mark the same
   entries of `h_l`, `h_u`, `x_l`, `x_u` as `±inf`. cuPIQP validates this at `setup()`
-  and raises a `ValueError` on a mismatch:
+  and raises a `ValueError` on a mismatch.
+- For sparse solver, all $P$ matrices in the batch must have the same sparsity pattern. This also applies to $A$ and $G$.
 
-    ```text
-    Bound structure mismatch in 'h_l': all problems in the batch
-    must have the same set of finite bounds.
-    ```
 
-  Vary the bound *values* freely across the batch — just keep the *pattern* of which
-  bounds are finite identical.
-
-## Typical use cases
-
-- **Sampling-based / scenario MPC** — solve one QP per sampled disturbance or scenario,
-  all at once.
-- **Reinforcement learning** — batch the QP layer over a rollout or a minibatch.
-- **Parameter sweeps & tuning** — solve the same controller for many set-points,
-  weights, or initial states in parallel.
-
-## Warm re-solving a batch
-
-Pair batching with [`update()`](../getting-started.md#re-solving-with-new-data) to
-re-solve a batch with new numerical data while reusing every GPU allocation — the standard inner loop for batched
-MPC:
-
-```python
-solver.setup(P=P_b, c=c_b, A=A_b, b=b0_b, G=G_b, h_l=h_l_b, h_u=h_u_b)
-solver.solve()
-
-for b_k in trajectory:           # b_k: (B, p), e.g. B sampled initial states
-    solver.update(b=b_k)
-    solver.solve()
-    U = solver.result.x          # (B, n)
-```

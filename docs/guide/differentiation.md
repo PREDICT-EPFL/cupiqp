@@ -25,8 +25,8 @@ solver = DenseSolver()
 solver.settings.enable_grad = True  # enable gradient computation
 solver.setup(P=P, c=c)
 
-status = solver.solve()
-assert status == Status.CUPIQP_SOLVED
+status = solver.solve()              # always a list, one Status per problem
+assert status[0] == Status.CUPIQP_SOLVED
 
 x_star = solver.result.x
 
@@ -105,5 +105,5 @@ and gradients carry the leading batch dimension `(B, ...)`.
     or undefined.
 
 See the [solver API](../api/solvers.md) for the full `backward()` signature and
-[Settings & Results](../api/settings-results.md) for `enable_grad` and solver
+[Settings](../api/settings.md) for `enable_grad` and solver
 tolerances.
