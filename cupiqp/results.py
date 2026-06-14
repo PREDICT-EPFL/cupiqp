@@ -1,7 +1,7 @@
 import cupy as cp
 import numpy as np
 from typing import List
-from enum import Enum, IntEnum, auto
+from enum import Enum, IntEnum
 import nvtx
 
 from .data import Data
@@ -196,39 +196,36 @@ class Variables:
         self._s_bl[:] = cp.random.rand(*self._s_bl.shape) + 1.0
 
 class InfoIdx(IntEnum):
-    """Index mapping for the contiguous Info scalar buffer."""
-    def _generate_next_value_(name, start, count, last_values):
-        return count   # 0, 1, 2, ...
-
-    rho = auto()
-    delta = auto()
-    mu = auto()
-    sigma = auto()
-    primal_step = auto()
-    dual_step = auto()
-    primal_res = auto()
-    primal_res_rel = auto()
-    dual_res = auto()
-    dual_res_rel = auto()
-    primal_res_reg = auto()
-    primal_res_reg_rel = auto()
-    dual_res_reg = auto()
-    dual_res_reg_rel = auto()
-    primal_prox_inf = auto()
-    dual_prox_inf = auto()
-    prev_primal_res = auto()
-    prev_dual_res = auto()
-    primal_obj = auto()
-    dual_obj = auto()
-    duality_gap = auto()
-    duality_gap_rel = auto()
-    reg_limit = auto()
-    setup_time = auto()
-    update_time = auto()
-    solve_time = auto()
-    kkt_factor_time = auto()
-    kkt_solve_time = auto()
-    run_time = auto()
+    """Column index of each scalar field in the contiguous Info buffer."""
+    rho = 0
+    delta = 1
+    mu = 2
+    sigma = 3
+    primal_step = 4
+    dual_step = 5
+    primal_res = 6
+    primal_res_rel = 7
+    dual_res = 8
+    dual_res_rel = 9
+    primal_res_reg = 10
+    primal_res_reg_rel = 11
+    dual_res_reg = 12
+    dual_res_reg_rel = 13
+    primal_prox_inf = 14
+    dual_prox_inf = 15
+    prev_primal_res = 16
+    prev_dual_res = 17
+    primal_obj = 18
+    dual_obj = 19
+    duality_gap = 20
+    duality_gap_rel = 21
+    reg_limit = 22
+    setup_time = 23
+    update_time = 24
+    solve_time = 25
+    kkt_factor_time = 26
+    kkt_solve_time = 27
+    run_time = 28
 
 class Info:
     """Per-problem solver info — ``(B, num_fields)`` GPU buffer.
@@ -237,22 +234,159 @@ class Info:
     For B=1 this is a ``(1, num_fields)`` buffer.
     """
 
-    # Auto-generate properties from InfoIdx: getter returns (B,) view,
-    # setter copies in-place.
-    for idx in InfoIdx:
-        def _make(i=idx):
-            def getter(self):
-                return self._buffer[:, i]
-            def setter(self, value):
-                self._buffer[:, i] = value
-            return property(getter, setter)
-        locals()[idx.name] = _make()
-    del idx, _make
+    # Each property is a (B,) view into the contiguous device buffer.
+    # Getters return the view; setters copy in-place to preserve the layout.
+
+    @property
+    def rho(self): return self._buffer[:, InfoIdx.rho]
+    @rho.setter
+    def rho(self, value): self._buffer[:, InfoIdx.rho] = value
+
+    @property
+    def delta(self): return self._buffer[:, InfoIdx.delta]
+    @delta.setter
+    def delta(self, value): self._buffer[:, InfoIdx.delta] = value
+
+    @property
+    def mu(self): return self._buffer[:, InfoIdx.mu]
+    @mu.setter
+    def mu(self, value): self._buffer[:, InfoIdx.mu] = value
+
+    @property
+    def sigma(self): return self._buffer[:, InfoIdx.sigma]
+    @sigma.setter
+    def sigma(self, value): self._buffer[:, InfoIdx.sigma] = value
+
+    @property
+    def primal_step(self): return self._buffer[:, InfoIdx.primal_step]
+    @primal_step.setter
+    def primal_step(self, value): self._buffer[:, InfoIdx.primal_step] = value
+
+    @property
+    def dual_step(self): return self._buffer[:, InfoIdx.dual_step]
+    @dual_step.setter
+    def dual_step(self, value): self._buffer[:, InfoIdx.dual_step] = value
+
+    @property
+    def primal_res(self): return self._buffer[:, InfoIdx.primal_res]
+    @primal_res.setter
+    def primal_res(self, value): self._buffer[:, InfoIdx.primal_res] = value
+
+    @property
+    def primal_res_rel(self): return self._buffer[:, InfoIdx.primal_res_rel]
+    @primal_res_rel.setter
+    def primal_res_rel(self, value): self._buffer[:, InfoIdx.primal_res_rel] = value
+
+    @property
+    def dual_res(self): return self._buffer[:, InfoIdx.dual_res]
+    @dual_res.setter
+    def dual_res(self, value): self._buffer[:, InfoIdx.dual_res] = value
+
+    @property
+    def dual_res_rel(self): return self._buffer[:, InfoIdx.dual_res_rel]
+    @dual_res_rel.setter
+    def dual_res_rel(self, value): self._buffer[:, InfoIdx.dual_res_rel] = value
+
+    @property
+    def primal_res_reg(self): return self._buffer[:, InfoIdx.primal_res_reg]
+    @primal_res_reg.setter
+    def primal_res_reg(self, value): self._buffer[:, InfoIdx.primal_res_reg] = value
+
+    @property
+    def primal_res_reg_rel(self): return self._buffer[:, InfoIdx.primal_res_reg_rel]
+    @primal_res_reg_rel.setter
+    def primal_res_reg_rel(self, value): self._buffer[:, InfoIdx.primal_res_reg_rel] = value
+
+    @property
+    def dual_res_reg(self): return self._buffer[:, InfoIdx.dual_res_reg]
+    @dual_res_reg.setter
+    def dual_res_reg(self, value): self._buffer[:, InfoIdx.dual_res_reg] = value
+
+    @property
+    def dual_res_reg_rel(self): return self._buffer[:, InfoIdx.dual_res_reg_rel]
+    @dual_res_reg_rel.setter
+    def dual_res_reg_rel(self, value): self._buffer[:, InfoIdx.dual_res_reg_rel] = value
+
+    @property
+    def primal_prox_inf(self): return self._buffer[:, InfoIdx.primal_prox_inf]
+    @primal_prox_inf.setter
+    def primal_prox_inf(self, value): self._buffer[:, InfoIdx.primal_prox_inf] = value
+
+    @property
+    def dual_prox_inf(self): return self._buffer[:, InfoIdx.dual_prox_inf]
+    @dual_prox_inf.setter
+    def dual_prox_inf(self, value): self._buffer[:, InfoIdx.dual_prox_inf] = value
+
+    @property
+    def prev_primal_res(self): return self._buffer[:, InfoIdx.prev_primal_res]
+    @prev_primal_res.setter
+    def prev_primal_res(self, value): self._buffer[:, InfoIdx.prev_primal_res] = value
+
+    @property
+    def prev_dual_res(self): return self._buffer[:, InfoIdx.prev_dual_res]
+    @prev_dual_res.setter
+    def prev_dual_res(self, value): self._buffer[:, InfoIdx.prev_dual_res] = value
+
+    @property
+    def primal_obj(self): return self._buffer[:, InfoIdx.primal_obj]
+    @primal_obj.setter
+    def primal_obj(self, value): self._buffer[:, InfoIdx.primal_obj] = value
+
+    @property
+    def dual_obj(self): return self._buffer[:, InfoIdx.dual_obj]
+    @dual_obj.setter
+    def dual_obj(self, value): self._buffer[:, InfoIdx.dual_obj] = value
+
+    @property
+    def duality_gap(self): return self._buffer[:, InfoIdx.duality_gap]
+    @duality_gap.setter
+    def duality_gap(self, value): self._buffer[:, InfoIdx.duality_gap] = value
+
+    @property
+    def duality_gap_rel(self): return self._buffer[:, InfoIdx.duality_gap_rel]
+    @duality_gap_rel.setter
+    def duality_gap_rel(self, value): self._buffer[:, InfoIdx.duality_gap_rel] = value
+
+    @property
+    def reg_limit(self): return self._buffer[:, InfoIdx.reg_limit]
+    @reg_limit.setter
+    def reg_limit(self, value): self._buffer[:, InfoIdx.reg_limit] = value
+
+    @property
+    def setup_time(self): return self._buffer[:, InfoIdx.setup_time]
+    @setup_time.setter
+    def setup_time(self, value): self._buffer[:, InfoIdx.setup_time] = value
+
+    @property
+    def update_time(self): return self._buffer[:, InfoIdx.update_time]
+    @update_time.setter
+    def update_time(self, value): self._buffer[:, InfoIdx.update_time] = value
+
+    @property
+    def solve_time(self): return self._buffer[:, InfoIdx.solve_time]
+    @solve_time.setter
+    def solve_time(self, value): self._buffer[:, InfoIdx.solve_time] = value
+
+    @property
+    def kkt_factor_time(self): return self._buffer[:, InfoIdx.kkt_factor_time]
+    @kkt_factor_time.setter
+    def kkt_factor_time(self, value): self._buffer[:, InfoIdx.kkt_factor_time] = value
+
+    @property
+    def kkt_solve_time(self): return self._buffer[:, InfoIdx.kkt_solve_time]
+    @kkt_solve_time.setter
+    def kkt_solve_time(self, value): self._buffer[:, InfoIdx.kkt_solve_time] = value
+
+    @property
+    def run_time(self): return self._buffer[:, InfoIdx.run_time]
+    @run_time.setter
+    def run_time(self, value): self._buffer[:, InfoIdx.run_time] = value
 
     def __init__(self, batch_size: int = 1):
         self._batch_size = batch_size
         self._status_value = np.full(batch_size, Status.CUPIQP_UNSOLVED.value, dtype=np.int32)
-        self.iter = np.zeros(batch_size, dtype=np.int32)
+        self.iter = np.zeros(batch_size, dtype=np.int32)  # individual iter counts for each problem in the batch
+        self.iter_total = 0  # total iterations the solver runs for this batch (the slowest problem's count)
         self.factor_retires = np.zeros(batch_size, dtype=np.int32)
         # Per-batch "no update" counters live on device (int32). Source of truth;
         # the rho/delta kernels reset on improved, increment on stagnated.
@@ -267,6 +401,11 @@ class Info:
     def status(self) -> List[Status]:
         """Per-problem status as a list of Status enums."""
         return [Status(v) for v in self._status_value]
+
+    @property
+    def status_value(self) -> np.ndarray:
+        """Per-problem status as a writable (B,) int32 array of Status values."""
+        return self._status_value
 
     @nvtx.annotate("Info:to_host")
     def to_host(self, info_host: 'InfoHost'):
@@ -287,9 +426,94 @@ class InfoHost:
     """
     __slots__ = ('_buffer', '_batch_size', 'no_primal_update', 'no_dual_update')
 
-    for _idx in InfoIdx:
-        locals()[_idx.name] = property(lambda self, i=_idx: self._buffer[:, i])
-    del _idx
+    # Each property is a read-only (B,) view into the contiguous host buffer.
+
+    @property
+    def rho(self): return self._buffer[:, InfoIdx.rho]
+
+    @property
+    def delta(self): return self._buffer[:, InfoIdx.delta]
+
+    @property
+    def mu(self): return self._buffer[:, InfoIdx.mu]
+
+    @property
+    def sigma(self): return self._buffer[:, InfoIdx.sigma]
+
+    @property
+    def primal_step(self): return self._buffer[:, InfoIdx.primal_step]
+
+    @property
+    def dual_step(self): return self._buffer[:, InfoIdx.dual_step]
+
+    @property
+    def primal_res(self): return self._buffer[:, InfoIdx.primal_res]
+
+    @property
+    def primal_res_rel(self): return self._buffer[:, InfoIdx.primal_res_rel]
+
+    @property
+    def dual_res(self): return self._buffer[:, InfoIdx.dual_res]
+
+    @property
+    def dual_res_rel(self): return self._buffer[:, InfoIdx.dual_res_rel]
+
+    @property
+    def primal_res_reg(self): return self._buffer[:, InfoIdx.primal_res_reg]
+
+    @property
+    def primal_res_reg_rel(self): return self._buffer[:, InfoIdx.primal_res_reg_rel]
+
+    @property
+    def dual_res_reg(self): return self._buffer[:, InfoIdx.dual_res_reg]
+
+    @property
+    def dual_res_reg_rel(self): return self._buffer[:, InfoIdx.dual_res_reg_rel]
+
+    @property
+    def primal_prox_inf(self): return self._buffer[:, InfoIdx.primal_prox_inf]
+
+    @property
+    def dual_prox_inf(self): return self._buffer[:, InfoIdx.dual_prox_inf]
+
+    @property
+    def prev_primal_res(self): return self._buffer[:, InfoIdx.prev_primal_res]
+
+    @property
+    def prev_dual_res(self): return self._buffer[:, InfoIdx.prev_dual_res]
+
+    @property
+    def primal_obj(self): return self._buffer[:, InfoIdx.primal_obj]
+
+    @property
+    def dual_obj(self): return self._buffer[:, InfoIdx.dual_obj]
+
+    @property
+    def duality_gap(self): return self._buffer[:, InfoIdx.duality_gap]
+
+    @property
+    def duality_gap_rel(self): return self._buffer[:, InfoIdx.duality_gap_rel]
+
+    @property
+    def reg_limit(self): return self._buffer[:, InfoIdx.reg_limit]
+
+    @property
+    def setup_time(self): return self._buffer[:, InfoIdx.setup_time]
+
+    @property
+    def update_time(self): return self._buffer[:, InfoIdx.update_time]
+
+    @property
+    def solve_time(self): return self._buffer[:, InfoIdx.solve_time]
+
+    @property
+    def kkt_factor_time(self): return self._buffer[:, InfoIdx.kkt_factor_time]
+
+    @property
+    def kkt_solve_time(self): return self._buffer[:, InfoIdx.kkt_solve_time]
+
+    @property
+    def run_time(self): return self._buffer[:, InfoIdx.run_time]
 
     def __init__(self, batch_size: int = 1, dtype=np.float64):
         self._batch_size = batch_size

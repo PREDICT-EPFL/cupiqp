@@ -1,16 +1,24 @@
 import cupy as cp
 import warp as wp
+from cupyx.scipy.sparse import csr_matrix
 
 from ..results import Variables
-from typing import Literal
+from typing import Literal, Optional, Sequence, Union
 
 from ..settings import Settings
 from ..solver import SolverBase
+from ..typedef import CudaArray
 from ..utils import is_cuda_array
 from .batched_csr import UniformBatchedCsrMatrix
 from .sparse_data import SparseData
 from .sparse_preconditioner import SparseRuizEquilibration
 from .sparse_solver_kernels import create_sparse_data_gradients_kernel
+
+
+# GPU CSR matrix inputs accepted by SparseSolver for P / A / G: a single GPU
+# CSR matrix (a cupy csr_matrix or a CUDA torch sparse-CSR tensor), cuPIQP's
+# own batched-CSR container, or a same-pattern sequence of cupy CSR matrices
+CsrMatrixInput = Union[csr_matrix, "torch.Tensor", UniformBatchedCsrMatrix, Sequence[csr_matrix]]
 
 
 
@@ -200,7 +208,18 @@ class SparseSolver(SolverBase):
         self._settings = value
 
 
-    def _init_data(self, P, c, A, b, G, h_u, h_l, x_u, x_l):
+    def _init_data(
+        self,
+        P: CsrMatrixInput,
+        c: CudaArray,
+        A: Optional[CsrMatrixInput],
+        b: Optional[CudaArray],
+        G: Optional[CsrMatrixInput],
+        h_u: Optional[CudaArray],
+        h_l: Optional[CudaArray],
+        x_u: Optional[CudaArray],
+        x_l: Optional[CudaArray],
+    ) -> SparseData:
         # Matrices: CSR-style sparse. Vectors: GPU dense (always).
         _check_sparse("P", P)
         _check_sparse("A", A)
@@ -215,7 +234,7 @@ class SparseSolver(SolverBase):
         data.init(P, c, A, b, G, h_u, h_l, x_u, x_l)
         return data
 
-    def _init_preconditioner(self):
+    def _init_preconditioner(self) -> SparseRuizEquilibration:
         return SparseRuizEquilibration(
             self._data.batch_size, self._data.n, self._data.p, self._data.m,
             self._data.idx_xl, self._data.idx_xu,
@@ -224,8 +243,18 @@ class SparseSolver(SolverBase):
             dtype=self._data.dtype,
         )
 
-    def setup(self, P, c, A=None, b=None, G=None,
-              h_u=None, h_l=None, x_u=None, x_l=None):
+    def setup(
+        self,
+        P: CsrMatrixInput,
+        c: CudaArray,
+        A: Optional[CsrMatrixInput] = None,
+        b: Optional[CudaArray] = None,
+        G: Optional[CsrMatrixInput] = None,
+        h_u: Optional[CudaArray] = None,
+        h_l: Optional[CudaArray] = None,
+        x_u: Optional[CudaArray] = None,
+        x_l: Optional[CudaArray] = None,
+    ) -> None:
         super().setup(P, c, A, b, G, h_u, h_l, x_u, x_l)
         # Cache CSR row decompressions for the backward-pass gather.
         # Sparsity patterns are fixed at setup, so this is done once.

@@ -125,13 +125,12 @@ nav:
   - Home: index.md
   - Installation: installation.md
   - Getting Started: getting-started.md
-  - Problem Formulation: problem-formulation.md
   - User Guide:
       - Backends: guide/backends.md
       - Batched Solving: guide/batched.md
       - Differentiation: guide/differentiation.md
   - API Reference:
-      - Overview: api/index.md
       - Solvers: api/solvers.md
       - Problem Data: api/data.md
-      - Settings & Results: api/settings-results.md
+      - Settings: api/settings.md
+      - Results & Statuses: api/results.md

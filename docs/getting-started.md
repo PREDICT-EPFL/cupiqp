@@ -211,4 +211,5 @@ new solver instance. See the [solver API](api/solvers.md) for exact method signa
 - [Backends](guide/backends.md) — choose dense, sparse, or multistage storage.
 - [Batched Solving](guide/batched.md) — the rules that apply across a batch.
 - [Differentiation](guide/differentiation.md) — compute VJPs through a solved QP.
-- [Settings & Results](api/settings-results.md) — tolerances, regularization, and more.
+- [Settings](api/settings.md) — tolerances, regularization, and more.
+- [Results & Status](api/results.md) — solution fields, per-problem diagnostics, and status codes.

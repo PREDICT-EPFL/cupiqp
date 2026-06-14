@@ -44,8 +44,8 @@ class MultistageRuizEquilibration(RuizEquilibration):
         self._dummy_4d = wp.zeros(
             (self.B, 1, 1, 1), dtype=to_warp_dtype(self._dtype), device="cuda"
         )
-        self._P_D = data.P.diag_blocks.data
-        self._P_E = data.P.off_diag_blocks_lower.data
+        self._P_D = data.P.D
+        self._P_E = data.P.E
         self._A_D = data.A.D if self.p > 0 else self._dummy_4d
         self._A_E = data.A.E if self.p > 0 else self._dummy_4d
         self._G_D = data.G.D if self.m > 0 else self._dummy_4d
@@ -120,8 +120,8 @@ class MultistageRuizEquilibration(RuizEquilibration):
         d_x_2d = d_x.reshape(B, N, bs)
 
         # P_D shape (B, N, d, d); P_E shape (B, N-1, d, d).
-        P_D = cp.from_dlpack(wp.to_dlpack(data.P.diag_blocks.data))
-        P_E = cp.from_dlpack(wp.to_dlpack(data.P.off_diag_blocks_lower.data))
+        P_D = cp.from_dlpack(wp.to_dlpack(data.P.D))
+        P_E = cp.from_dlpack(wp.to_dlpack(data.P.E))
         # P <- D_x P D_x: scale columns then rows of each batch's diag blocks.
         P_D *= d_x_2d[:, :, None, :]
         P_D *= d_x_2d[:, :, :, None]
@@ -162,8 +162,8 @@ class MultistageRuizEquilibration(RuizEquilibration):
         B = self.B
         N = data.num_blocks
         # (B, N, d, d) and (B, N-1, d, d).
-        P_D = cp.from_dlpack(wp.to_dlpack(data.P.diag_blocks.data))
-        P_E = cp.from_dlpack(wp.to_dlpack(data.P.off_diag_blocks_lower.data))
+        P_D = cp.from_dlpack(wp.to_dlpack(data.P.D))
+        P_E = cp.from_dlpack(wp.to_dlpack(data.P.E))
 
         # Column inf-norms of upper-triangular P (symmetric → col_norm == row_norm).
         # cp.triu broadcasts over the leading (B, N) axes.
@@ -217,13 +217,13 @@ class MultistageRuizEquilibration(RuizEquilibration):
         N, d = P.num_diag_blocks, P.block_size
 
         # (B, N, d, d) — row inf-norm over the trailing axis → (B, N, d).
-        P_D = cp.from_dlpack(wp.to_dlpack(P.diag_blocks.data))
+        P_D = cp.from_dlpack(wp.to_dlpack(P.D))
         out[:] = cp.linalg.norm(P_D, ord=cp.inf, axis=-1).reshape(B, N * d)
 
         if N > 1:
             # (B, N-1, d, d). Lower contributes to rows of blocks [1..N-1];
             # upper (= lower transposed) contributes to rows of blocks [0..N-2].
-            P_E = cp.from_dlpack(wp.to_dlpack(P.off_diag_blocks_lower.data))
+            P_E = cp.from_dlpack(wp.to_dlpack(P.E))
             row_lower = cp.linalg.norm(P_E, ord=cp.inf, axis=-1)                # (B, N-1, d)
             row_upper = cp.linalg.norm(P_E.swapaxes(-1, -2), ord=cp.inf, axis=-1)  # (B, N-1, d)
 

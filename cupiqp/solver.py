@@ -140,11 +140,6 @@ class SolverBase(ABC):
                 "create a new solver instance to set up a different problem."
             )
 
-        # Detect if user provided batched (3D P) or non-batched (2D P) data.
-        # DenseData auto-unsqueezes non-batched to (1, ...) internally,
-        # but we track this so solve() returns the right type.
-        self._user_batched = (hasattr(P, 'ndim') and P.ndim == 3) or (isinstance(P, (list, tuple)) and len(P) > 1)
-
         self._data = self._init_data(P, c, A, b, G, h_u, h_l, x_u, x_l)
         self._preconditioner = self._init_preconditioner()
         if self.settings.preconditioner_iter > 0:
@@ -367,16 +362,19 @@ class SolverBase(ABC):
             print("-" * _w)
             if self.settings.kkt_solver == "dense_cholesky":
                 print("dense backend:")
+                print(f"batch size B = {self._data.batch_size}")
                 print(f"variables n = {self._data.n}")
                 print(f"equality constraints p = {self._data.p}")
                 print(f"inequality constraints m = {self._data.m}")
             elif self.settings.kkt_solver == "sparse_ldlt":
                 print("sparse backend:")
+                print(f"batch size B = {self._data.batch_size}")
                 print(f"variables n = {self._data.n}, nnz(P) = {self._data.P.nnz}")
                 print(f"equality constraints p = {self._data.p}, nnz(A) = {self._data.A.nnz}")
                 print(f"inequality constraints m = {self._data.m}, nnz(G) = {self._data.G.nnz}")
             elif self.settings.kkt_solver == "multistage_block_cholesky":
                 print("multistage backend:")
+                print(f"batch size B = {self._data.batch_size}")
                 print(f"variables n = {self._data.n}, num_diag_blocks(P) = {self._data.P.num_diag_blocks}, block_size(P) = ({self._data.P.block_size}, {self._data.P.block_size})")
                 print(f"equality constraints p = {self._data.p}, num_diag_blocks(A) = {self._data.A.N}, block_size(A) = ({self._data.A.rows_of_blocks}, {self._data.A.cols_of_blocks})")
                 print(f"inequality constraints m = {self._data.m}, num_diag_blocks(G) = {self._data.G.N}, block_size(G) = ({self._data.G.rows_of_blocks}, {self._data.G.cols_of_blocks})")
@@ -390,10 +388,12 @@ class SolverBase(ABC):
             print("")
         return self._solve_impl()
 
-    def _solve_impl(self) -> Status:
-        self._result.info._status_value[:] = Status.CUPIQP_UNSOLVED.value
+    def _solve_impl(self) -> List[Status]:
+        self._result.info.status_value[:] = Status.CUPIQP_UNSOLVED.value
         self._unsolved_mask.fill(True)
         self._result.info.iter[:] = 0
+        self._result.info.iter_total = 0
+        self._iter = 0  # global IPM iteration counter (host scalar)
         self._result.info.reg_limit[:] = self.settings.reg_lower_limit
         # Refresh tau only if the user changed settings.tau between solves because it requires H2D memcpy
         if self._tau_host != self.settings.tau:
@@ -438,7 +438,8 @@ class SolverBase(ABC):
         ## ---------------------------------------------
         for iter in range(self.settings.max_iter):
             with nvtx.annotate(f"Solver::ipm_iteration"):
-                self._result.info.iter[:] = iter
+                self._iter = iter
+                self._result.info.iter[still_unsolved] = iter
                 if iter == 0:
                     self._update_residuals_nr()
                     self._result.info.prev_primal_res[:] = self._result.info.primal_res
@@ -466,7 +467,7 @@ class SolverBase(ABC):
                     gap_ok = (info_host.duality_gap < settings.eps_duality_gap_abs) | (info_host.duality_gap_rel < settings.eps_duality_gap_rel)
                     converged &= gap_ok
                 solved = still_unsolved & converged
-                self._result.info._status_value[solved] = Status.CUPIQP_SOLVED.value  # CPU write
+                self._result.info.status_value[solved] = Status.CUPIQP_SOLVED.value  # CPU write
 
                 # primal infeasibility check
                 primal_infeasible = still_unsolved & ~converged & (
@@ -474,7 +475,7 @@ class SolverBase(ABC):
                     (info_host.primal_prox_inf > settings.infeasibility_threshold) &
                     ((info_host.primal_res_reg < settings.eps_abs) | (info_host.primal_res_reg_rel < settings.eps_rel))
                 )
-                self._result.info._status_value[primal_infeasible] = Status.CUPIQP_PRIMAL_INFEASIBLE.value  # CPU write
+                self._result.info.status_value[primal_infeasible] = Status.CUPIQP_PRIMAL_INFEASIBLE.value  # CPU write
 
                 # dual infeasibility check
                 dual_infeasible = still_unsolved & ~converged & ~primal_infeasible & (
@@ -482,7 +483,7 @@ class SolverBase(ABC):
                     (info_host.dual_prox_inf > settings.infeasibility_threshold) &
                     ((info_host.dual_res_reg < settings.eps_abs) | (info_host.dual_res_reg_rel < settings.eps_rel))
                 )
-                self._result.info._status_value[dual_infeasible] = Status.CUPIQP_DUAL_INFEASIBLE.value  # CPU write
+                self._result.info.status_value[dual_infeasible] = Status.CUPIQP_DUAL_INFEASIBLE.value  # CPU write
 
                 newly_terminated = solved | primal_infeasible | dual_infeasible
                 mask_changed = np.any(newly_terminated)
@@ -533,7 +534,7 @@ class SolverBase(ABC):
                     self._result.info.no_dual_update[finetune_mask_dev] = 0
 
                 self._update_and_factorize_kkt()
-                if np.any(self._result.info._status_value == Status.CUPIQP_NUMERICAL_ISSUES.value):
+                if np.any(self._result.info.status_value == Status.CUPIQP_NUMERICAL_ISSUES.value):
                     break
 
                 if self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu == 0:
@@ -546,15 +547,16 @@ class SolverBase(ABC):
                     self._update_residuals_nr()
                     self._update_rho_delta_with_ineq()
 
+        self._result.info.iter_total = int(self._iter)
         # Mark remaining unsolved as max iter reached
-        self._result.info._status_value[self._result.info._status_value == Status.CUPIQP_UNSOLVED.value] = Status.CUPIQP_MAX_ITER_REACHED.value
+        self._result.info.status_value[self._result.info.status_value == Status.CUPIQP_UNSOLVED.value] = Status.CUPIQP_MAX_ITER_REACHED.value
+        if self.settings.verbose:
+            self._print_summary()
         if self.settings.preconditioner_iter > 0:
             self._preconditioner.unscale_solution(self._result, self._data)
         statuses = self._result.info.status
-        if self._user_batched:
-            return statuses
-        else:
-            return statuses[0]
+        
+        return statuses
 
     @nvtx.annotate("Solver::_initial_guess")
     def _initial_guess(self):
@@ -597,9 +599,6 @@ class SolverBase(ABC):
 
         self._kkt_system.solve(self._data, self._preconditioner, self.settings, self._res, self._result)  # getting an initial point of _result
 
-        if self.settings.debug:
-            print("Initial point after solving KKT system:", self._result)
-
         if self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu > 0:
             ## ----------- keep z and s non-negative --------------
             # this is according to the IV.A part of Roland Schwan 2023 paper.
@@ -614,9 +613,6 @@ class SolverBase(ABC):
             self._calculate_mu()
             cp.clip(self._result.info.mu, 1e-10, None, out=self._result.info.mu)
 
-            if self.settings.debug:
-                print("Initial mu:", self._result.info.mu)
-
             # put s and z on the central path
             # c = z - delta_z; z = (c + sqrt(c^2 + 4*mu)) / 2; s = z - c
             wp.launch(
@@ -627,9 +623,6 @@ class SolverBase(ABC):
                 device="cuda",
                 stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
             )
-
-            if self.settings.debug:
-                print("self._result:", self._result)
 
             self._calculate_mu()
 
@@ -644,7 +637,7 @@ class SolverBase(ABC):
 
         if B == 1:
             print(
-                f"{self._result.info.iter[0]:3d}   "
+                f"{self._iter:3d}   "
                 f"{info_host.primal_obj[0]: .5e}   "
                 f"{info_host.dual_obj[0]: .5e}  "
                 f"{info_host.duality_gap[0]: .5e}  "
@@ -659,11 +652,11 @@ class SolverBase(ABC):
             )
         
         else:
-            solved  = B - int((self._result.info._status_value == Status.CUPIQP_UNSOLVED.value).sum())
+            solved  = B - int((self._result.info.status_value == Status.CUPIQP_UNSOLVED.value).sum())
             counter = f"{solved}/{B}"
             counter_w = max(2 * len(str(B)) + 1, len("solved"))
             print(
-                f"{self._result.info.iter[0]:>4d}  "
+                f"{self._iter:>4d}  "
                 f"{counter:>{counter_w}}  "
                 f"{info_host.duality_gap.max():>12.5e}  "
                 f"{info_host.primal_res.max():>12.5e}  "
@@ -675,6 +668,22 @@ class SolverBase(ABC):
                 f"{info_host.dual_step.min():>6.4f}",
                 flush=True,
             )
+
+    @nvtx.annotate("Solver::_print_summary")
+    def _print_summary(self):
+        statuses = self._result.info.status
+        labels = {
+            "Solved":             Status.CUPIQP_SOLVED,
+            "Max iter reached":   Status.CUPIQP_MAX_ITER_REACHED,
+            "Primal infeasible":  Status.CUPIQP_PRIMAL_INFEASIBLE,
+            "Dual infeasible":    Status.CUPIQP_DUAL_INFEASIBLE,
+            "Numerical issues":   Status.CUPIQP_NUMERICAL_ISSUES,
+        }
+        print(f"\nFinished in {self._result.info.iter_total} iterations", flush=True)
+        for name, status in labels.items():
+            count = statuses.count(status)
+            if count > 0:
+                print(f"  {name + ':':<20} {count}/{len(statuses)}", flush=True)
 
     @nvtx.annotate("Solver::_update_and_factorize_kkt")
     def _update_and_factorize_kkt(self) -> None:
@@ -696,8 +705,8 @@ class SolverBase(ABC):
 
         if retries >= self.settings.max_factor_retires:
             # Mark all still-unsolved problems as numerical issues
-            still_unsolved = (self._result.info._status_value == Status.CUPIQP_UNSOLVED.value)
-            self._result.info._status_value[still_unsolved] = Status.CUPIQP_NUMERICAL_ISSUES.value
+            still_unsolved = (self._result.info.status_value == Status.CUPIQP_UNSOLVED.value)
+            self._result.info.status_value[still_unsolved] = Status.CUPIQP_NUMERICAL_ISSUES.value
 
     @abstractmethod
     def _init_data(self, P, c, A, b, G, h_u, h_l, x_u, x_l):
@@ -796,10 +805,6 @@ class SolverBase(ABC):
     def _run_predictor_corrector(self):
         """Predictor-corrector steps + variable update + mu calculation."""
         # ------------------ predictor step ------------------
-        if self.settings.debug:
-            print("before predictor step, result is: ", self._result)
-            print("before predictor step, res is: ", self._res)
-
         # Short derivation:
         # Complementarity (elementwise): s_i * z_i = mu (usually written s * z = mu e).
         # Predictor (affine) aims for the affine step that drives complementarity to zero, so require (s + Δs) ∘ (z + Δz) = 0.
@@ -817,13 +822,7 @@ class SolverBase(ABC):
             stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
         )
 
-        if self.settings.debug:
-            print("predictor step rhs is: res= ", self._res)
-
         self._kkt_system.solve(self._data, self._preconditioner, self.settings, self._res, self._step)
-
-        if self.settings.debug:
-            print("predictor step is:", self._step)
 
         # step in the non-negative orthant
         self._calculate_step()
@@ -848,12 +847,7 @@ class SolverBase(ABC):
             stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
         )
 
-        if self.settings.debug:
-            print("corrector step rhs is: res= ", self._res)
         self._kkt_system.solve(self._data, self._preconditioner, self.settings, self._res, self._step)
-
-        if self.settings.debug:
-            print("corrector step is:", self._step)
 
         # step in the non-negative orthant
         self._calculate_step()
@@ -1240,7 +1234,7 @@ class SolverBase(ABC):
                 settings.eps_rel,
                 settings.reg_finetune_lower_limit,
                 settings.infeasibility_threshold,
-                info.iter[0],
+                wp.int32(self._iter),
             ],
             device="cuda",
             stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
@@ -1267,7 +1261,7 @@ class SolverBase(ABC):
                 settings.eps_abs,
                 settings.eps_rel,
                 settings.infeasibility_threshold,
-                info.iter[0],
+                wp.int32(self._iter),  # self._iter is int64, need to convert to int32
             ],
             device="cuda",
             stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),

@@ -12,18 +12,46 @@ class MultistageData(Data):
     """
     Multistage QP data with block-structured matrices, natively batched.
 
-    Formulation (applied per batch index ``b``)::
+    Stored in condensed QP form::
 
-        min  0.5 * x[b]^T P[b] x[b] + c[b]^T x[b]
-        s.t. A[b] x[b] = b[b]
-             h_l[b] <= G[b] x[b] <= h_u[b]
-             x_l[b] <= x[b] <= x_u[b]
+        min  0.5 * x^T P x + c^T x
+        s.t. A x = b
+             h_l <= G x <= h_u
+             x_l <= x <= x_u
 
-    Where P is block-tridiagonal, A and G are block-bidiagonal, and all
-    matrices/vectors carry a leading batch axis. ``batch_size`` defaults to
-    1 so the single-QP API is unchanged at the user level.
+    where P is block-tridiagonal, and A and G are block-bidiagonal. This
+    structure comes from an underlying multistage (optimal-control) problem
+    over stages ``i = 0, ..., N`` -- equation (1) of Schwan et al.,
+    "Exploiting Multistage Optimization Structure in Proximal Solvers"
+    (arXiv:2503.12664), specialized to the case with no global variables::
 
-    All flat CuPy views (``_c``, ``_b``, ``_h_l``, …) are zero-copy DLPack
+        min   sum_{i=0}^{N-1} l_i(x_i, x_{i+1})  +  l_N(x_N)
+        s.t.  A_i x_i + B_i x_{i+1} = b_i,     i = 0, ..., N-1
+              A_N x_N = b_N
+              C_i x_i + D_i x_{i+1} <= h_i,    i = 0, ..., N-1
+              C_N x_N <= h_N
+
+    with per-stage costs::
+
+        l_i(x_i, x_{i+1}) = 0.5 x_i^T Q_i x_i + x_{i+1}^T S_i x_i + c_i^T x_i
+        l_N(x_N)          = 0.5 x_N^T Q_N x_N + c_N^T x_N
+
+    Stacking the stage variables ``x = (x_0, ..., x_N)`` recovers the
+    condensed QP above: the stage Hessians ``Q_i`` become the diagonal
+    blocks of P and the coupling terms ``S_i`` its lower off-diagonal blocks
+    (so P is block-tridiagonal); the ``c_i`` stack into c; and the stage
+    constraint matrices form the block-bidiagonal A (diagonal blocks ``A_i``,
+    lower off-diagonal blocks ``B_i``) and G (diagonal blocks ``C_i``, lower
+    off-diagonal blocks ``D_i``). The solver additionally supports two-sided
+    inequality bounds ``h_l <= G x <= h_u`` and box bounds
+    ``x_l <= x <= x_u`` on top of the one-sided form above.
+
+    A batch of such QPs is stored together: every matrix and vector carries
+    a leading batch axis, and the same formulation is solved independently
+    for each batch entry. ``batch_size`` defaults to 1 so the single-QP API
+    is unchanged at the user level.
+
+    All flat CuPy views (``_c``, ``_b``, ``_h_l``, ...) are zero-copy DLPack
     views of the underlying Warp buffers and have shape ``(B, k)``. Updating
     the Warp buffer (e.g. via ``set_c``) automatically makes the flat view
     reflect the new values.
@@ -46,8 +74,8 @@ class MultistageData(Data):
     ):
         """Allocate and populate buffers from user inputs. Returns self for chaining."""
 
-        self._require_dtype(P.diag_blocks.data)
-        self._require_dtype(P.off_diag_blocks_lower.data)
+        self._require_dtype(P.D)
+        self._require_dtype(P.E)
         self._require_dtype(c.data)
         if A is not None:
             self._require_dtype(A.D)
@@ -233,7 +261,7 @@ class MultistageData(Data):
         d = self.block_size
         N = self.num_blocks
         # (B, N, d, d) — Warp buffer.
-        P_D = cp.from_dlpack(wp.to_dlpack(self._P.diag_blocks.data))
+        P_D = cp.from_dlpack(wp.to_dlpack(self._P.D))
         # cp.diagonal over axes 2, 3 gives (B, N, d) → reshape to (B, N*d).
         diag_P[:] = cp.diagonal(P_D, axis1=2, axis2=3).reshape(B, N * d)
 
@@ -251,8 +279,8 @@ class MultistageData(Data):
                 raise ValueError(
                     f"P block_size mismatch: got {value.block_size}, expected {self._P.block_size}"
                 )
-        wp.copy(self._P.diag_blocks.data, value.diag_blocks.data)
-        wp.copy(self._P.off_diag_blocks_lower.data, value.off_diag_blocks_lower.data)
+        wp.copy(self._P.D, value.D)
+        wp.copy(self._P.E, value.E)
 
     def set_c(self, value: BlockVec, check: bool = True):
         if check:

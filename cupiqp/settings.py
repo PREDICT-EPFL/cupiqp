@@ -81,7 +81,6 @@ class Settings:
     enable_cuda_graph: bool = True
 
     verbose: bool = False
-    debug: bool = False
     compute_timings: bool = False
     enable_grad: bool = False
 

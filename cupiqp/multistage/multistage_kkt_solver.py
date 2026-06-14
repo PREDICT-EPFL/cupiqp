@@ -11,7 +11,7 @@ from socu.block_tridiag_solver import (
 from ..kkt_solver import KKTSolverBase
 from ..utils import to_warp_dtype
 from .multistage_data import MultistageData
-from .multistage_utils import (
+from .multistage_utils_kernels import (
     create_block_bidiag_gemv_n_kernel,
     create_block_bidiag_gemv_t_kernel,
     create_block_tridiag_gemv_kernel,
@@ -140,8 +140,8 @@ class MultistageKKTSolver(KKTSolverBase):
             kernel=self._update_kkt_kernel,
             dim=(B, N + 1, d, d),
             inputs=[
-                data._P.diag_blocks.data,
-                data._P.off_diag_blocks_lower.data,
+                data._P.D,
+                data._P.E,
                 x_reg,
                 self._AtA_diag, self._AtA_offdiag,
                 delta,
@@ -252,8 +252,8 @@ class MultistageKKTSolver(KKTSolverBase):
             dim=(self._batch_size, self.num_stages, self._block_size),
             inputs=[
                 self._wp_dtype(alpha),
-                data._P.diag_blocks.data,
-                data._P.off_diag_blocks_lower.data,
+                data._P.D,
+                data._P.E,
                 x,
                 self._wp_dtype(0.0),
                 z,
