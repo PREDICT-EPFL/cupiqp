@@ -73,7 +73,7 @@ Framework-independent dependencies (`numpy`, `scipy`, `warp-lang`, `nvmath-pytho
   [Getting Started](getting-started.md).
 - Building a controller or learning loop? See [Batched Solving](guide/batched.md).
 - Differentiating through a solution? See [Differentiation](guide/differentiation.md).
-- Looking for a specific class or setting? See the [API Reference](api/index.md).
+- Looking for a specific class or setting? See the [API Reference](api/solvers.md).
 
 ## Citing
 
