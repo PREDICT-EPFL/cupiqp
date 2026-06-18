@@ -14,7 +14,9 @@ The abstract base class shared by all backends.
     options:
       show_if_no_docstring: true
       members: [n, p, m, batch_size, dtype, device, P, c, A, b, G, h_l, h_u, x_l, x_u,
-                num_hl, num_hu, num_xl, num_xu, num_ineq, idx_hl, idx_hu, idx_xl, idx_xu]
+                num_hl, num_hu, num_xl, num_xu, num_ineq,
+                finite_mask_hl, finite_mask_hu, finite_mask_xl, finite_mask_xu,
+                active_G_row, active_x_bound, num_finite_bounds]
 
 ## DenseData
 

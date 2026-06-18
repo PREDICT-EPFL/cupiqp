@@ -83,9 +83,14 @@ All problems in a batch share the same **structure**, even though their numerica
 differ:
 
 - Same shapes `n`, `p`, `m` and (for the sparse backend) the same sparsity pattern.
-- **Same finite/infinite bound pattern.** Every problem in the batch must mark the same
-  entries of `h_l`, `h_u`, `x_l`, `x_u` as `±inf`. cuPIQP validates this at `setup()`
-  and raises a `ValueError` on a mismatch.
 - For sparse solver, all $P$ matrices in the batch must have the same sparsity pattern. This also applies to $A$ and $G$.
+
+!!! note "Bound patterns may differ per problem"
+    The finite/infinite **bound pattern** does **not** have to be shared across the batch.
+    Each problem may mark different entries of `h_l`, `h_u`, `x_l`, `x_u` as `±inf`, and you
+    may even toggle a bound between finite and `±inf` across solves with `update()` without
+    calling `setup()` again. cuPIQP stores a full-length dual/slack vector — one slot per
+    row of `G` and per variable — and masks the infinite entries per problem, so no common
+    bound pattern is required.
 
 

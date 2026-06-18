@@ -49,21 +49,23 @@ After calling `solver.solve()`, the per-problem status can be obtained from `sol
 
 ### Solution variables
 
-`solver.result` exposes the full primal–dual–slack variables as zero-copy `(B, …)` views of the internal states as cupy arrays on **device**. Blocks tied to absent constraints are empty (e.g., if $h_l$ is `None`, then the shapes `z_l` and `s_l` are both `(B, 0)`).
+`solver.result` exposes the full primal–dual–slack variables as zero-copy `(B, …)` views of the internal states as cupy arrays on **device**. The blocks are **full-length**: one entry per row of `G` for the inequality variables and one entry per decision variable for the box-bound variables. A block is empty `(B, 0)` only when the corresponding constraint type is absent entirely — e.g. if no `G` is given (`m = 0`), then `z_l`, `z_u`, `s_l`, `s_u` are all `(B, 0)`.
 
 | Attribute | Shape | Meaning |
 |---|---|---|
 | `x` | `(B, n)` | primal solution |
 | `y` | `(B, p)` | equality-constraint multipliers |
-| `z_l`, `z_u` | `(B, num_hl)`, `(B, num_hu)` | inequality multipliers (lower / upper rows of `G x`) |
-| `z_bl`, `z_bu` | `(B, num_xl)`, `(B, num_xu)` | box-bound multipliers (lower / upper) |
-| `s_l`, `s_u` | `(B, num_hl)`, `(B, num_hu)` | inequality slacks |
-| `s_bl`, `s_bu` | `(B, num_xl)`, `(B, num_xu)` | box-bound slacks |
+| `z_l`, `z_u` | `(B, m)` | inequality multipliers (lower / upper rows of `G x`) |
+| `z_bl`, `z_bu` | `(B, n)` | box-bound multipliers (lower / upper) |
+| `s_l`, `s_u` | `(B, m)` | inequality slacks |
+| `s_bl`, `s_bu` | `(B, n)` | box-bound slacks |
 
-The counts `num_hl`, `num_hu`, `num_xl`, `num_xu` are the numbers of **finite** lower/
-upper inequality and box bounds — infinite bounds are dropped, so these blocks only
-cover active bound rows. The convenience views `primals_all` and `duals_all` expose the
-packed primal and dual buffers.
+Every inequality block has one column per row of `G`, and every box block one column per
+variable, **whether or not** that individual bound is finite. Entries for infinite
+(inactive) bounds are held at zero rather than dropped, so each column keeps a stable
+position across solves even if you toggle a bound between finite and `±inf` via
+`update()`. The convenience views `primals_all` and `duals_all` expose the packed primal
+and dual buffers.
 
 !!! warning "Views, not copies"
     The solution attributes are views into the solver's internal GPU buffers and are

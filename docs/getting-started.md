@@ -188,8 +188,9 @@ print("All problems solved; dense and sparse batches agree.")
 
 ## Re-solving with new data
 
-`setup()` fixes the problem structure: shapes, sparsity patterns, which constraint
-blocks are present, and which bounds are finite. Call it once per solver instance.
+`setup()` fixes the problem structure: shapes, sparsity patterns, and which constraint
+blocks are present. Which individual bounds are finite is **not** part of that structure —
+see below. Call `setup()` once per solver instance.
 
 For new numerical values with the same structure, call `update()` and solve again.
 Arguments left as `None` keep their current values:
@@ -203,8 +204,11 @@ for b_k in trajectory:
     solver.solve()
 ```
 
-A change to dimensions, sparsity, constraint blocks, or finite-bound patterns requires a
-new solver instance. See the [solver API](api/solvers.md) for exact method signatures.
+It is allowed to change **which bounds are finite** in `update()`: pass new `h_l`, `h_u`, `x_l`, `x_u` arrays that mark different entries as `±inf` (cuPIQP keeps a full-length dual/slack vector
+and masks the infinite entries), so toggling a bound between finite and `±inf` does not need
+a new `setup()`. Only a change to dimensions, sparsity, or which constraint blocks are
+present requires a new solver instance. See the [solver API](api/solvers.md) for exact
+method signatures.
 
 ## Next steps
 
