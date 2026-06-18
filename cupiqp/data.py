@@ -16,7 +16,12 @@ class Data(ABC):
     def __init__(self, dtype=cp.float64, device: str = "cuda"):
         self._dtype = dtype
         self._device = device
-        self._finite_masks_kernel = create_finite_bound_masks_kernel(dtype)
+        # box-bound block presence is structural and fixed at setup(): the
+        # subclass init sets these from whether x_l / x_u were provided. An
+        # omitted block occupies no storage and produces empty (B, 0) views.
+        self._has_x_l = False
+        self._has_x_u = False
+        self._finite_masks_kernel = None
         self._finite_mask_all = None
 
     @property
@@ -82,6 +87,9 @@ class Data(ABC):
         self._init_h_u()
         self._init_x_l()
         self._init_x_u()
+        self._finite_masks_kernel = create_finite_bound_masks_kernel(
+            self._dtype, has_x_l=self._has_x_l, has_x_u=self._has_x_u
+        )
         self._update_finite_bound_masks()
 
     def _update_finite_bound_masks(self):
@@ -95,15 +103,25 @@ class Data(ABC):
         """
         B, m, n = self._batch_size, self.m, self._n
         dtype = self._dtype
-        num_ineq = 2 * m + 2 * n
+        num_hl, num_hu = self.num_hl, self.num_hu
+        num_xl, num_xu = self.num_xl, self.num_xu
+        num_ineq = num_hl + num_hu + num_xl + num_xu
+
+        # Running offsets in the packed [hl | hu | xl? | xu?] layout. An absent
+        # box block has zero width, so the following block slides up and its
+        # mask view becomes (B, 0).
+        off_hl = 0
+        off_hu = off_hl + num_hl
+        off_xl = off_hu + num_hu
+        off_xu = off_xl + num_xl
 
         # allocate once; reuse buffers on later calls
         if self._finite_mask_all is None or self._finite_mask_all.shape != (B, num_ineq):
             self._finite_mask_all = cp.empty((B, num_ineq), dtype=dtype)
-            self._finite_mask_hl = self._finite_mask_all[:, 0:m]
-            self._finite_mask_hu = self._finite_mask_all[:, m:2 * m]
-            self._finite_mask_xl = self._finite_mask_all[:, 2 * m:2 * m + n]
-            self._finite_mask_xu = self._finite_mask_all[:, 2 * m + n:2 * m + 2 * n]
+            self._finite_mask_hl = self._finite_mask_all[:, off_hl:off_hl + num_hl]
+            self._finite_mask_hu = self._finite_mask_all[:, off_hu:off_hu + num_hu]
+            self._finite_mask_xl = self._finite_mask_all[:, off_xl:off_xl + num_xl]
+            self._finite_mask_xu = self._finite_mask_all[:, off_xu:off_xu + num_xu]
             self._active_G_row = cp.empty((B, m), dtype=dtype)
             self._active_x_bound = cp.empty((B, n), dtype=dtype)
             self._num_finite_bounds = cp.empty((B,), dtype=dtype)
@@ -145,34 +163,24 @@ class Data(ABC):
             raise ValueError(f"h_u shape mismatch: expected {(B, m)}, got {self._h_u.shape}")
 
     def _init_x_l(self):
-        n = self._n
+        B, n = self._batch_size, self._n
+        if not self._has_x_l:
+            self._x_l = cp.empty((B, 0), dtype=self._dtype)
+            return
         if self._x_l.shape[-1] == 0:
-            self._x_l = -2 * PIQP_INF * cp.ones((self._batch_size, n), dtype=self._dtype)
-        if self._x_l.shape != (self._batch_size, n):
-            raise ValueError(f"x_l shape mismatch: expected {(self._batch_size, n)}, got {self._x_l.shape}")
+            self._x_l = -2 * PIQP_INF * cp.ones((B, n), dtype=self._dtype)
+        if self._x_l.shape != (B, n):
+            raise ValueError(f"x_l shape mismatch: expected {(B, n)}, got {self._x_l.shape}")
 
     def _init_x_u(self):
-        n = self._n
+        B, n = self._batch_size, self._n
+        if not self._has_x_u:
+            self._x_u = cp.empty((B, 0), dtype=self._dtype)
+            return
         if self._x_u.shape[-1] == 0:
-            self._x_u = 2 * PIQP_INF * cp.ones((self._batch_size, n), dtype=self._dtype)
-        if self._x_u.shape != (self._batch_size, n):
-            raise ValueError(f"x_u shape mismatch: expected {(self._batch_size, n)}, got {self._x_u.shape}")
-
-    @staticmethod
-    def _validate_bound_consistency(bounds: cp.ndarray, threshold: float,
-                                    direction: str, name: str):
-        """Ensure all problems in the batch have the same finite/infinite pattern."""
-        if bounds.shape[0] <= 1:
-            return  # nothing to validate for B=1
-        if direction == '>':
-            mask = bounds > -abs(threshold)
-        else:
-            mask = bounds < abs(threshold)
-        if not bool(cp.all(mask == mask[0:1])):
-            raise ValueError(
-                f"Bound structure mismatch in '{name}': all problems in the batch "
-                f"must have the same set of finite bounds."
-            )
+            self._x_u = 2 * PIQP_INF * cp.ones((B, n), dtype=self._dtype)
+        if self._x_u.shape != (B, n):
+            raise ValueError(f"x_u shape mismatch: expected {(B, n)}, got {self._x_u.shape}")
 
     # ------------------------------------------------------------------
     # Properties
@@ -235,25 +243,63 @@ class Data(ABC):
 
     @property
     def num_hl(self) -> int:
+        """Length of the lower-inequality dual/slack block, always ``m``.
+
+        With the full-length layout there is one slot per row of ``G``
+        regardless of how many lower bounds are finite; infinite bounds are
+        masked, not dropped.
+        """
         return self.m
 
     @property
     def num_hu(self) -> int:
+        """Length of the upper-inequality dual/slack block, always ``m``.
+
+        One slot per row of ``G``; infinite bounds are masked, not dropped.
+        """
         return self.m
 
     @property
+    def has_x_l(self) -> bool:
+        """Whether a lower box-bound block was provided at setup().
+
+        Box-block presence is structural and fixed at setup(); when ``False``
+        the lower box block occupies no storage and ``x_l`` / ``z_bl`` / ``s_bl``
+        are empty ``(B, 0)`` views.
+        """
+        return self._has_x_l
+
+    @property
+    def has_x_u(self) -> bool:
+        """Whether an upper box-bound block was provided at setup().
+
+        See :attr:`has_x_l`; when ``False`` the upper box block has no storage.
+        """
+        return self._has_x_u
+
+    @property
     def num_xl(self) -> int:
-        """Number of lower bound constraints."""
-        return self.n
+        """Length of the lower box-bound dual/slack block.
+
+        ``n`` when a lower box block was provided at setup(), else ``0``. When
+        present there is one slot per variable; infinite bounds inside the
+        block are masked, not dropped.
+        """
+        return self.n if self._has_x_l else 0
 
     @property
     def num_xu(self) -> int:
-        """Number of upper bound constraints."""
-        return self.n
+        """Length of the upper box-bound dual/slack block.
+
+        ``n`` when an upper box block was provided at setup(), else ``0``. When
+        present there is one slot per variable; infinite bounds inside the
+        block are masked, not dropped.
+        """
+        return self.n if self._has_x_u else 0
 
     @property
     def num_ineq(self) -> int:
-        return 2 * self.m + 2 * self.n
+        return self.num_hl + self.num_hu + self.num_xl + self.num_xu
 
     @property
     def finite_mask_hl(self):
@@ -292,5 +338,9 @@ class Data(ABC):
 
     @property
     def finite_mask_all(self):
-        """(B, 2*m+2*n) finite-bound mask in [l, u, bl, bu] layout."""
+        """(B, num_ineq) finite-bound mask in packed [hl | hu | xl? | xu?] layout.
+
+        Absent box blocks contribute zero width, so ``num_ineq`` is
+        ``2*m + num_xl + num_xu``.
+        """
         return self._finite_mask_all

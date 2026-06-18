@@ -197,6 +197,7 @@ class RuizEquilibration(PreconditionerBase):
     """
 
     def __init__(self, B: int, n: int, p: int, m: int,
+                 has_x_l: bool, has_x_u: bool,
                  active_x_bound: Optional[cp.ndarray] = None,
                  min_scaling: float = 1e-4,
                  max_scaling: float = 1e4,
@@ -209,6 +210,11 @@ class RuizEquilibration(PreconditionerBase):
         self.n = n
         self.p = p
         self.m = m
+
+        self._has_x_l = has_x_l
+        self._has_x_u = has_x_u
+        self._num_xl = n if has_x_l else 0
+        self._num_xu = n if has_x_u else 0
         self._dtype = dtype
 
         self.min_scaling = min_scaling
@@ -248,7 +254,7 @@ class RuizEquilibration(PreconditionerBase):
         #             [z_u]:  delta_inv[:, n + p : n + p + m]   (full-length)
         #             [z_bl]: delta_b_inv[:, :n]                (full-length)
         #             [z_bu]: delta_b_inv[:, :n]                (full-length)
-        num_duals = p + m + m + n + n
+        num_duals = p + m + m + self._num_xl + self._num_xu
         self._dual_res_unscale_factor = cp.ones((B, n), dtype=dtype)
         self._primal_res_unscale_factor = cp.ones((B, num_duals), dtype=dtype)
 
@@ -284,7 +290,7 @@ class RuizEquilibration(PreconditionerBase):
             self._conv_check_kernel = create_ruiz_conv_check_kernel(n, p, m, dtype=self._dtype)
             self._compute_rhs_inf_norm_unscaled_kernel = (
                 create_compute_constraints_rhs_inf_norm_unscaled_kernel(
-                    n, p, m, m, m, n, n,
+                    n, p, m, m, m, self._num_xl, self._num_xu,
                     dtype=self._dtype,
                 )
             )
@@ -292,11 +298,12 @@ class RuizEquilibration(PreconditionerBase):
             self._conv_check_kernel = None
             self._compute_rhs_inf_norm_unscaled_kernel = None
         self._calc_scaling_inv_and_scale_bounds_kernel = create_calc_scaling_inv_and_scale_bounds_kernel(
-            n, p, m, m, m, n, n,
+            n, p, m, m, m, self._num_xl, self._num_xu,
+            has_x_l=self._has_x_l, has_x_u=self._has_x_u,
             dtype=self._dtype,
         )
-        self._scale_bounds_kernel = create_scale_bounds_kernel(n, p, m, dtype=self._dtype)
-        self._unscale_bounds_kernel = create_unscale_bounds_kernel(n, p, m, dtype=self._dtype)
+        self._scale_bounds_kernel = create_scale_bounds_kernel(n, p, m, has_x_l=self._has_x_l, has_x_u=self._has_x_u, dtype=self._dtype)
+        self._unscale_bounds_kernel = create_unscale_bounds_kernel(n, p, m, has_x_l=self._has_x_l, has_x_u=self._has_x_u, dtype=self._dtype)
 
         # (2B,) buffer for per-batch (max_d, max_db) pairs — cp.max gives global.
         self._conv_buf = cp.empty(2 * B, dtype=dtype)
@@ -433,11 +440,12 @@ class RuizEquilibration(PreconditionerBase):
             # [z_u]: delta_inv[:, n + p : n + p + m]
             self._primal_res_unscale_factor[:, off:off + m] = self._delta_inv[:, n + p:n + p + m]
             off += m
-        if n > 0:
-            # [z_bl]: delta_b_inv[:, :n]
+        # [z_bl]: delta_b_inv[:, :n] — only when the lower box block exists.
+        if self._num_xl > 0:
             self._primal_res_unscale_factor[:, off:off + n] = self._delta_b_inv[:, :n]
             off += n
-            # [z_bu]: delta_b_inv[:, :n]
+        # [z_bu]: delta_b_inv[:, :n] — only when the upper box block exists.
+        if self._num_xu > 0:
             self._primal_res_unscale_factor[:, off:off + n] = self._delta_b_inv[:, :n]
 
     def reset(self):

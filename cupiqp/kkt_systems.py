@@ -143,10 +143,10 @@ class KKTSystem:
 
         # Create Warp kernels
         self._update_regularization_step_1_kernel = create_update_regularizations_step_1_kernel(num_ineq=num_ineq, dtype=self._dtype)
-        self._update_regularization_step_2_kernel = create_update_regularizations_step_2_kernel(n, m, dtype=self._dtype)
+        self._update_regularization_step_2_kernel = create_update_regularizations_step_2_kernel(n, m, has_x_l=data.has_x_l, has_x_u=data.has_x_u, dtype=self._dtype)
         self._eliminate_slacks_kernel = create_eliminate_slacks_kernel(dtype=self._dtype)
         self._eliminate_slacks_transposed_kernel = create_eliminate_slacks_transposed_kernel(dtype=self._dtype)
-        self._eliminate_duals_kernel = create_eliminate_duals_kernel(n, m, dtype=self._dtype)
+        self._eliminate_duals_kernel = create_eliminate_duals_kernel(n, m, has_x_l=data.has_x_l, has_x_u=data.has_x_u, dtype=self._dtype)
         self._recover_duals_kernel = create_recover_duals_kernel(data.num_hu, data.num_hl, data.num_xu, data.num_xl, dtype=self._dtype)
         self._recover_slacks_kernel = create_recover_slacks_kernel(dtype=self._dtype)
         self._recover_slacks_transposed_kernel = create_recover_slacks_transposed_kernel(dtype=self._dtype)
@@ -219,7 +219,14 @@ class KKTSystem:
             cp.multiply(self._w_delta_inv_all, data.finite_mask_all, out=self._w_delta_inv_all)
 
             xbs = preconditioner.x_b_scaling
-            self._x_reg[:] = self._rho[:, None] + xbs * xbs * (self._w_bu_delta_inv + self._w_bl_delta_inv)
+            # Box blocks are optional: w_bu/w_bl are (B, num_xu)/(B, num_xl),
+            # which are (B, 0) for an omitted side. Add each present side
+            # separately so a one-sided box does not broadcast (B, n) + (B, 0).
+            self._x_reg[:] = self._rho[:, None]
+            if data.num_xl > 0:
+                self._x_reg += xbs * xbs * self._w_bl_delta_inv
+            if data.num_xu > 0:
+                self._x_reg += xbs * xbs * self._w_bu_delta_inv
             if data.m > 0:
                 # z_reg_inv = weight = w_l + w_u (condensed row weight, 0 on
                 # inactive rows). z_reg = 1 / weight (explicit augmented diagonal

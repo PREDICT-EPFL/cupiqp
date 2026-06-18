@@ -4,7 +4,7 @@ from ..utils import to_warp_dtype
 
 def create_sparse_data_gradients_kernel(
     nnz_P: int, nnz_A: int, nnz_G: int,
-    p: int, m: int, n: int,
+    p: int, m: int, n: int, num_xu: int,
 dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     
@@ -34,7 +34,7 @@ dtype=wp.float64):
         dG_values: wp.array2d(dtype=dtype),  # type: ignore (B, nnz_G)
         db:        wp.array2d(dtype=dtype),  # type: ignore (B, p)
         dh_u:      wp.array2d(dtype=dtype),  # type: ignore (B, m)
-        dx_u:      wp.array2d(dtype=dtype),  # type: ignore (B, n)
+        dx_u:      wp.array2d(dtype=dtype),  # type: ignore (B, num_xu)
     ):
         b, t = wp.tid()
         nnzP_s = wp.static(nnz_P)
@@ -43,13 +43,14 @@ dtype=wp.float64):
         p_s    = wp.static(p)
         m_s    = wp.static(m)
         n_s    = wp.static(n)
+        num_xu_s = wp.static(num_xu)
 
         end_dP   = nnzP_s
         end_dA   = end_dP + nnzA_s
         end_dG   = end_dA + nnzG_s
         end_db   = end_dG + p_s
         end_dh_u = end_db + m_s
-        end_dx_u = end_dh_u + n_s
+        end_dx_u = end_dh_u + num_xu_s
 
         if t < end_dP:
             k = t

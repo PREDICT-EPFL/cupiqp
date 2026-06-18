@@ -3,7 +3,6 @@ from typing import Any, Optional
 import cupy as cp
 
 from ..data import Data
-from ..typedef import PIQP_INF
 
 
 # Type alias for every dense-input form the constructor accepts. ``cp.asarray``
@@ -127,6 +126,10 @@ class DenseData(Data):
         if x_l is not None and x_u is not None:
             if x_l.shape != (B, n) or x_u.shape != (B, n):
                 raise ValueError(f"x_l and x_u must have shape ({B}, {n}).")
+        # Box-block presence is structural and fixed here: an omitted bound
+        # gets no storage (empty (B, 0)); a provided one is a full (B, n) block.
+        self._has_x_l = x_l is not None
+        self._has_x_u = x_u is not None
         self._x_u = self._as_batched_vec(x_u)
         self._x_l = self._as_batched_vec(x_l)
 
@@ -184,12 +187,22 @@ class DenseData(Data):
         self._update_finite_bound_masks()
 
     def set_x_l(self, value: cp.ndarray, check: bool = True):
+        if not self._has_x_l:
+            raise ValueError(
+                "Cannot set x_l: no lower box-bound block was provided at setup(). "
+                "Adding a box-bound block requires a new setup()."
+            )
         if check and value.shape != self._x_l.shape:
             raise ValueError(f"x_l shape mismatch: expected {self._x_l.shape}, got {value.shape}")
         self._x_l[:] = value
         self._update_finite_bound_masks()
 
     def set_x_u(self, value: cp.ndarray, check: bool = True):
+        if not self._has_x_u:
+            raise ValueError(
+                "Cannot set x_u: no upper box-bound block was provided at setup(). "
+                "Adding a box-bound block requires a new setup()."
+            )
         if check and value.shape != self._x_u.shape:
             raise ValueError(f"x_u shape mismatch: expected {self._x_u.shape}, got {value.shape}")
         self._x_u[:] = value

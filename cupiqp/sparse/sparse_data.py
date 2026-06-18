@@ -2,7 +2,6 @@ from typing import Any, Optional
 import cupy as cp
 
 from ..data import Data
-from ..typedef import PIQP_INF
 from .batched_csr import UniformBatchedCsrMatrix
 
 
@@ -106,6 +105,10 @@ class SparseData(Data):
         m = self._G.rows
         self._h_u = self._to_batched_vec(h_u, B, m, "h_u", dtype=dtype) if h_u is not None else cp.zeros((B, 0), dtype=dtype)
         self._h_l = self._to_batched_vec(h_l, B, m, "h_l", dtype=dtype) if h_l is not None else cp.zeros((B, 0), dtype=dtype)
+        # Box-block presence is structural and fixed here: an omitted bound
+        # gets no storage (empty (B, 0)); a provided one is a full (B, n) block.
+        self._has_x_l = x_l is not None
+        self._has_x_u = x_u is not None
         self._x_u = self._to_batched_vec(x_u, B, n, "x_u", dtype=dtype) if x_u is not None else cp.zeros((B, 0), dtype=dtype)
         self._x_l = self._to_batched_vec(x_l, B, n, "x_l", dtype=dtype) if x_l is not None else cp.zeros((B, 0), dtype=dtype)
 
@@ -282,12 +285,22 @@ class SparseData(Data):
         self._update_finite_bound_masks()
 
     def set_x_l(self, value: cp.ndarray, check: bool = True):
+        if not self._has_x_l:
+            raise ValueError(
+                "Cannot set x_l: no lower box-bound block was provided at setup(). "
+                "Adding a box-bound block requires a new setup()."
+            )
         if check and value.shape != self._x_l.shape:
             raise ValueError(f"x_l shape mismatch: expected {self._x_l.shape}, got {value.shape}")
         self._x_l[:] = value
         self._update_finite_bound_masks()
 
     def set_x_u(self, value: cp.ndarray, check: bool = True):
+        if not self._has_x_u:
+            raise ValueError(
+                "Cannot set x_u: no upper box-bound block was provided at setup(). "
+                "Adding a box-bound block requires a new setup()."
+            )
         if check and value.shape != self._x_u.shape:
             raise ValueError(f"x_u shape mismatch: expected {self._x_u.shape}, got {value.shape}")
         self._x_u[:] = value

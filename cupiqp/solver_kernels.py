@@ -917,7 +917,7 @@ def create_update_residual_nr_kernel(n: int, p: int, m: int, num_hl: int, num_hu
     return update_residual_nr_kernel
 
 
-def create_prepare_zu_minus_zl_and_zbu_minus_zbl_kernel(m: int, n: int, dtype=wp.float64):
+def create_prepare_zu_minus_zl_and_zbu_minus_zbl_kernel(m: int, n: int, has_x_l: bool, has_x_u: bool, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Pre-matvec combination for _update_residuals_nr.
 
@@ -927,14 +927,18 @@ def create_prepare_zu_minus_zl_and_zbu_minus_zbl_kernel(m: int, n: int, dtype=wp
 
           zu_minus_zl[:, i]  = z_u[:, i] - z_l[:, i]                  for i in [0, m)
           zbu_minus_zbl[:, j] = x_b_scaling[:, j] * (z_bu[:, j] - z_bl[:, j])  for j in [0, n)
+
+    An omitted box block (``has_x_l`` / ``has_x_u`` False) has empty ``(B, 0)``
+    duals and contributes 0 to ``zbu_minus_zbl``; the box reads are guarded by
+    the static presence flags.
     """
 
     @wp.kernel
     def prepare_zu_minus_zl_and_zbu_minus_zbl_kernel(
         z_u:              wp.array2d(dtype=dtype),  # type: ignore  (B, m)
         z_l:              wp.array2d(dtype=dtype),  # type: ignore  (B, m)
-        z_bl:             wp.array2d(dtype=dtype),  # type: ignore  (B, n)
-        z_bu:             wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        z_bl:             wp.array2d(dtype=dtype),  # type: ignore  (B, num_xl)
+        z_bu:             wp.array2d(dtype=dtype),  # type: ignore  (B, num_xu)
         x_b_scaling:      wp.array2d(dtype=dtype),  # type: ignore  (B, n)
         zu_minus_zl:      wp.array2d(dtype=dtype),  # type: ignore  (B, m) output
         zbu_minus_zbl:    wp.array2d(dtype=dtype),  # type: ignore  (B, n) output
@@ -946,7 +950,13 @@ def create_prepare_zu_minus_zl_and_zbu_minus_zbl_kernel(m: int, n: int, dtype=wp
             zu_minus_zl[b, i] = z_u[b, i] - z_l[b, i]
         else:
             j = i - m_static
-            zbu_minus_zbl[b, j] = x_b_scaling[b, j] * (z_bu[b, j] - z_bl[b, j])
+            zbu = dtype(0.0)
+            zbl = dtype(0.0)
+            if wp.static(has_x_u):
+                zbu = z_bu[b, j]
+            if wp.static(has_x_l):
+                zbl = z_bl[b, j]
+            zbu_minus_zbl[b, j] = x_b_scaling[b, j] * (zbu - zbl)
 
     return prepare_zu_minus_zl_and_zbu_minus_zbl_kernel
 
@@ -1589,18 +1599,21 @@ dtype=wp.float64):
     return backward_copy_kernel
 
 
-def create_backward_pack_full_layout_kernel(m: int, n: int, dtype=wp.float64):
+def create_backward_pack_full_layout_kernel(m: int, n: int, num_xl: int, num_xu: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     r"""Fused full-layout pack for the backward pass.
 
     With the full-length dual layout the active-only inputs are already the
     same length as the full-layout outputs (identity index map), so each
-    region is a direct per-element copy.
+    region is a direct per-element copy. Box blocks are optional: when a side
+    was omitted at setup() its width (``num_xl`` / ``num_xu``) is 0, so that
+    region is empty and its ``sol_z_b*`` / ``lam_zb*_full`` arrays are ``(B, 0)``.
 
     Outputs:
 
     * ``lam_zu_full, lam_zl_full ∈ (B, m)`` — copy of ``sol.z_u/z_l``.
-    * ``lam_zbu_full, lam_zbl_full ∈ (B, n)`` — copy of ``sol.z_bu/z_bl``.
+    * ``lam_zbu_full ∈ (B, num_xu)``, ``lam_zbl_full ∈ (B, num_xl)`` — copy of
+      ``sol.z_bu/z_bl`` (empty when that box side is absent).
     * ``zu_full, zl_full ∈ (B, m)`` — copy of ``result.z_u/z_l``.
     """
     @wp.kernel
@@ -1615,20 +1628,22 @@ def create_backward_pack_full_layout_kernel(m: int, n: int, dtype=wp.float64):
         # Full-layout outputs (no pre-zero required).
         lam_zu_full:  wp.array2d(dtype=dtype),  # type: ignore (B, m)
         lam_zl_full:  wp.array2d(dtype=dtype),  # type: ignore (B, m)
-        lam_zbu_full: wp.array2d(dtype=dtype),  # type: ignore (B, n)
-        lam_zbl_full: wp.array2d(dtype=dtype),  # type: ignore (B, n)
+        lam_zbu_full: wp.array2d(dtype=dtype),  # type: ignore (B, num_xu)
+        lam_zbl_full: wp.array2d(dtype=dtype),  # type: ignore (B, num_xl)
         zu_full:      wp.array2d(dtype=dtype),  # type: ignore (B, m)
         zl_full:      wp.array2d(dtype=dtype),  # type: ignore (B, m)
     ):
         b, t = wp.tid()
         m_static = wp.static(m)
-        n_static = wp.static(n)
+        num_xu_static = wp.static(num_xu)
+        num_xl_static = wp.static(num_xl)
 
-        # Six regions, one full-buffer position per thread.
+        # Six regions, one full-buffer position per thread. Absent box sides
+        # contribute zero-width regions.
         end_lam_zu  = m_static
         end_lam_zl  = end_lam_zu  + m_static
-        end_lam_zbu = end_lam_zl  + n_static
-        end_lam_zbl = end_lam_zbu + n_static
+        end_lam_zbu = end_lam_zl  + num_xu_static
+        end_lam_zbl = end_lam_zbu + num_xl_static
         end_res_zu  = end_lam_zbl + m_static
         end_res_zl  = end_res_zu  + m_static
 

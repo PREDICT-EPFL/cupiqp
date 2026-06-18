@@ -37,12 +37,13 @@ class Variables:
         self.p = data.p
         self.m = data.m
         n, m, p = data.n, data.m, data.p
-        self.num_ineq = 2 * m + 2 * n
+        num_xl, num_xu = data.num_xl, data.num_xu
+        self.num_ineq = 2 * m + num_xl + num_xu
 
         B = self._batch_size
         dtype = data.dtype
 
-        # Primal buffer: [x(n) | s_l(m) | s_u(m) | s_bl(n) | s_bu(n)]
+        # Primal buffer: [x(n) | s_l(m) | s_u(m) | s_bl(num_xl) | s_bu(num_xu)]
         self._primal_buffer = cp.empty((B, n + self.num_ineq), dtype=dtype)
         offset = 0
         self._x = self._primal_buffer[:, offset : offset+n]
@@ -52,11 +53,11 @@ class Variables:
         offset += m
         self._s_u = self._primal_buffer[:, offset : offset+m]
         offset += m
-        self._s_bl = self._primal_buffer[:, offset : offset+n]
-        offset += n
-        self._s_bu = self._primal_buffer[:, offset : offset+n]
+        self._s_bl = self._primal_buffer[:, offset : offset+num_xl]
+        offset += num_xl
+        self._s_bu = self._primal_buffer[:, offset : offset+num_xu]
 
-        # Dual buffer: [y(p) | z_l(m) | z_u(m) | z_bl(n) | z_bu(n)]
+        # Dual buffer: [y(p) | z_l(m) | z_u(m) | z_bl(num_xl) | z_bu(num_xu)]
         self._dual_buffer = cp.empty((B, p + self.num_ineq), dtype=dtype)
         offset = 0
         self._y = self._dual_buffer[:, offset : offset+p]
@@ -66,9 +67,9 @@ class Variables:
         offset += m
         self._z_u = self._dual_buffer[:, offset : offset+m]
         offset += m
-        self._z_bl = self._dual_buffer[:, offset : offset+n]
-        offset += n
-        self._z_bu = self._dual_buffer[:, offset : offset+n]
+        self._z_bl = self._dual_buffer[:, offset : offset+num_xl]
+        offset += num_xl
+        self._z_bu = self._dual_buffer[:, offset : offset+num_xu]
 
     # -- Properties: getters return (batch_size, *) views, setters copy in-place --
 

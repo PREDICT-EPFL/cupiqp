@@ -66,7 +66,7 @@ def create_update_regularizations_step_1_kernel(num_ineq: int, dtype=wp.float64)
     return update_regularizations_step_1_kernel
 
 
-def create_update_regularizations_step_2_kernel(nx: int, nz: int, dtype=wp.float64):
+def create_update_regularizations_step_2_kernel(nx: int, nz: int, has_x_l: bool, has_x_u: bool, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Create kernel specialized for the condensed KKT regularization terms.
 
@@ -79,8 +79,12 @@ def create_update_regularizations_step_2_kernel(nx: int, nz: int, dtype=wp.float
 
         z_reg[:] = 1. / (w_u_delta_inv + w_l_delta_inv)
 
-    NOTE: if there are inactive rows in G s.t. -inf <= G[i] * x <= +inf, the 
-    corresponding z_reg[i] will be 0. 
+    An omitted box block (``has_x_l`` / ``has_x_u`` False) contributes nothing to
+    ``x_reg`` and its ``w_b*_delta_inv`` array is empty ``(B, 0)``, so the box
+    reads are guarded by the static presence flags.
+
+    NOTE: if there are inactive rows in G s.t. -inf <= G[i] * x <= +inf, the
+    corresponding z_reg[i] will be 0.
 
     Each thread writes only to its own unique slot: one variable regularization
     entry ``x_reg[b, t]`` or one inequality row weight ``z_reg[b, tz]``.
@@ -103,9 +107,12 @@ def create_update_regularizations_step_2_kernel(nx: int, nz: int, dtype=wp.float
 
         if t < nx_static:
             xb_scaling = x_b_scaling[b, t]
-            x_reg[b, t] = rho[b] + xb_scaling * xb_scaling * (
-                w_bu_delta_inv[b, t] + w_bl_delta_inv[b, t]
-            )
+            box_weight = dtype(0.0)
+            if wp.static(has_x_u):
+                box_weight += w_bu_delta_inv[b, t]
+            if wp.static(has_x_l):
+                box_weight += w_bl_delta_inv[b, t]
+            x_reg[b, t] = rho[b] + xb_scaling * xb_scaling * box_weight
         elif t < nx_static + nz_static:
             tz = t - nx_static
             tmp = w_u_delta_inv[b, tz] + w_l_delta_inv[b, tz]
@@ -118,7 +125,7 @@ def create_update_regularizations_step_2_kernel(nx: int, nz: int, dtype=wp.float
 
     return update_regularizations_step_2_kernel
 
-def create_eliminate_duals_kernel(nx: int, nz: int, dtype=wp.float64):
+def create_eliminate_duals_kernel(nx: int, nz: int, has_x_l: bool, has_x_u: bool, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Create kernel specialized for eliminating dual rows after slack elimination.
 
@@ -172,10 +179,12 @@ def create_eliminate_duals_kernel(nx: int, nz: int, dtype=wp.float64):
 
         if t < nx_static:
             xb_scaling = x_b_scaling[b, t]
-            rhs_x_updated[b, t] = rhs_x[b, t] + xb_scaling * (
-                w_bu_delta_inv[b, t] * rhs_z_bu[b, t]
-                - w_bl_delta_inv[b, t] * rhs_z_bl[b, t]
-            )
+            box_term = dtype(0.0)
+            if wp.static(has_x_u):
+                box_term += w_bu_delta_inv[b, t] * rhs_z_bu[b, t]
+            if wp.static(has_x_l):
+                box_term -= w_bl_delta_inv[b, t] * rhs_z_bl[b, t]
+            rhs_x_updated[b, t] = rhs_x[b, t] + xb_scaling * box_term
         elif t < nx_static + nz_static:
             tz = t - nx_static
             val = w_u_delta_inv[b, tz] * rhs_z_u[b, tz] - w_l_delta_inv[b, tz] * rhs_z_l[b, tz]

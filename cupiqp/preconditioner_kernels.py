@@ -47,6 +47,7 @@ def create_clamp_and_rsqrt_kernel(n: int, p: int, m: int,
 def create_calc_scaling_inv_and_scale_bounds_kernel(
     n: int, p: int, m: int,
     num_hl: int, num_hu: int, num_xl: int, num_xu: int,
+    has_x_l: bool, has_x_u: bool,
 dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Fuse the kernel for storing the inverse of scaling factors and scaling the bounds.
@@ -104,9 +105,11 @@ dtype=wp.float64):
         if k < n_static:
             delta_inv[b, k] = dtype(1.0) / delta[b, k]
             delta_b_inv[b, k] = dtype(1.0) / delta_b[b, k]
-            # scale x_l and x_u inplace
-            data_x_l[b, k] = data_x_l[b, k] * delta_b[b, k]
-            data_x_u[b, k] = data_x_u[b, k] * delta_b[b, k]
+            # scale x_l and x_u inplace (only for box blocks that exist)
+            if wp.static(has_x_l):
+                data_x_l[b, k] = data_x_l[b, k] * delta_b[b, k]
+            if wp.static(has_x_u):
+                data_x_u[b, k] = data_x_u[b, k] * delta_b[b, k]
             # dual_res_unscale_factor = cost_scaling_inv * delta_inv on x-block
             dual_res_unscale_factor[b, k] = dtype(1.0) / (cost_scaling[b] * delta[b, k])
         elif k < np_static:
@@ -149,7 +152,7 @@ dtype=wp.float64):
     return finalize_and_scale_bounds_kernel
 
 
-def create_scale_bounds_kernel(n: int, p: int, m: int, dtype=wp.float64):
+def create_scale_bounds_kernel(n: int, p: int, m: int, has_x_l: bool, has_x_u: bool, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Sentinel-safe in-place forward bound scaling, single launch (B, n+p+m).
 
@@ -176,8 +179,10 @@ def create_scale_bounds_kernel(n: int, p: int, m: int, dtype=wp.float64):
         npm_static = wp.static(n + p + m)
         if k < n_static:
             dx = delta_b[b, k]
-            data_x_l[b, k] = data_x_l[b, k] * dx
-            data_x_u[b, k] = data_x_u[b, k] * dx
+            if wp.static(has_x_l):
+                data_x_l[b, k] = data_x_l[b, k] * dx
+            if wp.static(has_x_u):
+                data_x_u[b, k] = data_x_u[b, k] * dx
         elif k < np_static:
             jp = k - n_static
             data_b[b, jp] = data_b[b, jp] * delta[b, k]
@@ -192,7 +197,7 @@ def create_scale_bounds_kernel(n: int, p: int, m: int, dtype=wp.float64):
     return scale_bounds_kernel
 
 
-def create_unscale_bounds_kernel(n: int, p: int, m: int, dtype=wp.float64):
+def create_unscale_bounds_kernel(n: int, p: int, m: int, has_x_l: bool, has_x_u: bool, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Sentinel-safe in-place inverse bound scaling, single launch (B, n+p+m).
 
@@ -225,8 +230,10 @@ def create_unscale_bounds_kernel(n: int, p: int, m: int, dtype=wp.float64):
         npm_static = wp.static(n + p + m)
         if k < n_static:
             dx_inv = delta_b_inv[b, k]
-            data_x_l[b, k] = data_x_l[b, k] * dx_inv
-            data_x_u[b, k] = data_x_u[b, k] * dx_inv
+            if wp.static(has_x_l):
+                data_x_l[b, k] = data_x_l[b, k] * dx_inv
+            if wp.static(has_x_u):
+                data_x_u[b, k] = data_x_u[b, k] * dx_inv
         elif k < np_static:
             jp = k - n_static
             data_b[b, jp] = data_b[b, jp] * delta_inv[b, k]

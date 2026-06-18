@@ -7,6 +7,7 @@ def create_multistage_data_gradients_kernel(
     N_a: int, r_a: int,
     N_g: int, r_g: int,
     p: int, m: int, n: int,
+    num_xu: int, num_xl: int,
     dtype=wp.float64
     ):
     dtype = to_warp_dtype(dtype)
@@ -57,8 +58,8 @@ def create_multistage_data_gradients_kernel(
     end_db         = end_dc         + p
     end_dh_u       = end_db         + m
     end_dh_l       = end_dh_u       + m
-    end_dx_u       = end_dh_l       + n
-    end_dx_l       = end_dx_u       + n
+    end_dx_u       = end_dh_l       + num_xu
+    end_dx_l       = end_dx_u       + num_xl
 
     @wp.kernel
     def multistage_data_gradients_kernel(

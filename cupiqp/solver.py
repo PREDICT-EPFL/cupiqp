@@ -751,6 +751,7 @@ class SolverBase(ABC):
             )
         self._prepare_zu_minus_zl_and_zbu_minus_zbl_kernel = create_prepare_zu_minus_zl_and_zbu_minus_zbl_kernel(
             self._data.m, self._data.n,
+            has_x_l=self._data.has_x_l, has_x_u=self._data.has_x_u,
             dtype=self._data.dtype
             )
         self._update_residual_nr_kernel = create_update_residual_nr_kernel(
@@ -793,7 +794,7 @@ class SolverBase(ABC):
             self._backward_compute_vector_grad_kernel = create_backward_compute_vector_grad_kernel(
                 n, p, nhu, nhl, nxu, nxl, dtype=self._data.dtype)
             self._backward_pack_full_layout_kernel = create_backward_pack_full_layout_kernel(
-                self._data.m, n, dtype=self._data.dtype)
+                self._data.m, n, nxl, nxu, dtype=self._data.dtype)
             self._backward_copy_kernel = create_backward_copy_kernel(
                 n, p, nhu, nhl, nxu, nxl, dtype=self._data.dtype)
 
@@ -1469,7 +1470,7 @@ class SolverBase(ABC):
         # ---- Step 3: write into full-layout buffers
         wp.launch(
             kernel=self._backward_pack_full_layout_kernel,
-            dim=(B, 4 * data.m + 2 * data.n),
+            dim=(B, 4 * data.m + data.num_xu + data.num_xl),
             inputs=[
                 self._backward_adjoint_vector.z_u, self._backward_adjoint_vector.z_l,
                 self._backward_adjoint_vector.z_bu, self._backward_adjoint_vector.z_bl,

@@ -2,9 +2,9 @@ import warp as wp
 from ..utils import to_warp_dtype
 
 
-def create_dense_data_gradients_kernel(n: int, p: int, m: int, dtype=wp.float64):
+def create_dense_data_gradients_kernel(n: int, p: int, m: int, num_xu: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
-    
+
     @wp.kernel
     def dense_data_gradients_kernel(
         # Inputs — user-space lambdas (active sizes) and full-layout scatters.
@@ -24,19 +24,20 @@ def create_dense_data_gradients_kernel(n: int, p: int, m: int, dtype=wp.float64)
         dG:   wp.array3d(dtype=dtype),  # type: ignore (B, m, n)
         db:   wp.array2d(dtype=dtype),  # type: ignore (B, p)
         dh_u: wp.array2d(dtype=dtype),  # type: ignore (B, m)
-        dx_u: wp.array2d(dtype=dtype),  # type: ignore (B, n)
+        dx_u: wp.array2d(dtype=dtype),  # type: ignore (B, num_xu)
     ):
         b, t = wp.tid()
         n_s = wp.static(n)
         p_s = wp.static(p)
         m_s = wp.static(m)
+        num_xu_s = wp.static(num_xu)
 
         end_dP   = n_s * n_s
         end_dA   = end_dP + p_s * n_s
         end_dG   = end_dA + m_s * n_s
         end_db   = end_dG + p_s
         end_dh_u = end_db + m_s
-        end_dx_u = end_dh_u + n_s
+        end_dx_u = end_dh_u + num_xu_s
 
         if t < end_dP:
             # dP[b, i, j] = 0.5 (λ_x[b,i]·x[b,j] + x[b,i]·λ_x[b,j])
