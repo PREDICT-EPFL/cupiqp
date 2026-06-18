@@ -43,7 +43,7 @@ class LargeProblemSolverBase(SolverBase):
             self._prepare_predictor_step_kernel = create_prepare_predictor_step_kernel(dtype=self._data.dtype)
             self._prepare_corrector_step_kernel = create_prepare_corrector_step_kernel(dtype=self._data.dtype)
             self._update_vars_after_corrector_step_kernel = create_update_vars_after_corrector_step_kernel(
-                n_primal=self._data.n + self._data.num_ineq, n_dual=self._data.p + self._data.num_ineq,
+                n=self._data.n, p=self._data.p, num_ineq=self._data.num_ineq,
                 dtype=self._data.dtype)
             self._init_guess_project_to_central_path_kernel = create_init_guess_project_to_central_path_kernel(dtype=self._data.dtype)
 
@@ -211,6 +211,18 @@ class LargeProblemSolverBase(SolverBase):
             G_x.fill(0.)
             GT_zu_minus_zl.fill(0)
 
+        # Mask infinite bounds to 0 before they enter any cupy arithmetic.
+        # data.h_l/h_u/x_l/x_u carry +/-inf (or a >PIQP_INF sentinel) on
+        # inactive rows, while their dual/slack stays at the central-path
+        # value, so an unmasked product would be inf*0 = NaN (and the
+        # residual would subtract an infinity). finite_mask_* is 1.0 on
+        # finite rows and 0.0 on infinite ones. The bounds are loop-invariant,
+        # but kept here to mirror SolverBase's per-iteration warp kernel.
+        h_l_masked = cp.where(self._data.finite_mask_hl > 0.5, self._data.h_l, 0.0)
+        h_u_masked = cp.where(self._data.finite_mask_hu > 0.5, self._data.h_u, 0.0)
+        x_l_masked = cp.where(self._data.finite_mask_xl > 0.5, self._data.x_l, 0.0)
+        x_u_masked = cp.where(self._data.finite_mask_xu > 0.5, self._data.x_u, 0.0)
+
         # ------------ update primal / dual objectives and duality gap ------------
         cp.sum(self._res_nr.x * self._result.x, axis=1, out=self._work_reduce[:, 0])
         self._work_reduce[:, 0] *= -0.5  # 0.5 * x^T P x
@@ -218,12 +230,12 @@ class LargeProblemSolverBase(SolverBase):
 
         self._work_reduce[:, 2] = self._work_reduce[:, 0]
         cp.sum(self._data.b * self._result.y, axis=1, out=self._work_reduce[:, 3])
-        cp.sum(self._data.h_l[:, :self._data.m] * self._result.z_l, axis=1, out=self._work_reduce[:, 4])
+        cp.sum(h_l_masked * self._result.z_l, axis=1, out=self._work_reduce[:, 4])
         self._work_reduce[:, 4] *= -1.
-        cp.sum(self._data.h_u[:, :self._data.m] * self._result.z_u, axis=1, out=self._work_reduce[:, 5])
-        cp.sum(self._data.x_l[:, :self._data.n] * self._result.z_bl, axis=1, out=self._work_reduce[:, 6])
+        cp.sum(h_u_masked * self._result.z_u, axis=1, out=self._work_reduce[:, 5])
+        cp.sum(x_l_masked * self._result.z_bl, axis=1, out=self._work_reduce[:, 6])
         self._work_reduce[:, 6] *= -1.
-        cp.sum(self._data.x_u[:, :self._data.n] * self._result.z_bu, axis=1, out=self._work_reduce[:, 7])
+        cp.sum(x_u_masked * self._result.z_bu, axis=1, out=self._work_reduce[:, 7])
 
         cp.sum(self._work_reduce[:, 0:2], axis=1, out=self._result.info.primal_obj)
         cp.sum(self._work_reduce[:, 2:8], axis=1, out=self._result.info.dual_obj)
@@ -253,28 +265,34 @@ class LargeProblemSolverBase(SolverBase):
         # res_nr.y = -(A*x - b)
         self._res_nr.y += self._data.b
 
-        # res_nr.z_l = G*x - s_l - hl
+        # res_nr.z_l = (G*x - s_l - h_l) on finite rows; 0 on inactive rows.
+        # The trailing mask multiply zeros the inactive rows so the shared
+        # _primal_res_nr() inf-norm (which does not re-mask) is correct.
         self._res_nr.z_l[:] = G_x[:, :self._data.m]
         cp.subtract(self._res_nr.z_l, self._result.s_l, out=self._res_nr.z_l)
-        cp.subtract(self._res_nr.z_l, self._data.h_l[:, :self._data.m], out=self._res_nr.z_l)
+        cp.subtract(self._res_nr.z_l, h_l_masked, out=self._res_nr.z_l)
+        self._res_nr.z_l *= self._data.finite_mask_hl
 
-        # res_nr.z_u = -G*x - s_u + hu
+        # res_nr.z_u = (-G*x - s_u + h_u) on finite rows; 0 on inactive rows.
         self._res_nr.z_u[:] = -G_x[:, :self._data.m]
         cp.subtract(self._res_nr.z_u, self._result.s_u, out=self._res_nr.z_u)
-        cp.add(self._res_nr.z_u, self._data.h_u[:, :self._data.m], out=self._res_nr.z_u)
+        cp.add(self._res_nr.z_u, h_u_masked, out=self._res_nr.z_u)
+        self._res_nr.z_u *= self._data.finite_mask_hu
 
-        # res_nr.z_bl = x_b_scaling*x - s_bl - xl
+        # res_nr.z_bl = (x_b_scaling*x - s_bl - x_l) on finite rows; 0 otherwise.
         self._res_nr.z_bl[:] = self._result.x[:, :self._data.n]
         self._res_nr.z_bl *= self._preconditioner.x_b_scaling[:, :self._data.n]
         cp.subtract(self._res_nr.z_bl, self._result.s_bl, out=self._res_nr.z_bl)
-        cp.subtract(self._res_nr.z_bl, self._data.x_l[:, :self._data.n], out=self._res_nr.z_bl)
+        cp.subtract(self._res_nr.z_bl, x_l_masked, out=self._res_nr.z_bl)
+        self._res_nr.z_bl *= self._data.finite_mask_xl
 
-        # res_nr.z_bu = -(x_b_scaling*x + s_bu - xu)
+        # res_nr.z_bu = -(x_b_scaling*x + s_bu - x_u) on finite rows; 0 otherwise.
         self._res_nr.z_bu[:] = self._result.x[:, :self._data.n]
         self._res_nr.z_bu *= self._preconditioner.x_b_scaling[:, :self._data.n]
         cp.add(self._res_nr.z_bu, self._result.s_bu, out=self._res_nr.z_bu)
-        cp.subtract(self._res_nr.z_bu, self._data.x_u[:, :self._data.n], out=self._res_nr.z_bu)
+        cp.subtract(self._res_nr.z_bu, x_u_masked, out=self._res_nr.z_bu)
         cp.negative(self._res_nr.z_bu, out=self._res_nr.z_bu)
+        self._res_nr.z_bu *= self._data.finite_mask_xu
 
         # ------------ update primal and dual residuals ------------
         self._result.info.prev_primal_res[:] = self._result.info.primal_res
@@ -283,39 +301,49 @@ class LargeProblemSolverBase(SolverBase):
         self._result.info.primal_res[:] = self._primal_res_nr()
 
         # primal_rel_norm: update running max
+        # G*x, s_*: zero the inactive rows (finite_mask_*) so they do not
+        # inflate the relative-norm denominator -- inactive slacks sit at the
+        # central-path value, not 0, so this masking is required to match
+        # SolverBase's warp-kernel relative norm.
         if self._data.num_hu > 0:
             self._work_z_1[:, :self._data.num_hu] = cp.abs(G_x[:, :self._data.m])
             self._work_z_1[:, :self._data.num_hu] *= pc.delta_inv[:, n + p:n + p + self._data.m]
+            self._work_z_1[:, :self._data.num_hu] *= self._data.finite_mask_hu
             cp.max(self._work_z_1[:, :self._data.num_hu], axis=1, out=self._work_norm_temp)
             cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
 
         if self._data.num_hl > 0:
             self._work_z_1[:, :self._data.num_hl] = cp.abs(G_x[:, :self._data.m])
             self._work_z_1[:, :self._data.num_hl] *= pc.delta_inv[:, n + p:n + p + self._data.m]
+            self._work_z_1[:, :self._data.num_hl] *= self._data.finite_mask_hl
             cp.max(self._work_z_1[:, :self._data.num_hl], axis=1, out=self._work_norm_temp)
             cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
 
         if self._data.num_hu > 0:
             cp.absolute(self._result.s_u, out=self._work_z_1[:, :self._data.num_hu])
             self._work_z_1[:, :self._data.num_hu] *= pc.delta_inv[:, n + p:n + p + self._data.m]
+            self._work_z_1[:, :self._data.num_hu] *= self._data.finite_mask_hu
             cp.max(self._work_z_1[:, :self._data.num_hu], axis=1, out=self._work_norm_temp)
             cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
 
         if self._data.num_hl > 0:
             cp.absolute(self._result.s_l, out=self._work_z_1[:, :self._data.num_hl])
             self._work_z_1[:, :self._data.num_hl] *= pc.delta_inv[:, n + p:n + p + self._data.m]
+            self._work_z_1[:, :self._data.num_hl] *= self._data.finite_mask_hl
             cp.max(self._work_z_1[:, :self._data.num_hl], axis=1, out=self._work_norm_temp)
             cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
 
         if self._data.num_xu > 0:
             cp.absolute(self._result.s_bu, out=self._work_z[:, :self._data.num_xu])
             self._work_z[:, :self._data.num_xu] *= pc.delta_b_inv[:, :self._data.n]
+            self._work_z[:, :self._data.num_xu] *= self._data.finite_mask_xu
             cp.max(self._work_z[:, :self._data.num_xu], axis=1, out=self._work_norm_temp)
             cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
 
         if self._data.num_xl > 0:
             cp.absolute(self._result.s_bl, out=self._work_z[:, :self._data.num_xl])
             self._work_z[:, :self._data.num_xl] *= pc.delta_b_inv[:, :self._data.n]
+            self._work_z[:, :self._data.num_xl] *= self._data.finite_mask_xl
             cp.max(self._work_z[:, :self._data.num_xl], axis=1, out=self._work_norm_temp)
             cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
 
