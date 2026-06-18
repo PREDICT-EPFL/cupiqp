@@ -137,18 +137,6 @@ class DenseData(Data):
             return v.astype(self._dtype, copy=True)
         return cp.zeros((self._batch_size, 0), dtype=self._dtype)
 
-    def _disable_inf_constraints(self):
-        """Zero out G rows where both h_l and h_u are infinite (fully free)."""
-        m = self.m
-        if m == 0:
-            return
-        free = (self._h_l[0] <= -PIQP_INF) & (self._h_u[0] >= PIQP_INF)
-        if not bool(cp.any(free)):
-            return
-        self._G[:, free, :] = 0.0
-        self._h_l[:, free] = -1.0
-        self._h_u[:, free] = 1.0
-
     def extract_P_diag(self, diag_P: cp.ndarray):
         """Extract diagonal of each P into diag_P — shape (B, n)."""
         idx = cp.arange(self._n)
@@ -187,19 +175,23 @@ class DenseData(Data):
         if check and value.shape != self._h_l.shape:
             raise ValueError(f"h_l shape mismatch: expected {self._h_l.shape}, got {value.shape}")
         self._h_l[:] = value
+        self._update_finite_bound_masks()
 
     def set_h_u(self, value: cp.ndarray, check: bool = True):
         if check and value.shape != self._h_u.shape:
             raise ValueError(f"h_u shape mismatch: expected {self._h_u.shape}, got {value.shape}")
         self._h_u[:] = value
+        self._update_finite_bound_masks()
 
     def set_x_l(self, value: cp.ndarray, check: bool = True):
         if check and value.shape != self._x_l.shape:
             raise ValueError(f"x_l shape mismatch: expected {self._x_l.shape}, got {value.shape}")
         self._x_l[:] = value
+        self._update_finite_bound_masks()
 
     def set_x_u(self, value: cp.ndarray, check: bool = True):
         if check and value.shape != self._x_u.shape:
             raise ValueError(f"x_u shape mismatch: expected {self._x_u.shape}, got {value.shape}")
         self._x_u[:] = value
+        self._update_finite_bound_masks()
 

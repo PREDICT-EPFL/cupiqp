@@ -152,8 +152,7 @@ class DenseSolver(SolverBase):
     def _init_preconditioner(self) -> DenseRuizEquilibration:
         return DenseRuizEquilibration(
             self._data.batch_size, self._data.n, self._data.p, self._data.m,
-            self._data.idx_xl, self._data.idx_xu,
-            self._data.idx_hl, self._data.idx_hu,
+            active_x_bound=self._data.active_x_bound,
             use_warp_tile_kernels=True,
             dtype=self._data.dtype,
         )

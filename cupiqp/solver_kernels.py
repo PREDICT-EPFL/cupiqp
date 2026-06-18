@@ -12,10 +12,10 @@ def create_init_guess_rhs_kernel(n: int, p: int,
 
         res.x [b, k] = -c   [b, k]                   for k in [0, n)
         res.y [b, k] =  b   [b, k]                   for k in [0, p)
-        res.z_l [b, k] = -h_l[b, idx_hl[k]]          for k in [0, num_hl)
-        res.z_u [b, k] =  h_u[b, idx_hu[k]]          for k in [0, num_hu)
-        res.z_bl[b, k] = -x_l[b, idx_xl[k]]          for k in [0, num_xl)
-        res.z_bu[b, k] =  x_u[b, idx_xu[k]]          for k in [0, num_xu)
+        res.z_l [b, k] = -h_l[b, k] if finite_mask_hl[b, k] else 0   for k in [0, m)
+        res.z_u [b, k] =  h_u[b, k] if finite_mask_hu[b, k] else 0   for k in [0, m)
+        res.z_bl[b, k] = -x_l[b, k] if finite_mask_xl[b, k] else 0   for k in [0, n)
+        res.z_bu[b, k] =  x_u[b, k] if finite_mask_xu[b, k] else 0   for k in [0, n)
     """
     dtype = to_warp_dtype(dtype)
     n_s   = wp.static(n)
@@ -39,10 +39,10 @@ def create_init_guess_rhs_kernel(n: int, p: int,
         h_u:    wp.array2d(dtype=dtype),        # type: ignore  (B, m)
         x_l:    wp.array2d(dtype=dtype),        # type: ignore  (B, n)
         x_u:    wp.array2d(dtype=dtype),        # type: ignore  (B, n)
-        idx_hl: wp.array(dtype=wp.int32),       # type: ignore  (num_hl,)
-        idx_hu: wp.array(dtype=wp.int32),       # type: ignore  (num_hu,)
-        idx_xl: wp.array(dtype=wp.int32),       # type: ignore  (num_xl,)
-        idx_xu: wp.array(dtype=wp.int32),       # type: ignore  (num_xu,)
+        finite_mask_hl: wp.array2d(dtype=dtype),     # type: ignore  (B, m)
+        finite_mask_hu: wp.array2d(dtype=dtype),     # type: ignore  (B, m)
+        finite_mask_xl: wp.array2d(dtype=dtype),     # type: ignore  (B, n)
+        finite_mask_xu: wp.array2d(dtype=dtype),     # type: ignore  (B, n)
         res_x:   wp.array2d(dtype=dtype),       # type: ignore  (B, n)   out
         res_y:   wp.array2d(dtype=dtype),       # type: ignore  (B, p)   out
         res_zl:  wp.array2d(dtype=dtype),       # type: ignore  (B, num_hl) out
@@ -59,16 +59,16 @@ def create_init_guess_rhs_kernel(n: int, p: int,
             res_y[b, k] = b_eq[b, k]
         elif t < n_s + p_s + nhl_s:
             k = t - off_zl
-            res_zl[b, k] = -h_l[b, idx_hl[k]]
+            res_zl[b, k] = wp.where(finite_mask_hl[b, k] > dtype(0.5), -h_l[b, k], dtype(0.0))
         elif t < n_s + p_s + nhl_s + nhu_s:
             k = t - off_zu
-            res_zu[b, k] = h_u[b, idx_hu[k]]
+            res_zu[b, k] = wp.where(finite_mask_hu[b, k] > dtype(0.5), h_u[b, k], dtype(0.0))
         elif t < n_s + p_s + nhl_s + nhu_s + nxl_s:
             k = t - off_zbl
-            res_zbl[b, k] = -x_l[b, idx_xl[k]]
+            res_zbl[b, k] = wp.where(finite_mask_xl[b, k] > dtype(0.5), -x_l[b, k], dtype(0.0))
         elif t < n_s + p_s + nhl_s + nhu_s + nxl_s + nxu_s:
             k = t - off_zbu
-            res_zbu[b, k] = x_u[b, idx_xu[k]]
+            res_zbu[b, k] = wp.where(finite_mask_xu[b, k] > dtype(0.5), x_u[b, k], dtype(0.0))
 
     return init_guess_rhs_kernel
 
@@ -92,14 +92,19 @@ def create_init_guess_project_to_central_path_kernel(dtype=wp.float64):
     def init_guess_project_to_central_path_kernel(
         delta_z: wp.array2d(dtype=dtype),   # type: ignore  (B, 1)
         mu:      wp.array(dtype=dtype),     # type: ignore  (B,)
+        finite_mask_all: wp.array2d(dtype=dtype),  # type: ignore  (B, num_ineq)
         z_all:   wp.array2d(dtype=dtype),   # type: ignore  (B, num_ineq) in-out
         s_all:   wp.array2d(dtype=dtype),   # type: ignore  (B, num_ineq) out
     ):
         b, i = wp.tid()
-        c_bi  = z_all[b, i] - delta_z[b, 0]
-        z_new = project_z_to_central_path(c_bi, mu[b])
-        z_all[b, i] = z_new
-        s_all[b, i] = z_new - c_bi
+        if finite_mask_all[b, i] > dtype(0.5):
+            c_bi  = z_all[b, i] - delta_z[b, 0]
+            z_new = project_z_to_central_path(c_bi, mu[b])
+            z_all[b, i] = z_new
+            s_all[b, i] = z_new - c_bi
+        else:
+            z_all[b, i] = dtype(0.0)
+            s_all[b, i] = dtype(0.0)
 
     return init_guess_project_to_central_path_kernel
 
@@ -114,10 +119,15 @@ def create_prepare_predictor_step_kernel(dtype=wp.float64):
     def prepare_predictor_step_kernel(
         s_all:     wp.array2d(dtype=dtype),  # type: ignore  (B, num_ineq)
         z_all:     wp.array2d(dtype=dtype),  # type: ignore  (B, num_ineq)
+        finite_mask_all: wp.array2d(dtype=dtype),  # type: ignore  (B, num_ineq)
         res_s_all: wp.array2d(dtype=dtype),  # type: ignore  (B, num_ineq) output
     ):
         b, i = wp.tid()
-        res_s_all[b, i] = -s_all[b, i] * z_all[b, i]
+        res_s_all[b, i] = wp.where(
+            finite_mask_all[b, i] > dtype(0.5),
+            -s_all[b, i] * z_all[b, i],
+            dtype(0.0),
+        )
 
     return prepare_predictor_step_kernel
 
@@ -138,52 +148,87 @@ def create_prepare_corrector_step_kernel(dtype=wp.float64):
         step_z_all: wp.array2d(dtype=dtype),  # type: ignore  (B, num_ineq)
         sigma:      wp.array(dtype=dtype),    # type: ignore  (B,)
         mu:         wp.array(dtype=dtype),    # type: ignore  (B,)
+        finite_mask_all: wp.array2d(dtype=dtype),  # type: ignore  (B, num_ineq)
         res_s_all:  wp.array2d(dtype=dtype),  # type: ignore  (B, num_ineq) in-out
     ):
         b, i = wp.tid()
-        sigma_mu = sigma[b] * mu[b]  # cheap redundant per-thread compute; no sync
-        res_s_all[b, i] = res_s_all[b, i] - step_s_all[b, i] * step_z_all[b, i] + sigma_mu
+        if finite_mask_all[b, i] > dtype(0.5):
+            sigma_mu = sigma[b] * mu[b]
+            res_s_all[b, i] = res_s_all[b, i] - step_s_all[b, i] * step_z_all[b, i] + sigma_mu
+        else:
+            res_s_all[b, i] = dtype(0.0)
 
     return prepare_corrector_step_kernel
 
 
-def create_update_vars_after_corrector_step_kernel(n_primal: int, n_dual: int, dtype=wp.float64):
+def create_update_vars_after_corrector_step_kernel(n: int, p: int, num_ineq: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
-    """Fused scaled-add for ``_update_vars_after_corrector_step``::
+    """Fused scaled-add for ``_update_vars_after_corrector_step``.
 
-        result.primals_all[b, i] += primal_step[b] * step.primals_all[b, i]   (i in [0, n_primal))
-        result.duals_all  [b, j] += dual_step  [b] * step.duals_all  [b, j]   (j in [0, n_dual))
+    The contiguous buffers are laid out as::
 
-    Note: here the slack variables are also counted into the primals and get updated.
+        primals_all = [x | s_l | s_u | s_bl | s_bu]
+        duals_all   = [y | z_l | z_u | z_bl | z_bu]
 
-    Dispatch: ``wp.launch(kernel, dim=(B, n_primal + n_dual))``.
-    ``n_primal = n + num_ineq``, ``n_dual = p + num_ineq``.
+    and this kernel applies the line search steps in place::
+
+        result.x += primal_step * step.x
+        result.s += primal_step * step.s
+        result.y += dual_step   * step.y
+        result.z += dual_step   * step.z
+
+    Full-length cone entries whose finite-bound mask is zero are not part of the
+    barrier problem. Those slack/dual entries are forced back to exactly zero
+    during the update so public results remain PIQP-style: length ``m`` or ``n``
+    with zero duals/slacks at infinite bounds.
+
+    Dispatch: ``wp.launch(kernel, dim=(B, n + num_ineq + p + num_ineq))``.
+    ``n``, ``p``, and ``num_ineq`` are compile-time constants so the per-thread
+    branches specialize cleanly.
     """
+    n_primal = n + num_ineq
+    n_dual = p + num_ineq
+
     @wp.kernel
     def update_vars_after_corrector_step_kernel(
         active_mask:      wp.array(dtype=wp.bool), # type: ignore  (B,)
+        finite_mask_all:       wp.array2d(dtype=dtype),  # type: ignore  (B, num_ineq)
         primal_step:      wp.array(dtype=dtype),    # type: ignore  (B,)
         dual_step:        wp.array(dtype=dtype),    # type: ignore  (B,)
         step_primals_all: wp.array2d(dtype=dtype),  # type: ignore  (B, n_primal)
         step_duals_all:   wp.array2d(dtype=dtype),  # type: ignore  (B, n_dual)
         primals_all:      wp.array2d(dtype=dtype),  # type: ignore  (B, n_primal) in-out
-        duals_all:        wp.array2d(dtype=dtype),  # type: ignore  (B, n_dual)   in-out
+        duals_all:        wp.array2d(dtype=dtype),  # type: ignore  (B, n_dual) in-out
     ):
         b, t = wp.tid()
-        # only update the problems that are unsolved
         if not active_mask[b]:
             return
+
+        n_static = wp.static(n)
+        p_static = wp.static(p)
         n_primal_static = wp.static(n_primal)
         n_dual_static = wp.static(n_dual)
 
-        if t < n_primal_static:
+        if t < n_static:
             primals_all[b, t] = primals_all[b, t] + primal_step[b] * step_primals_all[b, t]
-        elif t < n_primal_static + n_dual_static:
+        elif t < n_primal_static:
+            k = t - n_static
+            if finite_mask_all[b, k] > dtype(0.5):
+                primals_all[b, t] = primals_all[b, t] + primal_step[b] * step_primals_all[b, t]
+            else:
+                primals_all[b, t] = dtype(0.0)
+        else:
             j = t - n_primal_static
-            duals_all[b, j] = duals_all[b, j] + dual_step[b] * step_duals_all[b, j]
+            if j < p_static:
+                duals_all[b, j] = duals_all[b, j] + dual_step[b] * step_duals_all[b, j]
+            elif j < n_dual_static:
+                k = j - p_static
+                if finite_mask_all[b, k] > dtype(0.5):
+                    duals_all[b, j] = duals_all[b, j] + dual_step[b] * step_duals_all[b, j]
+                else:
+                    duals_all[b, j] = dtype(0.0)
 
     return update_vars_after_corrector_step_kernel
-
 
 def create_run_full_newton_step_kernel(n: int, p: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
@@ -239,10 +284,13 @@ def create_calculate_step_kernel(num_ineq: int, dtype=wp.float64):
     num_ineq_int = int(num_ineq)
     """Fused block-reduction kernel for step lengths (primal and dual).
 
-    For each batch ``b``, computes:
+    For each batch ``b``, computes over finite-bound entries only::
 
         alpha_s[b] = tau * min_i( ds[b,i] < 0 ? -s[b,i]/ds[b,i] : 1.0 )
         alpha_z[b] = tau * min_i( dz[b,i] < 0 ? -z[b,i]/dz[b,i] : 1.0 )
+
+    Inactive entries have mask value 0.0 and contribute candidate step 1.0,
+    so they never restrict the line search.
 
     Dispatch with ``wp.launch_tiled(..., dim=[B], block_dim=block_dim)``:
     one CUDA block per batch, threads cooperating to reduce ``num_ineq``-long
@@ -255,10 +303,15 @@ def create_calculate_step_kernel(num_ineq: int, dtype=wp.float64):
     def step_candidate(a: dtype, b: dtype) -> dtype:
         return wp.where(a < dtype(0.0), -b / a, dtype(1.0))
 
+    @wp.func
+    def step_candidate_masked(a: dtype, b: dtype, mask: dtype) -> dtype:
+        return wp.where(mask > dtype(0.5), step_candidate(a, b), dtype(1.0))
+
     @wp.kernel
     def calculate_step_kernel(
         s_all: wp.array2d(dtype=dtype),        # (B, num_ineq)  # type: ignore
         z_all: wp.array2d(dtype=dtype),        # (B, num_ineq)  # type: ignore
+        finite_mask_all: wp.array2d(dtype=dtype),   # (B, num_ineq)  # type: ignore
         step_s_all: wp.array2d(dtype=dtype),   # (B, num_ineq)  # type: ignore
         step_z_all: wp.array2d(dtype=dtype),   # (B, num_ineq)  # type: ignore
         tau: wp.array(dtype=dtype),            # (1,)           # type: ignore
@@ -267,28 +320,27 @@ def create_calculate_step_kernel(num_ineq: int, dtype=wp.float64):
     ):
         b, i = wp.tid()
 
+        mask_tile = wp.tile_load(finite_mask_all[b], shape=num_ineq_int)
+
         # Primal-step pipeline: alpha_s[b] = tau * min_i(cand_s[i])
         s_tile = wp.tile_load(s_all[b], shape=num_ineq_int)
         ds_tile = wp.tile_load(step_s_all[b], shape=num_ineq_int)
-        cand_s = wp.tile_map(step_candidate, ds_tile, s_tile)
+        cand_s = wp.tile_map(step_candidate_masked, ds_tile, s_tile, mask_tile)
         min_s = wp.tile_min(cand_s)
-        wp.tile_store(alpha_s, min_s, offset=b)  # store min_s into the corresponding batch of alpha_s
+        wp.tile_store(alpha_s, min_s, offset=b)
 
         # Dual-step pipeline: alpha_z[b] = tau * min_i(cand_z[i])
         z_tile = wp.tile_load(z_all[b], shape=num_ineq_int)
         dz_tile = wp.tile_load(step_z_all[b], shape=num_ineq_int)
-        cand_z = wp.tile_map(step_candidate, dz_tile, z_tile)
+        cand_z = wp.tile_map(step_candidate_masked, dz_tile, z_tile, mask_tile)
         min_z = wp.tile_min(cand_z)
-        wp.tile_store(alpha_z, min_z, offset=b)  # store min_z into the corresponding batch of alpha_z
+        wp.tile_store(alpha_z, min_z, offset=b)
 
-        # Scalar tau multiply via thread 0 (tile_store is block-collective, so
-        # the read-back is safe).
         if i == 0:
             alpha_s[b] = alpha_s[b] * tau[0]
             alpha_z[b] = alpha_z[b] * tau[0]
 
     return calculate_step_kernel
-
 
 def create_calculate_mu_kernel(num_ineq: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
@@ -309,6 +361,8 @@ def create_calculate_mu_kernel(num_ineq: int, dtype=wp.float64):
     def calculate_mu_kernel(
         s_all: wp.array2d(dtype=dtype),  # (B, num_ineq)  # type: ignore
         z_all: wp.array2d(dtype=dtype),  # (B, num_ineq)  # type: ignore
+        finite_mask_all: wp.array2d(dtype=dtype),  # (B, num_ineq)  # type: ignore
+        num_finite_bounds: wp.array(dtype=dtype),  # (B,)  # type: ignore
         mu:    wp.array(dtype=dtype),    # (B,) output    # type: ignore
     ):
         b, tid = wp.tid()
@@ -316,14 +370,19 @@ def create_calculate_mu_kernel(num_ineq: int, dtype=wp.float64):
         # Per-batch row loads, cooperatively filled by block threads.
         s_tile = wp.tile_load(s_all[b], shape=num_ineq_int)
         z_tile = wp.tile_load(z_all[b], shape=num_ineq_int)
+        mask_tile = wp.tile_load(finite_mask_all[b], shape=num_ineq_int)
 
-        # Block-wide reduction: sum_i(s*z). Result is a (1,)-tile in shared mem.
-        sum_tile = wp.tile_sum(s_tile * z_tile)
+        # Block-wide reduction: sum_i(mask*s*z). Result is a (1,)-tile in shared mem.
+        sum_tile = wp.tile_sum(s_tile * z_tile * mask_tile)
         wp.tile_store(mu, sum_tile, offset=b)
 
         # Scalar finalize by thread 0; safe because tile_store is block-collective.
         if tid == 0:
-            mu[b] = mu[b] / dtype(num_ineq)
+            denom = num_finite_bounds[b]
+            if denom > dtype(0.0):
+                mu[b] = mu[b] / denom
+            else:
+                mu[b] = dtype(0.0)
 
     return calculate_mu_kernel
 
@@ -351,6 +410,8 @@ def create_calculate_sigma_kernel(num_ineq: int, dtype=wp.float64):
         z_all: wp.array2d(dtype=dtype),        # (B, num_ineq)  # type: ignore
         step_s_all: wp.array2d(dtype=dtype),   # (B, num_ineq)  # type: ignore
         step_z_all: wp.array2d(dtype=dtype),   # (B, num_ineq)  # type: ignore
+        finite_mask_all: wp.array2d(dtype=dtype),   # (B, num_ineq)  # type: ignore
+        num_finite_bounds: wp.array(dtype=dtype),  # (B,)       # type: ignore
         primal_step: wp.array(dtype=dtype),    # (B,) alpha_s   # type: ignore
         dual_step: wp.array(dtype=dtype),      # (B,) alpha_z   # type: ignore
         mu: wp.array(dtype=dtype),             # (B,)           # type: ignore
@@ -360,7 +421,7 @@ def create_calculate_sigma_kernel(num_ineq: int, dtype=wp.float64):
         b, i = wp.tid()
         alpha_s = primal_step[b]
         alpha_z = dual_step[b]
-        denominator = mu[b] * dtype(num_ineq)
+        denominator = mu[b] * num_finite_bounds[b]
 
         # Block-wide tile loads + elementwise fuse + reduction. All intermediates
         # stay in registers / shared memory (no DRAM round-trip).
@@ -368,7 +429,8 @@ def create_calculate_sigma_kernel(num_ineq: int, dtype=wp.float64):
         z_tile = wp.tile_load(z_all[b], shape=num_ineq_int)
         ds_tile = wp.tile_load(step_s_all[b], shape=num_ineq_int)
         dz_tile = wp.tile_load(step_z_all[b], shape=num_ineq_int)
-        prod = (s_tile + alpha_s * ds_tile) * (z_tile + alpha_z * dz_tile)
+        mask_tile = wp.tile_load(finite_mask_all[b], shape=num_ineq_int)
+        prod = (s_tile + alpha_s * ds_tile) * (z_tile + alpha_z * dz_tile) * mask_tile
         sum_tile = wp.tile_sum(prod)  # (1,)-tile, in shared memory
 
         # Write raw sum; tile_store is a block-synchronous collective op, so the
@@ -376,9 +438,12 @@ def create_calculate_sigma_kernel(num_ineq: int, dtype=wp.float64):
         # in place with the finalized sigma.
         wp.tile_store(sigma, sum_tile, offset=b)
         if i == 0:
-            val = sigma[b] / denominator
-            val = wp.clamp(val, dtype(0.0), dtype(1.0))
-            sigma[b] = val * val * val
+            if denominator > dtype(0.0):
+                val = sigma[b] / denominator
+                val = wp.clamp(val, dtype(0.0), dtype(1.0))
+                sigma[b] = val * val * val
+            else:
+                sigma[b] = dtype(0.0)
 
     return calculate_sigma_kernel
 
@@ -571,6 +636,14 @@ def create_update_residual_nr_kernel(n: int, p: int, m: int, num_hl: int, num_hu
         dual_norm     = max(||P*x||, ||c||, ||A^T*y + G^T*(z_u-z_l) + x_b_scaling*(z_bu-z_bl)||) * delta_x_inv * cost_scaling_inv
         dual_res_rel  = dual_res / max(1, dual_norm)
     """
+    @wp.func
+    def finite_value(v: dtype, mask: dtype) -> dtype:
+        return wp.where(mask > dtype(0.5), v, dtype(0.0))
+
+    @wp.func
+    def masked_abs(v: dtype, mask: dtype) -> dtype:
+        return wp.abs(finite_value(v, mask))
+
     @wp.kernel
     def update_residual_nr_kernel(
         minus_Px:                   wp.array2d(dtype=dtype),  # type: ignore  (B, n)
@@ -586,6 +659,10 @@ def create_update_residual_nr_kernel(n: int, p: int, m: int, num_hl: int, num_hu
         data_h_u:                   wp.array2d(dtype=dtype),  # type: ignore  (B, m)
         data_x_l:                   wp.array2d(dtype=dtype),  # type: ignore  (B, n)
         data_x_u:                   wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        finite_mask_hl:                  wp.array2d(dtype=dtype),  # type: ignore  (B, m)
+        finite_mask_hu:                  wp.array2d(dtype=dtype),  # type: ignore  (B, m)
+        finite_mask_xl:                  wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        finite_mask_xu:                  wp.array2d(dtype=dtype),  # type: ignore  (B, n)
         # Variables at current iteration
         result_x:                   wp.array2d(dtype=dtype),  # type: ignore  (B, n)
         result_y:                   wp.array2d(dtype=dtype),  # type: ignore  (B, p)
@@ -603,11 +680,6 @@ def create_update_residual_nr_kernel(n: int, p: int, m: int, num_hl: int, num_hu
         delta_inv:                  wp.array2d(dtype=dtype),  # type: ignore  (B, n+p+m)
         delta_b_inv:                wp.array2d(dtype=dtype),  # type: ignore  (B, n)
         constraints_rhs_inf_norm:   wp.array(dtype=dtype),    # type: ignore  (B,)
-        # Segment index maps
-        idx_hl:                     wp.array(dtype=wp.int32),      # type: ignore
-        idx_hu:                     wp.array(dtype=wp.int32),      # type: ignore
-        idx_xl:                     wp.array(dtype=wp.int32),      # type: ignore
-        idx_xu:                     wp.array(dtype=wp.int32),      # type: ignore
         # Residuals
         res_nr_x:                   wp.array2d(dtype=dtype),  # type: ignore  (B, n)
         res_nr_y:                   wp.array2d(dtype=dtype),  # type: ignore  (B, p)
@@ -700,20 +772,19 @@ def create_update_residual_nr_kernel(n: int, p: int, m: int, num_hl: int, num_hu
 
         # ===================== z_l (hl) segment =====================
         if wp.static(num_hl > 0):
-            idx_hl_tile = wp.tile_load(idx_hl, shape=num_hl)
-            delta_z_hl_inv_tile = wp.tile_load_indexed(
-                delta_inv[b], indices=idx_hl_tile, shape=(num_hl,), offset=(n + p,), axis=0,
-            )
+            delta_z_hl_inv_tile = wp.tile_load(delta_inv[b], shape=num_hl, offset=n + p)
 
-            # h_l^T z_l obj-sum
-            hl_tile  = wp.tile_load_indexed(data_h_l[b], indices=idx_hl_tile, shape=(num_hl,), axis=0)
-            zhl_tile = wp.tile_load(result_z_hl[b], shape=num_hl)
+            # h_l^T z_l obj-sum. Inactive rows use a safe zero bound.
+            finite_mask_hl_tile = wp.tile_load(finite_mask_hl[b], shape=num_hl)
+            hl_raw_tile = wp.tile_load(data_h_l[b], shape=num_hl)
+            hl_tile = wp.tile_map(finite_value, hl_raw_tile, finite_mask_hl_tile)
+            zhl_tile = wp.tile_load(result_z_hl[b], shape=num_hl) * finite_mask_hl_tile
             hl_zhl = wp.tile_extract(wp.tile_sum(hl_tile * zhl_tile), 0)
 
-            # res_nr.z_l = G*x[idx_hl] - s_l - h_l[idx_hl]
-            Gx_idx_hl_tile = wp.tile_load_indexed(G_x[b], indices=idx_hl_tile, shape=(num_hl,), axis=0)
-            s_hl_tile = wp.tile_load(result_s_hl[b], shape=num_hl)
-            res_nr_z_hl_tile = Gx_idx_hl_tile - s_hl_tile - hl_tile
+            # res_nr.z_l = G*x - s_l - h_l on finite lower-bound rows.
+            Gx_idx_hl_tile = wp.tile_load(G_x[b], shape=num_hl)
+            s_hl_tile = wp.tile_load(result_s_hl[b], shape=num_hl) * finite_mask_hl_tile
+            res_nr_z_hl_tile = (Gx_idx_hl_tile - s_hl_tile - hl_tile) * finite_mask_hl_tile
             wp.tile_store(res_nr_z_hl[b], res_nr_z_hl_tile)
 
             # primal_res
@@ -724,7 +795,7 @@ def create_update_residual_nr_kernel(n: int, p: int, m: int, num_hl: int, num_hu
 
             # primal_rel_norm: ||G*x[hl]||, ||s_l||
             gx_hl_norm = wp.tile_extract(
-                wp.tile_max(wp.tile_map(wp.abs, Gx_idx_hl_tile * delta_z_hl_inv_tile)), 0,
+                wp.tile_max(wp.tile_map(wp.abs, Gx_idx_hl_tile * finite_mask_hl_tile * delta_z_hl_inv_tile)), 0,
             )
             s_hl_norm = wp.tile_extract(
                 wp.tile_max(wp.tile_map(wp.abs, s_hl_tile * delta_z_hl_inv_tile)), 0,
@@ -733,19 +804,18 @@ def create_update_residual_nr_kernel(n: int, p: int, m: int, num_hl: int, num_hu
 
         # ===================== z_u (hu) segment =====================
         if wp.static(num_hu > 0):
-            idx_hu_tile = wp.tile_load(idx_hu, shape=num_hu)
-            delta_z_hu_inv_tile = wp.tile_load_indexed(
-                delta_inv[b], indices=idx_hu_tile, shape=(num_hu,), offset=(n + p,), axis=0,
-            )
+            delta_z_hu_inv_tile = wp.tile_load(delta_inv[b], shape=num_hu, offset=n + p)
 
-            hu_tile  = wp.tile_load_indexed(data_h_u[b], indices=idx_hu_tile, shape=(num_hu,), axis=0)
-            zhu_tile = wp.tile_load(result_z_hu[b], shape=num_hu)
+            finite_mask_hu_tile = wp.tile_load(finite_mask_hu[b], shape=num_hu)
+            hu_raw_tile = wp.tile_load(data_h_u[b], shape=num_hu)
+            hu_tile = wp.tile_map(finite_value, hu_raw_tile, finite_mask_hu_tile)
+            zhu_tile = wp.tile_load(result_z_hu[b], shape=num_hu) * finite_mask_hu_tile
             hu_zhu = wp.tile_extract(wp.tile_sum(hu_tile * zhu_tile), 0)
 
-            # res_nr.z_u = -G*x[idx_hu] - s_u + h_u[idx_hu]
-            Gx_idx_hu_tile = wp.tile_load_indexed(G_x[b], indices=idx_hu_tile, shape=(num_hu,), axis=0)
-            s_hu_tile = wp.tile_load(result_s_hu[b], shape=num_hu)
-            res_nr_z_hu_tile = -Gx_idx_hu_tile - s_hu_tile + hu_tile
+            # res_nr.z_u = -G*x - s_u + h_u on finite upper-bound rows.
+            Gx_idx_hu_tile = wp.tile_load(G_x[b], shape=num_hu)
+            s_hu_tile = wp.tile_load(result_s_hu[b], shape=num_hu) * finite_mask_hu_tile
+            res_nr_z_hu_tile = (-Gx_idx_hu_tile - s_hu_tile + hu_tile) * finite_mask_hu_tile
             wp.tile_store(res_nr_z_hu[b], res_nr_z_hu_tile)
 
             hu_res_norm = wp.tile_extract(
@@ -754,7 +824,7 @@ def create_update_residual_nr_kernel(n: int, p: int, m: int, num_hl: int, num_hu
             primal_res = wp.max(primal_res, hu_res_norm)
 
             gx_hu_norm = wp.tile_extract(
-                wp.tile_max(wp.tile_map(wp.abs, Gx_idx_hu_tile * delta_z_hu_inv_tile)), 0,
+                wp.tile_max(wp.tile_map(wp.abs, Gx_idx_hu_tile * finite_mask_hu_tile * delta_z_hu_inv_tile)), 0,
             )
             s_hu_norm = wp.tile_extract(
                 wp.tile_max(wp.tile_map(wp.abs, s_hu_tile * delta_z_hu_inv_tile)), 0,
@@ -763,22 +833,19 @@ def create_update_residual_nr_kernel(n: int, p: int, m: int, num_hl: int, num_hu
 
         # ===================== z_bl (xl) segment =====================
         if wp.static(num_xl > 0):
-            idx_xl_tile = wp.tile_load(idx_xl, shape=num_xl)
-            delta_b_xl_inv_tile = wp.tile_load_indexed(
-                delta_b_inv[b], indices=idx_xl_tile, shape=(num_xl,), axis=0,
-            )
+            delta_b_xl_inv_tile = wp.tile_load(delta_b_inv[b], shape=num_xl)
 
-            xl_tile  = wp.tile_load_indexed(data_x_l[b], indices=idx_xl_tile, shape=(num_xl,), axis=0)
-            zxl_tile = wp.tile_load(result_z_xl[b], shape=num_xl)
+            finite_mask_xl_tile = wp.tile_load(finite_mask_xl[b], shape=num_xl)
+            xl_raw_tile = wp.tile_load(data_x_l[b], shape=num_xl)
+            xl_tile = wp.tile_map(finite_value, xl_raw_tile, finite_mask_xl_tile)
+            zxl_tile = wp.tile_load(result_z_xl[b], shape=num_xl) * finite_mask_xl_tile
             xl_zxl = wp.tile_extract(wp.tile_sum(xl_tile * zxl_tile), 0)
 
-            # res_nr.z_bl = x_b_scaling[idx_xl]*x[idx_xl] - s_bl - x_l[idx_xl]
-            x_idx_xl_tile = wp.tile_load_indexed(result_x[b], indices=idx_xl_tile, shape=(num_xl,), axis=0)
-            x_b_scaling_idx_xl_tile = wp.tile_load_indexed(
-                x_b_scaling[b], indices=idx_xl_tile, shape=(num_xl,), axis=0,
-            )
-            s_xl_tile = wp.tile_load(result_s_xl[b], shape=num_xl)
-            res_nr_z_xl_tile = x_b_scaling_idx_xl_tile * x_idx_xl_tile - s_xl_tile - xl_tile
+            # res_nr.z_bl = x_b_scaling*x - s_bl - x_l on finite lower box bounds.
+            x_idx_xl_tile = wp.tile_load(result_x[b], shape=num_xl)
+            x_b_scaling_idx_xl_tile = wp.tile_load(x_b_scaling[b], shape=num_xl)
+            s_xl_tile = wp.tile_load(result_s_xl[b], shape=num_xl) * finite_mask_xl_tile
+            res_nr_z_xl_tile = (x_b_scaling_idx_xl_tile * x_idx_xl_tile - s_xl_tile - xl_tile) * finite_mask_xl_tile
             wp.tile_store(res_nr_z_xl[b], res_nr_z_xl_tile)
 
             xl_res_norm = wp.tile_extract(
@@ -794,22 +861,19 @@ def create_update_residual_nr_kernel(n: int, p: int, m: int, num_hl: int, num_hu
 
         # ===================== z_bu (xu) segment =====================
         if wp.static(num_xu > 0):
-            idx_xu_tile = wp.tile_load(idx_xu, shape=num_xu)
-            delta_b_xu_inv_tile = wp.tile_load_indexed(
-                delta_b_inv[b], indices=idx_xu_tile, shape=(num_xu,), axis=0,
-            )
+            delta_b_xu_inv_tile = wp.tile_load(delta_b_inv[b], shape=num_xu)
 
-            xu_tile  = wp.tile_load_indexed(data_x_u[b], indices=idx_xu_tile, shape=(num_xu,), axis=0)
-            zxu_tile = wp.tile_load(result_z_xu[b], shape=num_xu)
+            finite_mask_xu_tile = wp.tile_load(finite_mask_xu[b], shape=num_xu)
+            xu_raw_tile = wp.tile_load(data_x_u[b], shape=num_xu)
+            xu_tile = wp.tile_map(finite_value, xu_raw_tile, finite_mask_xu_tile)
+            zxu_tile = wp.tile_load(result_z_xu[b], shape=num_xu) * finite_mask_xu_tile
             xu_zxu = wp.tile_extract(wp.tile_sum(xu_tile * zxu_tile), 0)
 
-            # res_nr.z_bu = -(x_b_scaling[idx_xu]*x[idx_xu] + s_bu - x_u[idx_xu])
-            x_idx_xu_tile = wp.tile_load_indexed(result_x[b], indices=idx_xu_tile, shape=(num_xu,), axis=0)
-            x_b_scaling_idx_xu_tile = wp.tile_load_indexed(
-                x_b_scaling[b], indices=idx_xu_tile, shape=(num_xu,), axis=0,
-            )
-            s_xu_tile = wp.tile_load(result_s_xu[b], shape=num_xu)
-            res_nr_z_xu_tile = -x_b_scaling_idx_xu_tile * x_idx_xu_tile - s_xu_tile + xu_tile
+            # res_nr.z_bu = -(x_b_scaling*x + s_bu - x_u) on finite upper box bounds.
+            x_idx_xu_tile = wp.tile_load(result_x[b], shape=num_xu)
+            x_b_scaling_idx_xu_tile = wp.tile_load(x_b_scaling[b], shape=num_xu)
+            s_xu_tile = wp.tile_load(result_s_xu[b], shape=num_xu) * finite_mask_xu_tile
+            res_nr_z_xu_tile = (-x_b_scaling_idx_xu_tile * x_idx_xu_tile - s_xu_tile + xu_tile) * finite_mask_xu_tile
             wp.tile_store(res_nr_z_xu[b], res_nr_z_xu_tile)
 
             xu_res_norm = wp.tile_extract(
@@ -855,29 +919,23 @@ def create_update_residual_nr_kernel(n: int, p: int, m: int, num_hl: int, num_hu
 
 def create_prepare_zu_minus_zl_and_zbu_minus_zbl_kernel(m: int, n: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
-    """Pre-matvec scatter-gather for _update_residuals_nr.
+    """Pre-matvec combination for _update_residuals_nr.
 
-          zhu_minus_zhl = 0
-          zhu_minus_zhl[:, idx_hu] += z_hu
-          zhu_minus_zhl[:, idx_hl] -= z_hl
+    Full-length layout: the dual blocks are stored at full size with exactly 0
+    on infinite-bound rows, so the combination is a plain elementwise
+    difference (no compressed gather/scatter needed)::
 
-          zbu_minus_zbl = 0
-          zbu_minus_zbl[:, idx_xu] += z_xu
-          zbu_minus_zbl[:, idx_xl] -= z_xl
-          zbu_minus_zbl *=  x_b_scaling[b, i]
+          zu_minus_zl[:, i]  = z_u[:, i] - z_l[:, i]                  for i in [0, m)
+          zbu_minus_zbl[:, j] = x_b_scaling[:, j] * (z_bu[:, j] - z_bl[:, j])  for j in [0, n)
     """
 
     @wp.kernel
     def prepare_zu_minus_zl_and_zbu_minus_zbl_kernel(
-        z_u:              wp.array2d(dtype=dtype),  # type: ignore  (B, num_hu)
-        z_l:              wp.array2d(dtype=dtype),  # type: ignore  (B, num_hl)
-        z_bl:             wp.array2d(dtype=dtype),  # type: ignore  (B, num_xl)
-        z_bu:             wp.array2d(dtype=dtype),  # type: ignore  (B, num_xu)
+        z_u:              wp.array2d(dtype=dtype),  # type: ignore  (B, m)
+        z_l:              wp.array2d(dtype=dtype),  # type: ignore  (B, m)
+        z_bl:             wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        z_bu:             wp.array2d(dtype=dtype),  # type: ignore  (B, n)
         x_b_scaling:      wp.array2d(dtype=dtype),  # type: ignore  (B, n)
-        inv_idx_hu:       wp.array(dtype=wp.int32),      # type: ignore  (m,)
-        inv_idx_hl:       wp.array(dtype=wp.int32),      # type: ignore  (m,)
-        inv_idx_xu:       wp.array(dtype=wp.int32),      # type: ignore  (n,)
-        inv_idx_xl:       wp.array(dtype=wp.int32),      # type: ignore  (n,)
         zu_minus_zl:      wp.array2d(dtype=dtype),  # type: ignore  (B, m) output
         zbu_minus_zbl:    wp.array2d(dtype=dtype),  # type: ignore  (B, n) output
     ):
@@ -885,24 +943,10 @@ def create_prepare_zu_minus_zl_and_zbu_minus_zbl_kernel(m: int, n: int, dtype=wp
         b, i = wp.tid()
 
         if i < m_static:
-            val = dtype(0.0)
-            k_hu = inv_idx_hu[i]
-            if k_hu >= 0:
-                val = val + z_u[b, k_hu]
-            k_hl = inv_idx_hl[i]
-            if k_hl >= 0:
-                val = val - z_l[b, k_hl]
-            zu_minus_zl[b, i] = val
+            zu_minus_zl[b, i] = z_u[b, i] - z_l[b, i]
         else:
             j = i - m_static
-            val = dtype(0.0)
-            k_xu = inv_idx_xu[j]
-            if k_xu >= 0:
-                val = val + z_bu[b, k_xu]
-            k_xl = inv_idx_xl[j]
-            if k_xl >= 0:
-                val = val - z_bl[b, k_xl]
-            zbu_minus_zbl[b, j] = x_b_scaling[b, j] * val
+            zbu_minus_zbl[b, j] = x_b_scaling[b, j] * (z_bu[b, j] - z_bl[b, j])
 
     return prepare_zu_minus_zl_and_zbu_minus_zbl_kernel
 
@@ -1097,21 +1141,32 @@ def create_boundary_shift_kernel(num_hl: int, num_hu: int, num_xl: int, num_xu: 
     dtype = to_warp_dtype(dtype)
     """Per-element ``z`` boundary shift to avoid division-by-zero in the IPM.
 
-        if z_hl[b, k] < eps: z_hl[b, k] += eps    (k in [0, num_hl))
-        if z_hu[b, k] < eps: z_hu[b, k] += eps    (k in [0, num_hu))
-        if z_bl[b, k] < eps: z_bl[b, k] += eps    (k in [0, num_xl))
-        if z_bu[b, k] < eps: z_bu[b, k] += eps    (k in [0, num_xu))
+    Only finite-bound entries are shifted::
+
+        if finite_mask_hl[b, k] and z_hl[b, k] < eps: z_hl[b, k] += eps
+        if finite_mask_hu[b, k] and z_hu[b, k] < eps: z_hu[b, k] += eps
+        if finite_mask_xl[b, k] and z_bl[b, k] < eps: z_bl[b, k] += eps
+        if finite_mask_xu[b, k] and z_bu[b, k] < eps: z_bu[b, k] += eps
+
+    Inactive entries correspond to infinite bounds in the full-length layout.
+    They are set to exactly zero here instead of being shifted positive, because
+    they are not barrier variables and must not affect step lengths, mu/sigma,
+    residual norms, or public dual/slack outputs.
     """
-    # IEEE 754 float64 machine epsilon (== np.finfo(np.float64).eps)
+    # IEEE 754 float64 machine epsilon (== np.finfo(np.float64).eps).
     EPS_F64 = wp.constant(dtype(2.220446049250313e-16))
-    
+
     @wp.kernel
     def boundary_shift_kernel(
         active_mask: wp.array(dtype=wp.bool), # type: ignore  (B,)
-        z_hl:  wp.array2d(dtype=dtype),  # type: ignore  (B, num_hl)
-        z_hu:  wp.array2d(dtype=dtype),  # type: ignore  (B, num_hu)
-        z_bl: wp.array2d(dtype=dtype),   # type: ignore  (B, num_xl)
-        z_bu: wp.array2d(dtype=dtype),   # type: ignore  (B, num_xu)
+        finite_mask_hl: wp.array2d(dtype=dtype),  # type: ignore  (B, num_hl)
+        finite_mask_hu: wp.array2d(dtype=dtype),  # type: ignore  (B, num_hu)
+        finite_mask_xl: wp.array2d(dtype=dtype),  # type: ignore  (B, num_xl)
+        finite_mask_xu: wp.array2d(dtype=dtype),  # type: ignore  (B, num_xu)
+        z_hl: wp.array2d(dtype=dtype),  # type: ignore  (B, num_hl)
+        z_hu: wp.array2d(dtype=dtype),  # type: ignore  (B, num_hu)
+        z_bl: wp.array2d(dtype=dtype),  # type: ignore  (B, num_xl)
+        z_bu: wp.array2d(dtype=dtype),  # type: ignore  (B, num_xu)
     ):
         b, t = wp.tid()
         if not active_mask[b]:
@@ -1123,25 +1178,34 @@ def create_boundary_shift_kernel(num_hl: int, num_hu: int, num_xl: int, num_xu: 
         n_xu = wp.static(num_xu)
 
         if t < n_hl:
-            if z_hl[b, t] < EPS_F64:
-                z_hl[b, t] = z_hl[b, t] + EPS_F64
+            if finite_mask_hl[b, t] > dtype(0.5):
+                if z_hl[b, t] < EPS_F64:
+                    z_hl[b, t] = z_hl[b, t] + EPS_F64
+            else:
+                z_hl[b, t] = dtype(0.0)
         elif t < n_hl + n_hu:
             i = t - n_hl
-            if z_hu[b, i] < EPS_F64:
-                z_hu[b, i] = z_hu[b, i] + EPS_F64
+            if finite_mask_hu[b, i] > dtype(0.5):
+                if z_hu[b, i] < EPS_F64:
+                    z_hu[b, i] = z_hu[b, i] + EPS_F64
+            else:
+                z_hu[b, i] = dtype(0.0)
         elif t < n_hl + n_hu + n_xl:
             i = t - n_hl - n_hu
-            if z_bl[b, i] < EPS_F64:
-                z_bl[b, i] = z_bl[b, i] + EPS_F64
+            if finite_mask_xl[b, i] > dtype(0.5):
+                if z_bl[b, i] < EPS_F64:
+                    z_bl[b, i] = z_bl[b, i] + EPS_F64
+            else:
+                z_bl[b, i] = dtype(0.0)
         elif t < n_hl + n_hu + n_xl + n_xu:
             i = t - n_hl - n_hu - n_xl
-            if z_bu[b, i] < EPS_F64:
-                z_bu[b, i] = z_bu[b, i] + EPS_F64
-        else:
-            return
+            if finite_mask_xu[b, i] > dtype(0.5):
+                if z_bu[b, i] < EPS_F64:
+                    z_bu[b, i] = z_bu[b, i] + EPS_F64
+            else:
+                z_bu[b, i] = dtype(0.0)
 
     return boundary_shift_kernel
-
 
 def create_backward_assemble_rhs_kernel(
     n: int, p: int,
@@ -1162,11 +1226,6 @@ dtype=wp.float64):
         grad_s_l:  wp.array2d(dtype=dtype),  # type: ignore (B, num_hl)
         grad_s_bu: wp.array2d(dtype=dtype),  # type: ignore (B, num_xu)
         grad_s_bl: wp.array2d(dtype=dtype),  # type: ignore (B, num_xl)
-        # Index maps
-        idx_hu:  wp.array(dtype=wp.int32),  # type: ignore (num_hu,)
-        idx_hl:  wp.array(dtype=wp.int32),  # type: ignore (num_hl,)
-        idx_xu:  wp.array(dtype=wp.int32),  # type: ignore (num_xu,)
-        idx_xl:  wp.array(dtype=wp.int32),  # type: ignore (num_xl,)
         # Preconditioner factors
         delta:             wp.array2d(dtype=dtype),  # type: ignore (B, n+p+m)
         delta_b:           wp.array2d(dtype=dtype),  # type: ignore (B, n)
@@ -1224,56 +1283,56 @@ dtype=wp.float64):
             i = t - end_y
             v = -grad_z_u[b, i]
             if precond:
-                v = v * delta[b, n_static + p_static + idx_hu[i]] * cost_scaling_inv[b]
+                v = v * delta[b, n_static + p_static + i] * cost_scaling_inv[b]
             rhs_z_u[b, i] = v
 
         elif t < end_zl:
             i = t - end_zu
             v = -grad_z_l[b, i]
             if precond:
-                v = v * delta[b, n_static + p_static + idx_hl[i]] * cost_scaling_inv[b]
+                v = v * delta[b, n_static + p_static + i] * cost_scaling_inv[b]
             rhs_z_l[b, i] = v
 
         elif t < end_zbu:
             i = t - end_zl
             v = -grad_z_bu[b, i]
             if precond:
-                v = v * delta_b[b, idx_xu[i]] * cost_scaling_inv[b]
+                v = v * delta_b[b, i] * cost_scaling_inv[b]
             rhs_z_bu[b, i] = v
 
         elif t < end_zbl:
             i = t - end_zbu
             v = -grad_z_bl[b, i]
             if precond:
-                v = v * delta_b[b, idx_xl[i]] * cost_scaling_inv[b]
+                v = v * delta_b[b, i] * cost_scaling_inv[b]
             rhs_z_bl[b, i] = v
 
         elif t < end_su:
             i = t - end_zbl
             v = -grad_s_u[b, i]
             if precond:
-                v = v * delta_inv[b, n_static + p_static + idx_hu[i]]
+                v = v * delta_inv[b, n_static + p_static + i]
             rhs_s_u[b, i] = v
 
         elif t < end_sl:
             i = t - end_su
             v = -grad_s_l[b, i]
             if precond:
-                v = v * delta_inv[b, n_static + p_static + idx_hl[i]]
+                v = v * delta_inv[b, n_static + p_static + i]
             rhs_s_l[b, i] = v
 
         elif t < end_sbu:
             i = t - end_sl
             v = -grad_s_bu[b, i]
             if precond:
-                v = v * delta_b_inv[b, idx_xu[i]]
+                v = v * delta_b_inv[b, i]
             rhs_s_bu[b, i] = v
 
         elif t < end_sbl:
             i = t - end_sbu
             v = -grad_s_bl[b, i]
             if precond:
-                v = v * delta_b_inv[b, idx_xl[i]]
+                v = v * delta_b_inv[b, i]
             rhs_s_bl[b, i] = v
 
         else:
@@ -1298,10 +1357,10 @@ def create_backward_unscale_lhs_kernel(
 
     * ``x``     :  ``sol *= cost_scaling * delta[:n]``
     * ``y``     :  ``sol *= delta[n:n+p]``
-    * ``z_u``   :  ``sol[i] *= delta[n+p+idx_hu[i]]``     (active)
-    * ``z_l``   :  ``sol[i] *= delta[n+p+idx_hl[i]]``     (active)
-    * ``z_bu``  :  ``sol[i] *= delta_b[idx_xu[i]]``        (active)
-    * ``z_bl``  :  ``sol[i] *= delta_b[idx_xl[i]]``        (active)
+    * ``z_u``   :  ``sol[i] *= delta[n+p+i]``     (full-length)
+    * ``z_l``   :  ``sol[i] *= delta[n+p+i]``     (full-length)
+    * ``z_bu``  :  ``sol[i] *= delta_b[i]``        (full-length)
+    * ``z_bl``  :  ``sol[i] *= delta_b[i]``        (full-length)
     """
     @wp.kernel
     def backward_unscale_lhs_kernel(
@@ -1312,11 +1371,6 @@ def create_backward_unscale_lhs_kernel(
         sol_z_l:  wp.array2d(dtype=dtype),  # type: ignore (B, num_hl)
         sol_z_bu: wp.array2d(dtype=dtype),  # type: ignore (B, num_xu)
         sol_z_bl: wp.array2d(dtype=dtype),  # type: ignore (B, num_xl)
-        # Index maps
-        idx_hu:   wp.array(dtype=wp.int32),  # type: ignore
-        idx_hl:   wp.array(dtype=wp.int32),  # type: ignore
-        idx_xu:   wp.array(dtype=wp.int32),  # type: ignore
-        idx_xl:   wp.array(dtype=wp.int32),  # type: ignore
         # Preconditioner factors
         delta:        wp.array2d(dtype=dtype),  # type: ignore (B, n+p+m)
         delta_b:      wp.array2d(dtype=dtype),  # type: ignore (B, n)
@@ -1353,19 +1407,19 @@ def create_backward_unscale_lhs_kernel(
 
         elif t < end_zu:
             i = t - end_y
-            sol_z_u[b, i] = sol_z_u[b, i] * delta[b, n_static + p_static + idx_hu[i]]
+            sol_z_u[b, i] = sol_z_u[b, i] * delta[b, n_static + p_static + i]
 
         elif t < end_zl:
             i = t - end_zu
-            sol_z_l[b, i] = sol_z_l[b, i] * delta[b, n_static + p_static + idx_hl[i]]
+            sol_z_l[b, i] = sol_z_l[b, i] * delta[b, n_static + p_static + i]
 
         elif t < end_zbu:
             i = t - end_zl
-            sol_z_bu[b, i] = sol_z_bu[b, i] * delta_b[b, idx_xu[i]]
+            sol_z_bu[b, i] = sol_z_bu[b, i] * delta_b[b, i]
 
         elif t < end_zbl:
             i = t - end_zbu
-            sol_z_bl[b, i] = sol_z_bl[b, i] * delta_b[b, idx_xl[i]]
+            sol_z_bl[b, i] = sol_z_bl[b, i] * delta_b[b, i]
 
         else:
             return
@@ -1539,14 +1593,15 @@ def create_backward_pack_full_layout_kernel(m: int, n: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     r"""Fused full-layout pack for the backward pass.
 
+    With the full-length dual layout the active-only inputs are already the
+    same length as the full-layout outputs (identity index map), so each
+    region is a direct per-element copy.
+
     Outputs:
 
-    * ``lam_zu_full, lam_zl_full ∈ (B, m)`` — scatter of
-      ``sol.z_u/z_l`` via ``inv_idx_hu/hl``.
-    * ``lam_zbu_full, lam_zbl_full ∈ (B, n)`` — scatter of
-      ``sol.z_bu/z_bl`` via ``inv_idx_xu/xl``.
-    * ``zu_full, zl_full ∈ (B, m)`` — scatter of
-      ``result.z_u/z_l`` via ``inv_idx_hu/hl``.
+    * ``lam_zu_full, lam_zl_full ∈ (B, m)`` — copy of ``sol.z_u/z_l``.
+    * ``lam_zbu_full, lam_zbl_full ∈ (B, n)`` — copy of ``sol.z_bu/z_bl``.
+    * ``zu_full, zl_full ∈ (B, m)`` — copy of ``result.z_u/z_l``.
     """
     @wp.kernel
     def backward_pack_full_layout_kernel(
@@ -1557,11 +1612,6 @@ def create_backward_pack_full_layout_kernel(m: int, n: int, dtype=wp.float64):
         sol_z_bl:   wp.array2d(dtype=dtype),  # type: ignore (B, num_xl)
         result_z_u: wp.array2d(dtype=dtype),  # type: ignore (B, num_hu)
         result_z_l: wp.array2d(dtype=dtype),  # type: ignore (B, num_hl)
-        # Inverse-index maps: inv_idx_*[j] = i if j == idx_*[i] else -1.
-        inv_idx_hu: wp.array(dtype=wp.int32),  # type: ignore (m,)
-        inv_idx_hl: wp.array(dtype=wp.int32),  # type: ignore (m,)
-        inv_idx_xu: wp.array(dtype=wp.int32),  # type: ignore (n,)
-        inv_idx_xl: wp.array(dtype=wp.int32),  # type: ignore (n,)
         # Full-layout outputs (no pre-zero required).
         lam_zu_full:  wp.array2d(dtype=dtype),  # type: ignore (B, m)
         lam_zl_full:  wp.array2d(dtype=dtype),  # type: ignore (B, m)
@@ -1584,51 +1634,27 @@ def create_backward_pack_full_layout_kernel(m: int, n: int, dtype=wp.float64):
 
         if t < end_lam_zu:
             j = t
-            i = inv_idx_hu[j]
-            if i >= 0:
-                lam_zu_full[b, j] = sol_z_u[b, i]
-            else:
-                lam_zu_full[b, j] = dtype(0.0)
+            lam_zu_full[b, j] = sol_z_u[b, j]
 
         elif t < end_lam_zl:
             j = t - end_lam_zu
-            i = inv_idx_hl[j]
-            if i >= 0:
-                lam_zl_full[b, j] = sol_z_l[b, i]
-            else:
-                lam_zl_full[b, j] = dtype(0.0)
+            lam_zl_full[b, j] = sol_z_l[b, j]
 
         elif t < end_lam_zbu:
             j = t - end_lam_zl
-            i = inv_idx_xu[j]
-            if i >= 0:
-                lam_zbu_full[b, j] = sol_z_bu[b, i]
-            else:
-                lam_zbu_full[b, j] = dtype(0.0)
+            lam_zbu_full[b, j] = sol_z_bu[b, j]
 
         elif t < end_lam_zbl:
             j = t - end_lam_zbu
-            i = inv_idx_xl[j]
-            if i >= 0:
-                lam_zbl_full[b, j] = sol_z_bl[b, i]
-            else:
-                lam_zbl_full[b, j] = dtype(0.0)
+            lam_zbl_full[b, j] = sol_z_bl[b, j]
 
         elif t < end_res_zu:
             j = t - end_lam_zbl
-            i = inv_idx_hu[j]
-            if i >= 0:
-                zu_full[b, j] = result_z_u[b, i]
-            else:
-                zu_full[b, j] = dtype(0.0)
+            zu_full[b, j] = result_z_u[b, j]
 
         elif t < end_res_zl:
             j = t - end_res_zu
-            i = inv_idx_hl[j]
-            if i >= 0:
-                zl_full[b, j] = result_z_l[b, i]
-            else:
-                zl_full[b, j] = dtype(0.0)
+            zl_full[b, j] = result_z_l[b, j]
 
         else:
             return
@@ -1677,16 +1703,12 @@ dtype=wp.float64):
         result_y:   wp.array2d(dtype=dtype),  # type: ignore (B, p)
         result_z_u: wp.array2d(dtype=dtype),  # type: ignore (B, num_hu)
         result_z_l: wp.array2d(dtype=dtype),  # type: ignore (B, num_hl)
-        # Index maps
-        idx_hu: wp.array(dtype=wp.int32),  # type: ignore
-        idx_hl: wp.array(dtype=wp.int32),  # type: ignore
-        idx_xu: wp.array(dtype=wp.int32),  # type: ignore
-        idx_xl: wp.array(dtype=wp.int32),  # type: ignore
         # Preconditioner factors
         delta_inv:    wp.array2d(dtype=dtype),  # type: ignore
         cost_scaling: wp.array(dtype=dtype),    # type: ignore
         # ---- Outputs ----
-        # Padded lambdas (size m or n) — zero-initialised by caller.
+        # Full-length lambdas (size m or n); the full-length dual layout makes
+        # the active->full map the identity, so every entry is written.
         lam_z_u:  wp.array2d(dtype=dtype),  # type: ignore (B, m)
         lam_z_l:  wp.array2d(dtype=dtype),  # type: ignore (B, m)
         lam_z_bu: wp.array2d(dtype=dtype),  # type: ignore (B, n)
@@ -1731,36 +1753,36 @@ dtype=wp.float64):
                 y_val[b, i] = result_y[b, i]
 
         elif t < end_zu:
-            # lam_z_u[:, idx_hu[i]] = lhs_z_u[b, i]
+            # lam_z_u[:, i] = lhs_z_u[b, i]
             i = t - end_y
-            lam_z_u[b, idx_hu[i]] = lhs_z_u[b, i]
+            lam_z_u[b, i] = lhs_z_u[b, i]
 
         elif t < end_zl:
             i = t - end_zu
-            lam_z_l[b, idx_hl[i]] = lhs_z_l[b, i]
+            lam_z_l[b, i] = lhs_z_l[b, i]
 
         elif t < end_zbu:
             i = t - end_zl
-            lam_z_bu[b, idx_xu[i]] = lhs_z_bu[b, i]
+            lam_z_bu[b, i] = lhs_z_bu[b, i]
 
         elif t < end_zbl:
             i = t - end_zbu
-            lam_z_bl[b, idx_xl[i]] = lhs_z_bl[b, i]
+            lam_z_bl[b, i] = lhs_z_bl[b, i]
 
         elif t < end_zuf:
-            # zu_full[:, idx_hu[i]] = result.z_u[b, i] * scale
+            # zu_full[:, i] = result.z_u[b, i] * scale
             i = t - end_zbl
             v = result_z_u[b, i]
             if precond:
-                v = v * delta_inv[b, n_c + p_c + idx_hu[i]] * cost_scaling[b]
-            zu_full[b, idx_hu[i]] = v
+                v = v * delta_inv[b, n_c + p_c + i] * cost_scaling[b]
+            zu_full[b, i] = v
 
         elif t < end_zlf:
             i = t - end_zuf
             v = result_z_l[b, i]
             if precond:
-                v = v * delta_inv[b, n_c + p_c + idx_hl[i]] * cost_scaling[b]
-            zl_full[b, idx_hl[i]] = v
+                v = v * delta_inv[b, n_c + p_c + i] * cost_scaling[b]
+            zl_full[b, i] = v
 
         else:
             return

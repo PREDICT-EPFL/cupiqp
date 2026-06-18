@@ -162,26 +162,6 @@ class SparseData(Data):
         """
         out[:] = self._P.diagonal()
 
-    def _disable_inf_constraints(self):
-        """Zero G-rows where both h_l and h_u are infinite (shared sparsity)."""
-        m = self.m
-        if m == 0:
-            return
-        # Bound structure is consistent across the batch — check batch 0
-        free = (self._h_l[0] <= -PIQP_INF) & (self._h_u[0] >= PIQP_INF)
-        if not bool(cp.any(free)):
-            return
-        # Zero the values for each free row across all batches (sparsity stays).
-        indptr_host = cp.asnumpy(self._G.indptr)
-        free_idx = cp.asnumpy(cp.where(free)[0])
-        g_data = self._G.data  # (B, nnz) view
-        for i in free_idx:
-            start, end = int(indptr_host[i]), int(indptr_host[i + 1])
-            if end > start:
-                g_data[:, start:end] = 0.0
-        self._h_l[:, free] = -1.0
-        self._h_u[:, free] = 1.0
-
     # ------------------------------------------------------------------
     # In-place setters
     # ------------------------------------------------------------------
@@ -233,10 +213,13 @@ class SparseData(Data):
     ):
         """Common helper for set_P / set_A / set_G.
 
-        When ``check`` is true, compare actual CSR ``indices`` / ``indptr``
-        values. Resolving that device-side comparison to a Python decision
-        synchronizes the update path. When ``check`` is false, the caller
-        must preserve the existing sparsity pattern.
+        The sparse KKT matrix scatters new values positionally into fixed CSR
+        slots, so a drifted ``indices`` / ``indptr`` would silently land values
+        in the wrong places. The sparsity-pattern identity is therefore ALWAYS
+        enforced (this resolves a device-side comparison to a Python decision,
+        which synchronizes the update path -- but it runs only on user
+        ``update()``, not inside the IPM loop). ``check`` additionally gates the
+        cheap dimension/batch checks.
         """
         new = UniformBatchedCsrMatrix.from_input(
             value,
@@ -249,21 +232,22 @@ class SparseData(Data):
                     f"{name} batch size mismatch: expected {target.batch_size}, "
                     f"got {new.batch_size}"
                 )
-            if new.nnz != target.nnz:
-                raise ValueError(
-                    f"{name} nnz mismatch: expected {target.nnz}, got {new.nnz} "
-                    "(sparsity pattern must be preserved)."
-                )
             if new.rows != target.rows or new.cols != target.cols:
                 raise ValueError(
                     f"{name} shape mismatch: expected ({target.rows}, {target.cols}), "
                     f"got ({new.rows}, {new.cols})"
                 )
-            if not self._same_sparsity_pattern(target, new, value):
-                raise ValueError(
-                    f"{name} sparsity pattern differs from setup(): "
-                    "indices/indptr values must be unchanged."
-                )
+        # Structural guard against silent corruption -- always enforced.
+        if new.nnz != target.nnz:
+            raise ValueError(
+                f"{name} nnz mismatch: expected {target.nnz}, got {new.nnz} "
+                "(sparsity pattern must be preserved)."
+            )
+        if not self._same_sparsity_pattern(target, new, value):
+            raise ValueError(
+                f"{name} sparsity pattern differs from setup(): "
+                "indices/indptr values must be unchanged."
+            )
         target.update_data(new.data)
 
     def set_P(self, value: SparseMatrixInput, check: bool = True):
@@ -289,18 +273,22 @@ class SparseData(Data):
         if check and value.shape != self._h_l.shape:
             raise ValueError(f"h_l shape mismatch: expected {self._h_l.shape}, got {value.shape}")
         self._h_l[:] = value
+        self._update_finite_bound_masks()
 
     def set_h_u(self, value: cp.ndarray, check: bool = True):
         if check and value.shape != self._h_u.shape:
             raise ValueError(f"h_u shape mismatch: expected {self._h_u.shape}, got {value.shape}")
         self._h_u[:] = value
+        self._update_finite_bound_masks()
 
     def set_x_l(self, value: cp.ndarray, check: bool = True):
         if check and value.shape != self._x_l.shape:
             raise ValueError(f"x_l shape mismatch: expected {self._x_l.shape}, got {value.shape}")
         self._x_l[:] = value
+        self._update_finite_bound_masks()
 
     def set_x_u(self, value: cp.ndarray, check: bool = True):
         if check and value.shape != self._x_u.shape:
             raise ValueError(f"x_u shape mismatch: expected {self._x_u.shape}, got {value.shape}")
         self._x_u[:] = value
+        self._update_finite_bound_masks()

@@ -1,7 +1,9 @@
 from abc import ABC, abstractmethod
 import cupy as cp
+import warp as wp
 
 from .typedef import PIQP_INF
+from .data_kernels import create_finite_bound_masks_kernel
 
 
 class Data(ABC):
@@ -14,6 +16,8 @@ class Data(ABC):
     def __init__(self, dtype=cp.float64, device: str = "cuda"):
         self._dtype = dtype
         self._device = device
+        self._finite_masks_kernel = create_finite_bound_masks_kernel(dtype)
+        self._finite_mask_all = None
 
     @property
     def dtype(self):
@@ -22,11 +26,6 @@ class Data(ABC):
     @property
     def device(self) -> str:
         return self._device
-
-    @abstractmethod
-    def _disable_inf_constraints(self):
-        """Zero out G rows where both h_l and h_u are infinite."""
-        ...
 
     @abstractmethod
     def extract_P_diag(self, diag_P: cp.ndarray) -> None:
@@ -81,11 +80,45 @@ class Data(ABC):
     def _preprocess(self):
         self._init_h_l()
         self._init_h_u()
-        self._disable_inf_constraints()
-        self._init_h_l()
-        self._init_h_u()
         self._init_x_l()
         self._init_x_u()
+        self._update_finite_bound_masks()
+
+    def _update_finite_bound_masks(self):
+        """Build per-batch finite-bound masks of inequality bounds.
+
+        For each bound class, a ``(B, m)`` or ``(B, n)`` float mask holds 1.0
+        where the bound is finite and 0.0 where it is +/-inf. ``num_finite_bounds``
+        is the per-problem count of finite bounds (the divisor used for mu/sigma).
+        Unlike the compressed ``idx_*`` arrays these are full-length and may
+        differ across batch elements.
+        """
+        B, m, n = self._batch_size, self.m, self._n
+        dtype = self._dtype
+        num_ineq = 2 * m + 2 * n
+
+        # allocate once; reuse buffers on later calls
+        if self._finite_mask_all is None or self._finite_mask_all.shape != (B, num_ineq):
+            self._finite_mask_all = cp.empty((B, num_ineq), dtype=dtype)
+            self._finite_mask_hl = self._finite_mask_all[:, 0:m]
+            self._finite_mask_hu = self._finite_mask_all[:, m:2 * m]
+            self._finite_mask_xl = self._finite_mask_all[:, 2 * m:2 * m + n]
+            self._finite_mask_xu = self._finite_mask_all[:, 2 * m + n:2 * m + 2 * n]
+            self._active_G_row = cp.empty((B, m), dtype=dtype)
+            self._active_x_bound = cp.empty((B, n), dtype=dtype)
+            self._num_finite_bounds = cp.empty((B,), dtype=dtype)
+
+        wp.launch(
+            kernel=self._finite_masks_kernel,
+            dim=(B,),
+            inputs=[
+                self._h_l, self._h_u, self._x_l, self._x_u,
+                self._finite_mask_all, self._active_G_row,
+                self._active_x_bound, self._num_finite_bounds,
+            ],
+            device="cuda",
+            stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+        )
 
     # ------------------------------------------------------------------
     # Bound index initialization — works on (B, k) dense vectors
@@ -93,45 +126,37 @@ class Data(ABC):
 
     def _init_h_l(self):
         B, m = self._batch_size, self.m
-        if m > 0 and self._h_l.shape[-1] == m:
-            mask0 = self._h_l[0] > -PIQP_INF
-            self._validate_bound_consistency(self._h_l, -PIQP_INF, '>', 'h_l')
-            self._idx_hl = cp.where(mask0)[0].astype(cp.int32)
-        else:
-            self._idx_hl = cp.empty((0,), dtype=cp.int32)
-            if self._h_l.shape[-1] == 0:
-                self._h_l = -2 * PIQP_INF * cp.ones((B, m), dtype=self._dtype)
+        if m == 0:
+            self._h_l = cp.empty((B, 0), dtype=self._dtype)
+            return
+        if self._h_l.shape[-1] == 0:
+            self._h_l = -2 * PIQP_INF * cp.ones((B, m), dtype=self._dtype)
+        if self._h_l.shape != (B, m):
+            raise ValueError(f"h_l shape mismatch: expected {(B, m)}, got {self._h_l.shape}")
 
     def _init_h_u(self):
         B, m = self._batch_size, self.m
-        if m > 0 and self._h_u.shape[-1] == m:
-            mask0 = self._h_u[0] < PIQP_INF
-            self._validate_bound_consistency(self._h_u, PIQP_INF, '<', 'h_u')
-            self._idx_hu = cp.where(mask0)[0].astype(cp.int32)
-        else:
-            self._idx_hu = cp.empty((0,), dtype=cp.int32)
-            if self._h_u.shape[-1] == 0:
-                self._h_u = 2 * PIQP_INF * cp.ones((B, m), dtype=self._dtype)
+        if m == 0:
+            self._h_u = cp.empty((B, 0), dtype=self._dtype)
+            return
+        if self._h_u.shape[-1] == 0:
+            self._h_u = 2 * PIQP_INF * cp.ones((B, m), dtype=self._dtype)
+        if self._h_u.shape != (B, m):
+            raise ValueError(f"h_u shape mismatch: expected {(B, m)}, got {self._h_u.shape}")
 
     def _init_x_l(self):
         n = self._n
-        if self._x_l.shape[-1] == n:
-            mask0 = self._x_l[0] > -PIQP_INF
-            self._validate_bound_consistency(self._x_l, -PIQP_INF, '>', 'x_l')
-            self._idx_xl = cp.where(mask0)[0].astype(cp.int32)
-        else:
-            self._idx_xl = cp.empty((0,), dtype=cp.int32)
+        if self._x_l.shape[-1] == 0:
             self._x_l = -2 * PIQP_INF * cp.ones((self._batch_size, n), dtype=self._dtype)
+        if self._x_l.shape != (self._batch_size, n):
+            raise ValueError(f"x_l shape mismatch: expected {(self._batch_size, n)}, got {self._x_l.shape}")
 
     def _init_x_u(self):
         n = self._n
-        if self._x_u.shape[-1] == n:
-            mask0 = self._x_u[0] < PIQP_INF
-            self._validate_bound_consistency(self._x_u, PIQP_INF, '<', 'x_u')
-            self._idx_xu = cp.where(mask0)[0].astype(cp.int32)
-        else:
-            self._idx_xu = cp.empty((0,), dtype=cp.int32)
+        if self._x_u.shape[-1] == 0:
             self._x_u = 2 * PIQP_INF * cp.ones((self._batch_size, n), dtype=self._dtype)
+        if self._x_u.shape != (self._batch_size, n):
+            raise ValueError(f"x_u shape mismatch: expected {(self._batch_size, n)}, got {self._x_u.shape}")
 
     @staticmethod
     def _validate_bound_consistency(bounds: cp.ndarray, threshold: float,
@@ -210,42 +235,62 @@ class Data(ABC):
 
     @property
     def num_hl(self) -> int:
-        return cp.size(self._idx_hl)
-
-    @property
-    def idx_hl(self):
-        """Indices of lower inequality constraints."""
-        return self._idx_hl
+        return self.m
 
     @property
     def num_hu(self) -> int:
-        return cp.size(self._idx_hu)
-
-    @property
-    def idx_hu(self):
-        """Indices of upper inequality constraints."""
-        return self._idx_hu
+        return self.m
 
     @property
     def num_xl(self) -> int:
         """Number of lower bound constraints."""
-        return cp.size(self._idx_xl)
-    
-    @property
-    def idx_xl(self):
-        """Indices of lower bound constraints."""
-        return self._idx_xl
+        return self.n
 
     @property
     def num_xu(self) -> int:
         """Number of upper bound constraints."""
-        return cp.size(self._idx_xu)
-
-    @property
-    def idx_xu(self):
-        """Indices of upper bound constraints."""
-        return self._idx_xu
+        return self.n
 
     @property
     def num_ineq(self) -> int:
-        return self.num_hl + self.num_hu + self.num_xl + self.num_xu
+        return 2 * self.m + 2 * self.n
+
+    @property
+    def finite_mask_hl(self):
+        """(B, m) float mask, 1.0 where the lower inequality bound is finite."""
+        return self._finite_mask_hl
+
+    @property
+    def finite_mask_hu(self):
+        """(B, m) float mask, 1.0 where the upper inequality bound is finite."""
+        return self._finite_mask_hu
+
+    @property
+    def finite_mask_xl(self):
+        """(B, n) float mask, 1.0 where the lower box bound is finite."""
+        return self._finite_mask_xl
+
+    @property
+    def finite_mask_xu(self):
+        """(B, n) float mask, 1.0 where the upper box bound is finite."""
+        return self._finite_mask_xu
+
+    @property
+    def active_G_row(self):
+        """(B, m) float mask, 1.0 where inequality row i has any finite bound."""
+        return self._active_G_row
+
+    @property
+    def active_x_bound(self):
+        """(B, n) float mask, 1.0 where variable i has any finite box bound."""
+        return self._active_x_bound
+
+    @property
+    def num_finite_bounds(self):
+        """(B,) per-problem count of finite bounds (mu/sigma divisor)."""
+        return self._num_finite_bounds
+
+    @property
+    def finite_mask_all(self):
+        """(B, 2*m+2*n) finite-bound mask in [l, u, bl, bu] layout."""
+        return self._finite_mask_all

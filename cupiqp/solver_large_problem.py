@@ -120,10 +120,10 @@ class LargeProblemSolverBase(SolverBase):
             res_nr.x    = -(P*x + c + A^T*y + G^T*(z_u - z_l)
                             + x_b_scaling*(z_bu - z_bl))
             res_nr.y    = -(A*x - b)
-            res_nr.z_l  =   G*x[idx_hl] - s_l - h_l[idx_hl]
-            res_nr.z_u  = -G*x[idx_hu] - s_u + h_u[idx_hu]
-            res_nr.z_bl =   x_b_scaling[idx_xl]*x[idx_xl] - s_bl - x_l[idx_xl]
-            res_nr.z_bu = -(x_b_scaling[idx_xu]*x[idx_xu] + s_bu - x_u[idx_xu])
+            res_nr.z_l  =   G*x - s_l - h_l
+            res_nr.z_u  = -G*x - s_u + h_u
+            res_nr.z_bl =   x_b_scaling*x - s_bl - x_l
+            res_nr.z_bu = -(x_b_scaling*x + s_bu - x_u)
 
         Convergence norms (unscaled, infinity norm per batch):
 
@@ -132,10 +132,10 @@ class LargeProblemSolverBase(SolverBase):
                              where u_p_seg is the per-segment primal
                              unscale factor:
                                  [y]:    delta_inv[:, n : n+p]
-                                 [z_l]:  delta_inv[:, n+p+idx_hl]
-                                 [z_u]:  delta_inv[:, n+p+idx_hu]
-                                 [z_bl]: delta_b_inv[:, idx_xl]
-                                 [z_bu]: delta_b_inv[:, idx_xu]
+                                 [z_l]:  delta_inv[:, n+p : n+p+m]
+                                 [z_u]:  delta_inv[:, n+p : n+p+m]
+                                 [z_bl]: delta_b_inv[:, :n]
+                                 [z_bu]: delta_b_inv[:, :n]
 
             dual_res       = cost_scaling_inv * ||delta_inv[:, :n] .* res_nr.x||_inf
 
@@ -143,8 +143,8 @@ class LargeProblemSolverBase(SolverBase):
         that go into the corresponding residual):
 
             primal_rel     = max( ||u_p_y .* A*x||,
-                                  ||u_p_zl .* G*x[idx_hl]||,
-                                  ||u_p_zu .* G*x[idx_hu]||,
+                                  ||u_p_zl .* G*x||,
+                                  ||u_p_zu .* G*x||,
                                   ||u_p_zl .* s_l||,  ||u_p_zu .* s_u||,
                                   ||u_p_zbl .* s_bl||, ||u_p_zbu .* s_bu||,
                                   constraints_rhs_inf_norm_unscaled )
@@ -199,8 +199,8 @@ class LargeProblemSolverBase(SolverBase):
             self._work_primal_rel_norm.fill(0.)
 
         self._work_z_1.fill(0.)
-        self._work_z_1[:, self._data.idx_hu] += self._result.z_u
-        self._work_z_1[:, self._data.idx_hl] -= self._result.z_l
+        self._work_z_1[:, :self._data.m] += self._result.z_u
+        self._work_z_1[:, :self._data.m] -= self._result.z_l
 
         G_x = self._work_z_2
         GT_zu_minus_zl = self._step.x
@@ -218,12 +218,12 @@ class LargeProblemSolverBase(SolverBase):
 
         self._work_reduce[:, 2] = self._work_reduce[:, 0]
         cp.sum(self._data.b * self._result.y, axis=1, out=self._work_reduce[:, 3])
-        cp.sum(self._data.h_l[:, self._data.idx_hl] * self._result.z_l, axis=1, out=self._work_reduce[:, 4])
+        cp.sum(self._data.h_l[:, :self._data.m] * self._result.z_l, axis=1, out=self._work_reduce[:, 4])
         self._work_reduce[:, 4] *= -1.
-        cp.sum(self._data.h_u[:, self._data.idx_hu] * self._result.z_u, axis=1, out=self._work_reduce[:, 5])
-        cp.sum(self._data.x_l[:, self._data.idx_xl] * self._result.z_bl, axis=1, out=self._work_reduce[:, 6])
+        cp.sum(self._data.h_u[:, :self._data.m] * self._result.z_u, axis=1, out=self._work_reduce[:, 5])
+        cp.sum(self._data.x_l[:, :self._data.n] * self._result.z_bl, axis=1, out=self._work_reduce[:, 6])
         self._work_reduce[:, 6] *= -1.
-        cp.sum(self._data.x_u[:, self._data.idx_xu] * self._result.z_bu, axis=1, out=self._work_reduce[:, 7])
+        cp.sum(self._data.x_u[:, :self._data.n] * self._result.z_bu, axis=1, out=self._work_reduce[:, 7])
 
         cp.sum(self._work_reduce[:, 0:2], axis=1, out=self._result.info.primal_obj)
         cp.sum(self._work_reduce[:, 2:8], axis=1, out=self._result.info.dual_obj)
@@ -247,33 +247,33 @@ class LargeProblemSolverBase(SolverBase):
         self._res_nr.x -= self._data.c
         self._res_nr.x -= self._res.x  # self._res.x holds A^T*y
         self._res_nr.x -= GT_zu_minus_zl
-        self._res_nr.x[:, self._data.idx_xl] += self._preconditioner.x_b_scaling[:, self._data.idx_xl] * self._result.z_bl
-        self._res_nr.x[:, self._data.idx_xu] -= self._preconditioner.x_b_scaling[:, self._data.idx_xu] * self._result.z_bu
+        self._res_nr.x[:, :self._data.n] += self._preconditioner.x_b_scaling[:, :self._data.n] * self._result.z_bl
+        self._res_nr.x[:, :self._data.n] -= self._preconditioner.x_b_scaling[:, :self._data.n] * self._result.z_bu
 
         # res_nr.y = -(A*x - b)
         self._res_nr.y += self._data.b
 
         # res_nr.z_l = G*x - s_l - hl
-        self._res_nr.z_l[:] = G_x[:, self._data.idx_hl]
+        self._res_nr.z_l[:] = G_x[:, :self._data.m]
         cp.subtract(self._res_nr.z_l, self._result.s_l, out=self._res_nr.z_l)
-        cp.subtract(self._res_nr.z_l, self._data.h_l[:, self._data.idx_hl], out=self._res_nr.z_l)
+        cp.subtract(self._res_nr.z_l, self._data.h_l[:, :self._data.m], out=self._res_nr.z_l)
 
         # res_nr.z_u = -G*x - s_u + hu
-        self._res_nr.z_u[:] = -G_x[:, self._data.idx_hu]
+        self._res_nr.z_u[:] = -G_x[:, :self._data.m]
         cp.subtract(self._res_nr.z_u, self._result.s_u, out=self._res_nr.z_u)
-        cp.add(self._res_nr.z_u, self._data.h_u[:, self._data.idx_hu], out=self._res_nr.z_u)
+        cp.add(self._res_nr.z_u, self._data.h_u[:, :self._data.m], out=self._res_nr.z_u)
 
         # res_nr.z_bl = x_b_scaling*x - s_bl - xl
-        self._res_nr.z_bl[:] = self._result.x[:, self._data.idx_xl]
-        self._res_nr.z_bl *= self._preconditioner.x_b_scaling[:, self._data.idx_xl]
+        self._res_nr.z_bl[:] = self._result.x[:, :self._data.n]
+        self._res_nr.z_bl *= self._preconditioner.x_b_scaling[:, :self._data.n]
         cp.subtract(self._res_nr.z_bl, self._result.s_bl, out=self._res_nr.z_bl)
-        cp.subtract(self._res_nr.z_bl, self._data.x_l[:, self._data.idx_xl], out=self._res_nr.z_bl)
+        cp.subtract(self._res_nr.z_bl, self._data.x_l[:, :self._data.n], out=self._res_nr.z_bl)
 
         # res_nr.z_bu = -(x_b_scaling*x + s_bu - xu)
-        self._res_nr.z_bu[:] = self._result.x[:, self._data.idx_xu]
-        self._res_nr.z_bu *= self._preconditioner.x_b_scaling[:, self._data.idx_xu]
+        self._res_nr.z_bu[:] = self._result.x[:, :self._data.n]
+        self._res_nr.z_bu *= self._preconditioner.x_b_scaling[:, :self._data.n]
         cp.add(self._res_nr.z_bu, self._result.s_bu, out=self._res_nr.z_bu)
-        cp.subtract(self._res_nr.z_bu, self._data.x_u[:, self._data.idx_xu], out=self._res_nr.z_bu)
+        cp.subtract(self._res_nr.z_bu, self._data.x_u[:, :self._data.n], out=self._res_nr.z_bu)
         cp.negative(self._res_nr.z_bu, out=self._res_nr.z_bu)
 
         # ------------ update primal and dual residuals ------------
@@ -284,38 +284,38 @@ class LargeProblemSolverBase(SolverBase):
 
         # primal_rel_norm: update running max
         if self._data.num_hu > 0:
-            self._work_z_1[:, :self._data.num_hu] = cp.abs(G_x[:, self._data.idx_hu])
-            self._work_z_1[:, :self._data.num_hu] *= pc.delta_inv[:, n + p + self._data.idx_hu]
+            self._work_z_1[:, :self._data.num_hu] = cp.abs(G_x[:, :self._data.m])
+            self._work_z_1[:, :self._data.num_hu] *= pc.delta_inv[:, n + p:n + p + self._data.m]
             cp.max(self._work_z_1[:, :self._data.num_hu], axis=1, out=self._work_norm_temp)
             cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
 
         if self._data.num_hl > 0:
-            self._work_z_1[:, :self._data.num_hl] = cp.abs(G_x[:, self._data.idx_hl])
-            self._work_z_1[:, :self._data.num_hl] *= pc.delta_inv[:, n + p + self._data.idx_hl]
+            self._work_z_1[:, :self._data.num_hl] = cp.abs(G_x[:, :self._data.m])
+            self._work_z_1[:, :self._data.num_hl] *= pc.delta_inv[:, n + p:n + p + self._data.m]
             cp.max(self._work_z_1[:, :self._data.num_hl], axis=1, out=self._work_norm_temp)
             cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
 
         if self._data.num_hu > 0:
             cp.absolute(self._result.s_u, out=self._work_z_1[:, :self._data.num_hu])
-            self._work_z_1[:, :self._data.num_hu] *= pc.delta_inv[:, n + p + self._data.idx_hu]
+            self._work_z_1[:, :self._data.num_hu] *= pc.delta_inv[:, n + p:n + p + self._data.m]
             cp.max(self._work_z_1[:, :self._data.num_hu], axis=1, out=self._work_norm_temp)
             cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
 
         if self._data.num_hl > 0:
             cp.absolute(self._result.s_l, out=self._work_z_1[:, :self._data.num_hl])
-            self._work_z_1[:, :self._data.num_hl] *= pc.delta_inv[:, n + p + self._data.idx_hl]
+            self._work_z_1[:, :self._data.num_hl] *= pc.delta_inv[:, n + p:n + p + self._data.m]
             cp.max(self._work_z_1[:, :self._data.num_hl], axis=1, out=self._work_norm_temp)
             cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
 
         if self._data.num_xu > 0:
             cp.absolute(self._result.s_bu, out=self._work_z[:, :self._data.num_xu])
-            self._work_z[:, :self._data.num_xu] *= pc.delta_b_inv[:, self._data.idx_xu]
+            self._work_z[:, :self._data.num_xu] *= pc.delta_b_inv[:, :self._data.n]
             cp.max(self._work_z[:, :self._data.num_xu], axis=1, out=self._work_norm_temp)
             cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
 
         if self._data.num_xl > 0:
             cp.absolute(self._result.s_bl, out=self._work_z[:, :self._data.num_xl])
-            self._work_z[:, :self._data.num_xl] *= pc.delta_b_inv[:, self._data.idx_xl]
+            self._work_z[:, :self._data.num_xl] *= pc.delta_b_inv[:, :self._data.n]
             cp.max(self._work_z[:, :self._data.num_xl], axis=1, out=self._work_norm_temp)
             cp.maximum(self._work_primal_rel_norm, self._work_norm_temp, out=self._work_primal_rel_norm)
 
@@ -335,8 +335,8 @@ class LargeProblemSolverBase(SolverBase):
 
         # ||unscale_dual_res(A^T*y + G^T*(z_u - z_l) + x_b_scaling*(z_bu - z_bl))||_inf
         self._res.x += GT_zu_minus_zl
-        self._res.x[:, self._data.idx_xl] -= self._preconditioner.x_b_scaling[:, self._data.idx_xl] * self._result.z_bl
-        self._res.x[:, self._data.idx_xu] += self._preconditioner.x_b_scaling[:, self._data.idx_xu] * self._result.z_bu
+        self._res.x[:, :self._data.n] -= self._preconditioner.x_b_scaling[:, :self._data.n] * self._result.z_bl
+        self._res.x[:, :self._data.n] += self._preconditioner.x_b_scaling[:, :self._data.n] * self._result.z_bu
         cp.absolute(self._res.x, out=self._work_primals)
         self._work_primals *= pc.delta_inv[:, :n]
         self._work_primals *= pc.cost_scaling_inv[:, None]
@@ -474,8 +474,7 @@ class DenseLargeProblemSolver(LargeProblemSolverBase, DenseSolver):
         # Override DenseSolver: skip the warp tile-kernel compile cliff.
         return DenseRuizEquilibration(
             self._data.batch_size, self._data.n, self._data.p, self._data.m,
-            self._data.idx_xl, self._data.idx_xu,
-            self._data.idx_hl, self._data.idx_hu,
+            active_x_bound=self._data.active_x_bound,
             use_warp_tile_kernels=False,
         )
 
@@ -487,8 +486,7 @@ class SparseLargeProblemSolver(LargeProblemSolverBase, SparseSolver):
         # Override SparseSolver: skip the warp tile-kernel compile cliff.
         return SparseRuizEquilibration(
             self._data.batch_size, self._data.n, self._data.p, self._data.m,
-            self._data.idx_xl, self._data.idx_xu,
-            self._data.idx_hl, self._data.idx_hu,
+            active_x_bound=self._data.active_x_bound,
             use_warp_tile_kernels=False,
         )
 
@@ -501,8 +499,7 @@ class MultistageLargeProblemSolver(LargeProblemSolverBase, MultistageSolver):
         # cliff. Multistage needs the block layout via ``data=``.
         return MultistageRuizEquilibration(
             self._data.batch_size, self._data.n, self._data.p, self._data.m,
-            self._data.idx_xl, self._data.idx_xu,
-            self._data.idx_hl, self._data.idx_hu,
+            active_x_bound=self._data.active_x_bound,
             data=self._data,
             use_warp_tile_kernels=False,
         )

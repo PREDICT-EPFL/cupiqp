@@ -215,46 +215,6 @@ class MultistageData(Data):
     def num_blocks(self):
         return self._P.num_diag_blocks
 
-    def _disable_inf_constraints(self):
-        """Zero out rows of G where both h_l and h_u are infinite (per batch).
-
-        Bound-structure consistency across batches is enforced separately by
-        ``_validate_bound_consistency`` in the base class, so the finite/
-        infinite mask is identical across batches and we can derive it from
-        batch 0.
-        """
-        if self._G is None:
-            return
-
-        # All batches share the same finite/infinite pattern.
-        inf_mask = (self._h_l[0] <= -PIQP_INF) & (self._h_u[0] >= PIQP_INF)
-        if not bool(inf_mask.any()):
-            return
-
-        N = self._G.N
-        r = self._G.rows_of_blocks
-
-        # CuPy zero-copy views of the (B, N, r, c) Warp arrays.
-        D_cp = cp.from_dlpack(wp.to_dlpack(self._G.D))
-        E_cp = cp.from_dlpack(wp.to_dlpack(self._G.E))
-
-        # mask shape (N+1, r) — same across all batches.
-        mask_2d = inf_mask.reshape(N + 1, r)
-        D_mask = mask_2d[:N]
-        E_mask = mask_2d[1:]
-
-        if bool(D_mask.any()):
-            # Broadcast over batch axis: D_cp[:, D_mask] = 0
-            D_cp[:, D_mask] = 0.0
-        if bool(E_mask.any()):
-            E_cp[:, E_mask] = 0.0
-
-        # Reset the infinite-bound rows to a benign finite value across batches.
-        # Use the same boolean mask shape as h_l / h_u: (B, m). Broadcast inf_mask
-        # across the batch axis.
-        self._h_l[:, inf_mask] = -1.0
-        self._h_u[:, inf_mask] = 1.0
-
     def extract_P_diag(self, diag_P: cp.ndarray):
         """Extract the diagonal of every batch's P into ``diag_P`` of shape ``(B, n)``."""
         B = self._batch_size
@@ -311,24 +271,28 @@ class MultistageData(Data):
             self._check_same_block_vec(self._h_l_blk, value)
         wp.copy(self._h_l_blk.data, value.data)
         self._h_l[:] = self._h_l_flat_view
+        self._update_finite_bound_masks()
 
     def set_h_u(self, value: BlockVec, check: bool = True):
         if check:
             self._check_same_block_vec(self._h_u_blk, value)
         wp.copy(self._h_u_blk.data, value.data)
         self._h_u[:] = self._h_u_flat_view
+        self._update_finite_bound_masks()
 
     def set_x_l(self, value: BlockVec, check: bool = True):
         if check:
             self._check_same_block_vec(self._x_l_block, value)
         wp.copy(self._x_l_block.data, value.data)
         self._x_l[:] = self._x_l_flat_view
+        self._update_finite_bound_masks()
 
     def set_x_u(self, value: BlockVec, check: bool = True):
         if check:
             self._check_same_block_vec(self._x_u_block, value)
         wp.copy(self._x_u_block.data, value.data)
         self._x_u[:] = self._x_u_flat_view
+        self._update_finite_bound_masks()
 
     @staticmethod
     def _block_vec_to_flat(bv: BlockVec, B: int) -> cp.ndarray:
