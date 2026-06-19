@@ -41,7 +41,10 @@ c = cp.array([-1.0, -4.0])
 A = cp.array([[1.0, -2.0]])
 b = cp.array([1.0])
 
-# two-sided inequalities:  h_l <= G x <= h_u   (use -inf / +inf for one-sided)
+# two-sided inequalities:  h_l <= G x <= h_u
+# For a one-sided block, either set the unused side to -inf / +inf, or omit it
+# entirely by passing only the side you need (e.g. h_u alone for G x <= h_u).
+# An omitted side is fixed at setup() and stores no duals/slacks for it.
 G   = cp.array([[1.0, -1.0],
                 [2.0,  0.0]])
 h_l = cp.array([-10.0, -cp.inf])
@@ -204,11 +207,8 @@ for b_k in trajectory:
     solver.solve()
 ```
 
-It is allowed to change **which bounds are finite** in `update()`: pass new `h_l`, `h_u`, `x_l`, `x_u` arrays that mark different entries as `±inf` (cuPIQP keeps a full-length dual/slack vector
-and masks the infinite entries), so toggling a bound between finite and `±inf` does not need
-a new `setup()`. Only a change to dimensions, sparsity, or which constraint blocks are
-present requires a new solver instance. See the [solver API](api/solvers.md) for exact
-method signatures.
+**It is allowed to change which bounds are finite** in `update()`: pass new `h_l`, `h_u`, `x_l`, `x_u` arrays that mark different entries as `±inf` (cuPIQP keeps a full-length dual/slack vector
+for each *present* side and masks the infinite entries), so toggling a bound between finite and `±inf` does not need a new `setup()`. Which bound sides are **present** is structural, however: each of `h_l`, `h_u`, `x_l`, `x_u` is either provided at `setup()` (full-length block) or omitted (no storage, `(B, 0)` duals/slacks), and that choice is fixed. Calling `update()`/`set_*` on a side that was omitted at `setup()` raises — adding a side, like any change to dimensions, sparsity, or which constraint blocks are present, requires a new solver instance.
 
 ## Next steps
 

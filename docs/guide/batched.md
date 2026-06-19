@@ -85,12 +85,33 @@ differ:
 - Same shapes `n`, `p`, `m` and (for the sparse backend) the same sparsity pattern.
 - For sparse solver, all $P$ matrices in the batch must have the same sparsity pattern. This also applies to $A$ and $G$.
 
-!!! note "Bound patterns may differ per problem"
-    The finite/infinite **bound pattern** does **not** have to be shared across the batch.
-    Each problem may mark different entries of `h_l`, `h_u`, `x_l`, `x_u` as `±inf`, and you
-    may even toggle a bound between finite and `±inf` across solves with `update()` without
-    calling `setup()` again. cuPIQP stores a full-length dual/slack vector — one slot per
-    row of `G` and per variable — and masks the infinite entries per problem, so no common
-    bound pattern is required.
+!!! note "Bound patterns can differ per problem"
+    There are two separate questions about bounds, and they behave differently:
+
+    **1. Which entries are finite — free to differ per problem, and changeable between solves.**
+    Within a bound array you pass, any entry set to `±inf` means "no bound there". This
+    pattern can be different for each problem in the batch, and you can change it later with
+    `update()` without calling `setup()` again. For example, in a batch of 2 problems with
+    `m = 2` inequality rows:
+
+    ```python
+    # problem 0: row 0 is one-sided (only upper), row 1 is two-sided
+    # problem 1: both rows two-sided
+    h_l = cp.array([[-cp.inf, -3.0],    # problem 0
+                    [  -2.0,  -3.0]])   # problem 1
+    h_u = cp.array([[   1.0,   4.0],
+                    [   1.0,   4.0]])
+    ```
+
+    cuPIQP keeps a full-length slot for every row and just ignores the `±inf` ones, so no
+    common pattern is needed.
+
+    **2. Which bound *sides* exist — fixed at `setup()`, shared by the whole batch.**
+    Each of the four sides `h_l`, `h_u`, `x_l`, `x_u` is either passed at `setup()` or left
+    out (`None`). A side you leave out is gone for *every* problem in the batch and uses no
+    memory (its result duals/slacks are `(B, 0)`); you cannot add it back later without a
+    fresh `setup()`. So if you only ever need an upper inequality, pass `h_u` and omit `h_l`
+    entirely. If *some* problems need the lower side, instead keep `h_l` present for the
+    whole batch and set it to `-inf` on the problems that don't (case 1 above).
 
 

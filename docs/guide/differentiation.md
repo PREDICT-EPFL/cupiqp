@@ -7,7 +7,8 @@ factorization from the forward solve instead of constructing the full solution J
 If an outer scalar loss $\ell$ depends on the solution $x^\star$, call
 `backward()` with the upstream gradient $\partial \ell / \partial x^\star$. The returned
 data object contains the corresponding gradients with respect to `P`, `c`, `A`, `b`,
-`G`, `h_l`, `h_u`, `x_l`, and `x_u`.
+`G`, `h_l`, `h_u`, `x_l`, and `x_u`. A bound side that was omitted at `setup()` has no
+gradient block (its gradient is absent / `(B, 0)`), mirroring the inputs you provided.
 
 ## Basic workflow
 
