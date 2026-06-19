@@ -5,13 +5,12 @@ from .typedef import Vector, Matrix
 
 
 class KKTSolverBase(ABC):
-    """Represent the system with the following form:
-    [P+x_reg     A^T      G^T    ] [Delta_x] = [rhs_x]  
+    """Base interface for backend KKT solvers.
+
+    Represent the system with the following form:
+    [P+x_reg     A^T      G^T    ] [Delta_x] = [rhs_x]
     [A         -delta*I     0    ] [Delta_y] = [rhs_y]
     [G           0     -(z_reg)  ] [Delta_z] = [rhs_z]
-
-    where W = diag(s_i/z_i) for i=1,...,m
-    Actually we should note the delta*I as regularization term since it's not necessarily delta*I if there are contributions from the box constriants, which are denoted as reg_x and reg_z.
     """
     def __init__(self):
         pass
@@ -23,7 +22,8 @@ class KKTSolverBase(ABC):
         pass
 
     @abstractmethod
-    def update_kkt(self, data: Data, delta: float, x_reg: Vector, z_reg: Vector) -> bool:
+    def update_kkt(self, data: Data, delta: float, x_reg: Vector, z_reg: Vector, z_reg_inv: Vector) -> bool:
+        """Refresh the KKT matrix with new regularization scalings."""
         pass
 
     @abstractmethod

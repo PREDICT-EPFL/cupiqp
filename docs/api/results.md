@@ -49,21 +49,42 @@ After calling `solver.solve()`, the per-problem status can be obtained from `sol
 
 ### Solution variables
 
-`solver.result` exposes the full primal–dual–slack variables as zero-copy `(B, …)` views of the internal states as cupy arrays on **device**. Blocks tied to absent constraints are empty (e.g., if $h_l$ is `None`, then the shapes `z_l` and `s_l` are both `(B, 0)`).
+`solver.result` exposes the full primal–dual–slack variables as zero-copy `(B, …)` views of the internal states as cupy arrays on **device**. A *present* block is **full-length**: one entry per row of `G` for the inequality variables and one entry per decision variable for the box-bound variables. A block is empty `(B, 0)` when that bound side was **omitted (passed as `None`) at `setup()`** — each of the four bound sides (`h_l`, `h_u`, `x_l`, `x_u`) is independent, so e.g. a one-sided problem `G x <= h_u` (with `h_l=None`) gives `z_l`, `s_l` of shape `(B, 0)` while `z_u`, `s_u` stay `(B, m)`. If no `G` is given at all (`m = 0`), then `z_l`, `z_u`, `s_l`, `s_u` are all `(B, 0)`.
 
 | Attribute | Shape | Meaning |
 |---|---|---|
 | `x` | `(B, n)` | primal solution |
 | `y` | `(B, p)` | equality-constraint multipliers |
-| `z_l`, `z_u` | `(B, num_hl)`, `(B, num_hu)` | inequality multipliers (lower / upper rows of `G x`) |
-| `z_bl`, `z_bu` | `(B, num_xl)`, `(B, num_xu)` | box-bound multipliers (lower / upper) |
-| `s_l`, `s_u` | `(B, num_hl)`, `(B, num_hu)` | inequality slacks |
-| `s_bl`, `s_bu` | `(B, num_xl)`, `(B, num_xu)` | box-bound slacks |
+| `z_l` | `(B, m)`, or `(B, 0)` if `h_l` is `None` at `setup()` | dual variables for $h_l \leq Gx$ |
+| `z_u` | `(B, m)`, or `(B, 0)` if `h_u` is `None` at `setup()` | dual variables for $Gx \leq h_u$ |
+| `z_bl` | `(B, n)`, or `(B, 0)` if `x_l` is `None` at `setup()` | dual variables for $x_l \leq x$ |
+| `z_bu` | `(B, n)`, or `(B, 0)` if `x_u` is `None` at `setup()` | dual variables for $x \leq x_u$ |
+| `s_l` | `(B, m)`, or `(B, 0)` if `h_l` is `None` at `setup()` | slack variables for $h_l \leq Gx$ |
+| `s_u` | `(B, m)`, or `(B, 0)` if `h_u` is `None` at `setup()` | slack variables for $Gx \leq h_u$ |
+| `s_bl` | `(B, n)`, or `(B, 0)` if `x_l` is `None` at `setup()` | slack variables for $x_l \leq x$ |
+| `s_bu` | `(B, n)`, or `(B, 0)` if `x_u` is `None` at `setup()` | slack variables for $x \leq x_u$ |
 
-The counts `num_hl`, `num_hu`, `num_xl`, `num_xu` are the numbers of **finite** lower/
-upper inequality and box bounds — infinite bounds are dropped, so these blocks only
-cover active bound rows. The convenience views `primals_all` and `duals_all` expose the
-packed primal and dual buffers.
+Note the difference between an *inactive* bound and an *absent* side. For example, with
+`m` inequality rows:
+
+- If you pass `h_l` as an array with some (or all) entries `-inf`, the lower side is
+  **present**: `z_l` and `s_l` keep their full `(B, m)` shape, and the entries for the
+  `-inf` rows are simply held at zero. The column for each row keeps a stable position, so
+  you can flip a bound between finite and `±inf` across solves via `update()` without the
+  shape changing.
+- If you instead pass `h_l=None` (or omit it) at `setup()`, the lower side is **absent**:
+  `z_l` and `s_l` are `(B, 0)` and use no memory. This is fixed for the lifetime of the
+  solver — you cannot add the side back with `update()`.
+
+The convenience views `primals_all` and `duals_all` expose the packed primal and dual
+buffers, concatenated in this order along the last axis:
+
+- `primals_all`: `[x | s_l | s_u | s_bl | s_bu]` — shape `(B, n + num_ineq)`
+- `duals_all`: `[y | z_l | z_u | z_bl | z_bu]` — shape `(B, p + num_ineq)`
+
+where `num_ineq = num_hl + num_hu + num_xl + num_xu`. Each bound block contributes its
+full width (`m` or `n`) when present and `0` when absent, so an omitted side simply drops
+out of the concatenation and the following block shifts up.
 
 !!! warning "Views, not copies"
     The solution attributes are views into the solver's internal GPU buffers and are

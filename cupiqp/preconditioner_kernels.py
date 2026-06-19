@@ -47,6 +47,8 @@ def create_clamp_and_rsqrt_kernel(n: int, p: int, m: int,
 def create_calc_scaling_inv_and_scale_bounds_kernel(
     n: int, p: int, m: int,
     num_hl: int, num_hu: int, num_xl: int, num_xu: int,
+    has_h_l: bool, has_h_u: bool,
+    has_x_l: bool, has_x_u: bool,
 dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Fuse the kernel for storing the inverse of scaling factors and scaling the bounds.
@@ -58,8 +60,8 @@ dtype=wp.float64):
         cp.reciprocal(cost_scaling, out=cost_scaling_inv)
         data._b    *= d_y                        # if p > 0
         data._h_l  *= d_z;  data._h_u *= d_z      # if m > 0
-        data._x_l[:, idx_xl] *= delta_b[:, idx_xl]
-        data._x_u[:, idx_xu] *= delta_b[:, idx_xu]
+        data._x_l *= delta_b
+        data._x_u *= delta_b
 
     with one launch dispatched ``(B, n+p+m+1)``.  Index k fans out:
       - k ∈ [0, n):            delta_inv[b, k]; delta_b_inv[b, k];
@@ -87,10 +89,6 @@ dtype=wp.float64):
         data_h_u:         wp.array2d(dtype=dtype),  # type: ignore  (B, m) — to be scaled in-place
         data_x_l:         wp.array2d(dtype=dtype),  # type: ignore  (B, n) — to be scaled in-place
         data_x_u:         wp.array2d(dtype=dtype),  # type: ignore  (B, n) — to be scaled in-place
-        idx_hl:                    wp.array(dtype=wp.int32),      # type: ignore  (num_hl,)
-        idx_hu:                    wp.array(dtype=wp.int32),      # type: ignore  (num_hu,)
-        idx_xl:                    wp.array(dtype=wp.int32),      # type: ignore  (num_xl,)
-        idx_xu:                    wp.array(dtype=wp.int32),      # type: ignore  (num_xu,)
         dual_res_unscale_factor:   wp.array2d(dtype=dtype),  # type: ignore  (B, n)          output
         primal_res_unscale_factor: wp.array2d(dtype=dtype),  # type: ignore  (B, num_duals)  output
     ):
@@ -108,9 +106,11 @@ dtype=wp.float64):
         if k < n_static:
             delta_inv[b, k] = dtype(1.0) / delta[b, k]
             delta_b_inv[b, k] = dtype(1.0) / delta_b[b, k]
-            # scale x_l and x_u inplace
-            data_x_l[b, k] = data_x_l[b, k] * delta_b[b, k]
-            data_x_u[b, k] = data_x_u[b, k] * delta_b[b, k]
+            # scale x_l and x_u inplace (only for box blocks that exist)
+            if wp.static(has_x_l):
+                data_x_l[b, k] = data_x_l[b, k] * delta_b[b, k]
+            if wp.static(has_x_u):
+                data_x_u[b, k] = data_x_u[b, k] * delta_b[b, k]
             # dual_res_unscale_factor = cost_scaling_inv * delta_inv on x-block
             dual_res_unscale_factor[b, k] = dtype(1.0) / (cost_scaling[b] * delta[b, k])
         elif k < np_static:
@@ -119,31 +119,35 @@ dtype=wp.float64):
             data_b[b, k - n_static] = data_b[b, k - n_static] * delta[b, k]
         elif k < npm_static:
             delta_inv[b, k] = dtype(1.0) / delta[b, k]
-            # scale rhs of inequality constraints inplace
+            # scale rhs of inequality constraints inplace (only for present sides)
             jm = k - np_static
-            data_h_l[b, jm] = data_h_l[b, jm] * delta[b, k]
-            data_h_u[b, jm] = data_h_u[b, jm] * delta[b, k]
+            if wp.static(has_h_l):
+                data_h_l[b, jm] = data_h_l[b, jm] * delta[b, k]
+            if wp.static(has_h_u):
+                data_h_u[b, jm] = data_h_u[b, jm] * delta[b, k]
         elif k < npm_static + 1:
             # compute inverse of cost scaling
             cost_scaling_inv[b] = dtype(1.0) / cost_scaling[b]
         elif k < tail_start + num_duals:
             # primal_res_unscale_factor[b, j], packed in _dual_buffer order
-            # [y | z_l | z_u | z_bl | z_bu]. Read only inputs (delta, delta_b,
-            # idx_*) — no read-after-write hazard within this kernel.
+            # [y | z_l | z_u | z_bl | z_bu]. The inequality/box duals are
+            # full-length (identity index map), so each segment maps to a
+            # contiguous slice of delta / delta_b. Read-only inputs (delta,
+            # delta_b) — no read-after-write hazard within this kernel.
             j = k - tail_start
             if j < off_zl_end:
                 primal_res_unscale_factor[b, j] = dtype(1.0) / delta[b, wp.static(n) + j]
             elif j < off_zu_end:
-                idx = idx_hl[j - wp.static(p)]
+                idx = j - wp.static(p)
                 primal_res_unscale_factor[b, j] = dtype(1.0) / delta[b, wp.static(n + p) + idx]
             elif j < off_zbl_end:
-                idx = idx_hu[j - wp.static(p + num_hl)]
+                idx = j - wp.static(p + num_hl)
                 primal_res_unscale_factor[b, j] = dtype(1.0) / delta[b, wp.static(n + p) + idx]
             elif j < off_zbu_end:
-                idx = idx_xl[j - wp.static(p + num_hl + num_hu)]
+                idx = j - wp.static(p + num_hl + num_hu)
                 primal_res_unscale_factor[b, j] = dtype(1.0) / delta_b[b, idx]
             else:
-                idx = idx_xu[j - wp.static(p + num_hl + num_hu + num_xl)]
+                idx = j - wp.static(p + num_hl + num_hu + num_xl)
                 primal_res_unscale_factor[b, j] = dtype(1.0) / delta_b[b, idx]
         else:
             return
@@ -151,7 +155,7 @@ dtype=wp.float64):
     return finalize_and_scale_bounds_kernel
 
 
-def create_scale_bounds_kernel(n: int, p: int, m: int, dtype=wp.float64):
+def create_scale_bounds_kernel(n: int, p: int, m: int, has_h_l: bool, has_h_u: bool, has_x_l: bool, has_x_u: bool, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Sentinel-safe in-place forward bound scaling, single launch (B, n+p+m).
 
@@ -159,8 +163,8 @@ def create_scale_bounds_kernel(n: int, p: int, m: int, dtype=wp.float64):
 
         b   *= d_y                                 # if p > 0
         h_l *= d_z;  h_u *= d_z                    # if m > 0
-        x_l[:, idx_xl] *= delta_b[:, idx_xl]       # fancy indexing → alloc
-        x_u[:, idx_xu] *= delta_b[:, idx_xu]
+        x_l *= delta_b                             # full-length box bounds
+        x_u *= delta_b
     """
     @wp.kernel
     def scale_bounds_kernel(
@@ -178,23 +182,27 @@ def create_scale_bounds_kernel(n: int, p: int, m: int, dtype=wp.float64):
         npm_static = wp.static(n + p + m)
         if k < n_static:
             dx = delta_b[b, k]
-            data_x_l[b, k] = data_x_l[b, k] * dx
-            data_x_u[b, k] = data_x_u[b, k] * dx
+            if wp.static(has_x_l):
+                data_x_l[b, k] = data_x_l[b, k] * dx
+            if wp.static(has_x_u):
+                data_x_u[b, k] = data_x_u[b, k] * dx
         elif k < np_static:
             jp = k - n_static
             data_b[b, jp] = data_b[b, jp] * delta[b, k]
         elif k < npm_static:
             jm = k - np_static
             dz = delta[b, k]
-            data_h_l[b, jm] = data_h_l[b, jm] * dz
-            data_h_u[b, jm] = data_h_u[b, jm] * dz
+            if wp.static(has_h_l):
+                data_h_l[b, jm] = data_h_l[b, jm] * dz
+            if wp.static(has_h_u):
+                data_h_u[b, jm] = data_h_u[b, jm] * dz
         else:
             return
 
     return scale_bounds_kernel
 
 
-def create_unscale_bounds_kernel(n: int, p: int, m: int, dtype=wp.float64):
+def create_unscale_bounds_kernel(n: int, p: int, m: int, has_h_l: bool, has_h_u: bool, has_x_l: bool, has_x_u: bool, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Sentinel-safe in-place inverse bound scaling, single launch (B, n+p+m).
 
@@ -207,8 +215,8 @@ def create_unscale_bounds_kernel(n: int, p: int, m: int, dtype=wp.float64):
 
         b   *= d_y_inv                                 # if p > 0
         h_l *= d_z_inv;  h_u *= d_z_inv                # if m > 0
-        x_l[:, idx_xl] *= delta_b_inv[:, idx_xl]       # fancy indexing → alloc
-        x_u[:, idx_xu] *= delta_b_inv[:, idx_xu]
+        x_l *= delta_b_inv                             # full-length box bounds
+        x_u *= delta_b_inv
 
     """
     @wp.kernel
@@ -227,16 +235,20 @@ def create_unscale_bounds_kernel(n: int, p: int, m: int, dtype=wp.float64):
         npm_static = wp.static(n + p + m)
         if k < n_static:
             dx_inv = delta_b_inv[b, k]
-            data_x_l[b, k] = data_x_l[b, k] * dx_inv
-            data_x_u[b, k] = data_x_u[b, k] * dx_inv
+            if wp.static(has_x_l):
+                data_x_l[b, k] = data_x_l[b, k] * dx_inv
+            if wp.static(has_x_u):
+                data_x_u[b, k] = data_x_u[b, k] * dx_inv
         elif k < np_static:
             jp = k - n_static
             data_b[b, jp] = data_b[b, jp] * delta_inv[b, k]
         elif k < npm_static:
             jm = k - np_static
             dz_inv = delta_inv[b, k]
-            data_h_l[b, jm] = data_h_l[b, jm] * dz_inv
-            data_h_u[b, jm] = data_h_u[b, jm] * dz_inv
+            if wp.static(has_h_l):
+                data_h_l[b, jm] = data_h_l[b, jm] * dz_inv
+            if wp.static(has_h_u):
+                data_h_u[b, jm] = data_h_u[b, jm] * dz_inv
         else:
             return
 
@@ -327,12 +339,16 @@ dtype=wp.float64):
         Perform:
 
         out.fill(0.0)
-        if p > 0:        max(out, max_axis1(|delta_inv_y      * b   |))
-        if num_hu > 0:   max(out, max_axis1(|delta_inv_z[idx_hu] * h_u[idx_hu]|))
-        if num_hl > 0:   max(out, max_axis1(|delta_inv_z[idx_hl] * h_l[idx_hl]|))
-        if num_xu > 0:   max(out, max_axis1(|delta_b_inv[idx_xu] * x_u[idx_xu]|))
-        if num_xl > 0:   max(out, max_axis1(|delta_b_inv[idx_xl] * x_l[idx_xl]|))
+        if p > 0:        max(out, max_axis1(|delta_inv_y * b|))
+        if num_hu > 0:   max(out, max_axis1(|finite_mask_hu * delta_inv_z * h_u|))
+        if num_hl > 0:   max(out, max_axis1(|finite_mask_hl * delta_inv_z * h_l|))
+        if num_xu > 0:   max(out, max_axis1(|finite_mask_xu * delta_b_inv * x_u|))
+        if num_xl > 0:   max(out, max_axis1(|finite_mask_xl * delta_b_inv * x_l|))
     """
+    @wp.func
+    def finite_value(v: dtype, mask: dtype) -> dtype:
+        return wp.where(mask > dtype(0.5), v, dtype(0.0))
+
     @wp.kernel
     def kernel(
         delta_inv:   wp.array2d(dtype=dtype),  # type: ignore  (B, n+p+m)
@@ -342,10 +358,10 @@ dtype=wp.float64):
         data_h_u:    wp.array2d(dtype=dtype),  # type: ignore  (B, m)
         data_x_l:    wp.array2d(dtype=dtype),  # type: ignore  (B, n)
         data_x_u:    wp.array2d(dtype=dtype),  # type: ignore  (B, n)
-        idx_hl:      wp.array(dtype=wp.int32),      # type: ignore  (num_hl,)
-        idx_hu:      wp.array(dtype=wp.int32),      # type: ignore  (num_hu,)
-        idx_xl:      wp.array(dtype=wp.int32),      # type: ignore  (num_xl,)
-        idx_xu:      wp.array(dtype=wp.int32),      # type: ignore  (num_xu,)
+        finite_mask_hl:   wp.array2d(dtype=dtype),  # type: ignore  (B, m)
+        finite_mask_hu:   wp.array2d(dtype=dtype),  # type: ignore  (B, m)
+        finite_mask_xl:   wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        finite_mask_xu:   wp.array2d(dtype=dtype),  # type: ignore  (B, n)
         out:         wp.array(dtype=dtype),    # type: ignore  (B,)  output
     ):
         b, i = wp.tid()
@@ -361,59 +377,45 @@ dtype=wp.float64):
             )
             m_val = wp.max(m_val, m_eq)
 
-        # h_u: gather at idx_hu.
+        # h_u: full-length inequality upper bounds, masked before use.
         if wp.static(num_hu > 0):
-            idx_hu_tile = wp.tile_load(idx_hu, shape=num_hu)
-            hu_tile = wp.tile_load_indexed(
-                data_h_u[b], indices=idx_hu_tile, shape=(num_hu,), axis=0,
-            )
-            dz_hu_tile = wp.tile_load_indexed(
-                delta_inv[b], indices=idx_hu_tile, shape=(num_hu,),
-                offset=(n + p,), axis=0,
-            )
+            finite_mask_hu_tile = wp.tile_load(finite_mask_hu[b], shape=num_hu)
+            hu_raw_tile = wp.tile_load(data_h_u[b], shape=num_hu)
+            hu_tile = wp.tile_map(finite_value, hu_raw_tile, finite_mask_hu_tile)
+            dz_hu_tile = wp.tile_load(delta_inv[b], shape=num_hu, offset=(n + p))
             m_hu = wp.tile_extract(
                 wp.tile_max(wp.tile_map(wp.abs, hu_tile * dz_hu_tile)), 0,
             )
             m_val = wp.max(m_val, m_hu)
 
-        # h_l: gather at idx_hl.
+        # h_l: full-length inequality lower bounds, masked before use.
         if wp.static(num_hl > 0):
-            idx_hl_tile = wp.tile_load(idx_hl, shape=num_hl)
-            hl_tile = wp.tile_load_indexed(
-                data_h_l[b], indices=idx_hl_tile, shape=(num_hl,), axis=0,
-            )
-            dz_hl_tile = wp.tile_load_indexed(
-                delta_inv[b], indices=idx_hl_tile, shape=(num_hl,),
-                offset=(n + p,), axis=0,
-            )
+            finite_mask_hl_tile = wp.tile_load(finite_mask_hl[b], shape=num_hl)
+            hl_raw_tile = wp.tile_load(data_h_l[b], shape=num_hl)
+            hl_tile = wp.tile_map(finite_value, hl_raw_tile, finite_mask_hl_tile)
+            dz_hl_tile = wp.tile_load(delta_inv[b], shape=num_hl, offset=(n + p))
             m_hl = wp.tile_extract(
                 wp.tile_max(wp.tile_map(wp.abs, hl_tile * dz_hl_tile)), 0,
             )
             m_val = wp.max(m_val, m_hl)
 
-        # x_u: gather at idx_xu (uses delta_b_inv, no n+p offset).
+        # x_u: full-length box upper bounds, masked before use.
         if wp.static(num_xu > 0):
-            idx_xu_tile = wp.tile_load(idx_xu, shape=num_xu)
-            xu_tile = wp.tile_load_indexed(
-                data_x_u[b], indices=idx_xu_tile, shape=(num_xu,), axis=0,
-            )
-            db_xu_tile = wp.tile_load_indexed(
-                delta_b_inv[b], indices=idx_xu_tile, shape=(num_xu,), axis=0,
-            )
+            finite_mask_xu_tile = wp.tile_load(finite_mask_xu[b], shape=num_xu)
+            xu_raw_tile = wp.tile_load(data_x_u[b], shape=num_xu)
+            xu_tile = wp.tile_map(finite_value, xu_raw_tile, finite_mask_xu_tile)
+            db_xu_tile = wp.tile_load(delta_b_inv[b], shape=num_xu)
             m_xu = wp.tile_extract(
                 wp.tile_max(wp.tile_map(wp.abs, xu_tile * db_xu_tile)), 0,
             )
             m_val = wp.max(m_val, m_xu)
 
-        # x_l: gather at idx_xl.
+        # x_l: full-length box lower bounds, masked before use.
         if wp.static(num_xl > 0):
-            idx_xl_tile = wp.tile_load(idx_xl, shape=num_xl)
-            xl_tile = wp.tile_load_indexed(
-                data_x_l[b], indices=idx_xl_tile, shape=(num_xl,), axis=0,
-            )
-            db_xl_tile = wp.tile_load_indexed(
-                delta_b_inv[b], indices=idx_xl_tile, shape=(num_xl,), axis=0,
-            )
+            finite_mask_xl_tile = wp.tile_load(finite_mask_xl[b], shape=num_xl)
+            xl_raw_tile = wp.tile_load(data_x_l[b], shape=num_xl)
+            xl_tile = wp.tile_map(finite_value, xl_raw_tile, finite_mask_xl_tile)
+            db_xl_tile = wp.tile_load(delta_b_inv[b], shape=num_xl)
             m_xl = wp.tile_extract(
                 wp.tile_max(wp.tile_map(wp.abs, xl_tile * db_xl_tile)), 0,
             )

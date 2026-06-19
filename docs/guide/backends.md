@@ -166,3 +166,6 @@ strategy differs.
     Reach for a `*LargeProblemSolver` only when first-solve latency on a large,
     single (or small-batch) problem is dominated by kernel compilation. For batched
     small-to-medium problems, the standard solvers are faster.
+
+See [Large-Scale Problems](large-scale.md) for why these variants exist and a worked
+portfolio-optimization example.

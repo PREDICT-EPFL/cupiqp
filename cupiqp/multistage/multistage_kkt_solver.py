@@ -123,8 +123,12 @@ class MultistageKKTSolver(KKTSolverBase):
             )
 
     @nvtx.annotate("MultistageKKTSolver::update_kkt")
-    def update_kkt(self, data: MultistageData, delta: cp.ndarray, x_reg: cp.ndarray, z_reg: cp.ndarray) -> None:
-        """KKT[b] = P[b] + diag(x_reg[b]) + (1/delta[b])*A[b]^T A[b] + G[b]^T diag(z_reg_inv[b]) G[b]"""
+    def update_kkt(self, data: MultistageData, delta: cp.ndarray, x_reg: cp.ndarray, z_reg: cp.ndarray, z_reg_inv: cp.ndarray) -> None:
+        """KKT[b] = P[b] + diag(x_reg[b]) + (1/delta[b])*A[b]^T A[b] + G[b]^T diag(z_reg_inv[b]) G[b].
+
+        The condensed multistage backend uses z_reg_inv. The explicit diagonal z_reg is
+        accepted for interface symmetry but not used here.
+        """
         stream = wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr)
 
         B = self._batch_size
@@ -146,7 +150,7 @@ class MultistageKKTSolver(KKTSolverBase):
                 self._AtA_diag, self._AtA_offdiag,
                 delta,
                 self._kkt_G_D, self._kkt_G_E,
-                z_reg,
+                z_reg_inv,
                 self._kkt_diag_blocks,
                 self._kkt_offdiag_blocks,
                 self._delta_inv,

@@ -2,19 +2,6 @@ import warp as wp
 from .utils import to_warp_dtype
 
 
-def create_build_inverse_index_kernel(dtype=wp.float64):
-    dtype = to_warp_dtype(dtype)
-    """Create a kernel that builds an inverse index map: inv_idx[idx[t]] = t."""
-    @wp.kernel
-    def build_inverse_index_kernel(
-        idx: wp.array(dtype=wp.int32),       # type: ignore
-        inv_idx: wp.array(dtype=wp.int32),   # type: ignore
-    ):
-        t = wp.tid()
-        inv_idx[idx[t]] = t
-    return build_inverse_index_kernel
-
-
 def create_update_regularizations_step_1_kernel(num_ineq: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Create kernel operating on contiguous s_all/z_all buffers. Performs:
@@ -49,8 +36,9 @@ def create_update_regularizations_step_1_kernel(num_ineq: int, dtype=wp.float64)
     """
     @wp.kernel
     def update_regularizations_step_1_kernel(
-        vars_s_all: wp.array2d(dtype=dtype),       # type: ignore
-        vars_z_all: wp.array2d(dtype=dtype),       # type: ignore
+        vars_s_all: wp.array2d(dtype=dtype),        # type: ignore
+        vars_z_all: wp.array2d(dtype=dtype),        # type: ignore
+        finite_mask_all: wp.array2d(dtype=dtype),   # type: ignore
         m_s_all: wp.array2d(dtype=dtype),           # type: ignore
         m_z_inv_all: wp.array2d(dtype=dtype),       # type: ignore
         w_delta_inv_all: wp.array2d(dtype=dtype),   # type: ignore
@@ -65,38 +53,49 @@ def create_update_regularizations_step_1_kernel(num_ineq: int, dtype=wp.float64)
             rho_out[b] = rho_in[b]
             delta_out[b] = delta_in[b]
         if i < num_ineq_static:
-            s = vars_s_all[b, i]
-            z_inv = dtype(1.0) / vars_z_all[b, i]
-            m_s_all[b, i] = s
-            m_z_inv_all[b, i] = z_inv
-            w_delta_inv_all[b, i] = dtype(1.0) / (s * z_inv + delta_in[b])
+            if finite_mask_all[b, i] > dtype(0.5):
+                s = vars_s_all[b, i]
+                z_inv = dtype(1.0) / vars_z_all[b, i]
+                m_s_all[b, i] = s
+                m_z_inv_all[b, i] = z_inv
+                w_delta_inv_all[b, i] = dtype(1.0) / (s * z_inv + delta_in[b])
+            else:
+                m_s_all[b, i] = dtype(0.0)
+                m_z_inv_all[b, i] = dtype(0.0)
+                w_delta_inv_all[b, i] = dtype(0.0)
     return update_regularizations_step_1_kernel
 
 
-def create_update_regularizations_step_2_kernel(nx: int, nz: int, dtype=wp.float64):
+def create_update_regularizations_step_2_kernel(nx: int, nz: int,
+                                                has_h_l: bool, has_h_u: bool,
+                                                has_x_l: bool, has_x_u: bool,
+                                                dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
-    """Create kernel specialized for computing the regularization terms for x and z
-    using a gather pattern.
+    """Create kernel specialized for the condensed KKT regularization terms.
 
-    Equivalent to:
+    The full-length cone layout stores a present bound block without compacting
+    finite entries. ``w_*_delta_inv`` is already zero on inactive entries, so the
+    full-index formulas are simple and do not need inverse gather maps::
+
         x_reg[:] = rho
-        x_reg[idx_xu] += w_bu_delta_inv
-        x_reg[idx_xl] += w_bl_delta_inv
+        x_reg += x_b_scaling**2 * (w_bu_delta_inv + w_bl_delta_inv)
 
-        z_reg[:] = 0.
-        z_reg[idx_hu] += w_u_delta_inv
-        z_reg[idx_hl] += w_l_delta_inv
-        z_reg[:] = 1. / z_reg
+        z_reg[:] = 1. / (w_u_delta_inv + w_l_delta_inv)
 
-    Each thread writes only to its own unique slot (x_reg[b, t] or z_reg[b, tz]),
-    using inverse index maps to gather contributions.
+    The ``z_reg`` row weight is per row of ``G`` and is always full ``(B, m)``.
+    An omitted inequality side (``has_h_l`` / ``has_h_u`` False) has an empty
+    ``(B, 0)`` ``w_*_delta_inv`` and contributes nothing to the row weight;
+    likewise an omitted box block (``has_x_l`` / ``has_x_u``) contributes nothing
+    to ``x_reg``. All optional reads are guarded by the static presence flags.
+
+    NOTE: if there are inactive rows in G s.t. -inf <= G[i] * x <= +inf, the
+    corresponding z_reg[i] will be 0.
+
+    Each thread writes only to its own unique slot: one variable regularization
+    entry ``x_reg[b, t]`` or one inequality row weight ``z_reg[b, tz]``.
     """
     @wp.kernel
     def update_regularizations_step_2_kernel(
-        inv_idx_xu: wp.array(dtype=wp.int32),  # type: ignore
-        inv_idx_xl: wp.array(dtype=wp.int32),  # type: ignore
-        inv_idx_hu: wp.array(dtype=wp.int32),  # type: ignore
-        inv_idx_hl: wp.array(dtype=wp.int32),  # type: ignore
         w_bu_delta_inv: wp.array2d(dtype=dtype),  # type: ignore
         w_bl_delta_inv: wp.array2d(dtype=dtype),  # type: ignore
         x_b_scaling: wp.array2d(dtype=dtype),  # type: ignore
@@ -105,61 +104,73 @@ def create_update_regularizations_step_2_kernel(nx: int, nz: int, dtype=wp.float
         w_u_delta_inv: wp.array2d(dtype=dtype),  # type: ignore
         w_l_delta_inv: wp.array2d(dtype=dtype),  # type: ignore
         z_reg: wp.array2d(dtype=dtype),  # type: ignore
+        z_reg_inv: wp.array2d(dtype=dtype), # type: ignore
     ):
         b, t = wp.tid()
         nx_static = wp.static(nx)
         nz_static = wp.static(nz)
 
         if t < nx_static:
-            val = rho[b]
             xb_scaling = x_b_scaling[b, t]
-            xb_scaling_squared = xb_scaling * xb_scaling
-            ixu = inv_idx_xu[t]
-            ixl = inv_idx_xl[t]
-            if ixu >= 0:
-                val = val + xb_scaling_squared * w_bu_delta_inv[b, ixu]
-            if ixl >= 0:
-                val = val + xb_scaling_squared * w_bl_delta_inv[b, ixl]
-            x_reg[b, t] = val
+            box_weight = dtype(0.0)
+            if wp.static(has_x_u):
+                box_weight += w_bu_delta_inv[b, t]
+            if wp.static(has_x_l):
+                box_weight += w_bl_delta_inv[b, t]
+            x_reg[b, t] = rho[b] + xb_scaling * xb_scaling * box_weight
         elif t < nx_static + nz_static:
             tz = t - nx_static
-            val = dtype(0.)
-            ihu = inv_idx_hu[tz]
-            ihl = inv_idx_hl[tz]
-            if ihu >= 0:
-                val = val + w_u_delta_inv[b, ihu]
-            if ihl >= 0:
-                val = val + w_l_delta_inv[b, ihl]
-            z_reg[b, tz] = dtype(1.0) / val
+            tmp = dtype(0.0)
+            if wp.static(has_h_u):
+                tmp += w_u_delta_inv[b, tz]
+            if wp.static(has_h_l):
+                tmp += w_l_delta_inv[b, tz]
+            if tmp > dtype(0.0):  # means this row of G is active
+                z_reg[b, tz] = dtype(1.0) / tmp
+                z_reg_inv[b, tz] = tmp
+            else:
+                z_reg[b, tz] = dtype(0.0)
+                z_reg_inv[b, tz] = dtype(0.0)
 
     return update_regularizations_step_2_kernel
 
-
-def create_eliminate_duals_kernel(nx: int, nz: int, dtype=wp.float64):
+def create_eliminate_duals_kernel(nx: int, nz: int,
+                                  has_h_l: bool, has_h_u: bool,
+                                  has_x_l: bool, has_x_u: bool,
+                                  dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
-    """Create kernel specialized for eliminating duals using a gather pattern.
+    """Create kernel specialized for eliminating dual rows after slack elimination.
 
-    Equivalent to:
+    The full-length layout means the four bound blocks have shapes ``(B, m)``,
+    ``(B, m)``, ``(B, n)``, and ``(B, n)``. Inactive entries are represented by
+    zero ``w_*_delta_inv`` weights, so they are inert without any compact
+    ``idx_*`` or ``inv_idx_*`` gather/scatter.
+
+    Forward and transposed KKT solves share this dual-elimination step. The
+    preceding slack-elimination kernel has already built ``updated_rhs_z_*`` as
+    either ``rhs.z - inv(Z) * rhs.s`` for the forward system or
+    ``rhs.z - (S/Z) * rhs.s`` for the transposed system.
+
+    Equivalent full-length operations::
+
         rhs_x_updated[:] = rhs_x
-        rhs_x_updated[idx_xu] += w_bu_delta_inv * rhs_z_bu
-        rhs_x_updated[idx_xl] -= w_bl_delta_inv * rhs_z_bl
+        rhs_x_updated += x_b_scaling * w_bu_delta_inv * updated_rhs_z_bu
+        rhs_x_updated -= x_b_scaling * w_bl_delta_inv * updated_rhs_z_bl
 
-        rhs_z_updated[:] = 0.
-        rhs_z_updated[idx_hu] += w_u_delta_inv * rhs_z_u
-        rhs_z_updated[idx_hl] -= w_l_delta_inv * rhs_z_l
-        rhs_z_updated[:] *= z_reg
+        tmp_z = w_u_delta_inv * updated_rhs_z_u
+              - w_l_delta_inv * updated_rhs_z_l
+        rhs_z_updated = tmp_z * z_reg          # z_reg = 1 / (w_u_delta_inv + w_l_delta_inv)
 
-    Each thread writes only to its own unique slot (rhs_x_updated[t] or
-    rhs_z_updated[tz]), using inverse index maps to gather contributions.
+    ``z_reg`` is the explicit augmented inequality diagonal magnitude
+    (``1 / weight``), so multiplying by it is the condensed division by the row
+    weight. It is zero on inactive inequality rows (both bounds infinite), so
+    those rows take the ``else`` branch and the condensed RHS is set to zero.
+
+    Each thread writes only to its own unique slot: one variable RHS entry
+    ``rhs_x_updated[b, t]`` or one inequality RHS entry ``rhs_z_updated[b, tz]``.
     """
     @wp.kernel
     def eliminate_duals_kernel(
-        # inverse index maps (gather lookups)
-        inv_idx_xu: wp.array(dtype=wp.int32),  # type: ignore
-        inv_idx_xl: wp.array(dtype=wp.int32),  # type: ignore
-        inv_idx_hu: wp.array(dtype=wp.int32),  # type: ignore
-        inv_idx_hl: wp.array(dtype=wp.int32),  # type: ignore
-        # prepare new rhs_x
         rhs_x: wp.array2d(dtype=dtype),  # type: ignore
         w_bu_delta_inv: wp.array2d(dtype=dtype),  # type: ignore
         w_bl_delta_inv: wp.array2d(dtype=dtype),  # type: ignore
@@ -167,7 +178,6 @@ def create_eliminate_duals_kernel(nx: int, nz: int, dtype=wp.float64):
         rhs_z_bu: wp.array2d(dtype=dtype),  # type: ignore
         rhs_z_bl: wp.array2d(dtype=dtype),  # type: ignore
         rhs_x_updated: wp.array2d(dtype=dtype),  # type: ignore
-        # prepare new rhs_z
         w_u_delta_inv: wp.array2d(dtype=dtype),  # type: ignore
         w_l_delta_inv: wp.array2d(dtype=dtype),  # type: ignore
         rhs_z_u: wp.array2d(dtype=dtype),  # type: ignore
@@ -180,29 +190,27 @@ def create_eliminate_duals_kernel(nx: int, nz: int, dtype=wp.float64):
         nz_static = wp.static(nz)
 
         if t < nx_static:
-            val = rhs_x[b, t]
             xb_scaling = x_b_scaling[b, t]
-            ixu = inv_idx_xu[t]
-            ixl = inv_idx_xl[t]
-            if ixu >= 0:
-                val = val + xb_scaling * w_bu_delta_inv[b, ixu] * rhs_z_bu[b, ixu]
-            if ixl >= 0:
-                val = val - xb_scaling * w_bl_delta_inv[b, ixl] * rhs_z_bl[b, ixl]
-            rhs_x_updated[b, t] = val
-
+            box_term = dtype(0.0)
+            if wp.static(has_x_u):
+                box_term += w_bu_delta_inv[b, t] * rhs_z_bu[b, t]
+            if wp.static(has_x_l):
+                box_term -= w_bl_delta_inv[b, t] * rhs_z_bl[b, t]
+            rhs_x_updated[b, t] = rhs_x[b, t] + xb_scaling * box_term
         elif t < nx_static + nz_static:
             tz = t - nx_static
-            val = dtype(0.)
-            ihu = inv_idx_hu[tz]
-            ihl = inv_idx_hl[tz]
-            if ihu >= 0:
-                val = val + w_u_delta_inv[b, ihu] * rhs_z_u[b, ihu]
-            if ihl >= 0:
-                val = val - w_l_delta_inv[b, ihl] * rhs_z_l[b, ihl]
-            rhs_z_updated[b, tz] = val * z_reg[b, tz]
+            val = dtype(0.0)
+            if wp.static(has_h_u):
+                val += w_u_delta_inv[b, tz] * rhs_z_u[b, tz]
+            if wp.static(has_h_l):
+                val -= w_l_delta_inv[b, tz] * rhs_z_l[b, tz]
+            zr = z_reg[b, tz]  # explicit augmented diagonal magnitude = 1 / weight
+            if zr > dtype(0.0):
+                rhs_z_updated[b, tz] = val * zr
+            else:
+                rhs_z_updated[b, tz] = dtype(0.0)
 
     return eliminate_duals_kernel
-
 
 def create_eliminate_slacks_kernel(dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
@@ -247,37 +255,37 @@ def create_eliminate_slacks_transposed_kernel(dtype=wp.float64):
 
 def create_recover_duals_kernel(num_hu: int, num_hl: int, num_xu: int, num_xl: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
-    """Create kernel specialized for recovering duals. Performs the operation:
+    """Create kernel specialized for recovering duals.
 
-    Performs the operation:
-        lhs.z_u = self._w_u_delta_inv * (G_dx[:, data.idx_hu] - self._updated_rhs_z_u)
-        lhs.z_l = self._w_l_delta_inv * (-G_dx[:, data.idx_hl] - self._updated_rhs_z_l)
-        lhs.z_bu = self._w_bu_delta_inv * (xbs * lhs.x[:, data.idx_xu] - rhs.z_bu + self._m_z_bu_inv * rhs.s_bu)
-        lhs.z_bl = -self._w_bl_delta_inv * (xbs * lhs.x[:, data.idx_xl] + rhs.z_bl - self._m_z_bl_inv * rhs.s_bl)
+    Full-length layout: a present block has width ``m`` (h sides) or ``n`` (box
+    sides) and an omitted one has width 0; the row index equals the bound index,
+    so no gather is needed. Inactive bounds carry ``w_*_delta_inv == 0`` and
+    recover to 0::
+
+        lhs.z_u  =  w_u_delta_inv  * ( G_dx                 - updated_rhs_z_u)
+        lhs.z_l  =  w_l_delta_inv  * (-G_dx                 - updated_rhs_z_l)
+        lhs.z_bu =  w_bu_delta_inv * ( xbs * lhs.x - rhs.z_bu + m_z_bu_inv * rhs.s_bu)
+        lhs.z_bl = -w_bl_delta_inv * ( xbs * lhs.x + rhs.z_bl - m_z_bl_inv * rhs.s_bl)
     """
     @wp.kernel
     def recover_duals_kernel(
         G_dx: wp.array2d(dtype=dtype),  # type: ignore
         lhs_x: wp.array2d(dtype=dtype),  # type: ignore
         # h_u
-        idx_hu: wp.array(dtype=wp.int32),  # type: ignore
         w_u_delta_inv: wp.array2d(dtype=dtype),  # type: ignore
         rhs_z_u: wp.array2d(dtype=dtype),  # type: ignore
         lhs_z_u: wp.array2d(dtype=dtype),  # type: ignore
         # h_l
-        idx_hl: wp.array(dtype=wp.int32),  # type: ignore
         w_l_delta_inv: wp.array2d(dtype=dtype),  # type: ignore
         rhs_z_l: wp.array2d(dtype=dtype),  # type: ignore
         lhs_z_l: wp.array2d(dtype=dtype),  # type: ignore
         # x_u
-        idx_xu: wp.array(dtype=wp.int32),  # type: ignore
         w_bu_delta_inv: wp.array2d(dtype=dtype),  # type: ignore
         m_z_bu_inv: wp.array2d(dtype=dtype),  # type: ignore
         rhs_z_bu: wp.array2d(dtype=dtype),  # type: ignore
         rhs_s_bu: wp.array2d(dtype=dtype),  # type: ignore
         lhs_z_bu: wp.array2d(dtype=dtype),  # type: ignore
         # x_l
-        idx_xl: wp.array(dtype=wp.int32),  # type: ignore
         w_bl_delta_inv: wp.array2d(dtype=dtype),  # type: ignore
         m_z_bl_inv: wp.array2d(dtype=dtype),  # type: ignore
         rhs_z_bl: wp.array2d(dtype=dtype),  # type: ignore
@@ -293,18 +301,16 @@ def create_recover_duals_kernel(num_hu: int, num_hl: int, num_xu: int, num_xl: i
         num_xl_static = wp.static(num_xl)
 
         if t < num_hu_static:
-            lhs_z_u[b, t] = (G_dx[b, idx_hu[t]] - rhs_z_u[b, t]) * w_u_delta_inv[b, t]
+            lhs_z_u[b, t] = (G_dx[b, t] - rhs_z_u[b, t]) * w_u_delta_inv[b, t]
         elif t < num_hu_static + num_hl_static:
             j = t - num_hu_static
-            lhs_z_l[b, j] = (-G_dx[b, idx_hl[j]] - rhs_z_l[b, j]) * w_l_delta_inv[b, j]
+            lhs_z_l[b, j] = (-G_dx[b, j] - rhs_z_l[b, j]) * w_l_delta_inv[b, j]
         elif t < num_hu_static + num_hl_static + num_xu_static:
             j = t - num_hu_static - num_hl_static
-            idx = idx_xu[j]
-            lhs_z_bu[b, j] = (x_b_scaling[b, idx] * lhs_x[b, idx] - rhs_z_bu[b, j] + m_z_bu_inv[b, j] * rhs_s_bu[b, j]) * w_bu_delta_inv[b, j]
+            lhs_z_bu[b, j] = (x_b_scaling[b, j] * lhs_x[b, j] - rhs_z_bu[b, j] + m_z_bu_inv[b, j] * rhs_s_bu[b, j]) * w_bu_delta_inv[b, j]
         elif t < num_hu_static + num_hl_static + num_xu_static + num_xl_static:
             j = t - num_hu_static - num_hl_static - num_xu_static
-            idx = idx_xl[j]
-            lhs_z_bl[b, j] = -(x_b_scaling[b, idx] * lhs_x[b, idx] + rhs_z_bl[b, j] - m_z_bl_inv[b, j] * rhs_s_bl[b, j]) * w_bl_delta_inv[b, j]
+            lhs_z_bl[b, j] = -(x_b_scaling[b, j] * lhs_x[b, j] + rhs_z_bl[b, j] - m_z_bl_inv[b, j] * rhs_s_bl[b, j]) * w_bl_delta_inv[b, j]
         else:
             return
 

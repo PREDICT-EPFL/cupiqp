@@ -248,8 +248,10 @@ class SolverBase(ABC):
         for example a moving target ``b`` or a re-linearized ``P`` in
         receding-horizon control. It reuses every GPU allocation from
         ``setup()``, so only the values change; shapes, sparsity patterns,
-        which blocks are present, and the finite/infinite bound pattern must
-        stay the same (create a new solver for a structural change).
+        and which blocks are present must stay the same (create a new solver
+        for a structural change). Bound *values* may change freely, including
+        which entries are ``+/-inf`` - a bound can flip between finite and
+        infinite without re-``setup()``.
 
         Any argument left as ``None`` keeps its current value. After
         ``update()``, call ``solve()`` to get the new solution.
@@ -264,8 +266,9 @@ class SolverBase(ABC):
             If ``True``, validate the dimensions and sparsity of the new
             data. Defaults to ``False`` for speed (validation forces
             device-to-host syncs in the sparse backend). When ``False``, you
-            must ensure the finite/infinite bound structure is unchanged (the
-            same entries are ``+/-inf`` as at ``setup()``).
+            must still keep the shapes and sparsity patterns of ``P``/``A``/
+            ``G`` unchanged; bound values (including which entries are
+            ``+/-inf``) may change.
         """
         if not self._setup_done:
             raise RuntimeError("Solver not setup yet. Call setup() first.")
@@ -294,6 +297,13 @@ class SolverBase(ABC):
 
         matrix_changed = P is not None or A is not None or G is not None
 
+        # NOTE: Since we allow changing h_l/h_u containing arbitrary +inf/-inf, 
+        # an inequality row G[i] can switch between active (a finite
+        # bound) and inactive (both bounds infinite) between updates.
+        # If either of h_l or h_u are updated, we need to update G 
+        # because for sparse kkt solver we need to set the inactive rows to 0
+        ineq_bound_pattern_may_change = h_l is not None or h_u is not None
+
         # Apply preconditioner scaling to updated data.
         preconditioner_did_fresh_ruiz = False
         if self.settings.preconditioner_iter > 0:
@@ -320,7 +330,7 @@ class SolverBase(ABC):
             self._data,
             (P is not None) or preconditioner_did_fresh_ruiz,
             (A is not None) or preconditioner_did_fresh_ruiz,
-            (G is not None) or preconditioner_did_fresh_ruiz,
+            (G is not None) or preconditioner_did_fresh_ruiz or ineq_bound_pattern_may_change,
         )
 
     def solve(self) -> List[Status]:
@@ -508,6 +518,8 @@ class SolverBase(ABC):
                              + self._data.num_xl + self._data.num_xu),
                         inputs=[
                             self._unsolved_mask,
+                            self._data.finite_mask_hl, self._data.finite_mask_hu,
+                            self._data.finite_mask_xl, self._data.finite_mask_xu,
                             self._result.z_l, self._result.z_u,
                             self._result.z_bl, self._result.z_bu,
                         ],
@@ -586,8 +598,8 @@ class SolverBase(ABC):
                 self._data.c, self._data.b,
                 self._data.h_l, self._data.h_u,
                 self._data.x_l, self._data.x_u,
-                self._data.idx_hl, self._data.idx_hu,
-                self._data.idx_xl, self._data.idx_xu,
+                self._data.finite_mask_hl, self._data.finite_mask_hu,
+                self._data.finite_mask_xl, self._data.finite_mask_xu,
                 self._res.x, self._res.y,
                 self._res.z_l, self._res.z_u,
                 self._res.z_bl, self._res.z_bu,
@@ -618,7 +630,7 @@ class SolverBase(ABC):
             wp.launch(
                 kernel=self._init_guess_project_to_central_path_kernel,
                 dim=(self._data.batch_size, self._data.num_ineq),
-                inputs=[delta_z, self._result.info.mu,
+                inputs=[delta_z, self._result.info.mu, self._data.finite_mask_all,
                         self._result.z_all, self._result.s_all],
                 device="cuda",
                 stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
@@ -726,7 +738,7 @@ class SolverBase(ABC):
             self._prepare_predictor_step_kernel = create_prepare_predictor_step_kernel(dtype=self._data.dtype)
             self._prepare_corrector_step_kernel = create_prepare_corrector_step_kernel(dtype=self._data.dtype)
             self._update_vars_after_corrector_step_kernel = create_update_vars_after_corrector_step_kernel(
-                n_primal=self._data.n + self._data.num_ineq, n_dual=self._data.p + self._data.num_ineq,
+                n=self._data.n, p=self._data.p, num_ineq=self._data.num_ineq,
                 dtype=self._data.dtype
                 )
 
@@ -739,6 +751,8 @@ class SolverBase(ABC):
             )
         self._prepare_zu_minus_zl_and_zbu_minus_zbl_kernel = create_prepare_zu_minus_zl_and_zbu_minus_zbl_kernel(
             self._data.m, self._data.n,
+            has_h_l=self._data.has_h_l, has_h_u=self._data.has_h_u,
+            has_x_l=self._data.has_x_l, has_x_u=self._data.has_x_u,
             dtype=self._data.dtype
             )
         self._update_residual_nr_kernel = create_update_residual_nr_kernel(
@@ -781,7 +795,7 @@ class SolverBase(ABC):
             self._backward_compute_vector_grad_kernel = create_backward_compute_vector_grad_kernel(
                 n, p, nhu, nhl, nxu, nxl, dtype=self._data.dtype)
             self._backward_pack_full_layout_kernel = create_backward_pack_full_layout_kernel(
-                self._data.m, n, dtype=self._data.dtype)
+                self._data.m, n, nhl, nhu, nxl, nxu, dtype=self._data.dtype)
             self._backward_copy_kernel = create_backward_copy_kernel(
                 n, p, nhu, nhl, nxu, nxl, dtype=self._data.dtype)
 
@@ -817,7 +831,7 @@ class SolverBase(ABC):
         wp.launch(
             kernel=self._prepare_predictor_step_kernel,
             dim=(self._data.batch_size, self._data.num_ineq),
-            inputs=[self._result.s_all, self._result.z_all, self._res.s_all],
+            inputs=[self._result.s_all, self._result.z_all, self._data.finite_mask_all, self._res.s_all],
             device="cuda",
             stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
         )
@@ -841,6 +855,7 @@ class SolverBase(ABC):
             inputs=[
                 self._step.s_all, self._step.z_all,
                 self._result.info.sigma, self._result.info.mu,
+                self._data.finite_mask_all,
                 self._res.s_all,
             ],
             device="cuda",
@@ -865,6 +880,7 @@ class SolverBase(ABC):
             dim=(self._data.batch_size, n_primal + n_dual),
             inputs=[
                 self._unsolved_mask,
+                self._data.finite_mask_all,
                 self._result.info.primal_step,
                 self._result.info.dual_step,
                 self._step.primals_all,
@@ -885,6 +901,7 @@ class SolverBase(ABC):
             dim=[self._data.batch_size],
             inputs=[
                 self._result.s_all, self._result.z_all,
+                self._data.finite_mask_all,
                 self._step.s_all, self._step.z_all,
                 self._tau_device,
                 self._result.info.primal_step, self._result.info.dual_step,
@@ -903,6 +920,7 @@ class SolverBase(ABC):
             dim=[self._data.batch_size],
             inputs=[
                 self._result.s_all, self._result.z_all,
+                self._data.finite_mask_all, self._data.num_finite_bounds,
                 self._result.info.mu,
             ],
             block_dim=MU_BLOCK_DIM,
@@ -920,6 +938,7 @@ class SolverBase(ABC):
             inputs=[
                 self._result.s_all, self._result.z_all,
                 self._step.s_all, self._step.z_all,
+                self._data.finite_mask_all, self._data.num_finite_bounds,
                 self._result.info.primal_step, self._result.info.dual_step,
                 self._result.info.mu,
                 self._result.info.sigma,
@@ -1027,8 +1046,6 @@ class SolverBase(ABC):
                 result.z_u, result.z_l,
                 result.z_bl, result.z_bu,
                 pc.x_b_scaling,
-                self._kkt_system._inv_idx_hu, self._kkt_system._inv_idx_hl,
-                self._kkt_system._inv_idx_xu, self._kkt_system._inv_idx_xl,
                 self._work_z_1, self._work_x,
             ],
             stream=wp_stream,
@@ -1055,6 +1072,7 @@ class SolverBase(ABC):
                 self._work_x,        # zb_assembled = x_b_scaling*(z_bu - z_bl)
                 # Data
                 data.c, data.b, data.h_l, data.h_u, data.x_l, data.x_u,
+                data.finite_mask_hl, data.finite_mask_hu, data.finite_mask_xl, data.finite_mask_xu,
                 # Result variables
                 result.x, result.y,
                 result.z_l, result.z_u, result.z_bl, result.z_bu,
@@ -1063,8 +1081,6 @@ class SolverBase(ABC):
                 pc.x_b_scaling, pc.cost_scaling_inv,
                 pc.delta_inv, pc.delta_b_inv,
                 self._constraints_rhs_inf_norm_unscaled,
-                # Index maps
-                data.idx_hl, data.idx_hu, data.idx_xl, data.idx_xu,
                 # Residual outputs
                 res_nr.x, res_nr.y,
                 res_nr.z_l, res_nr.z_u, res_nr.z_bl, res_nr.z_bu,
@@ -1129,16 +1145,16 @@ class SolverBase(ABC):
         self._work_duals[:, :p] *= pc.delta_inv[:, n:n + p]
         offset += p
         self._work_duals[:, offset:offset+self._data.num_hu] = self._res_nr.z_u
-        self._work_duals[:, offset:offset+self._data.num_hu] *= pc.delta_inv[:, n + p + self._data.idx_hu]
+        self._work_duals[:, offset:offset+self._data.num_hu] *= pc.delta_inv[:, n + p:n + p + self._data.num_hu]
         offset += self._data.num_hu
         self._work_duals[:, offset:offset+self._data.num_hl] = self._res_nr.z_l
-        self._work_duals[:, offset:offset+self._data.num_hl] *= pc.delta_inv[:, n + p + self._data.idx_hl]
+        self._work_duals[:, offset:offset+self._data.num_hl] *= pc.delta_inv[:, n + p:n + p + self._data.num_hl]
         offset += self._data.num_hl
         self._work_duals[:, offset:offset+self._data.num_xu] = self._res_nr.z_bu
-        self._work_duals[:, offset:offset+self._data.num_xu] *= pc.delta_b_inv[:, self._data.idx_xu]
+        self._work_duals[:, offset:offset+self._data.num_xu] *= pc.delta_b_inv[:, :self._data.num_xu]
         offset += self._data.num_xu
         self._work_duals[:, offset:offset+self._data.num_xl] = self._res_nr.z_bl
-        self._work_duals[:, offset:offset+self._data.num_xl] *= pc.delta_b_inv[:, self._data.idx_xl]
+        self._work_duals[:, offset:offset+self._data.num_xl] *= pc.delta_b_inv[:, :self._data.num_xl]
         offset += self._data.num_xl
         if offset > 0:
             cp.absolute(self._work_duals[:, :offset], out=self._work_duals[:, :offset])
@@ -1156,16 +1172,16 @@ class SolverBase(ABC):
         self._work_duals[:, :p] *= pc.delta_inv[:, n:n + p]
         offset = p
         self._work_duals[:, offset:offset+self._data.num_hu] = self._res.z_u
-        self._work_duals[:, offset:offset+self._data.num_hu] *= pc.delta_inv[:, n + p + self._data.idx_hu]
+        self._work_duals[:, offset:offset+self._data.num_hu] *= pc.delta_inv[:, n + p:n + p + self._data.num_hu]
         offset += self._data.num_hu
         self._work_duals[:, offset:offset+self._data.num_hl] = self._res.z_l
-        self._work_duals[:, offset:offset+self._data.num_hl] *= pc.delta_inv[:, n + p + self._data.idx_hl]
+        self._work_duals[:, offset:offset+self._data.num_hl] *= pc.delta_inv[:, n + p:n + p + self._data.num_hl]
         offset += self._data.num_hl
         self._work_duals[:, offset:offset+self._data.num_xu] = self._res.z_bu
-        self._work_duals[:, offset:offset+self._data.num_xu] *= pc.delta_b_inv[:, self._data.idx_xu]
+        self._work_duals[:, offset:offset+self._data.num_xu] *= pc.delta_b_inv[:, :self._data.num_xu]
         offset += self._data.num_xu
         self._work_duals[:, offset:offset+self._data.num_xl] = self._res.z_bl
-        self._work_duals[:, offset:offset+self._data.num_xl] *= pc.delta_b_inv[:, self._data.idx_xl]
+        self._work_duals[:, offset:offset+self._data.num_xl] *= pc.delta_b_inv[:, :self._data.num_xl]
         offset += self._data.num_xl
         if offset > 0:
             cp.absolute(self._work_duals[:, :offset], out=self._work_duals[:, :offset])
@@ -1328,7 +1344,6 @@ class SolverBase(ABC):
                 grad.x, grad.y,
                 grad.z_u, grad.z_l, grad.z_bu, grad.z_bl,
                 grad.s_u, grad.s_l, grad.s_bu, grad.s_bl,
-                data.idx_hu, data.idx_hl, data.idx_xu, data.idx_xl,
                 precond.delta, precond.delta_b,
                 precond.delta_inv, precond.delta_b_inv,
                 precond.cost_scaling_inv,
@@ -1351,7 +1366,6 @@ class SolverBase(ABC):
             inputs=[
                 sol.x, sol.y,
                 sol.z_u, sol.z_l, sol.z_bu, sol.z_bl,
-                data.idx_hu, data.idx_hl, data.idx_xu, data.idx_xl,
                 precond.delta, precond.delta_b, precond.cost_scaling,
             ],
             device="cuda",
@@ -1455,16 +1469,13 @@ class SolverBase(ABC):
         self._compute_adjoint(self._grad_in, self._backward_adjoint_vector)
 
         # ---- Step 3: write into full-layout buffers
-        kkt = self._kkt_system
         wp.launch(
             kernel=self._backward_pack_full_layout_kernel,
-            dim=(B, 4 * data.m + 2 * data.n),
+            dim=(B, 4 * data.m + data.num_xu + data.num_xl),
             inputs=[
                 self._backward_adjoint_vector.z_u, self._backward_adjoint_vector.z_l,
                 self._backward_adjoint_vector.z_bu, self._backward_adjoint_vector.z_bl,
                 self._result.z_u, self._result.z_l,
-                kkt._inv_idx_hu, kkt._inv_idx_hl,
-                kkt._inv_idx_xu, kkt._inv_idx_xl,
                 self._lam_zu_full, self._lam_zl_full,
                 self._lam_zbu_full, self._lam_zbl_full,
                 self._zu_full, self._zl_full,

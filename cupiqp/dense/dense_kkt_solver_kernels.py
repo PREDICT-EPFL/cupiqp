@@ -12,10 +12,16 @@ def create_update_kkt_kernel(n: int, p: int, m: int, dtype=wp.float64):
       - ``kkt_mat[b, i, j]     = P[b, i, j]
                                   + (i == j) * x_reg[b, i]
                                   + AtA[b, i, j] / delta[b]``
-      - ``z_reg_inv[b, k]      = 1 / z_reg[b, k]``                   (k in [0, m))
-      - ``z_reg_inv_sqrt[b, k] = sqrt(1 / z_reg[b, k])``
-      - ``G_scaled[b, i, j]    = sqrt(1 / z_reg[b, i]) * G[b, i, j]``  (z-sqrt recomputed
+      - ``z_reg_inv_out[b, k]  = z_reg_inv[b, k]``  (cached copy, k in [0, m))
+      - ``z_reg_inv_sqrt[b, k] = sqrt(z_reg_inv[b, k])``
+      - ``G_scaled[b, i, j]    = sqrt(z_reg_inv[b, i]) * G[b, i, j]``  (sqrt recomputed
                                   per (i, j) thread to avoid cross-thread sync)
+
+    Here ``z_reg_inv`` is the condensed inequality row weight ``w_l + w_u``. The
+    condensed dense assembly needs the weight directly (the explicit augmented
+    diagonal ``z_reg = 1 / weight`` is not used here). A zero weight is valid and
+    means the full-length row is inactive, so it contributes neither to
+    ``G_scaled`` nor to ``G.T @ diag(z_reg_inv) @ G``.
 
     """
     n_n_total  = n * n
@@ -30,10 +36,10 @@ def create_update_kkt_kernel(n: int, p: int, m: int, dtype=wp.float64):
         data_G:    wp.array3d(dtype=dtype),   # type: ignore  (B, m, n)  (zero-shape if m == 0)
         delta:     wp.array(dtype=dtype),     # type: ignore  (B,)
         x_reg:     wp.array2d(dtype=dtype),   # type: ignore  (B, n)
-        z_reg:     wp.array2d(dtype=dtype),   # type: ignore  (B, m)
+        z_reg_inv: wp.array2d(dtype=dtype),   # type: ignore  (B, m)
         # Outputs
         delta_inv:        wp.array(dtype=dtype),    # type: ignore  (B,)
-        z_reg_inv:        wp.array2d(dtype=dtype),  # type: ignore  (B, m)
+        z_reg_inv_out:    wp.array2d(dtype=dtype),  # type: ignore  (B, m), copy z_reg_inv to here
         z_reg_inv_sqrt:   wp.array2d(dtype=dtype),  # type: ignore  (B, m)
         kkt_mat:          wp.array3d(dtype=dtype),  # type: ignore  (B, n, n)
         G_scaled:         wp.array3d(dtype=dtype),  # type: ignore  (B, m, n)
@@ -49,7 +55,7 @@ def create_update_kkt_kernel(n: int, p: int, m: int, dtype=wp.float64):
             delta_inv[b] = dtype(1.0) / delta[b]
 
         if t < n_n_static:
-            # Region 1: kkt_mat = P + diag(x_reg) + 1/delta*AtA
+            # kkt_mat = P + diag(x_reg) + 1/delta*AtA
             i = t // n_static
             j = t % n_static
             v = data_P[b, i, j]
@@ -59,19 +65,19 @@ def create_update_kkt_kernel(n: int, p: int, m: int, dtype=wp.float64):
                 v = v + (dtype(1.0) / delta[b]) * data_AtA[b, i, j]
             kkt_mat[b, i, j] = v
         elif t < n_n_static + m_static:
-            # Region 2: z_reg_inv & z_reg_inv_sqrt.
+            # Cache the row weight and its sqrt for solve()/recovery.
+            # NOTE: z_reg_inv contains zeros for inactive rows s.t. -inf <= G[i] * x <= +inf
             k = t - n_n_static
-            zinv = dtype(1.0) / z_reg[b, k]
-            z_reg_inv[b, k] = zinv
-            z_reg_inv_sqrt[b, k] = wp.sqrt(zinv)
+            w = z_reg_inv[b, k]
+            z_reg_inv_out[b, k] = w
+            z_reg_inv_sqrt[b, k] = wp.sqrt(w)
         elif t < n_n_static + m_static + m_n_static:
-            # Region 3: G_scaled = z_reg_inv_sqrt[b, i] * G[b, i, j].
-            # Recompute the per-row sqrt locally to avoid the in-kernel
-            # producer-consumer dependency on Region B's writes.
+            # G_scaled = sqrt(weight[b, i]) * G[b, i, j]; inactive rows (weight 0)
+            # contribute nothing to G.T @ diag(z_reg_inv) @ G.
             k = t - n_n_static - m_static
             i = k // n_static
             j = k % n_static
-            G_scaled[b, i, j] = wp.sqrt(dtype(1.0) / z_reg[b, i]) * data_G[b, i, j]
+            G_scaled[b, i, j] = wp.sqrt(z_reg_inv[b, i]) * data_G[b, i, j]
         else:
             return
 

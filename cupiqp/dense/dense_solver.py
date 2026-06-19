@@ -152,8 +152,9 @@ class DenseSolver(SolverBase):
     def _init_preconditioner(self) -> DenseRuizEquilibration:
         return DenseRuizEquilibration(
             self._data.batch_size, self._data.n, self._data.p, self._data.m,
-            self._data.idx_xl, self._data.idx_xu,
-            self._data.idx_hl, self._data.idx_hu,
+            has_h_l=self._data.has_h_l, has_h_u=self._data.has_h_u,
+            has_x_l=self._data.has_x_l, has_x_u=self._data.has_x_u,
+            active_x_bound=self._data.active_x_bound,
             use_warp_tile_kernels=True,
             dtype=self._data.dtype,
         )
@@ -176,7 +177,7 @@ class DenseSolver(SolverBase):
             B = d.batch_size
             dtype = d.dtype
             self._dense_data_gradients_kernel = create_dense_data_gradients_kernel(
-                d.n, d.p, d.m, dtype=dtype)
+                d.n, d.p, d.m, d.num_hu, d.num_xu, dtype=dtype)
             self._grad_data = DenseData(dtype=dtype, device=self.settings.device)
             self._grad_data.init(
                 P=cp.zeros((B, d.n, d.n), dtype=dtype),
@@ -201,7 +202,7 @@ class DenseSolver(SolverBase):
         grad_data = self._grad_data
         B = data.batch_size
         total = (data.n * data.n + data.p * data.n + data.m * data.n
-                 + data.p + data.m + data.n)
+                 + data.p + data.num_hu + data.num_xu)
         if total > 0:
             wp.launch(
                 kernel=self._dense_data_gradients_kernel,
