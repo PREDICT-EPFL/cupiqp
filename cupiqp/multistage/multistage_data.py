@@ -127,6 +127,8 @@ class MultistageData(Data):
             raise ValueError("A and b must both be provided or both be None")
 
         # ---- G, h_u, h_l (inequality constraints) ----
+        self._has_h_l = h_l is not None
+        self._has_h_u = h_u is not None
         if G is not None:
             self._validate_bidiag(G, block_size, num_blocks, B)
             if h_u is None and h_l is None:
@@ -271,6 +273,11 @@ class MultistageData(Data):
         wp.copy(self._G.E, value.E)
 
     def set_h_l(self, value: BlockVec, check: bool = True):
+        if not self._has_h_l:
+            raise ValueError(
+                "Cannot set h_l: no lower-inequality block was provided at setup(). "
+                "Adding an inequality block requires a new setup()."
+            )
         if check:
             self._check_same_block_vec(self._h_l_blk, value)
         wp.copy(self._h_l_blk.data, value.data)
@@ -278,6 +285,11 @@ class MultistageData(Data):
         self._update_finite_bound_masks()
 
     def set_h_u(self, value: BlockVec, check: bool = True):
+        if not self._has_h_u:
+            raise ValueError(
+                "Cannot set h_u: no upper-inequality block was provided at setup(). "
+                "Adding an inequality block requires a new setup()."
+            )
         if check:
             self._check_same_block_vec(self._h_u_blk, value)
         wp.copy(self._h_u_blk.data, value.data)

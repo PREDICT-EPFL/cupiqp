@@ -103,10 +103,11 @@ class SparseData(Data):
             self._G = UniformBatchedCsrMatrix.empty(B, 0, n, dtype=dtype)
 
         m = self._G.rows
+        self._has_h_l = h_l is not None
+        self._has_h_u = h_u is not None
         self._h_u = self._to_batched_vec(h_u, B, m, "h_u", dtype=dtype) if h_u is not None else cp.zeros((B, 0), dtype=dtype)
         self._h_l = self._to_batched_vec(h_l, B, m, "h_l", dtype=dtype) if h_l is not None else cp.zeros((B, 0), dtype=dtype)
-        # Box-block presence is structural and fixed here: an omitted bound
-        # gets no storage (empty (B, 0)); a provided one is a full (B, n) block.
+
         self._has_x_l = x_l is not None
         self._has_x_u = x_u is not None
         self._x_u = self._to_batched_vec(x_u, B, n, "x_u", dtype=dtype) if x_u is not None else cp.zeros((B, 0), dtype=dtype)
@@ -273,12 +274,22 @@ class SparseData(Data):
         self._set_matrix_values(self._G, value, check, "G")
 
     def set_h_l(self, value: cp.ndarray, check: bool = True):
+        if not self._has_h_l:
+            raise ValueError(
+                "Cannot set h_l: no lower-inequality block was provided at setup(). "
+                "Adding an inequality block requires a new setup()."
+            )
         if check and value.shape != self._h_l.shape:
             raise ValueError(f"h_l shape mismatch: expected {self._h_l.shape}, got {value.shape}")
         self._h_l[:] = value
         self._update_finite_bound_masks()
 
     def set_h_u(self, value: cp.ndarray, check: bool = True):
+        if not self._has_h_u:
+            raise ValueError(
+                "Cannot set h_u: no upper-inequality block was provided at setup(). "
+                "Adding an inequality block requires a new setup()."
+            )
         if check and value.shape != self._h_u.shape:
             raise ValueError(f"h_u shape mismatch: expected {self._h_u.shape}, got {value.shape}")
         self._h_u[:] = value

@@ -751,6 +751,7 @@ class SolverBase(ABC):
             )
         self._prepare_zu_minus_zl_and_zbu_minus_zbl_kernel = create_prepare_zu_minus_zl_and_zbu_minus_zbl_kernel(
             self._data.m, self._data.n,
+            has_h_l=self._data.has_h_l, has_h_u=self._data.has_h_u,
             has_x_l=self._data.has_x_l, has_x_u=self._data.has_x_u,
             dtype=self._data.dtype
             )
@@ -794,7 +795,7 @@ class SolverBase(ABC):
             self._backward_compute_vector_grad_kernel = create_backward_compute_vector_grad_kernel(
                 n, p, nhu, nhl, nxu, nxl, dtype=self._data.dtype)
             self._backward_pack_full_layout_kernel = create_backward_pack_full_layout_kernel(
-                self._data.m, n, nxl, nxu, dtype=self._data.dtype)
+                self._data.m, n, nhl, nhu, nxl, nxu, dtype=self._data.dtype)
             self._backward_copy_kernel = create_backward_copy_kernel(
                 n, p, nhu, nhl, nxu, nxl, dtype=self._data.dtype)
 

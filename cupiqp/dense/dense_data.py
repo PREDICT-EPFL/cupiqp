@@ -115,6 +115,11 @@ class DenseData(Data):
                 raise ValueError("h_l and h_u must be None when G is None.")
             self._G = cp.zeros((B, 0, n), dtype=self._dtype)
 
+        # Inequality-block presence is structural and fixed here: an omitted
+        # side gets no storage (empty (B, 0)); a provided one is a full (B, m)
+        # block. Both omitted is only valid when G is absent (handled above).
+        self._has_h_l = h_l is not None
+        self._has_h_u = h_u is not None
         self._h_u = self._as_batched_vec(h_u)
         self._h_l = self._as_batched_vec(h_l)
 
@@ -175,12 +180,22 @@ class DenseData(Data):
         self._G[:] = value
 
     def set_h_l(self, value: cp.ndarray, check: bool = True):
+        if not self._has_h_l:
+            raise ValueError(
+                "Cannot set h_l: no lower-inequality block was provided at setup(). "
+                "Adding an inequality block requires a new setup()."
+            )
         if check and value.shape != self._h_l.shape:
             raise ValueError(f"h_l shape mismatch: expected {self._h_l.shape}, got {value.shape}")
         self._h_l[:] = value
         self._update_finite_bound_masks()
 
     def set_h_u(self, value: cp.ndarray, check: bool = True):
+        if not self._has_h_u:
+            raise ValueError(
+                "Cannot set h_u: no upper-inequality block was provided at setup(). "
+                "Adding an inequality block requires a new setup()."
+            )
         if check and value.shape != self._h_u.shape:
             raise ValueError(f"h_u shape mismatch: expected {self._h_u.shape}, got {value.shape}")
         self._h_u[:] = value

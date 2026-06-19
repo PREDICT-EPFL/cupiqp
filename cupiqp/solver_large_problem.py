@@ -212,9 +212,13 @@ class LargeProblemSolverBase(SolverBase):
         else:
             self._work_primal_rel_norm.fill(0.)
 
+        # zu_minus_zl is always full (B, m); an omitted inequality side has
+        # (B, 0) duals and contributes nothing, so guard each on its presence.
         self._work_z_1.fill(0.)
-        self._work_z_1[:, :self._data.m] += self._result.z_u
-        self._work_z_1[:, :self._data.m] -= self._result.z_l
+        if self._data.num_hu > 0:
+            self._work_z_1[:, :self._data.m] += self._result.z_u
+        if self._data.num_hl > 0:
+            self._work_z_1[:, :self._data.m] -= self._result.z_l
 
         G_x = self._work_z_2
         GT_zu_minus_zl = self._step.x
@@ -286,16 +290,18 @@ class LargeProblemSolverBase(SolverBase):
         # res_nr.z_l = (G*x - s_l - h_l) on finite rows; 0 on inactive rows.
         # The trailing mask multiply zeros the inactive rows so the shared
         # _primal_res_nr() inf-norm (which does not re-mask) is correct.
-        self._res_nr.z_l[:] = G_x[:, :self._data.m]
-        cp.subtract(self._res_nr.z_l, self._result.s_l, out=self._res_nr.z_l)
-        cp.subtract(self._res_nr.z_l, h_l_masked, out=self._res_nr.z_l)
-        self._res_nr.z_l *= self._data.finite_mask_hl
+        if self._data.num_hl > 0:
+            self._res_nr.z_l[:] = G_x[:, :self._data.m]
+            cp.subtract(self._res_nr.z_l, self._result.s_l, out=self._res_nr.z_l)
+            cp.subtract(self._res_nr.z_l, h_l_masked, out=self._res_nr.z_l)
+            self._res_nr.z_l *= self._data.finite_mask_hl
 
         # res_nr.z_u = (-G*x - s_u + h_u) on finite rows; 0 on inactive rows.
-        self._res_nr.z_u[:] = -G_x[:, :self._data.m]
-        cp.subtract(self._res_nr.z_u, self._result.s_u, out=self._res_nr.z_u)
-        cp.add(self._res_nr.z_u, h_u_masked, out=self._res_nr.z_u)
-        self._res_nr.z_u *= self._data.finite_mask_hu
+        if self._data.num_hu > 0:
+            self._res_nr.z_u[:] = -G_x[:, :self._data.m]
+            cp.subtract(self._res_nr.z_u, self._result.s_u, out=self._res_nr.z_u)
+            cp.add(self._res_nr.z_u, h_u_masked, out=self._res_nr.z_u)
+            self._res_nr.z_u *= self._data.finite_mask_hu
 
         # res_nr.z_bl = (x_b_scaling*x - s_bl - x_l) on finite rows; 0 otherwise.
         # Skipped entirely when the lower box block is absent (z_bl is (B, 0)).
@@ -527,6 +533,7 @@ class DenseLargeProblemSolver(LargeProblemSolverBase, DenseSolver):
         # Override DenseSolver: skip the warp tile-kernel compile cliff.
         return DenseRuizEquilibration(
             self._data.batch_size, self._data.n, self._data.p, self._data.m,
+            has_h_l=self._data.has_h_l, has_h_u=self._data.has_h_u,
             has_x_l=self._data.has_x_l, has_x_u=self._data.has_x_u,
             active_x_bound=self._data.active_x_bound,
             use_warp_tile_kernels=False,
@@ -540,6 +547,7 @@ class SparseLargeProblemSolver(LargeProblemSolverBase, SparseSolver):
         # Override SparseSolver: skip the warp tile-kernel compile cliff.
         return SparseRuizEquilibration(
             self._data.batch_size, self._data.n, self._data.p, self._data.m,
+            has_h_l=self._data.has_h_l, has_h_u=self._data.has_h_u,
             has_x_l=self._data.has_x_l, has_x_u=self._data.has_x_u,
             active_x_bound=self._data.active_x_bound,
             use_warp_tile_kernels=False,
@@ -554,6 +562,7 @@ class MultistageLargeProblemSolver(LargeProblemSolverBase, MultistageSolver):
         # cliff. Multistage needs the block layout via ``data=``.
         return MultistageRuizEquilibration(
             self._data.batch_size, self._data.n, self._data.p, self._data.m,
+            has_h_l=self._data.has_h_l, has_h_u=self._data.has_h_u,
             has_x_l=self._data.has_x_l, has_x_u=self._data.has_x_u,
             active_x_bound=self._data.active_x_bound,
             data=self._data,

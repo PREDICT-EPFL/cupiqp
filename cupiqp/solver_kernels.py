@@ -917,26 +917,30 @@ def create_update_residual_nr_kernel(n: int, p: int, m: int, num_hl: int, num_hu
     return update_residual_nr_kernel
 
 
-def create_prepare_zu_minus_zl_and_zbu_minus_zbl_kernel(m: int, n: int, has_x_l: bool, has_x_u: bool, dtype=wp.float64):
+def create_prepare_zu_minus_zl_and_zbu_minus_zbl_kernel(m: int, n: int,
+                                                        has_h_l: bool, has_h_u: bool,
+                                                        has_x_l: bool, has_x_u: bool,
+                                                        dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Pre-matvec combination for _update_residuals_nr.
 
-    Full-length layout: the dual blocks are stored at full size with exactly 0
-    on infinite-bound rows, so the combination is a plain elementwise
+    Full-length layout: a present dual block is stored at full size with exactly
+    0 on infinite-bound rows, so the combination is a plain elementwise
     difference (no compressed gather/scatter needed)::
 
           zu_minus_zl[:, i]  = z_u[:, i] - z_l[:, i]                  for i in [0, m)
           zbu_minus_zbl[:, j] = x_b_scaling[:, j] * (z_bu[:, j] - z_bl[:, j])  for j in [0, n)
 
-    An omitted box block (``has_x_l`` / ``has_x_u`` False) has empty ``(B, 0)``
-    duals and contributes 0 to ``zbu_minus_zbl``; the box reads are guarded by
-    the static presence flags.
+    The output ``zu_minus_zl`` is always full ``(B, m)``. An omitted inequality
+    side (``has_h_l`` / ``has_h_u`` False) has empty ``(B, 0)`` duals and
+    contributes 0; likewise an omitted box block (``has_x_l`` / ``has_x_u``).
+    All optional reads are guarded by the static presence flags.
     """
 
     @wp.kernel
     def prepare_zu_minus_zl_and_zbu_minus_zbl_kernel(
-        z_u:              wp.array2d(dtype=dtype),  # type: ignore  (B, m)
-        z_l:              wp.array2d(dtype=dtype),  # type: ignore  (B, m)
+        z_u:              wp.array2d(dtype=dtype),  # type: ignore  (B, num_hu)
+        z_l:              wp.array2d(dtype=dtype),  # type: ignore  (B, num_hl)
         z_bl:             wp.array2d(dtype=dtype),  # type: ignore  (B, num_xl)
         z_bu:             wp.array2d(dtype=dtype),  # type: ignore  (B, num_xu)
         x_b_scaling:      wp.array2d(dtype=dtype),  # type: ignore  (B, n)
@@ -947,7 +951,13 @@ def create_prepare_zu_minus_zl_and_zbu_minus_zbl_kernel(m: int, n: int, has_x_l:
         b, i = wp.tid()
 
         if i < m_static:
-            zu_minus_zl[b, i] = z_u[b, i] - z_l[b, i]
+            zu = dtype(0.0)
+            zl = dtype(0.0)
+            if wp.static(has_h_u):
+                zu = z_u[b, i]
+            if wp.static(has_h_l):
+                zl = z_l[b, i]
+            zu_minus_zl[b, i] = zu - zl
         else:
             j = i - m_static
             zbu = dtype(0.0)
@@ -1599,22 +1609,27 @@ dtype=wp.float64):
     return backward_copy_kernel
 
 
-def create_backward_pack_full_layout_kernel(m: int, n: int, num_xl: int, num_xu: int, dtype=wp.float64):
+def create_backward_pack_full_layout_kernel(m: int, n: int,
+                                            num_hl: int, num_hu: int,
+                                            num_xl: int, num_xu: int,
+                                            dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     r"""Fused full-layout pack for the backward pass.
 
-    With the full-length dual layout the active-only inputs are already the
-    same length as the full-layout outputs (identity index map), so each
-    region is a direct per-element copy. Box blocks are optional: when a side
-    was omitted at setup() its width (``num_xl`` / ``num_xu``) is 0, so that
-    region is empty and its ``sol_z_b*`` / ``lam_zb*_full`` arrays are ``(B, 0)``.
+    The inequality-row gradient scratch (``lam_z*_full`` / ``z*_full``) is always
+    full ``(B, m)`` because matrix gradients accumulate per row of ``G``. When an
+    inequality side is present its active dual block has width ``m`` and is copied
+    in directly; when it was omitted at setup() its ``sol_z*`` / ``result_z*``
+    block is empty ``(B, 0)`` and the corresponding full buffer is filled with 0
+    (the absent side contributes no dual). Box blocks are likewise optional: an
+    omitted box side has zero-width ``num_xl`` / ``num_xu`` regions.
 
     Outputs:
 
-    * ``lam_zu_full, lam_zl_full ∈ (B, m)`` — copy of ``sol.z_u/z_l``.
+    * ``lam_zu_full, lam_zl_full ∈ (B, m)`` — ``sol.z_u/z_l`` (0 if side absent).
     * ``lam_zbu_full ∈ (B, num_xu)``, ``lam_zbl_full ∈ (B, num_xl)`` — copy of
       ``sol.z_bu/z_bl`` (empty when that box side is absent).
-    * ``zu_full, zl_full ∈ (B, m)`` — copy of ``result.z_u/z_l``.
+    * ``zu_full, zl_full ∈ (B, m)`` — ``result.z_u/z_l`` (0 if side absent).
     """
     @wp.kernel
     def backward_pack_full_layout_kernel(
@@ -1637,9 +1652,12 @@ def create_backward_pack_full_layout_kernel(m: int, n: int, num_xl: int, num_xu:
         m_static = wp.static(m)
         num_xu_static = wp.static(num_xu)
         num_xl_static = wp.static(num_xl)
+        has_hu = wp.static(num_hu > 0)
+        has_hl = wp.static(num_hl > 0)
 
-        # Six regions, one full-buffer position per thread. Absent box sides
-        # contribute zero-width regions.
+        # Six regions, one full-buffer position per thread. The four inequality-
+        # row regions are full (B, m); absent box sides contribute zero-width
+        # regions.
         end_lam_zu  = m_static
         end_lam_zl  = end_lam_zu  + m_static
         end_lam_zbu = end_lam_zl  + num_xu_static
@@ -1649,11 +1667,17 @@ def create_backward_pack_full_layout_kernel(m: int, n: int, num_xl: int, num_xu:
 
         if t < end_lam_zu:
             j = t
-            lam_zu_full[b, j] = sol_z_u[b, j]
+            if has_hu:
+                lam_zu_full[b, j] = sol_z_u[b, j]
+            else:
+                lam_zu_full[b, j] = dtype(0.0)
 
         elif t < end_lam_zl:
             j = t - end_lam_zu
-            lam_zl_full[b, j] = sol_z_l[b, j]
+            if has_hl:
+                lam_zl_full[b, j] = sol_z_l[b, j]
+            else:
+                lam_zl_full[b, j] = dtype(0.0)
 
         elif t < end_lam_zbu:
             j = t - end_lam_zl
@@ -1665,11 +1689,17 @@ def create_backward_pack_full_layout_kernel(m: int, n: int, num_xl: int, num_xu:
 
         elif t < end_res_zu:
             j = t - end_lam_zbl
-            zu_full[b, j] = result_z_u[b, j]
+            if has_hu:
+                zu_full[b, j] = result_z_u[b, j]
+            else:
+                zu_full[b, j] = dtype(0.0)
 
         elif t < end_res_zl:
             j = t - end_res_zu
-            zl_full[b, j] = result_z_l[b, j]
+            if has_hl:
+                zl_full[b, j] = result_z_l[b, j]
+            else:
+                zl_full[b, j] = dtype(0.0)
 
         else:
             return

@@ -7,7 +7,7 @@ def create_multistage_data_gradients_kernel(
     N_a: int, r_a: int,
     N_g: int, r_g: int,
     p: int, m: int, n: int,
-    num_xu: int, num_xl: int,
+    num_hu: int, num_hl: int, num_xu: int, num_xl: int,
     dtype=wp.float64
     ):
     dtype = to_warp_dtype(dtype)
@@ -54,10 +54,13 @@ def create_multistage_data_gradients_kernel(
     end_dA_E       = end_dA_D       + sz_dA_E
     end_dG_D       = end_dA_E       + sz_dG_D
     end_dG_E       = end_dG_D       + sz_dG_E
+    # dG_D/dG_E use the always-(B, m) full-layout buffers (zero on absent
+    # sides). The dh_u / dh_l outputs have width num_hu / num_hl (0 when that
+    # inequality side was omitted at setup()).
     end_dc         = end_dG_E       + n
     end_db         = end_dc         + p
-    end_dh_u       = end_db         + m
-    end_dh_l       = end_dh_u       + m
+    end_dh_u       = end_db         + num_hu
+    end_dh_l       = end_dh_u       + num_hl
     end_dx_u       = end_dh_l       + num_xu
     end_dx_l       = end_dx_u       + num_xl
 

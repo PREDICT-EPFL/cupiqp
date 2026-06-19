@@ -2,7 +2,7 @@ import warp as wp
 from ..utils import to_warp_dtype
 
 
-def create_dense_data_gradients_kernel(n: int, p: int, m: int, num_xu: int, dtype=wp.float64):
+def create_dense_data_gradients_kernel(n: int, p: int, m: int, num_hu: int, num_xu: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
 
     @wp.kernel
@@ -30,13 +30,16 @@ def create_dense_data_gradients_kernel(n: int, p: int, m: int, num_xu: int, dtyp
         n_s = wp.static(n)
         p_s = wp.static(p)
         m_s = wp.static(m)
+        num_hu_s = wp.static(num_hu)
         num_xu_s = wp.static(num_xu)
 
+        # dG uses the always-(B, m) full-layout buffers (zero on absent sides).
+        # The dh_u output, by contrast, has width num_hu (0 when h_u omitted).
         end_dP   = n_s * n_s
         end_dA   = end_dP + p_s * n_s
         end_dG   = end_dA + m_s * n_s
         end_db   = end_dG + p_s
-        end_dh_u = end_db + m_s
+        end_dh_u = end_db + num_hu_s
         end_dx_u = end_dh_u + num_xu_s
 
         if t < end_dP:

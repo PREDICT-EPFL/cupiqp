@@ -66,11 +66,14 @@ def create_update_regularizations_step_1_kernel(num_ineq: int, dtype=wp.float64)
     return update_regularizations_step_1_kernel
 
 
-def create_update_regularizations_step_2_kernel(nx: int, nz: int, has_x_l: bool, has_x_u: bool, dtype=wp.float64):
+def create_update_regularizations_step_2_kernel(nx: int, nz: int,
+                                                has_h_l: bool, has_h_u: bool,
+                                                has_x_l: bool, has_x_u: bool,
+                                                dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Create kernel specialized for the condensed KKT regularization terms.
 
-    The full-length cone layout stores all four bound classes without compacting
+    The full-length cone layout stores a present bound block without compacting
     finite entries. ``w_*_delta_inv`` is already zero on inactive entries, so the
     full-index formulas are simple and do not need inverse gather maps::
 
@@ -79,9 +82,11 @@ def create_update_regularizations_step_2_kernel(nx: int, nz: int, has_x_l: bool,
 
         z_reg[:] = 1. / (w_u_delta_inv + w_l_delta_inv)
 
-    An omitted box block (``has_x_l`` / ``has_x_u`` False) contributes nothing to
-    ``x_reg`` and its ``w_b*_delta_inv`` array is empty ``(B, 0)``, so the box
-    reads are guarded by the static presence flags.
+    The ``z_reg`` row weight is per row of ``G`` and is always full ``(B, m)``.
+    An omitted inequality side (``has_h_l`` / ``has_h_u`` False) has an empty
+    ``(B, 0)`` ``w_*_delta_inv`` and contributes nothing to the row weight;
+    likewise an omitted box block (``has_x_l`` / ``has_x_u``) contributes nothing
+    to ``x_reg``. All optional reads are guarded by the static presence flags.
 
     NOTE: if there are inactive rows in G s.t. -inf <= G[i] * x <= +inf, the
     corresponding z_reg[i] will be 0.
@@ -115,7 +120,11 @@ def create_update_regularizations_step_2_kernel(nx: int, nz: int, has_x_l: bool,
             x_reg[b, t] = rho[b] + xb_scaling * xb_scaling * box_weight
         elif t < nx_static + nz_static:
             tz = t - nx_static
-            tmp = w_u_delta_inv[b, tz] + w_l_delta_inv[b, tz]
+            tmp = dtype(0.0)
+            if wp.static(has_h_u):
+                tmp += w_u_delta_inv[b, tz]
+            if wp.static(has_h_l):
+                tmp += w_l_delta_inv[b, tz]
             if tmp > dtype(0.0):  # means this row of G is active
                 z_reg[b, tz] = dtype(1.0) / tmp
                 z_reg_inv[b, tz] = tmp
@@ -125,7 +134,10 @@ def create_update_regularizations_step_2_kernel(nx: int, nz: int, has_x_l: bool,
 
     return update_regularizations_step_2_kernel
 
-def create_eliminate_duals_kernel(nx: int, nz: int, has_x_l: bool, has_x_u: bool, dtype=wp.float64):
+def create_eliminate_duals_kernel(nx: int, nz: int,
+                                  has_h_l: bool, has_h_u: bool,
+                                  has_x_l: bool, has_x_u: bool,
+                                  dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Create kernel specialized for eliminating dual rows after slack elimination.
 
@@ -187,7 +199,11 @@ def create_eliminate_duals_kernel(nx: int, nz: int, has_x_l: bool, has_x_u: bool
             rhs_x_updated[b, t] = rhs_x[b, t] + xb_scaling * box_term
         elif t < nx_static + nz_static:
             tz = t - nx_static
-            val = w_u_delta_inv[b, tz] * rhs_z_u[b, tz] - w_l_delta_inv[b, tz] * rhs_z_l[b, tz]
+            val = dtype(0.0)
+            if wp.static(has_h_u):
+                val += w_u_delta_inv[b, tz] * rhs_z_u[b, tz]
+            if wp.static(has_h_l):
+                val -= w_l_delta_inv[b, tz] * rhs_z_l[b, tz]
             zr = z_reg[b, tz]  # explicit augmented diagonal magnitude = 1 / weight
             if zr > dtype(0.0):
                 rhs_z_updated[b, tz] = val * zr
@@ -241,9 +257,10 @@ def create_recover_duals_kernel(num_hu: int, num_hl: int, num_xu: int, num_xl: i
     dtype = to_warp_dtype(dtype)
     """Create kernel specialized for recovering duals.
 
-    Full-length layout (``num_hu == num_hl == m``, ``num_xu == num_xl == n``,
-    identity index maps): the row index equals the bound index, so no gather is
-    needed. Inactive bounds carry ``w_*_delta_inv == 0`` and recover to 0::
+    Full-length layout: a present block has width ``m`` (h sides) or ``n`` (box
+    sides) and an omitted one has width 0; the row index equals the bound index,
+    so no gather is needed. Inactive bounds carry ``w_*_delta_inv == 0`` and
+    recover to 0::
 
         lhs.z_u  =  w_u_delta_inv  * ( G_dx                 - updated_rhs_z_u)
         lhs.z_l  =  w_l_delta_inv  * (-G_dx                 - updated_rhs_z_l)

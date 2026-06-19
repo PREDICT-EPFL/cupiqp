@@ -143,10 +143,12 @@ class KKTSystem:
 
         # Create Warp kernels
         self._update_regularization_step_1_kernel = create_update_regularizations_step_1_kernel(num_ineq=num_ineq, dtype=self._dtype)
-        self._update_regularization_step_2_kernel = create_update_regularizations_step_2_kernel(n, m, has_x_l=data.has_x_l, has_x_u=data.has_x_u, dtype=self._dtype)
+        self._update_regularization_step_2_kernel = create_update_regularizations_step_2_kernel(
+            n, m, has_h_l=data.has_h_l, has_h_u=data.has_h_u, has_x_l=data.has_x_l, has_x_u=data.has_x_u, dtype=self._dtype)
         self._eliminate_slacks_kernel = create_eliminate_slacks_kernel(dtype=self._dtype)
         self._eliminate_slacks_transposed_kernel = create_eliminate_slacks_transposed_kernel(dtype=self._dtype)
-        self._eliminate_duals_kernel = create_eliminate_duals_kernel(n, m, has_x_l=data.has_x_l, has_x_u=data.has_x_u, dtype=self._dtype)
+        self._eliminate_duals_kernel = create_eliminate_duals_kernel(
+            n, m, has_h_l=data.has_h_l, has_h_u=data.has_h_u, has_x_l=data.has_x_l, has_x_u=data.has_x_u, dtype=self._dtype)
         self._recover_duals_kernel = create_recover_duals_kernel(data.num_hu, data.num_hl, data.num_xu, data.num_xl, dtype=self._dtype)
         self._recover_slacks_kernel = create_recover_slacks_kernel(dtype=self._dtype)
         self._recover_slacks_transposed_kernel = create_recover_slacks_transposed_kernel(dtype=self._dtype)
@@ -230,11 +232,17 @@ class KKTSystem:
             if data.m > 0:
                 # z_reg_inv = weight = w_l + w_u (condensed row weight, 0 on
                 # inactive rows). z_reg = 1 / weight (explicit augmented diagonal
-                # magnitude); inactive rows (weight == 0) get z_reg = 0.
-                tmp = self._w_u_delta_inv + self._w_l_delta_inv
+                # magnitude); inactive rows (weight == 0) get z_reg = 0. The row
+                # weight is per row of G and always (B, m); an omitted inequality
+                # side has an empty (B, 0) w_*_delta_inv, so add each present
+                # side separately to avoid broadcasting (B, m) + (B, 0).
+                self._z_reg_inv.fill(0)
+                if data.num_hu > 0:
+                    self._z_reg_inv += self._w_u_delta_inv
+                if data.num_hl > 0:
+                    self._z_reg_inv += self._w_l_delta_inv
                 self._z_reg.fill(0)
-                self._z_reg_inv[:] = tmp
-                cp.divide(1.0, tmp, out=self._z_reg, where=tmp > 0)
+                cp.divide(1.0, self._z_reg_inv, out=self._z_reg, where=self._z_reg_inv > 0)
 
         # Update KKT matrix
         self._kkt_solver.update_kkt(data, self._delta, self._x_reg, self._z_reg, self._z_reg_inv)

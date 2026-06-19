@@ -16,9 +16,9 @@ class Data(ABC):
     def __init__(self, dtype=cp.float64, device: str = "cuda"):
         self._dtype = dtype
         self._device = device
-        # box-bound block presence is structural and fixed at setup(): the
-        # subclass init sets these from whether x_l / x_u were provided. An
-        # omitted block occupies no storage and produces empty (B, 0) views.
+
+        self._has_h_l = False
+        self._has_h_u = False
         self._has_x_l = False
         self._has_x_u = False
         self._finite_masks_kernel = None
@@ -88,7 +88,9 @@ class Data(ABC):
         self._init_x_l()
         self._init_x_u()
         self._finite_masks_kernel = create_finite_bound_masks_kernel(
-            self._dtype, has_x_l=self._has_x_l, has_x_u=self._has_x_u
+            has_h_l=self._has_h_l, has_h_u=self._has_h_u,
+            has_x_l=self._has_x_l, has_x_u=self._has_x_u,
+            dtype=self._dtype,
         )
         self._update_finite_bound_masks()
 
@@ -107,9 +109,9 @@ class Data(ABC):
         num_xl, num_xu = self.num_xl, self.num_xu
         num_ineq = num_hl + num_hu + num_xl + num_xu
 
-        # Running offsets in the packed [hl | hu | xl? | xu?] layout. An absent
-        # box block has zero width, so the following block slides up and its
-        # mask view becomes (B, 0).
+        # Running offsets in the packed [hl? | hu? | xl? | xu?] layout. An
+        # absent block (any of the four) has zero width, so the following block
+        # slides up and its mask view becomes (B, 0).
         off_hl = 0
         off_hu = off_hl + num_hl
         off_xl = off_hu + num_hu
@@ -144,7 +146,7 @@ class Data(ABC):
 
     def _init_h_l(self):
         B, m = self._batch_size, self.m
-        if m == 0:
+        if not self._has_h_l:
             self._h_l = cp.empty((B, 0), dtype=self._dtype)
             return
         if self._h_l.shape[-1] == 0:
@@ -154,7 +156,7 @@ class Data(ABC):
 
     def _init_h_u(self):
         B, m = self._batch_size, self.m
-        if m == 0:
+        if not self._has_h_u:
             self._h_u = cp.empty((B, 0), dtype=self._dtype)
             return
         if self._h_u.shape[-1] == 0:
@@ -242,22 +244,44 @@ class Data(ABC):
         return self._x_l
 
     @property
-    def num_hl(self) -> int:
-        """Length of the lower-inequality dual/slack block, always ``m``.
+    def has_h_l(self) -> bool:
+        """Whether a lower-inequality bound block was provided at setup().
 
-        With the full-length layout there is one slot per row of ``G``
-        regardless of how many lower bounds are finite; infinite bounds are
-        masked, not dropped.
+        Block presence is structural and fixed at setup(); when ``False`` the
+        lower-inequality block occupies no storage and ``h_l`` / ``z_l`` /
+        ``s_l`` are empty ``(B, 0)`` views.
         """
-        return self.m
+        return self._has_h_l
+
+    @property
+    def has_h_u(self) -> bool:
+        """Whether an upper-inequality bound block was provided at setup().
+
+        See :attr:`has_h_l`; when ``False`` the upper-inequality block has no
+        storage.
+        """
+        return self._has_h_u
+
+    @property
+    def num_hl(self) -> int:
+        """Length of the lower-inequality dual/slack block.
+
+        ``m`` when a lower-inequality block was provided at setup(), else ``0``.
+        When present there is one slot per row of ``G`` regardless of how many
+        lower bounds are finite; infinite bounds inside the block are masked,
+        not dropped.
+        """
+        return self.m if self._has_h_l else 0
 
     @property
     def num_hu(self) -> int:
-        """Length of the upper-inequality dual/slack block, always ``m``.
+        """Length of the upper-inequality dual/slack block.
 
-        One slot per row of ``G``; infinite bounds are masked, not dropped.
+        ``m`` when an upper-inequality block was provided at setup(), else
+        ``0``. When present there is one slot per row of ``G``; infinite bounds
+        inside the block are masked, not dropped.
         """
-        return self.m
+        return self.m if self._has_h_u else 0
 
     @property
     def has_x_l(self) -> bool:
@@ -338,9 +362,9 @@ class Data(ABC):
 
     @property
     def finite_mask_all(self):
-        """(B, num_ineq) finite-bound mask in packed [hl | hu | xl? | xu?] layout.
+        """(B, num_ineq) finite-bound mask in packed [hl? | hu? | xl? | xu?] layout.
 
-        Absent box blocks contribute zero width, so ``num_ineq`` is
-        ``2*m + num_xl + num_xu``.
+        Any absent block (inequality or box) contributes zero width, so
+        ``num_ineq`` is ``num_hl + num_hu + num_xl + num_xu``.
         """
         return self._finite_mask_all

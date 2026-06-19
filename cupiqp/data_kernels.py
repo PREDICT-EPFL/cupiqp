@@ -4,23 +4,25 @@ from .utils import to_warp_dtype
 from .typedef import PIQP_INF
 
 
-def create_finite_bound_masks_kernel(dtype=wp.float64, has_x_l: bool = False, has_x_u: bool = False):
+def create_finite_bound_masks_kernel(
+    has_h_l: bool, has_h_u: bool, has_x_l: bool, has_x_u: bool, dtype=wp.float64,
+    ):
     """Build all per-batch finite-bound masks in a single GPU pass.
 
-    The kernel is specialized to the box-block presence flags ``has_x_l`` /
-    ``has_x_u``, which are fixed at setup(): a box block that was omitted
-    occupies no storage and is never read or written. The inequality blocks
-    (``h_l`` / ``h_u``) are always full length ``m``.
+    The kernel is specialized to the block presence flags ``has_h_l`` /
+    ``has_h_u`` / ``has_x_l`` / ``has_x_u``, which are fixed at setup(): a block
+    that was omitted occupies no storage and is never read or written.
 
     For each problem in the batch the kernel marks, with 1.0 (finite) or 0.0
     (+/-inf), which inequality and box bounds are active, writing:
 
     * ``finite_mask_all`` -- the packed ``(B, num_ineq)`` mask laid out as
-      ``[finite_mask_hl(m) | finite_mask_hu(m) | finite_mask_xl(num_xl) | finite_mask_xu(num_xu)]``,
-      where ``num_xl``/``num_xu`` are ``n`` if the block is present and ``0``
-      otherwise (the four per-class masks are views into this buffer);
+      ``[finite_mask_hl(num_hl) | finite_mask_hu(num_hu) | finite_mask_xl(num_xl) | finite_mask_xu(num_xu)]``,
+      where each width is ``m`` (for h blocks) or ``n`` (for x blocks) if the
+      block is present and ``0`` otherwise (the four per-class masks are views
+      into this buffer);
     * ``active_G_row`` ``(B, m)`` -- 1.0 where an inequality row has any finite
-      bound (lower or upper);
+      bound (lower or upper); all-zero when both inequality blocks are absent;
     * ``active_x_bound`` ``(B, n)`` -- 1.0 where a variable has any finite box
       bound; all-zero when both box blocks are absent;
     * ``num_finite_bounds`` ``(B,)`` -- the per-problem count of finite bounds
@@ -33,34 +35,45 @@ def create_finite_bound_masks_kernel(dtype=wp.float64, has_x_l: bool = False, ha
 
     @wp.kernel
     def finite_bound_masks_kernel(
-        h_l: wp.array2d(dtype=dtype),               # type: ignore  (B, m)
-        h_u: wp.array2d(dtype=dtype),               # type: ignore  (B, m)
+        h_l: wp.array2d(dtype=dtype),               # type: ignore  (B, num_hl)
+        h_u: wp.array2d(dtype=dtype),               # type: ignore  (B, num_hu)
         x_l: wp.array2d(dtype=dtype),               # type: ignore  (B, num_xl)
         x_u: wp.array2d(dtype=dtype),               # type: ignore  (B, num_xu)
-        finite_mask_all: wp.array2d(dtype=dtype),        # type: ignore  (B, num_ineq)
+        finite_mask_all: wp.array2d(dtype=dtype),   # type: ignore  (B, num_ineq)
         active_G_row: wp.array2d(dtype=dtype),      # type: ignore  (B, m)
         active_x_bound: wp.array2d(dtype=dtype),    # type: ignore  (B, n)
         num_finite_bounds: wp.array(dtype=dtype),   # type: ignore  (B,)
     ):
         b = wp.tid()
-        m = h_l.shape[1]
-        n = active_x_bound.shape[1]   # never derive n from x_l: it may be (B, 0)
+        # never derive m / n from h_l / x_l: an omitted block is (B, 0).
+        m = active_G_row.shape[1]
+        n = active_x_bound.shape[1]
         one = dtype(1.0)
         zero = dtype(0.0)
         neg_inf = dtype(-PIQP_INF)
         pos_inf = dtype(PIQP_INF)
 
+        # Running offsets in the packed [hl? | hu? | xl? | xu?] layout. An
+        # omitted block has zero width, so the following block slides up.
+        off_hl = 0
+        off_hu = wp.static(int(has_h_l)) * m
+        off_xl = wp.static(int(has_h_l) + int(has_h_u)) * m
+
         count = zero
         for i in range(m):
-            fl = wp.where(h_l[b, i] > neg_inf, one, zero)
-            fu = wp.where(h_u[b, i] < pos_inf, one, zero)
-            finite_mask_all[b, i] = fl          # finite_mask_hl
-            finite_mask_all[b, m + i] = fu      # finite_mask_hu
+            fl = zero
+            fu = zero
+            if wp.static(has_h_l):
+                fl = wp.where(h_l[b, i] > neg_inf, one, zero)
+                finite_mask_all[b, off_hl + i] = fl     # finite_mask_hl
+                count += fl
+            if wp.static(has_h_u):
+                fu = wp.where(h_u[b, i] < pos_inf, one, zero)
+                finite_mask_all[b, off_hu + i] = fu     # finite_mask_hu
+                count += fu
             active_G_row[b, i] = wp.max(fl, fu)
-            count += fl + fu
 
-        off_xl = 2 * m
-        off_xu = 2 * m + wp.static(int(has_x_l)) * n
+        off_xu = off_xl + wp.static(int(has_x_l)) * n
         for j in range(n):
             fl = zero
             fu = zero

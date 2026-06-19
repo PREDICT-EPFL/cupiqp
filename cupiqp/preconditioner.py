@@ -197,6 +197,7 @@ class RuizEquilibration(PreconditionerBase):
     """
 
     def __init__(self, B: int, n: int, p: int, m: int,
+                 has_h_l: bool, has_h_u: bool,
                  has_x_l: bool, has_x_u: bool,
                  active_x_bound: Optional[cp.ndarray] = None,
                  min_scaling: float = 1e-4,
@@ -211,6 +212,10 @@ class RuizEquilibration(PreconditionerBase):
         self.p = p
         self.m = m
 
+        self._has_h_l = has_h_l
+        self._has_h_u = has_h_u
+        self._num_hl = m if has_h_l else 0
+        self._num_hu = m if has_h_u else 0
         self._has_x_l = has_x_l
         self._has_x_u = has_x_u
         self._num_xl = n if has_x_l else 0
@@ -254,7 +259,7 @@ class RuizEquilibration(PreconditionerBase):
         #             [z_u]:  delta_inv[:, n + p : n + p + m]   (full-length)
         #             [z_bl]: delta_b_inv[:, :n]                (full-length)
         #             [z_bu]: delta_b_inv[:, :n]                (full-length)
-        num_duals = p + m + m + self._num_xl + self._num_xu
+        num_duals = p + self._num_hl + self._num_hu + self._num_xl + self._num_xu
         self._dual_res_unscale_factor = cp.ones((B, n), dtype=dtype)
         self._primal_res_unscale_factor = cp.ones((B, num_duals), dtype=dtype)
 
@@ -290,7 +295,7 @@ class RuizEquilibration(PreconditionerBase):
             self._conv_check_kernel = create_ruiz_conv_check_kernel(n, p, m, dtype=self._dtype)
             self._compute_rhs_inf_norm_unscaled_kernel = (
                 create_compute_constraints_rhs_inf_norm_unscaled_kernel(
-                    n, p, m, m, m, self._num_xl, self._num_xu,
+                    n, p, m, self._num_hl, self._num_hu, self._num_xl, self._num_xu,
                     dtype=self._dtype,
                 )
             )
@@ -298,12 +303,13 @@ class RuizEquilibration(PreconditionerBase):
             self._conv_check_kernel = None
             self._compute_rhs_inf_norm_unscaled_kernel = None
         self._calc_scaling_inv_and_scale_bounds_kernel = create_calc_scaling_inv_and_scale_bounds_kernel(
-            n, p, m, m, m, self._num_xl, self._num_xu,
+            n, p, m, self._num_hl, self._num_hu, self._num_xl, self._num_xu,
+            has_h_l=self._has_h_l, has_h_u=self._has_h_u,
             has_x_l=self._has_x_l, has_x_u=self._has_x_u,
             dtype=self._dtype,
         )
-        self._scale_bounds_kernel = create_scale_bounds_kernel(n, p, m, has_x_l=self._has_x_l, has_x_u=self._has_x_u, dtype=self._dtype)
-        self._unscale_bounds_kernel = create_unscale_bounds_kernel(n, p, m, has_x_l=self._has_x_l, has_x_u=self._has_x_u, dtype=self._dtype)
+        self._scale_bounds_kernel = create_scale_bounds_kernel(n, p, m, has_h_l=self._has_h_l, has_h_u=self._has_h_u, has_x_l=self._has_x_l, has_x_u=self._has_x_u, dtype=self._dtype)
+        self._unscale_bounds_kernel = create_unscale_bounds_kernel(n, p, m, has_h_l=self._has_h_l, has_h_u=self._has_h_u, has_x_l=self._has_x_l, has_x_u=self._has_x_u, dtype=self._dtype)
 
         # (2B,) buffer for per-batch (max_d, max_db) pairs — cp.max gives global.
         self._conv_buf = cp.empty(2 * B, dtype=dtype)
@@ -377,17 +383,19 @@ class RuizEquilibration(PreconditionerBase):
                                         * primal_res_unscale_factor[b, j]
 
         Laid out in ``Variables._dual_buffer`` order
-        ``[y | z_l | z_u | z_bl | z_bu]``. Per-segment computation from
-        the preconditioner's inverse scalings (``delta_inv = 1 / delta``,
-        ``delta_b_inv = 1 / delta_b``):
+        ``[y | z_l | z_u | z_bl | z_bu]``. Each inequality/box segment has its
+        full width (``m`` or ``n``) when the block was provided at setup() and
+        zero width when omitted, so the following segment slides up. Per-segment
+        computation from the preconditioner's inverse scalings
+        (``delta_inv = 1 / delta``, ``delta_b_inv = 1 / delta_b``):
 
-            offset range                                  content
+            segment (width)                               content
             -----------------------------------           ----------------------------
-            [0 : p]                                       delta_inv[:, n : n+p]
-            [p : p+m]                                     delta_inv[:, n + p : n + p + m]
-            [p+m : p+2m]                                  delta_inv[:, n + p : n + p + m]
-            [p+2m : p+2m+n]                               delta_b_inv[:, :n]
-            [p+2m+n : num_duals]                          delta_b_inv[:, :n]
+            [y]    (p)                                    delta_inv[:, n : n+p]
+            [z_l]  (num_hl)                               delta_inv[:, n + p : n + p + m]
+            [z_u]  (num_hu)                               delta_inv[:, n + p : n + p + m]
+            [z_bl] (num_xl)                               delta_b_inv[:, :n]
+            [z_bu] (num_xu)                               delta_b_inv[:, :n]
 
         Note there's no ``cost_scaling_inv`` factor on the primal side — only
         the dual residual is scaled by the cost factor.
@@ -433,11 +441,15 @@ class RuizEquilibration(PreconditionerBase):
             # [y]: delta_inv[:, n : n+p]
             self._primal_res_unscale_factor[:, off:off + p] = self._delta_inv[:, n:n + p]
             off += p
-        if m > 0:
-            # [z_l]: delta_inv[:, n + p : n + p + m]
+        # [z_l]: delta_inv[:, n + p : n + p + m] — only when the lower inequality
+        # block exists. The row scaling is shared per G row, so z_l and z_u both
+        # read the same delta_inv slice but pack into their own (possibly absent)
+        # segments.
+        if self._num_hl > 0:
             self._primal_res_unscale_factor[:, off:off + m] = self._delta_inv[:, n + p:n + p + m]
             off += m
-            # [z_u]: delta_inv[:, n + p : n + p + m]
+        # [z_u]: delta_inv[:, n + p : n + p + m] — only when the upper block exists.
+        if self._num_hu > 0:
             self._primal_res_unscale_factor[:, off:off + m] = self._delta_inv[:, n + p:n + p + m]
             off += m
         # [z_bl]: delta_b_inv[:, :n] — only when the lower box block exists.

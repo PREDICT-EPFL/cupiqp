@@ -4,7 +4,7 @@ from ..utils import to_warp_dtype
 
 def create_sparse_data_gradients_kernel(
     nnz_P: int, nnz_A: int, nnz_G: int,
-    p: int, m: int, n: int, num_xu: int,
+    p: int, m: int, n: int, num_hu: int, num_xu: int,
 dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     
@@ -43,13 +43,16 @@ dtype=wp.float64):
         p_s    = wp.static(p)
         m_s    = wp.static(m)
         n_s    = wp.static(n)
+        num_hu_s = wp.static(num_hu)
         num_xu_s = wp.static(num_xu)
 
+        # dG uses the always-(B, m) full-layout buffers (zero on absent sides).
+        # The dh_u output has width num_hu (0 when h_u omitted).
         end_dP   = nnzP_s
         end_dA   = end_dP + nnzA_s
         end_dG   = end_dA + nnzG_s
         end_db   = end_dG + p_s
-        end_dh_u = end_db + m_s
+        end_dh_u = end_db + num_hu_s
         end_dx_u = end_dh_u + num_xu_s
 
         if t < end_dP:
