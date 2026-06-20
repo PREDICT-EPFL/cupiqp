@@ -6,7 +6,7 @@ import cupy as cp
 import warp as wp
 
 from ..typedef import CudaArray
-from ..utils import to_warp_dtype
+from ..utils import to_warp_dtype, is_cuda_array
 from .multistage_utils import BlockTridiagMat, BlockBidiagMat, BlockVec
 
 
@@ -249,10 +249,16 @@ class OcpData:
 
         ``field`` is an HPIPM field name (``A``, ``B``, ``E``, ``b``, ``x0``,
         ``Q``, ``R``, ``S``, ``q``, ``r``, ``C``, ``D``, ``lg``, ``ug``,
-        ``lbx``, ``ubx``, ``lbu``, ``ubu``). ``value`` may be NumPy, CuPy,
-        Torch, or a nested list, either unbatched (broadcast across the batch)
-        or with a leading batch axis. The value must exactly match one of those
-        two shapes.
+        ``lbx``, ``ubx``, ``lbu``, ``ubu``). ``value`` must be a CUDA array;
+        cuPIQP is GPU-only and never silently copies host data to the device.
+
+        ``value`` must match exactly one of two shapes:
+
+        * **unbatched** -- the field's plain per-stage shape. The same value is
+          **broadcast across the whole batch**: every one of the ``B`` problems
+          is set to this value.
+        * **batched** -- with a leading batch axis ``(B, ...)``, to set a
+          different value per problem.
         """
         nx, ng = self._nx, self._ng
 
@@ -271,6 +277,10 @@ class OcpData:
 
         expected_shape, lo, hi = self._field_specific_info[field]
         k = self._check_stage(stage, lo, hi, field)
+        if not is_cuda_array(value):
+            raise TypeError(
+                f"field {field!r}: value must be a CUDA array; got {type(value)}."
+            )
         val = cp.asarray(value)
         self._check_value_shape(field, val, expected_shape)
 

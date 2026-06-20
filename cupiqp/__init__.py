@@ -11,6 +11,7 @@ from .sparse.sparse_data import SparseData
 from .sparse.batched_csr import UniformBatchedCsrMatrix
 
 from .multistage.multistage_data import MultistageData
+from .multistage.ocp_data import OcpData
 from .multistage.multistage_utils import BlockTridiagMat, BlockBidiagMat, BlockVec
 
 
@@ -20,6 +21,7 @@ from .multistage.multistage_utils import BlockTridiagMat, BlockBidiagMat, BlockV
 from .dense.dense_solver import DenseSolver
 from .sparse.sparse_solver import SparseSolver
 from .multistage.multistage_solver import MultistageSolver
+from .multistage.ocp_solver import OcpSolver
 
 # Cupy-axis-reduction kernel strategy + the three (strategy x backend)
 # concrete classes. Use these when max(n, p, m) is large enough that
@@ -49,6 +51,7 @@ __all__ = [
     "DenseSolver",
     "SparseSolver",
     "MultistageSolver",
+    "OcpSolver",
     "DenseLargeProblemSolver",
     "SparseLargeProblemSolver",
     "MultistageLargeProblemSolver",
@@ -57,6 +60,7 @@ __all__ = [
     "DenseData",
     "SparseData",
     "MultistageData",
+    "OcpData",
     "BlockTridiagMat",
     "BlockBidiagMat",
     "BlockVec",

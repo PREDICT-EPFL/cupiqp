@@ -176,8 +176,16 @@ class OcpSolver(MultistageSolver):
         """Set one block of OCP data at a given stage (delegates to :class:`OcpData`).
 
         See the class docstring for the accepted ``field`` names and shapes.
-        ``value`` may be NumPy / CuPy / Torch (or a nested list), unbatched
-        (broadcast across the batch) or with a leading batch axis.
+        ``value`` must be a CUDA array; cuPIQP is GPU-only and never silently copies host
+        data to the device, so passing a host array raises ``TypeError``.
+
+        ``value`` is accepted in one of two shapes:
+
+        * **unbatched** -- the field's plain per-stage shape (e.g. ``(nx, nx)``
+          for ``'A'``). The same value is **broadcast across the whole batch**:
+          every one of the ``B`` problems is set to this value.
+        * **batched** -- with a leading batch axis ``(B, ...)``, to set a
+          different value per problem (e.g. a distinct ``'x0'`` per element).
         """
         if not self._ocp_ready:
             raise RuntimeError("Call setup() before set().")
