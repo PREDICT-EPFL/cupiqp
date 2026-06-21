@@ -75,6 +75,14 @@ The returned object matches the selected backend:
 All returned gradients are expressed in the original, unscaled problem coordinates;
 the backward pass handles any solver preconditioning internally.
 
+!!! warning "The high-level `OcpSolver` is not differentiable yet"
+    Gradients are supported on `DenseSolver`, `SparseSolver`, and `MultistageSolver`
+    (over their raw QP data). The high-level [`OcpSolver`](backends.md#multistagesolver)
+    is **not** differentiable: it has no mapping from solution gradients back to the OCP
+    fields you set (`Q`, `R`, `A`, `B`, `x0`, ...), and `enable_grad` is unsupported on
+    it. To differentiate an optimal-control problem today, assemble the QP yourself and
+    use `DenseSolver` or `SparseSolver`.
+
 ## Repeated solves
 
 The backward pass can follow each solve in a fixed-structure update loop:

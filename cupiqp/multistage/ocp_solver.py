@@ -103,6 +103,9 @@ class OcpSolver(MultistageSolver):
     values, keeping every declared bound finite (to drop a bound use a large
     value, not infinity). The next-input coupling ``F_k u_{k+1}`` is not
     implemented but the block layout leaves room for a future ``'F'`` field.
+
+    **Not differentiable (yet).** ``OcpSolver`` does not support gradients.
+    For differentiable QPs use ``DenseSolver``, ``SparseSolver`` or ``MultistageSolver``.
     """
 
     def __init__(self, dtype: Literal["float32", "float64"] = "float64") -> None:
@@ -159,6 +162,12 @@ class OcpSolver(MultistageSolver):
             raise RuntimeError(
                 "setup() may only be called once per solver instance; "
                 "create a new solver instance to set up a different problem."
+            )
+
+        if self.settings.enable_grad:
+            raise NotImplementedError(
+                "OcpSolver does not yet support differentiation: settings.enable_grad "
+                "To differentiate a QP, use DenseSolver, SparseSolver or MultistageSolver."
             )
 
         ocp_data = OcpData(
