@@ -143,29 +143,36 @@ s.solve()
 
 ---
 
-## Large-problem variants
+## Kernel strategy
 
-For each backend there is a `*LargeProblemSolver` companion:
+cuPIQP runs the same interior-point algorithm at every problem size; only the
+inner-loop kernel implementation changes, and the solver picks it automatically at
+`setup()` — there is no setting to tune and nothing to change in your code. The inner
+loop (step length, barrier parameter `mu`, centering `sigma`, residual and merit
+evaluation) is evaluated one of two ways:
 
-```python
-from cupiqp import (
-    DenseLargeProblemSolver,
-    SparseLargeProblemSolver,
-    MultistageLargeProblemSolver,
-)
-```
+- **Fused Warp tile kernels** — JIT-compiled and specialized to the problem dimensions,
+  very fast per launch, and they amortize across a batch and across IPM iterations.
+  The catch is the compile step: because the kernels are specialized to the problem
+  width, the **first-solve compile time grows with the problem** and eventually
+  dominates — you can spend more time compiling kernels than actually solving.
+- **CuPy axis-reduction kernels** (`cp.min`, `cp.sum`, `cp.max` over the data axis) —
+  generic, so they need no shape-specialized compilation and the compile cliff
+  disappears. They carry more per-launch overhead, but over a long reduction axis — i.e.
+  a wide problem — that overhead is amortized and the trade is worth it. This path also
+  builds the Ruiz preconditioner with the tile kernels switched off, for the same reason.
 
-These replace the shape-specialized Warp **tile kernels** in the inner IPM loop with
-CuPy axis-reduction kernels. Use them when `max(n, p, m)` is large enough that the Warp
-tile-kernel **compile time dominates first-solve latency**, and the per-launch overhead
-of CuPy reductions amortizes well at that scale. They are numerically equivalent to the
-regular backends (agree to solver tolerance) and share the same API — only the kernel
-strategy differs.
+The choice is made from the problem width at `setup()`: with
+`tile_width = max(n + p + m, p + num_ineq)`, the solver uses the CuPy axis-reduction
+kernels when `tile_width >= 1024` and the fused Warp tile kernels otherwise, where
+`num_ineq` is the total number of finite inequality + box-bound rows. It depends
+on width only — independent of batch size and dtype, because the thing it avoids
+(tile-kernel compile time) depends on shape, not on how many problems you batch. The
+threshold is an internal heuristic, not a precisely calibrated constant, and both paths
+run the same algorithm and agree to solver tolerance.
 
-!!! note "Rule of thumb"
-    Reach for a `*LargeProblemSolver` only when first-solve latency on a large,
-    single (or small-batch) problem is dominated by kernel compilation. For batched
-    small-to-medium problems, the standard solvers are faster.
-
-See [Large-Scale Problems](large-scale.md) for why these variants exist and a worked
-portfolio-optimization example.
+!!! note "Batched workloads use the tile kernels"
+    The selection is by problem width, not batch size: a large batch of moderately-wide
+    problems still uses the fused tile kernels (they amortize across the batch), which is
+    the intended behavior. The CuPy path targets a single (or small-batch) wide
+    problem where compile time of warp tile-based kernels would dominate the run time.
