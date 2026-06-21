@@ -128,7 +128,6 @@ nav:
   - User Guide:
       - Backends: guide/backends.md
       - Batched Solving: guide/batched.md
-      - Large-Scale Problems: guide/large-scale.md
       - Differentiation: guide/differentiation.md
   - API Reference:
       - Solvers: api/solvers.md
