@@ -57,21 +57,3 @@ argument expects which type):
       show_if_no_docstring: true
       members: false
 
-## Large-problem variants
-
-Drop-in variants that replace the Warp tile kernels in the inner IPM loop with CuPy
-axis-reduction kernels — use when `max(n, p, m)` is large enough that Warp tile-kernel
-compile time dominates first-solve latency. They share the lifecycle and settings of the
-standard solvers above. See [Backends → Large-problem variants](../guide/backends.md#large-problem-variants).
-
-::: cupiqp.DenseLargeProblemSolver
-    options:
-      members: false
-
-::: cupiqp.SparseLargeProblemSolver
-    options:
-      members: false
-
-::: cupiqp.MultistageLargeProblemSolver
-    options:
-      members: false

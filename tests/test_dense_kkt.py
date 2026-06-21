@@ -17,23 +17,15 @@ from cupiqp.results import Variables
 from cupiqp.settings import Settings
 
 
-# ---------------------------------------------------------------------------
-# Shared helpers
-# ---------------------------------------------------------------------------
-def _dense_data(**kw):
-    d = DenseData()
-    d.init(**kw)
-    return d
-
-
-def _make_preconditioner(data):
+def make_preconditioner(data):
     return DenseRuizEquilibration(
-        data.batch_size, data.n, data.p, data.m, data.idx_xl, data.idx_xu,
-        data.idx_hl, data.idx_hu,
+        data.batch_size, data.n, data.p, data.m,
+        has_h_l=data.has_h_l, has_h_u=data.has_h_u,
+        has_x_l=data.has_x_l, has_x_u=data.has_x_u,
     )
 
 
-def make_random_dense_qp(B=1, n=20, p=8, m=9, seed=42) -> DenseData:
+def random_dense_qp(B=1, n=20, p=8, m=9, seed=42) -> DenseData:
     """Generate a batched strongly-convex random dense QP.
 
     Bound sparsity structure (which entries are +/-inf) is shared across
@@ -85,23 +77,29 @@ def make_random_dense_qp(B=1, n=20, p=8, m=9, seed=42) -> DenseData:
         kw["h_u"] = cp.array(np.stack(h_us))
         kw["h_l"] = cp.array(np.stack(h_ls))
 
-    return _dense_data(**kw)
+    data = DenseData()
+    data.init(**kw)
+    return data
 
 
-def _numpy_condensed_kkt_solve(P, A, G, x_reg, z_reg, delta, rhs_x, rhs_y, rhs_z):
-    """Reference: assemble and solve the condensed KKT system with NumPy."""
+def _numpy_condensed_kkt_solve(P, A, G, x_reg, z_reg_inv, delta, rhs_x, rhs_y, rhs_z):
+    """Reference: assemble and solve the condensed KKT system with NumPy.
+
+    ``z_reg_inv`` is the condensed inequality row weight (w_l + w_u): the
+    condensed Schur term is ``G^T diag(z_reg_inv) G`` and the eliminated dual
+    recovers as ``dz = z_reg_inv * (G dx - rhs_z)``.
+    """
     p = A.shape[0]
     m = G.shape[0]
 
-    z_reg_inv = 1.0 / z_reg if m > 0 else np.empty(0)
     delta_inv = 1.0 / delta
 
     kkt = P.copy() + np.diag(x_reg)
     if p > 0:
         kkt += delta_inv * (A.T @ A)
     if m > 0:
-        z_reg_inv_sqrt = np.sqrt(z_reg_inv)
-        G_scaled = z_reg_inv_sqrt[:, None] * G
+        z_sqrt = np.sqrt(z_reg_inv)
+        G_scaled = z_sqrt[:, None] * G
         kkt += G_scaled.T @ G_scaled
 
     rhs = rhs_x.copy()
@@ -142,7 +140,7 @@ class TestDenseKKTSolverMatvec:
 
     @pytest.mark.parametrize("B,n,p,m", MATVEC_SIZES)
     def test_eval_P_x(self, B, n, p, m):
-        data = make_random_dense_qp(B, n, p=p, m=m)
+        data = random_dense_qp(B, n, p=p, m=m)
         solver = DenseKKTSolver(data)
 
         x = cp.array(np.random.default_rng(B * 100 + n).standard_normal((B, n)))
@@ -157,7 +155,7 @@ class TestDenseKKTSolverMatvec:
     def test_eval_A_xn_and_AT_xt(self, B, n, p, m):
         if p == 0:
             pytest.skip("no equality constraints — A has zero rows")
-        data = make_random_dense_qp(B, n, p=p, m=m)
+        data = random_dense_qp(B, n, p=p, m=m)
         solver = DenseKKTSolver(data)
 
         x = cp.array(np.random.default_rng(B * 100 + n + 1).standard_normal((B, n)))
@@ -180,7 +178,7 @@ class TestDenseKKTSolverMatvec:
     def test_eval_G_xn_and_GT_xt(self, B, n, p, m):
         if m == 0:
             pytest.skip("no inequality constraints — G has zero rows")
-        data = make_random_dense_qp(B, n, p=p, m=m)
+        data = random_dense_qp(B, n, p=p, m=m)
         solver = DenseKKTSolver(data)
 
         x = cp.array(np.random.default_rng(B * 100 + n + 3).standard_normal((B, n)))
@@ -206,27 +204,29 @@ class TestDenseKKTSolverAssembly:
     @pytest.mark.parametrize("B", BATCH_SIZES)
     def test_kkt_matrix_assembly(self, B):
         n, p, m = 5, 2, 4
-        data = make_random_dense_qp(B, n, p=p, m=m)
+        data = random_dense_qp(B, n, p=p, m=m)
         solver = DenseKKTSolver(data)
 
         rng = np.random.default_rng(99 + B)
         x_reg = cp.array(np.abs(rng.standard_normal((B, n))) + 0.1)
-        z_reg = cp.array(np.abs(rng.standard_normal((B, m))) + 0.1)
+        # z_reg_inv = condensed row weight (w_l + w_u); z_reg = 1/weight is the
+        # explicit augmented diagonal magnitude. Both are passed to update_kkt.
+        z_reg_inv = cp.array(np.abs(rng.standard_normal((B, m))) + 0.1)
+        z_reg = 1.0 / z_reg_inv
         delta = cp.array(np.abs(rng.standard_normal(B)) + 0.1)
 
-        solver.update_kkt(data, delta, x_reg, z_reg)
+        solver.update_kkt(data, delta, x_reg, z_reg, z_reg_inv)
 
         for i in range(B):
             Pi = cp.asnumpy(data.P[i])
             Ai = cp.asnumpy(data.A[i])
             Gi = cp.asnumpy(data.G[i])
             xr = cp.asnumpy(x_reg[i])
-            zr = cp.asnumpy(z_reg[i])
+            zr = cp.asnumpy(z_reg_inv[i])  # weight used in the reference assembly
             d = float(cp.asnumpy(delta[i]))
 
             ref_kkt = Pi + np.diag(xr) + (1.0 / d) * (Ai.T @ Ai)
-            zri = 1.0 / zr
-            G_sc = np.sqrt(zri)[:, None] * Gi
+            G_sc = np.sqrt(zr)[:, None] * Gi
             ref_kkt += G_sc.T @ G_sc
 
             actual_kkt = cp.asnumpy(solver._kkt_mat[i])
@@ -247,20 +247,22 @@ class TestDenseKKTSolverSolve:
 
     @staticmethod
     def _run_solve(B, n, p, m, seed=42):
-        data = make_random_dense_qp(B, n, p=p, m=m, seed=seed)
+        data = random_dense_qp(B, n, p=p, m=m, seed=seed)
         solver = DenseKKTSolver(data)
 
         rng = np.random.default_rng(seed + 100)
         x_reg = cp.array(np.abs(rng.standard_normal((B, n))) + 1.0)
-        z_reg = (cp.array(np.abs(rng.standard_normal((B, m))) + 1.0)
-                 if m > 0 else cp.empty((B, 0)))
+        # z_reg_inv = condensed row weight; z_reg = 1/weight (augmented diagonal).
+        z_reg_inv = (cp.array(np.abs(rng.standard_normal((B, m))) + 1.0)
+                     if m > 0 else cp.empty((B, 0)))
+        z_reg = (1.0 / z_reg_inv if m > 0 else cp.empty((B, 0)))
         delta = cp.array(np.abs(rng.standard_normal(B)) + 1.0)
 
         rhs_x = cp.array(rng.standard_normal((B, n)))
         rhs_y = cp.array(rng.standard_normal((B, p))) if p > 0 else cp.empty((B, 0))
         rhs_z = cp.array(rng.standard_normal((B, m))) if m > 0 else cp.empty((B, 0))
 
-        solver.update_kkt(data, delta, x_reg, z_reg)
+        solver.update_kkt(data, delta, x_reg, z_reg, z_reg_inv)
         assert solver.factor() is True
 
         delta_x = cp.empty((B, n), dtype=cp.float64)
@@ -275,7 +277,7 @@ class TestDenseKKTSolverSolve:
                 cp.asnumpy(cp.asarray(data.A)[i]) if p > 0 else np.zeros((0, n)),
                 cp.asnumpy(cp.asarray(data.G)[i]) if m > 0 else np.zeros((0, n)),
                 cp.asnumpy(x_reg[i]),
-                cp.asnumpy(z_reg[i]) if m > 0 else np.empty(0),
+                cp.asnumpy(z_reg_inv[i]) if m > 0 else np.empty(0),
                 float(cp.asnumpy(delta[i])),
                 cp.asnumpy(rhs_x[i]),
                 cp.asnumpy(rhs_y[i]) if p > 0 else np.empty(0),
@@ -307,10 +309,6 @@ class TestDenseKKTSolverSolve:
     def test_full_pipeline(self, B, n, p, m):
         self._run_solve(B=B, n=n, p=p, m=m, seed=B * 100 + n + p + m)
 
-
-# ===========================================================================
-# Higher-level KKTSystem path (with preconditioner, Variables, etc.)
-# ===========================================================================
 class TestDenseKKTSystemCondensedSolve:
     """``KKTSystem`` round-trip: K * solve(rhs) ≈ rhs via mul_condensed_kkt."""
 
@@ -323,20 +321,20 @@ class TestDenseKKTSystemCondensedSolve:
         (60, 20, 30),
     ])
     def test_condensed_factorize_solve(self, B, n, p, m):
-        data = make_random_dense_qp(B=B, n=n, p=p, m=m)
+        data = random_dense_qp(B=B, n=n, p=p, m=m)
 
         settings = Settings()
         settings.kkt_solver = "dense_cholesky"
         kkt = KKTSystem()
         kkt.init(data, settings)
-        preconditioner = _make_preconditioner(data)
+        preconditioner = make_preconditioner(data)
 
         vars_ = Variables()
         vars_.init(data)
         vars_.set_random()
 
-        rho_arr = cp.array([1.])
-        delta_arr = cp.array([1.])
+        rho_arr = cp.full(B, 1.0)
+        delta_arr = cp.full(B, 1.0)
 
         success = kkt.update_scalings_and_factor(
             data, preconditioner, settings, False, rho_arr, delta_arr, vars_)
@@ -346,6 +344,8 @@ class TestDenseKKTSystemCondensedSolve:
         rhs_x = cp.random.randn(B, n)
         rhs_y = cp.random.randn(B, p)
         rhs_z = cp.random.randn(B, m)
+        if m > 0:
+            rhs_z *= data.active_G_row
 
         lhs_x = cp.zeros((B, n))
         lhs_y = cp.zeros((B, p))
@@ -364,6 +364,8 @@ class TestDenseKKTSystemCondensedSolve:
             f"x block mismatch: max err = {float(cp.max(cp.abs(rhs_x - check_x))):.2e}"
         assert cp.allclose(rhs_y, check_y, atol=atol), \
             f"y block mismatch: max err = {float(cp.max(cp.abs(rhs_y - check_y))):.2e}"
+        if m > 0:
+            check_z *= data.active_G_row
         assert cp.allclose(rhs_z, check_z, atol=atol), \
             f"z block mismatch: max err = {float(cp.max(cp.abs(rhs_z - check_z))):.2e}"
 
@@ -381,10 +383,10 @@ class TestDenseKKTSystemIR:
     def test_condensed_solve_with_ir(self, B, n, p, m):
         """IR should never make the residual meaningfully worse on a
         well-conditioned problem."""
-        data = make_random_dense_qp(B=B, n=n, p=p, m=m)
+        data = random_dense_qp(B=B, n=n, p=p, m=m)
 
-        rho_arr = cp.array([1.])
-        delta_arr = cp.array([1.])
+        rho_arr = cp.full(B, 1.0)
+        delta_arr = cp.full(B, 1.0)
 
         # --- Without IR ---
         settings_no_ir = Settings()
@@ -392,7 +394,7 @@ class TestDenseKKTSystemIR:
         settings_no_ir.iterative_refinement_max_iter = 0
         kkt_no_ir = KKTSystem()
         kkt_no_ir.init(data, settings_no_ir)
-        preconditioner = _make_preconditioner(data)
+        preconditioner = make_preconditioner(data)
 
         vars_no_ir = Variables()
         vars_no_ir.init(data)
@@ -405,6 +407,8 @@ class TestDenseKKTSystemIR:
         rhs_x = cp.random.randn(B, n)
         rhs_y = cp.random.randn(B, p)
         rhs_z = cp.random.randn(B, m)
+        if m > 0:
+            rhs_z *= data.active_G_row
 
         lhs_x = cp.zeros((B, n))
         lhs_y = cp.zeros((B, p))
@@ -427,7 +431,7 @@ class TestDenseKKTSystemIR:
         settings_ir.iterative_refinement_max_iter = 10
         kkt_ir = KKTSystem()
         kkt_ir.init(data, settings_ir)
-        preconditioner = _make_preconditioner(data)
+        preconditioner = make_preconditioner(data)
 
         vars_ir = Variables()
         vars_ir.init(data)

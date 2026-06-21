@@ -1,10 +1,6 @@
 # cuPIQP
 
-[![Institution](https://img.shields.io/badge/Institution-Automatic%20Control%20Laboratory,%20EPFL-%23E1251B?style=flat)](https://www.epfl.ch)
-[![Funding](https://img.shields.io/badge/Grant-NCCR%20Automation%20(51NF40__180545)-90e3dc.svg)](https://nccr-automation.ch/)
-![License](https://img.shields.io/badge/License-BSD--2--Clause-brightgreen.svg)
-
-**cuPIQP** is a GPU-native convex **Quadratic Programming (QP)** solver that
+**CuPIQP** is a GPU-native convex **Quadratic Programming (QP)** solver that
 implements the [PIQP](https://github.com/PREDICT-EPFL/piqp) (Proximal Interior Point
 Quadratic Programming) algorithm **entirely on NVIDIA GPUs**.
 
@@ -73,7 +69,7 @@ Framework-independent dependencies (`numpy`, `scipy`, `warp-lang`, `nvmath-pytho
   [Getting Started](getting-started.md).
 - Building a controller or learning loop? See [Batched Solving](guide/batched.md).
 - Differentiating through a solution? See [Differentiation](guide/differentiation.md).
-- Looking for a specific class or setting? See the [API Reference](api/index.md).
+- Looking for a specific class or setting? See the [API Reference](api/solvers.md).
 
 ## Citing
 
@@ -84,5 +80,5 @@ is available.
 ## License
 
 BSD-2-Clause. cuPIQP is developed at the
-[Automatic Control Laboratory, EPFL](https://www.epfl.ch), with support from
+[Automatic Control Laboratory, EPFL](https://www.epfl.ch/labs/la/), with support from
 [NCCR Automation](https://nccr-automation.ch/).

@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from typing import Optional
 import nvtx
 import cupy as cp
 import warp as wp
@@ -96,17 +97,17 @@ class PreconditionerBase(ABC):
             self.unscale_dual_eq(result.y, out=result.y)
 
         if data.num_hu > 0:
-            self.unscale_dual_ineq(result.z_u, data.idx_hu, out=result.z_u)
-            self.unscale_slack_ineq(result.s_u, data.idx_hu, out=result.s_u)
+            self.unscale_dual_ineq(result.z_u, out=result.z_u)
+            self.unscale_slack_ineq(result.s_u, out=result.s_u)
         if data.num_hl > 0:
-            self.unscale_dual_ineq(result.z_l, data.idx_hl, out=result.z_l)
-            self.unscale_slack_ineq(result.s_l, data.idx_hl, out=result.s_l)
+            self.unscale_dual_ineq(result.z_l, out=result.z_l)
+            self.unscale_slack_ineq(result.s_l, out=result.s_l)
         if data.num_xu > 0:
-            self.unscale_dual_b(result.z_bu, data.idx_xu, out=result.z_bu)
-            self.unscale_slack_b(result.s_bu, data.idx_xu, out=result.s_bu)
+            self.unscale_dual_b(result.z_bu, out=result.z_bu)
+            self.unscale_slack_b(result.s_bu, out=result.s_bu)
         if data.num_xl > 0:
-            self.unscale_dual_b(result.z_bl, data.idx_xl, out=result.z_bl)
-            self.unscale_slack_b(result.s_bl, data.idx_xl, out=result.s_bl)
+            self.unscale_dual_b(result.z_bl, out=result.z_bl)
+            self.unscale_slack_b(result.s_bl, out=result.s_bl)
 
     # ------------------------------------------------------------------
     # Per-component scaling / unscaling (abstract).
@@ -125,16 +126,16 @@ class PreconditionerBase(ABC):
     def scale_dual_eq(self, y: cp.ndarray, out: cp.ndarray): ...
 
     @abstractmethod
-    def unscale_dual_ineq(self, z: cp.ndarray, idx: cp.ndarray, out: cp.ndarray): ...
+    def unscale_dual_ineq(self, z: cp.ndarray, out: cp.ndarray): ...
 
     @abstractmethod
-    def unscale_dual_b(self, z_b: cp.ndarray, idx: cp.ndarray, out: cp.ndarray): ...
+    def unscale_dual_b(self, z_b: cp.ndarray, out: cp.ndarray): ...
 
     @abstractmethod
-    def unscale_slack_ineq(self, s: cp.ndarray, idx: cp.ndarray, out: cp.ndarray): ...
+    def unscale_slack_ineq(self, s: cp.ndarray, out: cp.ndarray): ...
 
     @abstractmethod
-    def unscale_slack_b(self, s_b: cp.ndarray, idx: cp.ndarray, out: cp.ndarray): ...
+    def unscale_slack_b(self, s_b: cp.ndarray, out: cp.ndarray): ...
 
     @abstractmethod
     def unscale_dual_res(self, v: cp.ndarray, out: cp.ndarray): ...
@@ -143,10 +144,10 @@ class PreconditionerBase(ABC):
     def unscale_primal_res_eq(self, v: cp.ndarray, out: cp.ndarray): ...
 
     @abstractmethod
-    def unscale_primal_res_ineq(self, v: cp.ndarray, idx: cp.ndarray, out: cp.ndarray): ...
+    def unscale_primal_res_ineq(self, v: cp.ndarray, out: cp.ndarray): ...
 
     @abstractmethod
-    def unscale_primal_res_b(self, v: cp.ndarray, idx: cp.ndarray, out: cp.ndarray): ...
+    def unscale_primal_res_b(self, v: cp.ndarray, out: cp.ndarray): ...
 
     @abstractmethod
     def unscale_cost(self, cost: cp.ndarray, out: cp.ndarray): ...
@@ -196,10 +197,9 @@ class RuizEquilibration(PreconditionerBase):
     """
 
     def __init__(self, B: int, n: int, p: int, m: int,
-                 idx_xl: cp.ndarray,
-                 idx_xu: cp.ndarray,
-                 idx_hl: cp.ndarray,
-                 idx_hu: cp.ndarray,
+                 has_h_l: bool, has_h_u: bool,
+                 has_x_l: bool, has_x_u: bool,
+                 active_x_bound: Optional[cp.ndarray] = None,
                  min_scaling: float = 1e-4,
                  max_scaling: float = 1e4,
                  convergence_tol: float = 1e-3,
@@ -211,12 +211,16 @@ class RuizEquilibration(PreconditionerBase):
         self.n = n
         self.p = p
         self.m = m
-        self._dtype = dtype
 
-        self._idx_xl = idx_xl
-        self._idx_xu = idx_xu
-        self._idx_hl = idx_hl
-        self._idx_hu = idx_hu
+        self._has_h_l = has_h_l
+        self._has_h_u = has_h_u
+        self._num_hl = m if has_h_l else 0
+        self._num_hu = m if has_h_u else 0
+        self._has_x_l = has_x_l
+        self._has_x_u = has_x_u
+        self._num_xl = n if has_x_l else 0
+        self._num_xu = n if has_x_u else 0
+        self._dtype = dtype
 
         self.min_scaling = min_scaling
         self.max_scaling = max_scaling
@@ -251,23 +255,24 @@ class RuizEquilibration(PreconditionerBase):
         #         content (see _refresh_unscale_factors for the exact slices):
         #
         #             [y]:    delta_inv[:, n : n+p]
-        #             [z_l]:  delta_inv[:, n + p + idx_hl]     (gather)
-        #             [z_u]:  delta_inv[:, n + p + idx_hu]     (gather)
-        #             [z_bl]: delta_b_inv[:, idx_xl]           (gather)
-        #             [z_bu]: delta_b_inv[:, idx_xu]           (gather)
-        num_duals = p + idx_hl.size + idx_hu.size + idx_xl.size + idx_xu.size
+        #             [z_l]:  delta_inv[:, n + p : n + p + m]   (full-length)
+        #             [z_u]:  delta_inv[:, n + p : n + p + m]   (full-length)
+        #             [z_bl]: delta_b_inv[:, :n]                (full-length)
+        #             [z_bu]: delta_b_inv[:, :n]                (full-length)
+        num_duals = p + self._num_hl + self._num_hu + self._num_xl + self._num_xu
         self._dual_res_unscale_factor = cp.ones((B, n), dtype=dtype)
         self._primal_res_unscale_factor = cp.ones((B, num_duals), dtype=dtype)
 
-        # x_b_scaling: (B, n) — 1 for bounded variables, 0 for unbounded.
-        # Bound structure is shared across batch, so init is the same for all b.
-        self._x_b_scaling_init = cp.zeros((B, n), dtype=dtype)
-        bounded = cp.zeros(n, dtype=bool)
-        if idx_xl.size > 0:
-            bounded[idx_xl] = True
-        if idx_xu.size > 0:
-            bounded[idx_xu] = True
-        self._x_b_scaling_init[:, bounded] = 1.0
+        # x_b_scaling: (B, n) -- 1 for variables with any finite box bound,
+        # 0 for variables without finite box bounds. Full-length dual storage
+        # allows this mask to differ across the batch.
+        if active_x_bound is None:
+            # No per-variable bound mask supplied: with the full-length dual
+            # layout every variable carries a box-bound slot, so the default
+            # scaling mask is all-ones.
+            self._x_b_scaling_init = cp.ones((B, n), dtype=dtype)
+        else:
+            self._x_b_scaling_init = active_x_bound.astype(dtype, copy=True)
         self._x_b_scaling = cp.copy(self._x_b_scaling_init)
 
         # Per-iteration workspace: (B, n+p+m) and (B, n)
@@ -282,15 +287,15 @@ class RuizEquilibration(PreconditionerBase):
             n, p, m, min_scaling, max_scaling, dtype=self._dtype,
         )
         self._accumulate_deltas_kernel = create_accumulate_deltas_kernel(n, p, m, dtype=self._dtype)
-        # Gate the tile-factory call — calling it triggers shape-specialized
-        # warp tile codegen. ``LargeProblemSolver`` constructs this class
-        # with ``use_warp_kernels=False`` to skip the compile entirely; the
-        # cupy fallback at the launch site is used instead.
+        # Gate the tile-factory call -- calling it triggers shape-specialized
+        # warp tile codegen. The "cupy" kernel strategy constructs this class
+        # with ``use_warp_tile_kernels=False`` to skip the compile entirely;
+        # the cupy fallback at the launch site is used instead.
         if use_warp_tile_kernels:
             self._conv_check_kernel = create_ruiz_conv_check_kernel(n, p, m, dtype=self._dtype)
             self._compute_rhs_inf_norm_unscaled_kernel = (
                 create_compute_constraints_rhs_inf_norm_unscaled_kernel(
-                    n, p, m, idx_hl.size, idx_hu.size, idx_xl.size, idx_xu.size,
+                    n, p, m, self._num_hl, self._num_hu, self._num_xl, self._num_xu,
                     dtype=self._dtype,
                 )
             )
@@ -298,11 +303,13 @@ class RuizEquilibration(PreconditionerBase):
             self._conv_check_kernel = None
             self._compute_rhs_inf_norm_unscaled_kernel = None
         self._calc_scaling_inv_and_scale_bounds_kernel = create_calc_scaling_inv_and_scale_bounds_kernel(
-            n, p, m, idx_hl.size, idx_hu.size, idx_xl.size, idx_xu.size,
+            n, p, m, self._num_hl, self._num_hu, self._num_xl, self._num_xu,
+            has_h_l=self._has_h_l, has_h_u=self._has_h_u,
+            has_x_l=self._has_x_l, has_x_u=self._has_x_u,
             dtype=self._dtype,
         )
-        self._scale_bounds_kernel = create_scale_bounds_kernel(n, p, m, dtype=self._dtype)
-        self._unscale_bounds_kernel = create_unscale_bounds_kernel(n, p, m, dtype=self._dtype)
+        self._scale_bounds_kernel = create_scale_bounds_kernel(n, p, m, has_h_l=self._has_h_l, has_h_u=self._has_h_u, has_x_l=self._has_x_l, has_x_u=self._has_x_u, dtype=self._dtype)
+        self._unscale_bounds_kernel = create_unscale_bounds_kernel(n, p, m, has_h_l=self._has_h_l, has_h_u=self._has_h_u, has_x_l=self._has_x_l, has_x_u=self._has_x_u, dtype=self._dtype)
 
         # (2B,) buffer for per-batch (max_d, max_db) pairs — cp.max gives global.
         self._conv_buf = cp.empty(2 * B, dtype=dtype)
@@ -376,17 +383,19 @@ class RuizEquilibration(PreconditionerBase):
                                         * primal_res_unscale_factor[b, j]
 
         Laid out in ``Variables._dual_buffer`` order
-        ``[y | z_l | z_u | z_bl | z_bu]``. Per-segment computation from
-        the preconditioner's inverse scalings (``delta_inv = 1 / delta``,
-        ``delta_b_inv = 1 / delta_b``):
+        ``[y | z_l | z_u | z_bl | z_bu]``. Each inequality/box segment has its
+        full width (``m`` or ``n``) when the block was provided at setup() and
+        zero width when omitted, so the following segment slides up. Per-segment
+        computation from the preconditioner's inverse scalings
+        (``delta_inv = 1 / delta``, ``delta_b_inv = 1 / delta_b``):
 
-            offset range                                  content
+            segment (width)                               content
             -----------------------------------           ----------------------------
-            [0 : p]                                       delta_inv[:, n : n+p]
-            [p : p+num_hl]                                delta_inv[:, n + p + idx_hl]
-            [p+num_hl : p+num_hl+num_hu]                  delta_inv[:, n + p + idx_hu]
-            [p+num_hl+num_hu : p+num_hl+num_hu+num_xl]    delta_b_inv[:, idx_xl]
-            [p+num_hl+num_hu+num_xl : num_duals]          delta_b_inv[:, idx_xu]
+            [y]    (p)                                    delta_inv[:, n : n+p]
+            [z_l]  (num_hl)                               delta_inv[:, n + p : n + p + m]
+            [z_u]  (num_hu)                               delta_inv[:, n + p : n + p + m]
+            [z_bl] (num_xl)                               delta_b_inv[:, :n]
+            [z_bu] (num_xu)                               delta_b_inv[:, :n]
 
         Note there's no ``cost_scaling_inv`` factor on the primal side — only
         the dual residual is scaled by the cost factor.
@@ -416,7 +425,7 @@ class RuizEquilibration(PreconditionerBase):
                                                 delta_b_inv, in
                                                 _dual_buffer order.
         """
-        n, p = self.n, self.p
+        n, p, m = self.n, self.p, self.m
 
         # x-block for the dual residual:
         #     dual_res_unscale_factor = cost_scaling_inv[:, None] * delta_inv[:, :n]
@@ -424,32 +433,32 @@ class RuizEquilibration(PreconditionerBase):
                     out=self._dual_res_unscale_factor)
 
         # Duals-block for the primal residual, packed in Variables._dual_buffer
-        # order [y | z_l | z_u | z_bl | z_bu]. Offsets are computed from the
-        # compile-time-fixed segment sizes (p, num_hl, num_hu, num_xl, num_xu).
+        # order [y | z_l | z_u | z_bl | z_bu]. With the full-length dual layout
+        # the inequality / box segments are contiguous slices of delta_inv /
+        # delta_b_inv (identity index map), so no gather is needed.
         off = 0
         if p > 0:
             # [y]: delta_inv[:, n : n+p]
             self._primal_res_unscale_factor[:, off:off + p] = self._delta_inv[:, n:n + p]
             off += p
-        n_hl = self._idx_hl.size
-        if n_hl > 0:
-            # [z_l]: gather delta_inv[:, n + p + idx_hl]
-            self._primal_res_unscale_factor[:, off:off + n_hl] = self._delta_inv[:, n + p + self._idx_hl]
-            off += n_hl
-        n_hu = self._idx_hu.size
-        if n_hu > 0:
-            # [z_u]: gather delta_inv[:, n + p + idx_hu]
-            self._primal_res_unscale_factor[:, off:off + n_hu] = self._delta_inv[:, n + p + self._idx_hu]
-            off += n_hu
-        n_xl = self._idx_xl.size
-        if n_xl > 0:
-            # [z_bl]: gather delta_b_inv[:, idx_xl]
-            self._primal_res_unscale_factor[:, off:off + n_xl] = self._delta_b_inv[:, self._idx_xl]
-            off += n_xl
-        n_xu = self._idx_xu.size
-        if n_xu > 0:
-            # [z_bu]: gather delta_b_inv[:, idx_xu]
-            self._primal_res_unscale_factor[:, off:off + n_xu] = self._delta_b_inv[:, self._idx_xu]
+        # [z_l]: delta_inv[:, n + p : n + p + m] — only when the lower inequality
+        # block exists. The row scaling is shared per G row, so z_l and z_u both
+        # read the same delta_inv slice but pack into their own (possibly absent)
+        # segments.
+        if self._num_hl > 0:
+            self._primal_res_unscale_factor[:, off:off + m] = self._delta_inv[:, n + p:n + p + m]
+            off += m
+        # [z_u]: delta_inv[:, n + p : n + p + m] — only when the upper block exists.
+        if self._num_hu > 0:
+            self._primal_res_unscale_factor[:, off:off + m] = self._delta_inv[:, n + p:n + p + m]
+            off += m
+        # [z_bl]: delta_b_inv[:, :n] — only when the lower box block exists.
+        if self._num_xl > 0:
+            self._primal_res_unscale_factor[:, off:off + n] = self._delta_b_inv[:, :n]
+            off += n
+        # [z_bu]: delta_b_inv[:, :n] — only when the upper box block exists.
+        if self._num_xu > 0:
+            self._primal_res_unscale_factor[:, off:off + n] = self._delta_b_inv[:, :n]
 
     def reset(self):
         self._delta.fill(1.0)
@@ -537,7 +546,6 @@ class RuizEquilibration(PreconditionerBase):
                 self._delta_b, self._delta_b_inv,
                 self._cost_scaling, self._cost_scaling_inv,
                 data.b, data.h_l, data.h_u, data.x_l, data.x_u,
-                self._idx_hl, self._idx_hu, self._idx_xl, self._idx_xu,
                 self._dual_res_unscale_factor, self._primal_res_unscale_factor,
             ],
             device="cuda", stream=stream,
@@ -635,23 +643,23 @@ class RuizEquilibration(PreconditionerBase):
         cp.multiply(y, self._delta_inv[:, self.n:self.n + self.p], out=out)
         out *= self._cost_scaling[:, None]
 
-    def unscale_dual_ineq(self, z: cp.ndarray, idx: cp.ndarray, out: cp.ndarray):
-        """out = c_inv * delta_z[idx] * z_scaled"""
-        cp.multiply(z, self._delta[:, self.n + self.p + idx], out=out)
+    def unscale_dual_ineq(self, z: cp.ndarray, out: cp.ndarray):
+        """out = c_inv * delta_z * z_scaled (full-length inequality duals)"""
+        cp.multiply(z, self._delta[:, self.n + self.p:], out=out)
         out *= self._cost_scaling_inv[:, None]
 
-    def unscale_dual_b(self, z_b: cp.ndarray, idx: cp.ndarray, out: cp.ndarray):
-        """out = c_inv * delta_b[idx] * z_b_scaled"""
-        cp.multiply(z_b, self._delta_b[:, idx], out=out)
+    def unscale_dual_b(self, z_b: cp.ndarray, out: cp.ndarray):
+        """out = c_inv * delta_b * z_b_scaled (full-length box duals)"""
+        cp.multiply(z_b, self._delta_b, out=out)
         out *= self._cost_scaling_inv[:, None]
 
-    def unscale_slack_ineq(self, s: cp.ndarray, idx: cp.ndarray, out: cp.ndarray):
-        """out = delta_inv_z[idx] * s_scaled"""
-        cp.multiply(s, self._delta_inv[:, self.n + self.p + idx], out=out)
+    def unscale_slack_ineq(self, s: cp.ndarray, out: cp.ndarray):
+        """out = delta_inv_z * s_scaled (full-length inequality slacks)"""
+        cp.multiply(s, self._delta_inv[:, self.n + self.p:], out=out)
 
-    def unscale_slack_b(self, s_b: cp.ndarray, idx: cp.ndarray, out: cp.ndarray):
-        """out = delta_b_inv[idx] * s_b_scaled"""
-        cp.multiply(s_b, self._delta_b_inv[:, idx], out=out)
+    def unscale_slack_b(self, s_b: cp.ndarray, out: cp.ndarray):
+        """out = delta_b_inv * s_b_scaled (full-length box slacks)"""
+        cp.multiply(s_b, self._delta_b_inv, out=out)
 
     # ------------------------------------------------------------------
     # Residual unscaling (used every iteration for convergence checks)
@@ -666,13 +674,13 @@ class RuizEquilibration(PreconditionerBase):
         """out = delta_inv_y * v_scaled"""
         cp.multiply(v, self._delta_inv[:, self.n:self.n + self.p], out=out)
 
-    def unscale_primal_res_ineq(self, v: cp.ndarray, idx: cp.ndarray, out: cp.ndarray):
-        """out = delta_inv_z[idx] * v_scaled"""
-        cp.multiply(v, self._delta_inv[:, self.n + self.p + idx], out=out)
+    def unscale_primal_res_ineq(self, v: cp.ndarray, out: cp.ndarray):
+        """out = delta_inv_z * v_scaled (full-length inequality residual)"""
+        cp.multiply(v, self._delta_inv[:, self.n + self.p:], out=out)
 
-    def unscale_primal_res_b(self, v: cp.ndarray, idx: cp.ndarray, out: cp.ndarray):
-        """out = delta_b_inv[idx] * v_scaled"""
-        cp.multiply(v, self._delta_b_inv[:, idx], out=out)
+    def unscale_primal_res_b(self, v: cp.ndarray, out: cp.ndarray):
+        """out = delta_b_inv * v_scaled (full-length box residual)"""
+        cp.multiply(v, self._delta_b_inv, out=out)
 
     @nvtx.annotate("RuizEquilibration::compute_constraints_rhs_inf_norm_unscaled")
     def compute_constraints_rhs_inf_norm_unscaled(self, data: Data, out: cp.ndarray) -> None:
@@ -692,7 +700,7 @@ class RuizEquilibration(PreconditionerBase):
                 inputs=[
                     self._delta_inv, self._delta_b_inv,
                     data.b, data.h_l, data.h_u, data.x_l, data.x_u,
-                    self._idx_hl, self._idx_hu, self._idx_xl, self._idx_xu,
+                    data.finite_mask_hl, data.finite_mask_hu, data.finite_mask_xl, data.finite_mask_xu,
                     out,
                 ],
                 block_dim=BLOCK_DIM,
@@ -701,27 +709,27 @@ class RuizEquilibration(PreconditionerBase):
             )
         
         else:
-            # cupy fallback (use_warp_tile_kernels=False; LargeProblemSolver path).
+            # cupy fallback (use_warp_tile_kernels=False; "cupy" strategy path).
             out.fill(0.0)
             if data.p > 0:
                 tmp = cp.empty_like(data.b)
                 self.unscale_primal_res_eq(data.b, out=tmp)
                 cp.maximum(out, cp.max(cp.abs(tmp), axis=1), out=out)
             if data.num_hu > 0:
-                tmp = data.h_u[:, data.idx_hu]   # fancy indexing -> fresh copy
-                self.unscale_primal_res_ineq(tmp, data.idx_hu, out=tmp)
+                tmp = cp.where(data.finite_mask_hu > 0.5, data.h_u, 0.0)
+                self.unscale_primal_res_ineq(tmp, out=tmp)
                 cp.maximum(out, cp.max(cp.abs(tmp), axis=1), out=out)
             if data.num_hl > 0:
-                tmp = data.h_l[:, data.idx_hl]
-                self.unscale_primal_res_ineq(tmp, data.idx_hl, out=tmp)
+                tmp = cp.where(data.finite_mask_hl > 0.5, data.h_l, 0.0)
+                self.unscale_primal_res_ineq(tmp, out=tmp)
                 cp.maximum(out, cp.max(cp.abs(tmp), axis=1), out=out)
             if data.num_xu > 0:
-                tmp = data.x_u[:, data.idx_xu]
-                self.unscale_primal_res_b(tmp, data.idx_xu, out=tmp)
+                tmp = cp.where(data.finite_mask_xu > 0.5, data.x_u, 0.0)
+                self.unscale_primal_res_b(tmp, out=tmp)
                 cp.maximum(out, cp.max(cp.abs(tmp), axis=1), out=out)
             if data.num_xl > 0:
-                tmp = data.x_l[:, data.idx_xl]
-                self.unscale_primal_res_b(tmp, data.idx_xl, out=tmp)
+                tmp = cp.where(data.finite_mask_xl > 0.5, data.x_l, 0.0)
+                self.unscale_primal_res_b(tmp, out=tmp)
                 cp.maximum(out, cp.max(cp.abs(tmp), axis=1), out=out)
 
     # ------------------------------------------------------------------

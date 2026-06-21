@@ -10,7 +10,6 @@ from .settings import Settings
 from .utils import cuda_graph_capture
 from .preconditioner import PreconditionerBase
 from .kkt_systems_kernels import (
-    create_build_inverse_index_kernel,
     create_eliminate_slacks_kernel,
     create_eliminate_slacks_transposed_kernel,
     create_eliminate_duals_kernel,
@@ -80,6 +79,7 @@ class KKTSystem:
         self._delta = cp.empty(B, dtype=self._dtype)
         self._x_reg = cp.empty((B, n), dtype=self._dtype)
         self._z_reg = cp.empty((B, m), dtype=self._dtype)
+        self._z_reg_inv = cp.empty((B, m), dtype=self._dtype)
 
         # used to store the rhs of the condensed KKT system (per problem)
         # K_condensed * [dx; dy; dz] = [rhs_x_bar; rhs_y_bar; rhs_z_bar],
@@ -143,33 +143,15 @@ class KKTSystem:
 
         # Create Warp kernels
         self._update_regularization_step_1_kernel = create_update_regularizations_step_1_kernel(num_ineq=num_ineq, dtype=self._dtype)
-        self._update_regularization_step_2_kernel = create_update_regularizations_step_2_kernel(n, m, dtype=self._dtype)
+        self._update_regularization_step_2_kernel = create_update_regularizations_step_2_kernel(
+            n, m, has_h_l=data.has_h_l, has_h_u=data.has_h_u, has_x_l=data.has_x_l, has_x_u=data.has_x_u, dtype=self._dtype)
         self._eliminate_slacks_kernel = create_eliminate_slacks_kernel(dtype=self._dtype)
         self._eliminate_slacks_transposed_kernel = create_eliminate_slacks_transposed_kernel(dtype=self._dtype)
-        self._eliminate_duals_kernel = create_eliminate_duals_kernel(n, m, dtype=self._dtype)
+        self._eliminate_duals_kernel = create_eliminate_duals_kernel(
+            n, m, has_h_l=data.has_h_l, has_h_u=data.has_h_u, has_x_l=data.has_x_l, has_x_u=data.has_x_u, dtype=self._dtype)
         self._recover_duals_kernel = create_recover_duals_kernel(data.num_hu, data.num_hl, data.num_xu, data.num_xl, dtype=self._dtype)
         self._recover_slacks_kernel = create_recover_slacks_kernel(dtype=self._dtype)
         self._recover_slacks_transposed_kernel = create_recover_slacks_transposed_kernel(dtype=self._dtype)
-
-        # Precompute inverse index maps for gather-pattern kernels.
-        # inv_idx_xu[j] = i such that idx_xu[i] == j, or -1 if variable j has no upper bound.
-        _build_inv_idx_kernel = create_build_inverse_index_kernel(dtype=self._dtype)
-        self._inv_idx_xu = wp.full(n, value=-1, dtype=wp.int32, device=self._device)
-        self._inv_idx_xl = wp.full(n, value=-1, dtype=wp.int32, device=self._device)
-        self._inv_idx_hu = wp.full(m, value=-1, dtype=wp.int32, device=self._device) if m > 0 else wp.zeros(0, dtype=wp.int32, device=self._device)
-        self._inv_idx_hl = wp.full(m, value=-1, dtype=wp.int32, device=self._device) if m > 0 else wp.zeros(0, dtype=wp.int32, device=self._device)
-        if data.num_xu > 0:
-            wp.launch(_build_inv_idx_kernel, dim=data.num_xu,
-                      inputs=[data.idx_xu, self._inv_idx_xu], device=self._device)
-        if data.num_xl > 0:
-            wp.launch(_build_inv_idx_kernel, dim=data.num_xl,
-                      inputs=[data.idx_xl, self._inv_idx_xl], device=self._device)
-        if data.num_hu > 0:
-            wp.launch(_build_inv_idx_kernel, dim=data.num_hu,
-                      inputs=[data.idx_hu, self._inv_idx_hu], device=self._device)
-        if data.num_hl > 0:
-            wp.launch(_build_inv_idx_kernel, dim=data.num_hl,
-                      inputs=[data.idx_hl, self._inv_idx_hl], device=self._device)
 
     @property
     def batch_size(self) -> int:
@@ -189,7 +171,7 @@ class KKTSystem:
         """
         self._update_reg_and_kkt(data, preconditioner, delta, rho, vars)
         self._use_iterative_refinement = iterative_refinement
-        factor_success = self._kkt_solver.factor() # ! this is implicitly assuming idx_hu and idx_hl cover all indices of inequalities 0:m
+        factor_success = self._kkt_solver.factor()
         return factor_success
 
     @nvtx.annotate("KKTSystem::_update_reg_and_kkt")
@@ -204,7 +186,7 @@ class KKTSystem:
             wp.launch(
                 kernel=self._update_regularization_step_1_kernel,
                 dim=(B, max(data.num_ineq, 1)),
-                inputs=[vars.s_all, vars.z_all,
+                inputs=[vars.s_all, vars.z_all, data.finite_mask_all,
                         self._m_s_all, self._m_z_inv_all, self._w_delta_inv_all,
                         rho, delta, self._rho, self._delta],
                 device=self._device,
@@ -214,10 +196,6 @@ class KKTSystem:
                 kernel=self._update_regularization_step_2_kernel,
                 dim=(B, data.n + data.m),
                 inputs=[
-                    self._inv_idx_xu,
-                    self._inv_idx_xl,
-                    self._inv_idx_hu,
-                    self._inv_idx_hl,
                     self._w_bu_delta_inv,
                     self._w_bl_delta_inv,
                     preconditioner.x_b_scaling,
@@ -226,6 +204,7 @@ class KKTSystem:
                     self._w_u_delta_inv,
                     self._w_l_delta_inv,
                     self._z_reg,
+                    self._z_reg_inv,
                 ],
                 device=self._device,
                 stream=wp_stream,
@@ -233,34 +212,40 @@ class KKTSystem:
         else:
             self._rho[:] = rho
             self._delta[:] = delta
-
-            # cache s, 1/z and w = 1/(s/z + delta)
-            self._m_s_all[:] = vars.s_all
-            cp.reciprocal(vars.z_all, out=self._m_z_inv_all)
+            cp.multiply(vars.s_all, data.finite_mask_all, out=self._m_s_all)
+            self._m_z_inv_all.fill(0)
+            cp.divide(1.0, vars.z_all, out=self._m_z_inv_all, where=data.finite_mask_all > 0.5)
             cp.multiply(self._m_s_all, self._m_z_inv_all, out=self._w_delta_inv_all)
             cp.add(self._w_delta_inv_all, self._delta[:, None], out=self._w_delta_inv_all)
             cp.reciprocal(self._w_delta_inv_all, out=self._w_delta_inv_all)
+            cp.multiply(self._w_delta_inv_all, data.finite_mask_all, out=self._w_delta_inv_all)
 
-            # compute x_reg (B, n) and z_reg (B, m)
+            xbs = preconditioner.x_b_scaling
+            # Box blocks are optional: w_bu/w_bl are (B, num_xu)/(B, num_xl),
+            # which are (B, 0) for an omitted side. Add each present side
+            # separately so a one-sided box does not broadcast (B, n) + (B, 0).
             self._x_reg[:] = self._rho[:, None]
-            xbs = preconditioner.x_b_scaling  # (B, n)
-            if data.num_xu > 0:
-                xbs_xu = xbs[:, data.idx_xu]  # (B, num_xu)
-                self._x_reg[:, data.idx_xu] += xbs_xu * xbs_xu * self._w_bu_delta_inv
             if data.num_xl > 0:
-                xbs_xl = xbs[:, data.idx_xl]  # (B, num_xl)
-                self._x_reg[:, data.idx_xl] += xbs_xl * xbs_xl * self._w_bl_delta_inv
-
+                self._x_reg += xbs * xbs * self._w_bl_delta_inv
+            if data.num_xu > 0:
+                self._x_reg += xbs * xbs * self._w_bu_delta_inv
             if data.m > 0:
-                self._z_reg[:] = 0.0
+                # z_reg_inv = weight = w_l + w_u (condensed row weight, 0 on
+                # inactive rows). z_reg = 1 / weight (explicit augmented diagonal
+                # magnitude); inactive rows (weight == 0) get z_reg = 0. The row
+                # weight is per row of G and always (B, m); an omitted inequality
+                # side has an empty (B, 0) w_*_delta_inv, so add each present
+                # side separately to avoid broadcasting (B, m) + (B, 0).
+                self._z_reg_inv.fill(0)
                 if data.num_hu > 0:
-                    self._z_reg[:, data.idx_hu] += self._w_u_delta_inv
+                    self._z_reg_inv += self._w_u_delta_inv
                 if data.num_hl > 0:
-                    self._z_reg[:, data.idx_hl] += self._w_l_delta_inv
-                cp.reciprocal(self._z_reg, out=self._z_reg)
+                    self._z_reg_inv += self._w_l_delta_inv
+                self._z_reg.fill(0)
+                cp.divide(1.0, self._z_reg_inv, out=self._z_reg, where=self._z_reg_inv > 0)
 
         # Update KKT matrix
-        self._kkt_solver.update_kkt(data, self._delta, self._x_reg, self._z_reg)
+        self._kkt_solver.update_kkt(data, self._delta, self._x_reg, self._z_reg, self._z_reg_inv)
     
     @nvtx.annotate("KKTSystem::solve")
     def solve(self, data: Data, preconditioner: PreconditionerBase, settings: Settings, rhs: Variables, lhs: Variables,
@@ -342,8 +327,6 @@ class KKTSystem:
             kernel=self._eliminate_duals_kernel,
             dim=(B, data.n + data.m),
             inputs=[
-                self._inv_idx_xu, self._inv_idx_xl,
-                self._inv_idx_hu, self._inv_idx_hl,
                 rhs.x,
                 self._w_bu_delta_inv, self._w_bl_delta_inv,
                 preconditioner.x_b_scaling,
@@ -408,10 +391,10 @@ class KKTSystem:
                 dim=(B, data.num_ineq),
                 inputs=[
                     self._work_z, lhs.x,
-                    data.idx_hu, self._w_u_delta_inv, self._updated_rhs_z_u, lhs.z_u,
-                    data.idx_hl, self._w_l_delta_inv, self._updated_rhs_z_l, lhs.z_l,
-                    data.idx_xu, self._w_bu_delta_inv, self._m_z_bu_inv, rhs.z_bu, rhs.s_bu, lhs.z_bu,
-                    data.idx_xl, self._w_bl_delta_inv, self._m_z_bl_inv, rhs.z_bl, rhs.s_bl, lhs.z_bl,
+                    self._w_u_delta_inv, self._updated_rhs_z_u, lhs.z_u,
+                    self._w_l_delta_inv, self._updated_rhs_z_l, lhs.z_l,
+                    self._w_bu_delta_inv, self._m_z_bu_inv, rhs.z_bu, rhs.s_bu, lhs.z_bu,
+                    self._w_bl_delta_inv, self._m_z_bl_inv, rhs.z_bl, rhs.s_bl, lhs.z_bl,
                     preconditioner.x_b_scaling],
                 device=self._device,
                 stream=wp_stream,
@@ -574,14 +557,11 @@ class KKTSystem:
                           lhs_x: cp.ndarray, lhs_y: cp.ndarray, lhs_z: cp.ndarray,
                           rhs_x: cp.ndarray, rhs_y: cp.ndarray, rhs_z: cp.ndarray) -> None:
         """
-        Compute the matrix-vector product with the condensed (reduced) KKT matrix:
+        Compute the matrix-vector product with the reduced KKT matrix:
 
-            [ P + x_reg*I   A^T       G^T    ] [ lhs_x ]   [ rhs_x ]
-            [ A            -delta*I    0     ] [ lhs_y ] = [ rhs_y ]
-            [ G              0       -z_reg  ] [ lhs_z ]   [ rhs_z ]
-
-        where x_reg and z_reg incorporate the eliminated slack/bound contributions.
-        Requires update_scalings_and_factor() to have been called first (sets _x_reg, _z_reg, _delta).
+            [ P + x_reg*I   A^T        G^T      ] [ lhs_x ]   [ rhs_x ]
+            [ A            -delta*I     0       ] [ lhs_y ] = [ rhs_y ]
+            [ G              0       -z_reg     ] [ lhs_z ]   [ rhs_z ]
 
         All output arrays (rhs_x, rhs_y, rhs_z) are overwritten.
         """
@@ -596,12 +576,23 @@ class KKTSystem:
             rhs_x += self._work_x
             rhs_y -= self._delta[:, None] * lhs_y
 
-        # G block: rhs_z = G*lhs_x, rhs_x += G^T*lhs_z
+        # G block. Inactive rows (z_reg == 0) are decoupled: mask their G/G^T
+        # coupling and use a -1 diagonal (matches the factorized augmented KKT).
         if data.m > 0:
-            self.eval_G_xn(data, 1., lhs_x, rhs_z)
-            self.eval_GT_xt(data, 1., lhs_z, self._work_x)
+            agr = data.active_G_row                       # (B, m) 1.0 active / 0.0 inactive
+            # rhs_x += G^T (active * lhs_z)  -- inactive columns contribute nothing.
+            cp.multiply(lhs_z, agr, out=self._work_z)
+            self.eval_GT_xt(data, 1., self._work_z, self._work_x)
             rhs_x += self._work_x
-            rhs_z -= self._z_reg * lhs_z
+            # rhs_z = active * (G lhs_x) - diag_term
+            self.eval_G_xn(data, 1., lhs_x, rhs_z)
+            cp.multiply(rhs_z, agr, out=rhs_z)
+            # diag_term = z_reg * lhs_z (active row); lhs_z (inactive row,
+            # diagonal -1). z_reg is already 0 on inactive rows, so the multiply gives 0
+            # there and copyto restores lhs_z.
+            cp.multiply(self._z_reg, lhs_z, out=self._work_z)
+            cp.copyto(self._work_z, lhs_z, where=(self._z_reg <= 0.0))
+            rhs_z -= self._work_z
 
     @nvtx.annotate("KKTSystem::get_refinement_error")
     def get_refinement_error(self, data: Data,

@@ -11,7 +11,8 @@ name: docs
 
 on:
   push:
-    branches: [main]
+    # main: build + deploy.  develop: build-only (strict link check), no deploy.
+    branches: [main, develop]
     # Rebuild only when docs-relevant files change.
     paths:
       - "docs/**"
@@ -55,8 +56,10 @@ jobs:
       - name: Build (strict)
         run: mkdocs build --strict
 
-      # Publishes the built site to the gh-pages branch.
+      # Publishes the built site to the gh-pages branch -- main only, so that
+      # building develop tests the docs without overwriting the live site.
       - name: Deploy to GitHub Pages
+        if: github.ref == 'refs/heads/main'
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"

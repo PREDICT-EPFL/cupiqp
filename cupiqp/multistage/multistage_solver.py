@@ -180,10 +180,11 @@ class MultistageSolver(SolverBase):
     def _init_preconditioner(self) -> MultistageRuizEquilibration:
         return MultistageRuizEquilibration(
             self._data.batch_size, self._data.n, self._data.p, self._data.m,
-            self._data.idx_xl, self._data.idx_xu,
-            self._data.idx_hl, self._data.idx_hu,
+            has_h_l=self._data.has_h_l, has_h_u=self._data.has_h_u,
+            has_x_l=self._data.has_x_l, has_x_u=self._data.has_x_u,
+            active_x_bound=self._data.active_x_bound,
             data=self._data,
-            use_warp_tile_kernels=True,
+            use_warp_tile_kernels=(self._kernel_strategy == "warp_tile"),
             dtype=self._data.dtype,
         )
 
@@ -222,16 +223,20 @@ class MultistageSolver(SolverBase):
             placeholder_G = BlockBidiagMat(
                 rows_of_blocks=r_g, cols_of_blocks=d_sz, N=N_g, batch_size=B, dtype=wp_dtype,
             ) if d.m > 0 else None
-            # c, x_u, x_l: always (B, n)-sized buffers, matching the original
-            # backward-buffer shape regardless of which bound directions are
-            # active. The kernel uses index masks (idx_xu / idx_xl) internally.
+            # c: always (B, n). Box blocks x_u / x_l are optional -- their
+            # gradient block exists only when that side was provided at
+            # setup(), matching the full-length contract (grad_data.x_u is
+            # (B, 0) / absent when the forward problem omitted it).
             placeholder_c = BlockVec(num_blocks=N, rows=d_sz, batch_size=B, dtype=wp_dtype)
-            placeholder_xu = BlockVec(num_blocks=N, rows=d_sz, batch_size=B, dtype=wp_dtype)
-            placeholder_xl = BlockVec(num_blocks=N, rows=d_sz, batch_size=B, dtype=wp_dtype)
-            # b, h_u, h_l: presence tied to A / G existing.
+            placeholder_xu = BlockVec(num_blocks=N, rows=d_sz, batch_size=B, dtype=wp_dtype) if d.has_x_u else None
+            placeholder_xl = BlockVec(num_blocks=N, rows=d_sz, batch_size=B, dtype=wp_dtype) if d.has_x_l else None
+            # b: presence tied to A existing. h_u / h_l are optional inequality
+            # sides -- their gradient block exists only when that side was
+            # provided at setup() (grad_data.h_u is (B, 0) / absent when the
+            # forward problem omitted it), matching the box-block contract.
             placeholder_b  = BlockVec(num_blocks=N_a + 1, rows=r_a, batch_size=B, dtype=wp_dtype) if d.p > 0 else None
-            placeholder_hu = BlockVec(num_blocks=N_g + 1, rows=r_g, batch_size=B, dtype=wp_dtype) if d.m > 0 else None
-            placeholder_hl = BlockVec(num_blocks=N_g + 1, rows=r_g, batch_size=B, dtype=wp_dtype) if d.m > 0 else None
+            placeholder_hu = BlockVec(num_blocks=N_g + 1, rows=r_g, batch_size=B, dtype=wp_dtype) if d.has_h_u else None
+            placeholder_hl = BlockVec(num_blocks=N_g + 1, rows=r_g, batch_size=B, dtype=wp_dtype) if d.has_h_l else None
 
             self._grad_data = MultistageData(dtype=dtype, device=self.settings.device)
             self._grad_data.init(
@@ -253,7 +258,7 @@ class MultistageSolver(SolverBase):
 
             # Eager-compile the fused multistage data-gradients kernel.
             self._multistage_data_gradients_kernel = create_multistage_data_gradients_kernel(
-                N, d_sz, N_a, r_a, N_g, r_g, d.p, d.m, d.n, dtype=dtype)
+                N, d_sz, N_a, r_a, N_g, r_g, d.p, d.m, d.n, d.num_hu, d.num_hl, d.num_xu, d.num_xl, dtype=dtype)
 
     def _compute_data_gradients(self, adjoint_vector: Variables) -> MultistageData:
         r"""Populate ``self._grad_data`` in place and return it.
@@ -282,7 +287,7 @@ class MultistageSolver(SolverBase):
             + N_off * d_sz * d_sz
             + 2 * N_a * r_a * d_sz
             + 2 * N_g * r_g * d_sz
-            + data.n + data.p + 2 * data.m + 2 * data.n
+            + data.n + data.p + data.num_hu + data.num_hl + data.num_xu + data.num_xl
         )
         if total > 0:
             wp.launch(

@@ -20,7 +20,7 @@ class DenseKKTSolver(KKTSolverBase):
     Dense KKT solver.
 
     Eliminates Delta_y and Delta_z to form:
-    (P + diag(x_reg) + (1/delta)*A^T*A + G^T*diag(z_reg^{-1})*G) Delta_x = rhs
+    (P + diag(x_reg) + (1/delta)*A^T*A + G^T*diag(z_reg_inv)*G) Delta_x = rhs.
     """
     def __init__(self, data: DenseData):
         super().__init__()
@@ -47,9 +47,6 @@ class DenseKKTSolver(KKTSolverBase):
 
         self._cublas_handle = cublas_create_handle()
 
-        # Lazy-import the right cuBLAS precision variant based on the data
-        # dtype. Picking the symbol once at init means the per-call lambdas
-        # below have zero precision-dispatch overhead.
         if self._dtype == "float32":
             from .cublas_wrappers import (
                 sgemv as _gemv_fn,
@@ -101,18 +98,19 @@ class DenseKKTSolver(KKTSolverBase):
             self._compute_AtA(data)
 
     @nvtx.annotate("DenseKKTSolver::update_kkt")
-    def update_kkt(self, data: DenseData, delta: cp.ndarray, x_reg: cp.ndarray, z_reg: cp.ndarray) -> None:
+    def update_kkt(self, data: DenseData, delta: cp.ndarray, x_reg: cp.ndarray, z_reg: cp.ndarray, z_reg_inv: cp.ndarray) -> None:
         """Assemble KKT matrix using batched cuBLAS calls (CUDA graph safe)."""
         cublas_set_stream(self._cublas_handle, cp.cuda.get_current_stream().ptr)
 
         USE_WARP_IMPL = True
         if USE_WARP_IMPL:
-            # compute kkt = P + diag(x_reg) + 1/delta*AtA, as well as delta_inv, G_scaled, z_reg_inv, z_reg_inv_sqrt
+            # For inactive rows G[i], z_reg_inv[i] is already zero. 
+            # Therefore the contribution of G[i] to the condensed KKT is zero.
             wp.launch(
                 kernel=self._update_kkt_kernel,
                 dim=(self._batch_size, self._update_kkt_kernel_launch_dim),
                 inputs=[
-                    data.P, self._AtA, data.G, delta, x_reg, z_reg,
+                    data.P, self._AtA, data.G, delta, x_reg, z_reg_inv,
                     self._delta_inv, self._z_reg_inv, self._z_reg_inv_sqrt,
                     self._kkt_mat, self._G_scaled,
                 ],
@@ -121,7 +119,7 @@ class DenseKKTSolver(KKTSolverBase):
             )
             if data.m > 0:
                 self._syrk(self._cublas_handle, self._G_scaled, self._kkt_mat, 1.0, 1.0)
-        
+
         else:
             # --- cupy fallback ---
             n = data.n
@@ -145,8 +143,9 @@ class DenseKKTSolver(KKTSolverBase):
                 self._kkt_mat += self._delta_inv[:, None] * self._AtA
 
             if data.m > 0:
-                cp.reciprocal(z_reg, out=self._z_reg_inv)
-                cp.sqrt(self._z_reg_inv, out=self._z_reg_inv_sqrt)
+                # Condensed term uses the row weight z_reg_inv (0 on inactive rows).
+                self._z_reg_inv[:] = z_reg_inv
+                cp.sqrt(z_reg_inv, out=self._z_reg_inv_sqrt)
                 cp.multiply(self._z_reg_inv_sqrt[:, :, None], data.G, out=self._G_scaled)
                 self._syrk(self._cublas_handle, self._G_scaled, self._kkt_mat, 1.0, 1.0)
 

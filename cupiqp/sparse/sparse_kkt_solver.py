@@ -10,7 +10,7 @@ from .sparse_data import SparseData
 from .sparse_matvec import SingleSparseMatVecProduct, BatchedSparseMatVecProduct
 from .sparse_direct_solver import CudssSparseDirectSolver
 from .csr_helpers import csr_diag_indices, csr_row_indices, csr_subblock_indices
-from .sparse_kkt_solver_kernels import create_update_kkt_diag_kernel
+from .sparse_kkt_solver_kernels import create_update_kkt_diag_kernel, create_scatter_masked_G_kernel
 
 
 class SparseKKTSolver(KKTSolverBase):
@@ -53,6 +53,7 @@ class SparseKKTSolver(KKTSolverBase):
         self._diag_z_indices = single_kkt_diag_idx[n+p:n+p+m]
 
         self._update_kkt_diag_kernel = create_update_kkt_diag_kernel(n, p, m, dtype=self._dtype)
+        self._scatter_masked_G_kernel = create_scatter_masked_G_kernel(dtype=self._dtype) if m > 0 else None
 
         # -- P-diagonal CSR indices (for vectorized P diag extraction) --
         # P may have zero diagonal entries that are not stored in the CSR.
@@ -81,10 +82,12 @@ class SparseKKTSolver(KKTSolverBase):
         # -- Block-to-KKT index maps (shared) --------------------------
         kkt0 = self._kkt_mats[0]
         self._P_indices = csr_subblock_indices(P0, kkt0, 0, 0)
-        if p > 0:
-            self._A_indices  = csr_subblock_indices(A0, kkt0, n, 0)
-        if m > 0:
-            self._G_indices  = csr_subblock_indices(G0, kkt0, n + p, 0)
+        self._A_indices = csr_subblock_indices(A0, kkt0, n, 0) if p > 0 else None
+        self._G_indices = csr_subblock_indices(G0, kkt0, n + p, 0) if m > 0 else None
+        # Row index of each G non-zero, used to zero the G coupling of inactive
+        # inequality rows (both bounds infinite) when scattering into the KKT.
+        # Cast to int32 so the warp scatter kernel can index with it directly.
+        self._G_row_idx = csr_row_indices(G0).astype(cp.int32) if m > 0 else None
 
         # -- Scatter initial P, A, G values (vectorized) ---------------
         self._scatter_P_A_G(data, update_P=True, update_A=(p > 0), update_G=(m > 0))
@@ -175,10 +178,22 @@ class SparseKKTSolver(KKTSolverBase):
         """Vectorized scatter of P / A / G values into the (B, kkt_nnz) buffer."""
         if update_P:
             self._kkt_mats.data[:, self._P_indices] = data._P.data
-        if update_A:
+        if update_A and self._A_indices is not None:
             self._kkt_mats.data[:, self._A_indices] = data._A.data
-        if update_G:
-            self._kkt_mats.data[:, self._G_indices] = data._G.data
+        if update_G and self._G_indices is not None:
+            # Scatter G into the KKT data buffer, zeroing the contribution of
+            # inactive inequality rows (both bounds infinite) in place.
+            wp.launch(
+                kernel=self._scatter_masked_G_kernel,
+                dim=(self._batch_size, self._G_indices.shape[0]),
+                inputs=[
+                    data._G.data, data.active_G_row,
+                    self._G_row_idx, self._G_indices,
+                    self._kkt_mats.data,
+                ],
+                device="cuda",
+                stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+            )
 
     def update_data(self, data: SparseData, update_P: bool, update_A: bool, update_G: bool) -> None:
         """Update the sparse KKT matrices when P, A, or G values change.
@@ -192,7 +207,7 @@ class SparseKKTSolver(KKTSolverBase):
             self._refresh_P_diag_buffer(data._P)
 
     @nvtx.annotate("SparseKKTSolver::update_kkt")
-    def update_kkt(self, data: SparseData, delta: cp.ndarray, x_reg: cp.ndarray, z_reg: cp.ndarray) -> None:
+    def update_kkt(self, data: SparseData, delta: cp.ndarray, x_reg: cp.ndarray, z_reg: cp.ndarray, z_reg_inv: cp.ndarray) -> None:
         """Update diagonal blocks of all batched KKT matrices."""
         wp.launch(
             kernel=self._update_kkt_diag_kernel,

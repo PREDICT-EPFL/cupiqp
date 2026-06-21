@@ -15,25 +15,7 @@ from cupiqp.sparse.sparse_data import SparseData
 from cupiqp.sparse.sparse_preconditioner import SparseRuizEquilibration
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-def _sparse_data(**kw) -> SparseData:
-    """Build a ``SparseData`` from keyword inputs (``init`` doesn't return self)."""
-    d = SparseData()
-    d.init(**kw)
-    return d
-
-
-def _make_preconditioner(data: SparseData) -> SparseRuizEquilibration:
-    """An identity Ruiz preconditioner (no scaling) for the given data."""
-    return SparseRuizEquilibration(
-        data.batch_size, data.n, data.p, data.m,
-        data.idx_xl, data.idx_xu, data.idx_hl, data.idx_hu,
-    )
-
-
-def _make_random_sparse_qp(
+def random_sparse_qp(
     n: int = 20, p: int = 8, m: int = 9,
     density: float = 0.3, seed: int = 42,
 ) -> SparseData:
@@ -67,26 +49,38 @@ def _make_random_sparse_qp(
     x_u[rng.random(n) < 0.3] = np.inf
     x_l[rng.random(n) < 0.3] = -np.inf
 
-    return _sparse_data(
+    data = SparseData()
+    data.init(
         P=csr_matrix(P), c=cp.array(c),
         A=csr_matrix(A), b=cp.array(b),
         G=csr_matrix(G), h_u=cp.array(h_u), h_l=cp.array(h_l),
         x_u=cp.array(x_u), x_l=cp.array(x_l),
-    )
+        )
+    return data
 
 
-def _factor(
+def random_rhs(n: int, p: int, m: int, seed: int) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray]:
+    """Three random (1, k) condensed-RHS blocks for the (B=1) sparse KKT."""
+    rng = cp.random.RandomState(seed)
+    return rng.randn(1, n), rng.randn(1, p), rng.randn(1, m)
+
+
+def factor(
     data: SparseData,
     settings: Settings,
     use_static_reg: bool,
     rho: float = 1.0,
-    delta: float = 1.0,
-    vars_seed: int = 0,
-) -> tuple[KKTSystem, Variables]:
+    delta: float = 1.0
+    ) -> tuple[KKTSystem, Variables]:
     """Init a ``KKTSystem``, randomize IPM variables, factor — return both."""
     kkt = KKTSystem()
     kkt.init(data, settings)
-    preconditioner = _make_preconditioner(data)
+
+    preconditioner = SparseRuizEquilibration(
+        data.batch_size, data.n, data.p, data.m,
+        has_h_l=data.has_h_l, has_h_u=data.has_h_u,
+        has_x_l=data.has_x_l, has_x_u=data.has_x_u,
+    )
 
     variables = Variables()
     variables.init(data)
@@ -101,10 +95,7 @@ def _factor(
     return kkt, variables
 
 
-def _random_rhs(n: int, p: int, m: int, seed: int) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray]:
-    """Three random (1, k) condensed-RHS blocks for the (B=1) sparse KKT."""
-    rng = cp.random.RandomState(seed)
-    return rng.randn(1, n), rng.randn(1, p), rng.randn(1, m)
+
 
 
 # ---------------------------------------------------------------------------
@@ -136,11 +127,11 @@ IR_SHAPES: list[tuple[int, int, int]] = [
 def test_condensed_factorize_solve(n: int, p: int, m: int) -> None:
     """Solve ``K_c * lhs = rhs`` for the condensed KKT and verify the
     multiply-back identity holds via the public ``mul_condensed_kkt``."""
-    data = _make_random_sparse_qp(n, p, m)
+    data = random_sparse_qp(n, p, m)
     settings = Settings()
-    kkt, _ = _factor(data, settings, use_static_reg=False)
+    kkt, _ = factor(data, settings, use_static_reg=False)
 
-    rhs_x, rhs_y, rhs_z = _random_rhs(n, p, m, seed=123)
+    rhs_x, rhs_y, rhs_z = random_rhs(n, p, m, seed=123)
 
     lhs_x = cp.zeros((1, n))
     lhs_y = cp.zeros((1, p))
@@ -164,13 +155,13 @@ def test_condensed_factorize_solve(n: int, p: int, m: int) -> None:
 def test_condensed_solve_with_ir(n: int, p: int, m: int) -> None:
     """Run the same RHS through the condensed solve twice — once without
     iterative refinement, once with — and assert IR doesn't make things worse."""
-    data = _make_random_sparse_qp(n, p, m)
-    rhs_x, rhs_y, rhs_z = _random_rhs(n, p, m, seed=111)
+    data = random_sparse_qp(n, p, m)
+    rhs_x, rhs_y, rhs_z = random_rhs(n, p, m, seed=111)
 
     # --- Without IR ----------------------------------------------------------
     settings_no_ir = Settings()
     settings_no_ir.iterative_refinement_max_iter = 0
-    kkt_no_ir, _ = _factor(data, settings_no_ir, use_static_reg=False)
+    kkt_no_ir, _ = factor(data, settings_no_ir, use_static_reg=False)
 
     lhs_x = cp.zeros((1, n))
     lhs_y = cp.zeros((1, p))
@@ -186,7 +177,7 @@ def test_condensed_solve_with_ir(n: int, p: int, m: int) -> None:
     # --- With IR (static reg + IR loop) --------------------------------------
     settings_ir = Settings()
     settings_ir.iterative_refinement_max_iter = 10
-    kkt_ir, _ = _factor(data, settings_ir, use_static_reg=True)
+    kkt_ir, _ = factor(data, settings_ir, use_static_reg=True)
 
     lhs_x2 = cp.zeros((1, n))
     lhs_y2 = cp.zeros((1, p))

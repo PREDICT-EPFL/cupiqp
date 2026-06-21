@@ -237,9 +237,10 @@ class SparseSolver(SolverBase):
     def _init_preconditioner(self) -> SparseRuizEquilibration:
         return SparseRuizEquilibration(
             self._data.batch_size, self._data.n, self._data.p, self._data.m,
-            self._data.idx_xl, self._data.idx_xu,
-            self._data.idx_hl, self._data.idx_hu,
-            use_warp_tile_kernels=True,
+            has_h_l=self._data.has_h_l, has_h_u=self._data.has_h_u,
+            has_x_l=self._data.has_x_l, has_x_u=self._data.has_x_u,
+            active_x_bound=self._data.active_x_bound,
+            use_warp_tile_kernels=(self._kernel_strategy == "warp_tile"),
             dtype=self._data.dtype,
         )
 
@@ -305,7 +306,7 @@ class SparseSolver(SolverBase):
 
             # Eager-compile the fused sparse data-gradients kernel.
             self._sparse_data_gradients_kernel = create_sparse_data_gradients_kernel(
-                nnz_P, nnz_A, nnz_G, d.p, d.m, d.n, dtype=dtype)
+                nnz_P, nnz_A, nnz_G, d.p, d.m, d.n, d.num_hu, d.num_xu, dtype=dtype)
 
             # Pre-allocate the gradient SparseData. The matrix
             # UniformBatchedCsrMatrix views share the forward sparsity (same
@@ -361,7 +362,7 @@ class SparseSolver(SolverBase):
         B = data.batch_size
         total = (
             grad_data._P.nnz + grad_data._A.nnz + grad_data._G.nnz
-            + data.p + data.m + data.n
+            + data.p + data.num_hu + data.num_xu
         )
         if total > 0:
             wp.launch(

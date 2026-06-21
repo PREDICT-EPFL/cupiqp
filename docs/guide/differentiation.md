@@ -7,7 +7,8 @@ factorization from the forward solve instead of constructing the full solution J
 If an outer scalar loss $\ell$ depends on the solution $x^\star$, call
 `backward()` with the upstream gradient $\partial \ell / \partial x^\star$. The returned
 data object contains the corresponding gradients with respect to `P`, `c`, `A`, `b`,
-`G`, `h_l`, `h_u`, `x_l`, and `x_u`.
+`G`, `h_l`, `h_u`, `x_l`, and `x_u`. A bound side that was omitted at `setup()` has no
+gradient block (its gradient is absent / `(B, 0)`), mirroring the inputs you provided.
 
 ## Basic workflow
 
@@ -73,6 +74,14 @@ The returned object matches the selected backend:
 
 All returned gradients are expressed in the original, unscaled problem coordinates;
 the backward pass handles any solver preconditioning internally.
+
+!!! warning "The high-level `OcpSolver` is not differentiable yet"
+    Gradients are supported on `DenseSolver`, `SparseSolver`, and `MultistageSolver`
+    (over their raw QP data). The high-level [`OcpSolver`](backends.md#multistagesolver)
+    is **not** differentiable: it has no mapping from solution gradients back to the OCP
+    fields you set (`Q`, `R`, `A`, `B`, `x0`, ...), and `enable_grad` is unsupported on
+    it. To differentiate an optimal-control problem today, assemble the QP yourself and
+    use `DenseSolver` or `SparseSolver`.
 
 ## Repeated solves
 
