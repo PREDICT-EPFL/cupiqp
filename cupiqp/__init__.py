@@ -23,15 +23,6 @@ from .sparse.sparse_solver import SparseSolver
 from .multistage.multistage_solver import MultistageSolver
 from .multistage.ocp_solver import OcpSolver
 
-# Cupy-axis-reduction kernel strategy + the three (strategy x backend)
-# concrete classes. Use these when max(n, p, m) is large enough that
-# warp tile-kernel compile time dominates first-solve latency.
-from .solver_large_problem import (
-    DenseLargeProblemSolver,
-    SparseLargeProblemSolver,
-    MultistageLargeProblemSolver,
-)
-
 
 CUPIQP_UNSOLVED          = Status.CUPIQP_UNSOLVED
 CUPIQP_SOLVED            = Status.CUPIQP_SOLVED
@@ -52,9 +43,6 @@ __all__ = [
     "SparseSolver",
     "MultistageSolver",
     "OcpSolver",
-    "DenseLargeProblemSolver",
-    "SparseLargeProblemSolver",
-    "MultistageLargeProblemSolver",
     # Problem data
     "Data",
     "DenseData",

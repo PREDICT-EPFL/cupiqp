@@ -287,10 +287,10 @@ class RuizEquilibration(PreconditionerBase):
             n, p, m, min_scaling, max_scaling, dtype=self._dtype,
         )
         self._accumulate_deltas_kernel = create_accumulate_deltas_kernel(n, p, m, dtype=self._dtype)
-        # Gate the tile-factory call — calling it triggers shape-specialized
-        # warp tile codegen. ``LargeProblemSolver`` constructs this class
-        # with ``use_warp_kernels=False`` to skip the compile entirely; the
-        # cupy fallback at the launch site is used instead.
+        # Gate the tile-factory call -- calling it triggers shape-specialized
+        # warp tile codegen. The "cupy" kernel strategy constructs this class
+        # with ``use_warp_tile_kernels=False`` to skip the compile entirely;
+        # the cupy fallback at the launch site is used instead.
         if use_warp_tile_kernels:
             self._conv_check_kernel = create_ruiz_conv_check_kernel(n, p, m, dtype=self._dtype)
             self._compute_rhs_inf_norm_unscaled_kernel = (
@@ -709,7 +709,7 @@ class RuizEquilibration(PreconditionerBase):
             )
         
         else:
-            # cupy fallback (use_warp_tile_kernels=False; LargeProblemSolver path).
+            # cupy fallback (use_warp_tile_kernels=False; "cupy" strategy path).
             out.fill(0.0)
             if data.p > 0:
                 tmp = cp.empty_like(data.b)
