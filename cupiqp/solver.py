@@ -291,6 +291,9 @@ class SolverBase(ABC):
         if not self._setup_done:
             raise RuntimeError("Solver not setup yet. Call setup() first.")
 
+        # TODO: in the future should allow only update some problems of the whole batch, and only marks the updated ones as unsolved
+        self._result.info.status_value[:] = Status.CUPIQP_UNSOLVED.value
+
         if self.settings.preconditioner_iter > 0:
             self._preconditioner.unscale_data(self._data)
 
