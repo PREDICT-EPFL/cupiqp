@@ -345,7 +345,7 @@ class SparseSolver(SolverBase):
             self._grad_A_values = self._grad_data._A.data
             self._grad_G_values = self._grad_data._G.data
 
-    def _compute_data_gradients(self, adjoint_vector: Variables) -> SparseData:
+    def _compute_data_gradients(self, adjoint_vector: Variables, linearization_point: Variables) -> SparseData:
         r"""Populate ``self._grad_data`` in place and return it.
 
         Matrix gradients are gathered directly at each structural nonzero
@@ -373,7 +373,7 @@ class SparseSolver(SolverBase):
                     self._lam_zu_full, self._lam_zl_full,
                     self._lam_zbu_full,
                     self._zu_full, self._zl_full,
-                    self._result.x, self._result.y,
+                    linearization_point.x, linearization_point.y,
                     self._p_rows, self._p_indices_arr,
                     self._a_rows, self._a_indices_arr,
                     self._g_rows, self._g_indices_arr,

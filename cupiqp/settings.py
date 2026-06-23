@@ -84,6 +84,11 @@ class Settings:
     compute_timings: bool = False
     enable_grad: bool = False
 
+    gradient_smoothing: bool = False
+    gradient_smoothing_mu: float = 1e-3
+    gradient_smoothing_tol: float = 1e-5
+    gradient_smoothing_max_iter: int = 5
+
 
     @classmethod
     def for_dtype(cls, dtype) -> "Settings":
@@ -139,4 +144,7 @@ class Settings:
                self.iterative_refinement_static_regularization_rel >= 0 and
                self.kkt_solver in ["dense_cholesky", "sparse_ldlt", "multistage_block_cholesky"]
                and self.dtype in ("float32", "float64")
+               and self.gradient_smoothing_mu > 0
+               and self.gradient_smoothing_tol > 0
+               and self.gradient_smoothing_max_iter > 0
                )

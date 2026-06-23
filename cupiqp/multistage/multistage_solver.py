@@ -260,7 +260,7 @@ class MultistageSolver(SolverBase):
             self._multistage_data_gradients_kernel = create_multistage_data_gradients_kernel(
                 N, d_sz, N_a, r_a, N_g, r_g, d.p, d.m, d.n, d.num_hu, d.num_hl, d.num_xu, d.num_xl, dtype=dtype)
 
-    def _compute_data_gradients(self, adjoint_vector: Variables) -> MultistageData:
+    def _compute_data_gradients(self, adjoint_vector: Variables, linearization_point: Variables) -> MultistageData:
         r"""Populate ``self._grad_data`` in place and return it.
 
         Matrix gradients are written into ``self._grad_data._P/_A/_G``
@@ -298,7 +298,7 @@ class MultistageSolver(SolverBase):
                     self._lam_zu_full, self._lam_zl_full,
                     self._lam_zbu_full, self._lam_zbl_full,
                     self._zu_full, self._zl_full,
-                    self._result.x, self._result.y,
+                    linearization_point.x, linearization_point.y,
                     grad_data._P.D,
                     grad_data._P.E,
                     self._grad_dA_D, self._grad_dA_E,

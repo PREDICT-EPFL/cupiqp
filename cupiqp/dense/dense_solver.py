@@ -191,7 +191,7 @@ class DenseSolver(SolverBase):
                 x_l=cp.zeros((B, d.n), dtype=dtype) if d.num_xl > 0 else None,
             )
 
-    def _compute_data_gradients(self, adjoint_vector: Variables) -> DenseData:
+    def _compute_data_gradients(self, adjoint_vector: Variables, linearization_point: Variables) -> DenseData:
         """Populate ``self._grad_data`` in place and return it.
 
         The returned instance is the same on every call; its buffers are
@@ -212,7 +212,7 @@ class DenseSolver(SolverBase):
                     self._lam_zu_full, self._lam_zl_full,
                     self._lam_zbu_full,
                     self._zu_full, self._zl_full,
-                    self._result.x, self._result.y,
+                    linearization_point.x, linearization_point.y,
                     grad_data._P, grad_data._A, grad_data._G,
                     grad_data._b, grad_data._h_u, grad_data._x_u,
                 ],
