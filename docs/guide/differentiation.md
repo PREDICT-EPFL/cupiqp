@@ -99,6 +99,12 @@ for c_k in costs:
 As with the forward solution, every problem in a batch is differentiated independently
 and gradients carry the leading batch dimension `(B, ...)`.
 
+!!! note "`backward()` needs a converged solve"
+    `backward()` differentiates the *converged* QP, so it requires the preceding `solve()`
+    to have reached `CUPIQP_SOLVED` for **every** batch element; otherwise it raises. An
+    `update()` marks the cached solution unsolved, so you must `solve()` again before the
+    next `backward()` (as the loop above does).
+
 !!! warning "Gradient buffers are reused"
     Each solver returns the same internal gradient-data object on every `backward()`
     call. Its buffers are overwritten by the next backward pass. Copy any gradient that
@@ -111,7 +117,63 @@ and gradients carry the leading batch dimension `(B, ...)`.
 !!! note "Differentiability at active-set changes"
     The VJP describes the local solution map at the converged QP. At points where the
     active set changes, that map can be nonsmooth and the gradient may be discontinuous
-    or undefined.
+    or undefined. [Gradient smoothing](#gradient-smoothing) replaces it with a smooth
+    surrogate.
+
+## Gradient smoothing
+
+At a converged solution the complementarity product `s * z` is driven to ~0, so each
+constraint is either strictly active or strictly inactive. Across an active-set change
+that hard switch makes the VJP jump or become undefined. Following
+[qpax](https://arxiv.org/abs/2406.11749), **gradient smoothing** instead differentiates at
+a *relaxed* point where `s * z = mu` for a small fixed `mu > 0`, which keeps the
+solution map smooth through active-set transitions.
+
+Enable it (with `enable_grad`) **before** `setup()`; the mode is fixed at setup:
+
+```python
+solver.settings.enable_grad = True
+solver.settings.gradient_smoothing = True
+solver.settings.gradient_smoothing_mu = 1e-3   # smoothing amount (default)
+solver.setup(P=P, c=c, x_l=x_l)
+solver.solve()
+grad = solver.backward(grad_x=grad_x)             # smoothed surrogate VJP
+```
+
+How it works: after the normal solve, `backward()` runs a short damped-Newton relaxation
+(`gradient_smoothing_tol`, `gradient_smoothing_max_iter`) from the converged point to a
+nearby point satisfying `s * z = mu`, then applies the ordinary implicit-diff VJP there.
+The settings are summarized in [Settings](../api/settings.md#differentiation-diagnostics-and-logging).
+
+!!! note "Smoothing is fixed at setup"
+    `settings.gradient_smoothing` is read at `setup()` (it gates the relaxation buffers), so
+    it cannot be toggled afterwards — changing it before a later `backward()` raises. The
+    amount `gradient_smoothing_mu` and the inner-solve controls `gradient_smoothing_tol` /
+    `gradient_smoothing_max_iter` may be changed freely between `backward()` calls.
+
+!!! warning "It is a surrogate gradient, not the derivative of the forward map"
+    The forward `solve()` still returns the **true** optimum `x*`; only the gradient is
+    changed. `backward()` returns the derivative of the **relaxed** solution map `x_mu`,
+    not of `x*`. Consequently a finite difference of the forward solution will **not** match
+    the smoothed gradient near an active-set change (they agree only as `mu -> 0`, away
+    from boundaries).
+
+!!! note "Smoothness and bias are qualified"
+    Smoothing removes the active-set switch under the usual regularity conditions (a
+    nonsingular relaxed KKT Jacobian); it does not make every QP globally smooth. The bias
+    is `mu`-controlled: roughly `O(mu)` away from transitions and `O(sqrt(mu))`
+    in the primal at a transition. cuPIQP's factor keeps the solver's `rho`/`delta`
+    regularization, so the result is qpax-style rather than bit-exact qpax.
+
+The relaxed point is smooth in all of `(x, y, s, z)` (since `s * z = mu > 0`), so
+cotangents on **any** solution variable — primal `x`, equality dual `y`, and the
+inequality/box duals and slacks — return the corresponding relaxed-map VJP, exactly as in
+the standard path. Smoothing is available on `DenseSolver`, `SparseSolver`,
+`MultistageSolver`, and the PyTorch layer; the high-level `OcpSolver` remains
+non-differentiable.
+
+The example notebook `examples/differentiable_qp_2d.ipynb` works this through on a 2-D box QP,
+visualizing how smoothing rounds the gradient's discontinuity at the active-set boundaries.
 
 See the [solver API](../api/solvers.md) for the full `backward()` signature and
 [Settings](../api/settings.md) for `enable_grad` and solver

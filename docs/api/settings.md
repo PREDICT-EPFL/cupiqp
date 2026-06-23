@@ -124,6 +124,10 @@ cuPIQP equilibrates the problem with a Ruiz preconditioner before solving.
 | Field | Default | Description |
 |---|---|---|
 | `enable_grad` | `False` | Allocate backward buffers; see [Differentiation](../guide/differentiation.md). |
+| `gradient_smoothing` | `False` | Enable qpax-style relaxed-KKT gradient smoothing. Fixed at `setup()`. Requires `enable_grad`. See [Differentiation](../guide/differentiation.md#gradient-smoothing). |
+| `gradient_smoothing_mu` | `1e-3` | Target complementarity `s * z = mu` at the relaxed point. Larger smooths more (more bias); smaller approaches the unsmoothed gradient. |
+| `gradient_smoothing_tol` | `1e-5` | Convergence tolerance of the inner relaxed-Newton solve (separate from the forward `eps_abs`). |
+| `gradient_smoothing_max_iter` | `5` | Maximum relaxed-Newton iterations per backward (separate from the forward `max_iter`). |
 | `verbose` | `False` | Print the banner and the per-iteration log during `solve()`. |
 
 ### Validation
