@@ -29,7 +29,9 @@ with primal decision variables $x \in \mathbb{R}^n$, matrices $P\in \mathbb{S}_+
 
 - **Native batched solving** — solve multiple independent QPs with the same dimension and sparsity pattern in parallel from a single solver instance by stacking inputs along a leading batch axis.
 - **Differentiable** — efficiently compute VJPs via implicit differentiation
-  by reusing the condensed factor from the forward solve.
+  by reusing the condensed factor from the forward solve, with optional
+  [gradient smoothing](guide/differentiation.md#gradient-smoothing) for smooth
+  derivatives across active-set changes.
 - **Scales to large QPs** — the same solver handles large sparse and dense QPs.
 - **Robust** - implements proximal iterior point method, with modern techniques including preconditioner, iterative refinement, etc.
 - **GPU-resident** — the IPM iterations, KKT factorizations, and linear algebra run on the GPU.

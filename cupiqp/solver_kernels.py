@@ -81,7 +81,7 @@ def create_init_guess_project_to_central_path_kernel(dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
 
     @wp.func
-    def project_z_to_central_path(c: dtype, mu: dtype) -> dtype:
+    def project_z_to_central_path(c: dtype, mu: dtype) -> dtype:    # type: ignore
         """Positive root of the central-path quadratic ``z*(z - c) = mu``.
 
             z = (c + sqrt(c**2 + 4*mu)) / 2
@@ -152,11 +152,8 @@ def create_prepare_corrector_step_kernel(dtype=wp.float64):
         res_s_all:  wp.array2d(dtype=dtype),  # type: ignore  (B, num_ineq) in-out
     ):
         b, i = wp.tid()
-        if finite_mask_all[b, i] > dtype(0.5):
-            sigma_mu = sigma[b] * mu[b]
-            res_s_all[b, i] = res_s_all[b, i] - step_s_all[b, i] * step_z_all[b, i] + sigma_mu
-        else:
-            res_s_all[b, i] = dtype(0.0)
+        res_s_all[b, i] = res_s_all[b, i] - step_s_all[b, i] * step_z_all[b, i] + sigma[b] * mu[b]
+        res_s_all[b, i] = res_s_all[b, i] * finite_mask_all[b, i]
 
     return prepare_corrector_step_kernel
 
@@ -300,11 +297,11 @@ def create_calculate_step_kernel(num_ineq: int, dtype=wp.float64):
     finalizes both outputs by multiplying by ``tau``.
     """
     @wp.func
-    def step_candidate(a: dtype, b: dtype) -> dtype:
+    def step_candidate(a: dtype, b: dtype) -> dtype:    # type: ignore
         return wp.where(a < dtype(0.0), -b / a, dtype(1.0))
 
     @wp.func
-    def step_candidate_masked(a: dtype, b: dtype, mask: dtype) -> dtype:
+    def step_candidate_masked(a: dtype, b: dtype, mask: dtype) -> dtype:    # type: ignore
         return wp.where(mask > dtype(0.5), step_candidate(a, b), dtype(1.0))
 
     @wp.kernel
@@ -508,7 +505,7 @@ def create_update_residuals_r_kernel(
     num_duals = p + num_hu + num_hl + num_xu + num_xl
 
     @wp.func
-    def _abs_mul(a: dtype, b: dtype) -> dtype:
+    def _abs_mul(a: dtype, b: dtype) -> dtype:    # type: ignore
         return wp.abs(a) * b
 
     @wp.kernel
@@ -637,12 +634,8 @@ def create_update_residual_nr_kernel(n: int, p: int, m: int, num_hl: int, num_hu
         dual_res_rel  = dual_res / max(1, dual_norm)
     """
     @wp.func
-    def finite_value(v: dtype, mask: dtype) -> dtype:
+    def finite_value(v: dtype, mask: dtype) -> dtype:    # type: ignore
         return wp.where(mask > dtype(0.5), v, dtype(0.0))
-
-    @wp.func
-    def masked_abs(v: dtype, mask: dtype) -> dtype:
-        return wp.abs(finite_value(v, mask))
 
     @wp.kernel
     def update_residual_nr_kernel(
@@ -915,6 +908,164 @@ def create_update_residual_nr_kernel(n: int, p: int, m: int, num_hl: int, num_hu
             info_dual_res_rel[b] = dual_res / dual_res_rel_norm
 
     return update_residual_nr_kernel
+
+
+def create_update_smoothing_residual_nr_kernel(n: int, p: int, m: int, num_hl: int, num_hu: int, num_xl: int, num_xu: int, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
+    r"""Fused kernel for the gradient-smoothing Newton steps RHS.
+
+    The negative non-regularized KKT residual (sign convention of the forward
+    KKT solve RHS) with the complementarity row driven to a target ``mu`` instead
+    of 0. The matrix-vector products are precomputed (same inputs as
+    :func:`create_update_residual_nr_kernel`); this kernel does the elementwise
+    assembly of every residual block plus the scaled-space inf-norm used for the
+    relaxation convergence test, in one launch.
+
+        res.x      = -(P*x + c + A^T*y + G^T*(z_u - z_l) + x_b_scaling*(z_bu - z_bl))
+        res.y      = -A*x + b
+        res.z_hl   =  (G*x - s_l - h_l) * mask_hl
+        res.z_hu   =  (-G*x - s_u + h_u) * mask_hu
+        res.z_xl   =  (x_b_scaling*x - s_bl - x_l) * mask_xl
+        res.z_xu   =  (-x_b_scaling*x - s_bu + x_u) * mask_xu
+        res.s_*    =  (mu - s_* * z_*) * mask_*          (relaxed complementarity)
+        norm_out   =  max over all residual blocks of |.|   (scaled space)
+
+    ``mu`` is the per-batch scaled target ``cost_scaling * gradient_smoothing_mu``.
+    """
+    @wp.func
+    def finite_value(v: dtype, mask: dtype) -> dtype:    # type: ignore
+        return wp.where(mask > dtype(0.5), v, dtype(0.0))
+
+    @wp.kernel
+    def update_smoothing_residual_nr_kernel(
+        # Precomputed matrix-vector products
+        minus_Px:        wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        A_x:             wp.array2d(dtype=dtype),  # type: ignore  (B, p)
+        AT_y:            wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        G_x:             wp.array2d(dtype=dtype),  # type: ignore  (B, m)
+        GT_zh_assembled: wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        zb_assembled:    wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        # Data
+        data_c:          wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        data_b:          wp.array2d(dtype=dtype),  # type: ignore  (B, p)
+        data_h_l:        wp.array2d(dtype=dtype),  # type: ignore  (B, m)
+        data_h_u:        wp.array2d(dtype=dtype),  # type: ignore  (B, m)
+        data_x_l:        wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        data_x_u:        wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        finite_mask_hl:  wp.array2d(dtype=dtype),  # type: ignore  (B, m)
+        finite_mask_hu:  wp.array2d(dtype=dtype),  # type: ignore  (B, m)
+        finite_mask_xl:  wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        finite_mask_xu:  wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        # Relaxed iterate
+        result_x:        wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        result_z_hl:     wp.array2d(dtype=dtype),  # type: ignore  (B, num_hl)
+        result_z_hu:     wp.array2d(dtype=dtype),  # type: ignore  (B, num_hu)
+        result_z_xl:     wp.array2d(dtype=dtype),  # type: ignore  (B, num_xl)
+        result_z_xu:     wp.array2d(dtype=dtype),  # type: ignore  (B, num_xu)
+        result_s_hl:     wp.array2d(dtype=dtype),  # type: ignore  (B, num_hl)
+        result_s_hu:     wp.array2d(dtype=dtype),  # type: ignore  (B, num_hu)
+        result_s_xl:     wp.array2d(dtype=dtype),  # type: ignore  (B, num_xl)
+        result_s_xu:     wp.array2d(dtype=dtype),  # type: ignore  (B, num_xu)
+        # Preconditioner + target
+        x_b_scaling:     wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        mu_scaled:       wp.array(dtype=dtype),    # type: ignore  (B,)
+        # Outputs (RHS blocks)
+        res_x:           wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        res_y:           wp.array2d(dtype=dtype),  # type: ignore  (B, p)
+        res_z_hl:        wp.array2d(dtype=dtype),  # type: ignore  (B, num_hl)
+        res_z_hu:        wp.array2d(dtype=dtype),  # type: ignore  (B, num_hu)
+        res_z_xl:        wp.array2d(dtype=dtype),  # type: ignore  (B, num_xl)
+        res_z_xu:        wp.array2d(dtype=dtype),  # type: ignore  (B, num_xu)
+        res_s_hl:        wp.array2d(dtype=dtype),  # type: ignore  (B, num_hl)
+        res_s_hu:        wp.array2d(dtype=dtype),  # type: ignore  (B, num_hu)
+        res_s_xl:        wp.array2d(dtype=dtype),  # type: ignore  (B, num_xl)
+        res_s_xu:        wp.array2d(dtype=dtype),  # type: ignore  (B, num_xu)
+        norm_out:        wp.array(dtype=dtype),    # type: ignore  (1,) global inf-norm (atomic max over batch); must be pre-zeroed
+    ):
+        b, i = wp.tid()
+        mu_b = mu_scaled[b]
+
+        # ---- res.x = -(P*x + c + A^T*y + G^T*(z_u-z_l) + x_b_scaling*(z_bu-z_bl)) ----
+        minus_Px_tile = wp.tile_load(minus_Px[b], shape=n)
+        c_tile        = wp.tile_load(data_c[b], shape=n)
+        AT_y_tile     = wp.tile_load(AT_y[b], shape=n)
+        GT_tile       = wp.tile_load(GT_zh_assembled[b], shape=n)
+        zb_tile       = wp.tile_load(zb_assembled[b], shape=n)
+        res_x_tile = minus_Px_tile - c_tile - AT_y_tile - GT_tile - zb_tile
+        wp.tile_store(res_x[b], res_x_tile)
+        nrm = wp.tile_extract(wp.tile_max(wp.tile_map(wp.abs, res_x_tile)), 0)
+
+        # ---- res.y = -A*x + b ----
+        if wp.static(p > 0):
+            b_tile   = wp.tile_load(data_b[b], shape=p)
+            A_x_tile = wp.tile_load(A_x[b], shape=p)
+            res_y_tile = -A_x_tile + b_tile
+            wp.tile_store(res_y[b], res_y_tile)
+            nrm = wp.max(nrm, wp.tile_extract(wp.tile_max(wp.tile_map(wp.abs, res_y_tile)), 0))
+
+        # ---- lower inequality (hl): z-row and relaxed s-row ----
+        if wp.static(num_hl > 0):
+            mask  = wp.tile_load(finite_mask_hl[b], shape=num_hl)
+            hl    = wp.tile_map(finite_value, wp.tile_load(data_h_l[b], shape=num_hl), mask)
+            Gx    = wp.tile_load(G_x[b], shape=num_hl)
+            s_raw = wp.tile_load(result_s_hl[b], shape=num_hl)
+            z_raw = wp.tile_load(result_z_hl[b], shape=num_hl)
+            res_z = (Gx - s_raw * mask - hl) * mask
+            wp.tile_store(res_z_hl[b], res_z)
+            res_s = mu_b * mask - (s_raw * z_raw) * mask
+            wp.tile_store(res_s_hl[b], res_s)
+            nrm = wp.max(nrm, wp.tile_extract(wp.tile_max(wp.tile_map(wp.abs, res_z)), 0))
+            nrm = wp.max(nrm, wp.tile_extract(wp.tile_max(wp.tile_map(wp.abs, res_s)), 0))
+
+        # ---- upper inequality (hu) ----
+        if wp.static(num_hu > 0):
+            mask  = wp.tile_load(finite_mask_hu[b], shape=num_hu)
+            hu    = wp.tile_map(finite_value, wp.tile_load(data_h_u[b], shape=num_hu), mask)
+            Gx    = wp.tile_load(G_x[b], shape=num_hu)
+            s_raw = wp.tile_load(result_s_hu[b], shape=num_hu)
+            z_raw = wp.tile_load(result_z_hu[b], shape=num_hu)
+            res_z = (-Gx - s_raw * mask + hu) * mask
+            wp.tile_store(res_z_hu[b], res_z)
+            res_s = mu_b * mask - (s_raw * z_raw) * mask
+            wp.tile_store(res_s_hu[b], res_s)
+            nrm = wp.max(nrm, wp.tile_extract(wp.tile_max(wp.tile_map(wp.abs, res_z)), 0))
+            nrm = wp.max(nrm, wp.tile_extract(wp.tile_max(wp.tile_map(wp.abs, res_s)), 0))
+
+        # ---- lower box (xl) ----
+        if wp.static(num_xl > 0):
+            mask  = wp.tile_load(finite_mask_xl[b], shape=num_xl)
+            xl    = wp.tile_map(finite_value, wp.tile_load(data_x_l[b], shape=num_xl), mask)
+            x_t   = wp.tile_load(result_x[b], shape=num_xl)
+            xbs   = wp.tile_load(x_b_scaling[b], shape=num_xl)
+            s_raw = wp.tile_load(result_s_xl[b], shape=num_xl)
+            z_raw = wp.tile_load(result_z_xl[b], shape=num_xl)
+            res_z = (xbs * x_t - s_raw * mask - xl) * mask
+            wp.tile_store(res_z_xl[b], res_z)
+            res_s = mu_b * mask - (s_raw * z_raw) * mask
+            wp.tile_store(res_s_xl[b], res_s)
+            nrm = wp.max(nrm, wp.tile_extract(wp.tile_max(wp.tile_map(wp.abs, res_z)), 0))
+            nrm = wp.max(nrm, wp.tile_extract(wp.tile_max(wp.tile_map(wp.abs, res_s)), 0))
+
+        # ---- upper box (xu) ----
+        if wp.static(num_xu > 0):
+            mask  = wp.tile_load(finite_mask_xu[b], shape=num_xu)
+            xu    = wp.tile_map(finite_value, wp.tile_load(data_x_u[b], shape=num_xu), mask)
+            x_t   = wp.tile_load(result_x[b], shape=num_xu)
+            xbs   = wp.tile_load(x_b_scaling[b], shape=num_xu)
+            s_raw = wp.tile_load(result_s_xu[b], shape=num_xu)
+            z_raw = wp.tile_load(result_z_xu[b], shape=num_xu)
+            res_z = (-xbs * x_t - s_raw * mask + xu) * mask
+            wp.tile_store(res_z_xu[b], res_z)
+            res_s = mu_b * mask - (s_raw * z_raw) * mask
+            wp.tile_store(res_s_xu[b], res_s)
+            nrm = wp.max(nrm, wp.tile_extract(wp.tile_max(wp.tile_map(wp.abs, res_z)), 0))
+            nrm = wp.max(nrm, wp.tile_extract(wp.tile_max(wp.tile_map(wp.abs, res_s)), 0))
+
+        # Reduce the per-batch inf-norms to a single global scalar across blocks.
+        if i == 0:
+            wp.atomic_max(norm_out, 0, nrm)
+
+    return update_smoothing_residual_nr_kernel
 
 
 def create_prepare_zu_minus_zl_and_zbu_minus_zbl_kernel(m: int, n: int,

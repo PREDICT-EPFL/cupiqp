@@ -24,6 +24,7 @@ from .solver_kernels import (
     create_update_residuals_r_kernel,
     create_prepare_zu_minus_zl_and_zbu_minus_zbl_kernel,
     create_update_residual_nr_kernel,
+    create_update_smoothing_residual_nr_kernel,
     create_update_rho_delta_with_ineq_kernel,
     create_update_rho_delta_without_ineq_kernel,
     create_run_full_newton_step_kernel,
@@ -64,6 +65,16 @@ class SolverBase(ABC):
         self._kkt_system = KKTSystem()
         self._preconditioner = None
         self._setup_done = False
+
+        # Gradient smoothing (qpax-style relaxed-KKT differentiation) state.
+        # The mode is frozen at setup(); the relaxation buffers (see setup) are
+        # only allocated when it is on. The backward outer products read the
+        # linearization point passed in by backward(): ``self._result`` (the true
+        # optimum) in standard mode, or ``self._result_smoothed`` (the user-space
+        # relaxed iterate) in smoothed mode.
+        self._grad_smoothing = None
+        self._result_scaled = Variables()
+        self._result_smoothed = Variables()
 
     @property
     def settings(self) -> Settings:
@@ -236,6 +247,24 @@ class SolverBase(ABC):
             self._zu_full      = cp.empty((B, data.m), dtype=self._dtype)
             self._zl_full      = cp.empty((B, data.m), dtype=self._dtype)
 
+
+        self._grad_smoothing = bool(self.settings.enable_grad and self.settings.gradient_smoothing)
+        if self._grad_smoothing:           
+            self._result_scaled.init(self._data)
+            self._result_smoothed.init(self._data)
+            self._smoothing_mu_scaled = cp.empty(B, dtype=self._dtype)            # cost_scaling * mu
+            self._smoothing_mu_scaled_sqrt = cp.empty(B, dtype=self._dtype)       # sqrt(mu_scaled)
+            self._smoothing_alpha_s = cp.empty(B, dtype=self._dtype)              # primal step length
+            self._smoothing_alpha_z = cp.empty(B, dtype=self._dtype)              # dual step length
+
+            self._smoothing_residual_norm = cp.empty(1, dtype=self._dtype)
+            if self._kernel_strategy == "warp_tile":
+                self._update_smoothing_residual_nr_kernel = create_update_smoothing_residual_nr_kernel(
+                    data.n, data.p, data.m,
+                    data.num_hl, data.num_hu, data.num_xl, data.num_xu,
+                    dtype=self._dtype,
+                )
+
         self._enable_iterative_refinement = self.settings.iterative_refinement_always_enabled
 
         # Unscaled-RHS inf-norm. When preconditioner_iter == 0 the stored
@@ -290,6 +319,9 @@ class SolverBase(ABC):
         """
         if not self._setup_done:
             raise RuntimeError("Solver not setup yet. Call setup() first.")
+
+        # TODO: in the future should allow only update some problems of the whole batch, and only marks the updated ones as unsolved
+        self._result.info.status_value[:] = Status.CUPIQP_UNSOLVED.value
 
         if self.settings.preconditioner_iter > 0:
             self._preconditioner.unscale_data(self._data)
@@ -582,10 +614,18 @@ class SolverBase(ABC):
         self._result.info.status_value[self._result.info.status_value == Status.CUPIQP_UNSOLVED.value] = Status.CUPIQP_MAX_ITER_REACHED.value
         if self.settings.verbose:
             self._print_summary()
+        # Capture the converged iterate in SCALED coordinates before it is
+        # unscaled below. Gradient smoothing warm-starts its relaxed Newton loop
+        # from this converged point, which must live in the same scaled frame as
+        # the data / KKT factor. (The frozen rho/delta are read straight from
+        # self._result.info at backward time, so they are not copied here.)
+        if self._grad_smoothing:
+            self._result_scaled.primals_all[:] = self._result.primals_all
+            self._result_scaled.duals_all[:] = self._result.duals_all
         if self.settings.preconditioner_iter > 0:
             self._preconditioner.unscale_solution(self._result, self._data)
         statuses = self._result.info.status
-        
+
         return statuses
 
     @nvtx.annotate("Solver::_initial_guess")
@@ -872,7 +912,7 @@ class SolverBase(ABC):
         """Predictor-corrector steps + variable update + mu calculation."""
         # ------------------ predictor step ------------------
         # Short derivation:
-        # Complementarity (elementwise): s_i * z_i = mu (usually written s * z = mu e).
+        # Complementarity (elementwise): s_i * z_i = mu (usually written S * z = mu e).
         # Predictor (affine) aims for the affine step that drives complementarity to zero, so require (s + Δs) ∘ (z + Δz) = 0.
         # Expand: s ∘ z + S Δz + Z Δs + Δs ∘ Δz = 0, where S = diag(s), Z = diag(z).
         # Drop the quadratic term Δs ∘ Δz (first‑order Newton linearization) to get the linear system S Δz + Z Δs = - s ∘ z.
@@ -980,6 +1020,7 @@ class SolverBase(ABC):
     @nvtx.annotate("Solver::_calculate_mu")
     @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
     def _calculate_mu(self) -> None:
+        """Calculate mu (the duality measure)."""
         self._calculate_mu_impl()
 
     def _calculate_mu_warp(self) -> None:
@@ -1008,6 +1049,7 @@ class SolverBase(ABC):
     @nvtx.annotate("Solver::_calculate_sigma")
     @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
     def _calculate_sigma(self) -> None:
+        """Calculate sigma (the centering parameter)."""
         self._calculate_sigma_impl()
 
     def _calculate_sigma_warp(self) -> None:
@@ -1720,6 +1762,270 @@ class SolverBase(ABC):
             info.no_dual_update,
         )
 
+    # ------------------------------------------------------------------
+    # Gradient smoothing
+    # ------------------------------------------------------------------
+    def _run_smoothing_steps(self) -> None:
+        """Run the relaxed Newton loop for gradient smoothing.
+
+        From the scaled converged solution (``self._result_scaled``), drive
+        ``s * z -> mu`` and leave (a) the cached KKT factor at the relaxed point
+        and (b) the user-space relaxed iterate in ``self._result_smoothed`` --
+        which ``backward()`` then passes as the linearization point to the
+        adjoint solve and the matrix/vector gradient assembly.
+        """
+        data = self._data
+        pc = self._preconditioner
+        settings = self.settings
+
+        # mu in scaled space: s_scaled * z_scaled = cost_scaling * mu_user
+        # (the Ruiz constraint scaling cancels in the s*z product; cost scaling
+        # does not). cost_scaling is 1 unless preconditioner_scale_cost is set.
+        cp.multiply(pc.cost_scaling, settings.gradient_smoothing_mu,
+                    out=self._smoothing_mu_scaled)
+        cp.sqrt(self._smoothing_mu_scaled, out=self._smoothing_mu_scaled_sqrt)
+
+        # Restart from the immutable scaled converged solution.
+        self._result_smoothed.primals_all[:] = self._result_scaled.primals_all
+        self._result_smoothed.duals_all[:] = self._result_scaled.duals_all
+
+        # Floor s, z at sqrt(mu_scaled) on finite-bound entries so the first
+        # factorization of H = Q + G^T diag(z/s) G stays well conditioned.
+        if data.num_ineq > 0:
+            mask = data.finite_mask_all
+            self._result_smoothed.s_all[:] = cp.where(mask > 0.5, cp.maximum(self._result_smoothed.s_all, self._smoothing_mu_scaled_sqrt[:, None]), self._result_smoothed.s_all)
+            self._result_smoothed.z_all[:] = cp.where(mask > 0.5, cp.maximum(self._result_smoothed.z_all, self._smoothing_mu_scaled_sqrt[:, None]), self._result_smoothed.z_all)
+
+        # Frozen regularization = the converged solve's final rho/delta
+        rho, delta = self._result.info.rho, self._result.info.delta
+
+        for _ in range(settings.gradient_smoothing_max_iter + 1):
+            self._kkt_system.update_scalings_and_factor(
+                data, pc, settings, False, rho, delta, self._result_smoothed)
+            norm = self._calculate_smoothing_step_rhs()
+            if norm < settings.gradient_smoothing_tol:
+                break
+            self._kkt_system.solve(data, pc, settings, self._res, self._step)
+            self._apply_smoothing_step()
+
+        if settings.preconditioner_iter > 0:
+            pc.unscale_solution(self._result_smoothed, data)
+
+    def _calculate_smoothing_step_rhs(self) -> float:
+        """Assemble the relaxed Newton RHS (negative non-regularized KKT residual
+        with complementarity target mu) into ``self._res`` and return its
+        scaled-space inf-norm. Sign convention matches the forward KKT solve
+        RHS: x/y/z rows are the negative stationarity/feasibility residuals and
+        the s-row is ``mu_scaled - s*z``.
+        """
+        if self._kernel_strategy == "warp_tile":
+            return self._calculate_smoothing_step_rhs_warp()
+        else:
+            return self._calculate_smoothing_step_rhs_cupy()
+
+    def _calculate_smoothing_step_rhs_warp(self) -> float:
+        data = self._data
+        pc = self._preconditioner
+        result_smooth = self._result_smoothed
+        res = self._res
+        wp_stream = wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr)
+
+        self._kkt_system.eval_P_x(data, -1.0, result_smooth.x, res.x)        # minus_Px
+        if data.p > 0:
+            self._kkt_system.eval_A_xn(data, 1.0, result_smooth.x, res.y)    # A_x
+            self._kkt_system.eval_AT_xt(data, 1.0, result_smooth.y, self._work_x)  # AT_y
+        else:
+            self._work_x.fill(0.0)
+
+        # z_u - z_l -> work_z_1 ; x_b_scaling*(z_bu - z_bl) -> work_primals
+        if data.num_ineq > 0:
+            wp.launch(
+                kernel=self._prepare_zu_minus_zl_and_zbu_minus_zbl_kernel,
+                dim=(data.batch_size, data.m + data.n),
+                inputs=[result_smooth.z_u, result_smooth.z_l, result_smooth.z_bl, result_smooth.z_bu, pc.x_b_scaling,
+                        self._work_z_1, self._work_primals],
+                stream=wp_stream,
+            )
+        else:
+            self._work_primals.fill(0.0)
+        # G_x -> work_z_2 ; G^T(z_u - z_l) -> step.x
+        if data.m > 0:
+            self._kkt_system.eval_G_xn(data, 1.0, result_smooth.x, self._work_z_2)
+            self._kkt_system.eval_GT_xt(data, 1.0, self._work_z_1, self._step.x)
+        else:
+            self._step.x.fill(0.0)
+
+        # --- fused elementwise assembly + relaxed s-row + inf-norm ---
+        # norm_out is an atomic-max accumulator; zero it before the launch.
+        self._smoothing_residual_norm.fill(0.0)
+        wp.launch_tiled(
+            kernel=self._update_smoothing_residual_nr_kernel,
+            dim=[data.batch_size],
+            inputs=[
+                res.x, res.y, self._work_x, self._work_z_2, self._step.x, self._work_primals,
+                data.c, data.b, data.h_l, data.h_u, data.x_l, data.x_u,
+                data.finite_mask_hl, data.finite_mask_hu, data.finite_mask_xl, data.finite_mask_xu,
+                result_smooth.x, result_smooth.z_l, result_smooth.z_u, result_smooth.z_bl, result_smooth.z_bu, result_smooth.s_l, result_smooth.s_u, result_smooth.s_bl, result_smooth.s_bu,
+                pc.x_b_scaling, self._smoothing_mu_scaled,
+                res.x, res.y, res.z_l, res.z_u, res.z_bl, res.z_bu,
+                res.s_l, res.s_u, res.s_bl, res.s_bu,
+                self._smoothing_residual_norm,
+            ],
+            block_dim=256,
+            device="cuda",
+            stream=wp_stream,
+        )
+        return float(self._smoothing_residual_norm[0])
+
+    def _calculate_smoothing_step_rhs_cupy(self) -> float:
+        data = self._data
+        pc = self._preconditioner
+        n, p, m = data.n, data.p, data.m
+        rv = self._result_smoothed
+        res = self._res
+        xbs = pc.x_b_scaling
+
+        # res.x = -(P x + c + A^T y + G^T (z_u - z_l) + xbs * (z_bu - z_bl))
+        self._kkt_system.eval_P_x(data, -1.0, rv.x, res.x)
+        res.x -= data.c
+        if p > 0:
+            self._kkt_system.eval_AT_xt(data, 1.0, rv.y, self._work_x)
+            res.x -= self._work_x
+        if m > 0:
+            self._work_z_1.fill(0.0)
+            if data.num_hu > 0:
+                self._work_z_1 += rv.z_u
+            if data.num_hl > 0:
+                self._work_z_1 -= rv.z_l
+            self._kkt_system.eval_GT_xt(data, 1.0, self._work_z_1, self._work_x)
+            res.x -= self._work_x
+        if data.num_xl > 0:
+            res.x[:, :n] += xbs[:, :n] * rv.z_bl
+        if data.num_xu > 0:
+            res.x[:, :n] -= xbs[:, :n] * rv.z_bu
+
+        # res.y = -(A x - b)
+        if p > 0:
+            self._kkt_system.eval_A_xn(data, -1.0, rv.x, res.y)
+            res.y += data.b
+
+        if m > 0:
+            self._kkt_system.eval_G_xn(data, 1.0, rv.x, self._work_z_2)
+
+        if data.num_hl > 0:
+            h_l_m = cp.where(data.finite_mask_hl > 0.5, data.h_l, 0.0)
+            res.z_l[:] = self._work_z_2
+            res.z_l -= rv.s_l
+            res.z_l -= h_l_m
+            res.z_l *= data.finite_mask_hl
+        if data.num_hu > 0:
+            h_u_m = cp.where(data.finite_mask_hu > 0.5, data.h_u, 0.0)
+            res.z_u[:] = -self._work_z_2
+            res.z_u -= rv.s_u
+            res.z_u += h_u_m
+            res.z_u *= data.finite_mask_hu
+        if data.num_xl > 0:
+            x_l_m = cp.where(data.finite_mask_xl > 0.5, data.x_l, 0.0)
+            res.z_bl[:] = rv.x[:, :n] * xbs[:, :n]
+            res.z_bl -= rv.s_bl
+            res.z_bl -= x_l_m
+            res.z_bl *= data.finite_mask_xl
+        if data.num_xu > 0:
+            x_u_m = cp.where(data.finite_mask_xu > 0.5, data.x_u, 0.0)
+            res.z_bu[:] = rv.x[:, :n] * xbs[:, :n]
+            res.z_bu += rv.s_bu
+            res.z_bu -= x_u_m
+            res.z_bu *= -1.0
+            res.z_bu *= data.finite_mask_xu
+
+        # Relaxed complementarity: res.s = (mu_scaled - s*z) on finite rows.
+        # Reuse the forward predictor kernel for the masked -s*z part, then add
+        # the relaxed target mu on finite rows (mask is 0 on infinite-bound rows,
+        # which the kernel already set to 0).
+        if data.num_ineq > 0:
+            wp.launch(
+                kernel=self._prepare_predictor_step_kernel,
+                dim=(data.batch_size, data.num_ineq),
+                inputs=[rv.s_all, rv.z_all, data.finite_mask_all, res.s_all],
+                device="cuda",
+                stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+            )
+            res.s_all += self._smoothing_mu_scaled[:, None] * data.finite_mask_all
+
+        norm = 0.0
+        for arr in (res.x, res.y, res.z_l, res.z_u, res.z_bl, res.z_bu, res.s_all):
+            if arr.size:
+                norm = max(norm, float(cp.max(cp.abs(arr))))
+        return norm
+
+    def _apply_smoothing_step(self) -> None:
+        """Take a damped Newton step on ``self._result_smoothed``. The per-side
+        fraction-to-boundary step lengths ``tau * min(1, min_i -v_i / dv_i)`` are
+        computed with the forward solve's machinery (the fused warp kernel under
+        the warp_tile strategy, cupy otherwise), then a single *common* step
+        ``alpha = min(alpha_s, alpha_z)`` is applied to all of (x, y, s, z).
+        Stepping s and z together keeps them positive and drives ``s * z`` to
+        ``mu`` in a few iterations -- separate primal/dual steps let the product
+        overshoot near the boundary. The step rule only affects the path; the
+        relaxed fixed point ``s * z = mu`` (hence the gradient) is the same.
+        """
+        data = self._data
+        rv = self._result_smoothed
+        step = self._step
+        tau = self.settings.tau
+
+        if data.num_ineq == 0:
+            self._smoothing_alpha_s.fill(1.0)
+            self._smoothing_alpha_z.fill(1.0)
+        elif self._kernel_strategy == "warp_tile":
+            # Reuse the forward fused step-length kernel (created only under the
+            # warp_tile strategy). It writes tau * min(1, min_i -v_i/dv_i) for s
+            # and z into the two output arrays.
+            wp.launch_tiled(
+                kernel=self._calculate_step_kernel,
+                dim=[data.batch_size],
+                inputs=[
+                    rv.s_all, rv.z_all, data.finite_mask_all,
+                    step.s_all, step.z_all, self._tau_device,
+                    self._smoothing_alpha_s, self._smoothing_alpha_z,
+                ],
+                block_dim=256,
+                device="cuda",
+                stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+            )
+        else:
+            # cupy fallback (wide problems / cupy strategy): same formula as
+            # _calculate_step_cupy. where picks 1 on non-negative steps; the
+            # masked-row steps are 0 (decoupled by the KKT solve), so they
+            # contribute 1 and never bind.
+            self._work_s[:] = cp.where(step.s_all < 0, -rv.s_all / step.s_all, 1.0)
+            self._smoothing_alpha_s[:] = cp.min(self._work_s, axis=1)
+            self._smoothing_alpha_s *= tau
+            self._work_z[:] = cp.where(step.z_all < 0, -rv.z_all / step.z_all, 1.0)
+            self._smoothing_alpha_z[:] = cp.min(self._work_z, axis=1)
+            self._smoothing_alpha_z *= tau
+
+        # The fused/cupy reductions return tau * min_i(ratio) but do not cap a
+        # single active row at the full Newton step, so clamp each per-side step
+        # at tau (= tau * min(1, ratio)); an uncapped ratio > 1 would overshoot
+        # the Newton step and stall the relaxation near a transition.
+        cp.minimum(self._smoothing_alpha_s, tau, out=self._smoothing_alpha_s)
+        cp.minimum(self._smoothing_alpha_z, tau, out=self._smoothing_alpha_z)
+        # Common step length min(primal, dual), damped once more by tau. The
+        # extra tau keeps iterates centered (away from the boundary), which
+        # converges to s*z=mu reliably within the small iteration budget
+        cp.minimum(self._smoothing_alpha_s, self._smoothing_alpha_z, out=self._smoothing_alpha_s)
+        self._smoothing_alpha_s *= tau
+        a = self._smoothing_alpha_s[:, None]
+        rv.x += a * step.x
+        if data.p > 0:
+            rv.y += a * step.y
+        if data.num_ineq > 0:
+            cp.multiply(step.s_all, data.finite_mask_all, out=self._work_s)
+            rv.s_all += a * self._work_s
+            cp.multiply(step.z_all, data.finite_mask_all, out=self._work_z)
+            rv.z_all += a * self._work_z
+
     @nvtx.annotate("Solver::_compute_adjoint")
     def _compute_adjoint(self, grad: Variables, sol: Variables) -> None:
         r"""Solve the adjoint KKT system :math:`K^\top \lambda = -\partial L / \partial v`.
@@ -1869,6 +2175,26 @@ class SolverBase(ABC):
                 f"{type(self).__name__}.grad() requires a prior solve(); "
                 f"call setup() and solve() before grad()."
             )
+        
+        if not (self._result.info.status_value == Status.CUPIQP_SOLVED.value).all():
+            raise RuntimeError(
+                "Gradient computation requires every problem in the batch to be "
+                "solved (status CUPIQP_SOLVED) since the last setup()/update(); "
+                "call solve() and check the status before backward()."
+            )
+
+        # The smoothing mode is fixed at setup() (it gates buffer allocation).
+        if self.settings.gradient_smoothing != self._grad_smoothing:
+            raise RuntimeError(
+                "settings.gradient_smoothing was changed after setup(); the "
+                "smoothing mode is fixed at setup. Create a new solver to change it."
+            )
+        
+        if self._grad_smoothing:
+            self._run_smoothing_steps()
+            result_for_calc_grad = self._result_smoothed
+        else:
+            result_for_calc_grad = self._result
 
         data = self._data
         B = data.batch_size
@@ -1912,7 +2238,7 @@ class SolverBase(ABC):
             inputs=[
                 self._backward_adjoint_vector.z_u, self._backward_adjoint_vector.z_l,
                 self._backward_adjoint_vector.z_bu, self._backward_adjoint_vector.z_bl,
-                self._result.z_u, self._result.z_l,
+                result_for_calc_grad.z_u, result_for_calc_grad.z_l,
                 self._lam_zu_full, self._lam_zl_full,
                 self._lam_zbu_full, self._lam_zbl_full,
                 self._zu_full, self._zl_full,
@@ -1923,17 +2249,19 @@ class SolverBase(ABC):
 
         # ---- Step 4: backend-specific matrix and vector gradient
         # assembly + Data subclass construction.
-        return self._compute_data_gradients(self._backward_adjoint_vector)
+        return self._compute_data_gradients(self._backward_adjoint_vector, result_for_calc_grad)
 
     @abstractmethod
-    def _compute_data_gradients(self, sol_adj: Variables):
+    def _compute_data_gradients(self, sol_adj: Variables, linearization_point: Variables):
         """Build and return the backend's ``Data`` subclass populated
         with user-space gradients ``(P, c, A, b, G, h_u, h_l, x_u,
         x_l)``.
 
         Implementations read user-space adjoint lambdas from
         ``sol_adj`` (active-only sizes), the user-space primal/dual
-        solution from ``self._result``, and the pre-scattered full-
-        layout buffers ``self._lam_z*_full`` / ``self._z*_full`` set
-        up by :meth:`grad`'s scatter step.
+        ``linearization_point`` (``self._result`` normally, or the
+        relaxed iterate ``self._result_smoothed`` under gradient
+        smoothing), and the pre-scattered full-layout buffers
+        ``self._lam_z*_full`` / ``self._z*_full`` set up by :meth:`grad`'s
+        scatter step.
         """
