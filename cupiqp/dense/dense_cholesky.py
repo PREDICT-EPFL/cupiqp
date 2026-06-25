@@ -1,6 +1,5 @@
 import cupy as cp
-from cupy_backends.cuda.libs import cublas, cusolver
-from nvmath.bindings import cusolverDn
+from nvmath.bindings import cublas, cusolverDn
 
 
 # ---------------------------------------------------------------------------
@@ -33,26 +32,26 @@ class CholeskyInplaceSolver:
         self._cusolver_handle = cusolver_create_handle()
         
         if self._dtype == 'f':
-            self._potrf = cusolver.spotrf
-            self._potrs = cusolver.spotrs
-            buffer_func = cusolver.spotrf_bufferSize
+            self._potrf = cusolverDn.spotrf
+            self._potrs = cusolverDn.spotrs
+            buffer_func = cusolverDn.spotrf_buffer_size
         elif self._dtype == 'd':
-            self._potrf = cusolver.dpotrf
-            self._potrs = cusolver.dpotrs
-            buffer_func = cusolver.dpotrf_bufferSize
+            self._potrf = cusolverDn.dpotrf
+            self._potrs = cusolverDn.dpotrs
+            buffer_func = cusolverDn.dpotrf_buffer_size
         elif self._dtype == 'F':
-            self._potrf = cusolver.cpotrf
-            self._potrs = cusolver.cpotrs
-            buffer_func = cusolver.cpotrf_bufferSize
+            self._potrf = cusolverDn.cpotrf
+            self._potrs = cusolverDn.cpotrs
+            buffer_func = cusolverDn.cpotrf_buffer_size
         elif self._dtype == 'D':
-            self._potrf = cusolver.zpotrf
-            self._potrs = cusolver.zpotrs
-            buffer_func = cusolver.zpotrf_bufferSize
+            self._potrf = cusolverDn.zpotrf
+            self._potrs = cusolverDn.zpotrs
+            buffer_func = cusolverDn.zpotrf_buffer_size
         else:
             raise ValueError(f"Unsupported dtype: {dtype}")
 
         self._dev_info = cp.empty(1, dtype=cp.int32)
-        self._buffersize = buffer_func(self._cusolver_handle, cublas.CUBLAS_FILL_MODE_UPPER, n, 0, n)
+        self._buffersize = buffer_func(self._cusolver_handle, cublas.FillMode.UPPER, n, 0, n)
         self._workspace = cp.empty(self._buffersize, dtype=self._dtype)
 
         self._factor_ptr = None
@@ -77,9 +76,9 @@ class CholeskyInplaceSolver:
         
         # Layout Detection
         if A.flags.f_contiguous:
-            self._uplo = cublas.CUBLAS_FILL_MODE_LOWER
+            self._uplo = cublas.FillMode.LOWER
         elif A.flags.c_contiguous:
-            self._uplo = cublas.CUBLAS_FILL_MODE_UPPER
+            self._uplo = cublas.FillMode.UPPER
         else:
             raise ValueError("Matrix A must be contiguous (C or F order).")
 
@@ -173,20 +172,20 @@ class BatchedCholeskyInplaceSolver:
         self._batch_size = batch_size
         self._dtype = cp.dtype(dtype).char
         self._cusolver_handle = cusolver_create_handle()
-        self._uplo = cublas.CUBLAS_FILL_MODE_UPPER  # C-contiguous → upper in col-major
+        self._uplo = cublas.FillMode.UPPER  # C-contiguous → upper in col-major
 
         if self._dtype == 'f':
-            self._potrf_batched = cusolver.spotrfBatched
-            self._potrs_batched = cusolver.spotrsBatched
+            self._potrf_batched = cusolverDn.spotrf_batched
+            self._potrs_batched = cusolverDn.spotrs_batched
         elif self._dtype == 'd':
-            self._potrf_batched = cusolver.dpotrfBatched
-            self._potrs_batched = cusolver.dpotrsBatched
+            self._potrf_batched = cusolverDn.dpotrf_batched
+            self._potrs_batched = cusolverDn.dpotrs_batched
         elif self._dtype == 'F':
-            self._potrf_batched = cusolver.cpotrfBatched
-            self._potrs_batched = cusolver.cpotrsBatched
+            self._potrf_batched = cusolverDn.cpotrf_batched
+            self._potrs_batched = cusolverDn.cpotrs_batched
         elif self._dtype == 'D':
-            self._potrf_batched = cusolver.zpotrfBatched
-            self._potrs_batched = cusolver.zpotrsBatched
+            self._potrf_batched = cusolverDn.zpotrf_batched
+            self._potrs_batched = cusolverDn.zpotrs_batched
         else:
             raise ValueError(f"Unsupported dtype: {dtype}")
 
