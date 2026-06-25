@@ -4,6 +4,7 @@ import nvtx
 import cupy as cp
 import warp as wp
 
+from .utils import cuda_graph_capture
 from .data import Data
 from .results import Variables
 from .preconditioner_kernels import (
@@ -89,6 +90,10 @@ class PreconditionerBase(ABC):
     # ------------------------------------------------------------------
 
     @nvtx.annotate("Preconditioner::unscale_solution")
+    @cuda_graph_capture(
+        key=lambda self, result, data: result.buffer_ptr,
+        enable=lambda self: getattr(self, "_enable_cuda_graph", True),
+    )
     def unscale_solution(self, result: Variables, data: Data):
         """Transform scaled IPM solution back to original coordinates, in place."""
         self.unscale_primal(result.x, out=result.x)
@@ -204,9 +209,11 @@ class RuizEquilibration(PreconditionerBase):
                  max_scaling: float = 1e4,
                  convergence_tol: float = 1e-3,
                  use_warp_tile_kernels: bool = True,
+                 enable_cuda_graph: bool = True,
                  dtype=cp.float64,
                  ):
         self._use_warp_tile_kernels = use_warp_tile_kernels
+        self._enable_cuda_graph = enable_cuda_graph
         self.B = B
         self.n = n
         self.p = p

@@ -185,6 +185,7 @@ class MultistageSolver(SolverBase):
             active_x_bound=self._data.active_x_bound,
             data=self._data,
             use_warp_tile_kernels=(self._kernel_strategy == "warp_tile"),
+            enable_cuda_graph=self.settings.enable_cuda_graph,
             dtype=self._data.dtype,
         )
 

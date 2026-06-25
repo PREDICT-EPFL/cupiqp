@@ -241,6 +241,7 @@ class SparseSolver(SolverBase):
             has_x_l=self._data.has_x_l, has_x_u=self._data.has_x_u,
             active_x_bound=self._data.active_x_bound,
             use_warp_tile_kernels=(self._kernel_strategy == "warp_tile"),
+            enable_cuda_graph=self.settings.enable_cuda_graph,
             dtype=self._data.dtype,
         )
 
