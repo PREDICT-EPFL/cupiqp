@@ -1,5 +1,15 @@
 import cupy as cp
+import warp as wp
 from nvmath.bindings import cublas, cusolverDn
+
+
+@wp.kernel
+def _fill_ptrs_kernel(base: wp.int64, stride: wp.int64,
+                      out: wp.array(dtype=wp.int64)):  # type: ignore
+    # out[i] = base + i * stride : device pointer to each matrix/row in a
+    # batch, computed from the base address and outer batch stride (bytes).
+    i = wp.tid()
+    out[i] = base + wp.int64(i) * stride
 
 
 # ---------------------------------------------------------------------------
@@ -210,14 +220,14 @@ class BatchedCholeskyInplaceSolver:
         """
         key = (arr.data.ptr, arr.strides[0])
         if key != cached_key:
-            _fill_ptrs_kernel = cp.ElementwiseKernel(
-                'int64 base, int64 stride',
-                'int64 out',
-                'out = base + i * stride',
-                'fill_ptrs',
+            wp.launch(
+                _fill_ptrs_kernel,
+            dim=ptrs.shape[0],
+                inputs=[wp.int64(arr.data.ptr), wp.int64(arr.strides[0])],
+                outputs=[ptrs],
+                device="cuda",
+                stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
             )
-            _fill_ptrs_kernel(cp.int64(arr.data.ptr),
-                              cp.int64(arr.strides[0]), ptrs)
         return key
 
     def __del__(self):
