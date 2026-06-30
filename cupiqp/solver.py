@@ -1799,7 +1799,7 @@ class SolverBase(ABC):
         # Frozen regularization = the converged solve's final rho/delta
         rho, delta = self._result.info.rho, self._result.info.delta
 
-        for _ in range(settings.gradient_smoothing_max_iter + 1):
+        for _ in range(settings.gradient_smoothing_max_iter):
             self._kkt_system.update_scalings_and_factor(
                 data, pc, settings, False, rho, delta, self._result_smoothed)
             norm = self._calculate_smoothing_step_rhs()
