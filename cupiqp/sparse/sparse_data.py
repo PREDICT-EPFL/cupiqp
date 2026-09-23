@@ -210,7 +210,7 @@ class SparseData(Data):
     def set_c(self, value: cp.ndarray, check: bool = True):
         if check and value.shape not in (self._c.shape, self._c.shape[1:]):
             raise ValueError(f"c shape mismatch: expected {self._c.shape} or {self._c.shape[1:]}, got {value.shape}")
-        self._c[:] = value
+        self._c[:] = self._as_gpu_array(value, "c")
 
     def set_A(self, value: cp.ndarray, check: bool = True):
         self._set_matrix_values(self._A, value, "A")
@@ -218,7 +218,7 @@ class SparseData(Data):
     def set_b(self, value: cp.ndarray, check: bool = True):
         if check and value.shape not in (self._b.shape, self._b.shape[1:]):
             raise ValueError(f"b shape mismatch: expected {self._b.shape} or {self._b.shape[1:]}, got {value.shape}")
-        self._b[:] = value
+        self._b[:] = self._as_gpu_array(value, "b")
 
     def set_G(self, value: cp.ndarray, check: bool = True):
         self._set_matrix_values(self._G, value, "G")
@@ -231,7 +231,7 @@ class SparseData(Data):
             )
         if check and value.shape not in (self._h_l.shape, self._h_l.shape[1:]):
             raise ValueError(f"h_l shape mismatch: expected {self._h_l.shape} or {self._h_l.shape[1:]}, got {value.shape}")
-        self._h_l[:] = value
+        self._h_l[:] = self._as_gpu_array(value, "h_l")
         self._update_finite_bound_masks()
 
     def set_h_u(self, value: cp.ndarray, check: bool = True):
@@ -242,7 +242,7 @@ class SparseData(Data):
             )
         if check and value.shape not in (self._h_u.shape, self._h_u.shape[1:]):
             raise ValueError(f"h_u shape mismatch: expected {self._h_u.shape} or {self._h_u.shape[1:]}, got {value.shape}")
-        self._h_u[:] = value
+        self._h_u[:] = self._as_gpu_array(value, "h_u")
         self._update_finite_bound_masks()
 
     def set_x_l(self, value: cp.ndarray, check: bool = True):
@@ -253,7 +253,7 @@ class SparseData(Data):
             )
         if check and value.shape not in (self._x_l.shape, self._x_l.shape[1:]):
             raise ValueError(f"x_l shape mismatch: expected {self._x_l.shape} or {self._x_l.shape[1:]}, got {value.shape}")
-        self._x_l[:] = value
+        self._x_l[:] = self._as_gpu_array(value, "x_l")
         self._update_finite_bound_masks()
 
     def set_x_u(self, value: cp.ndarray, check: bool = True):
@@ -264,5 +264,5 @@ class SparseData(Data):
             )
         if check and value.shape not in (self._x_u.shape, self._x_u.shape[1:]):
             raise ValueError(f"x_u shape mismatch: expected {self._x_u.shape} or {self._x_u.shape[1:]}, got {value.shape}")
-        self._x_u[:] = value
+        self._x_u[:] = self._as_gpu_array(value, "x_u")
         self._update_finite_bound_masks()
