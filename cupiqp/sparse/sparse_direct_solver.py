@@ -7,10 +7,10 @@ from cupyx.scipy.sparse import csr_matrix
 import nvtx
 from nvmath.sparse.advanced import (
     DirectSolver,
-    DirectSolverAlgType,
     DirectSolverOptions,
     DirectSolverMatrixType,
     DirectSolverMatrixViewType,
+    DirectSolverReorderingAlg,
     ExecutionHybrid,
     ExecutionCUDA,
 )
@@ -135,7 +135,7 @@ class CudssSparseDirectSolver(SparseDirectSolver):
                 ubatch_size.ctypes.data,
                 ubatch_size.dtype.itemsize,
             )
-        self._cudss_solver.plan_config.reordering_algorithm = DirectSolverAlgType.ALG_DEFAULT
+        self._cudss_solver.plan_config.reordering_algorithm = DirectSolverReorderingAlg.DEFAULT
         self._cudss_solver.plan_config.use_superpanels = 0
         self._cudss_solver.solution_config.ir_num_steps = 0  # NOTE: iterative refinement steps, to be tuned
         # cudss has IR_TOL, but not implemented yet according to https://docs.nvidia.com/cuda/cudss/types.html#c.cudssConfigParam_t.CUDSS_CONFIG_IR_TOL

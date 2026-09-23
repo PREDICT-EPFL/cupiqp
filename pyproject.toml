@@ -53,7 +53,7 @@ dependencies = [
   "numpy>=2.0",
   "scipy>=1.13",
   "warp-lang>=1.12",
-  "nvmath-python>=0.7.0",
+  "nvmath-python>=1.0.0",
   "nvtx>=0.2",
   "socu @ git+https://github.com/PREDICT-EPFL/socu.git",
 ]
@@ -70,8 +70,8 @@ dependencies = [
 #
 # These are mutually exclusive — installing both will resolve, but only the
 # wheel matching the driver actually loads at runtime.
-cuda12 = ["cupy-cuda12x", "nvmath-python[cu12]>=0.7.0"]
-cuda13 = ["cupy-cuda13x", "nvmath-python[cu13]>=0.7.0"]
+cuda12 = ["cupy-cuda12x", "nvmath-python[cu12]>=1.0.0"]
+cuda13 = ["cupy-cuda13x", "nvmath-python[cu13]>=1.0.0"]
 
 # --- Differentiable layers ----------------------------------------------
 # The `cupiqp.torch` and `cupiqp.jax` packages are always shipped in the
