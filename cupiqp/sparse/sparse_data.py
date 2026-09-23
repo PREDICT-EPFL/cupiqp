@@ -2,6 +2,7 @@ from typing import Any, Optional
 import cupy as cp
 
 from ..data import Data
+from ..utils import is_cuda_array
 from .batched_csr import UniformBatchedCsrMatrix
 
 
@@ -170,108 +171,57 @@ class SparseData(Data):
     # In-place setters
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _same_sparsity_pattern(
-        target: UniformBatchedCsrMatrix,
-        new: UniformBatchedCsrMatrix,
-        value: SparseMatrixInput,
-    ) -> bool:
-        """Compare CSR structure values, including supplied batch members."""
-        if isinstance(value, (list, tuple)):
-            if any(
-                mat.shape != (target.rows, target.cols) or mat.nnz != target.nnz
-                for mat in value
-            ):
-                return False
-            indices = cp.stack([mat.indices for mat in value])
-            indptr = cp.stack([mat.indptr for mat in value])
-            same = (
-                cp.array_equal(indices, cp.broadcast_to(target.indices, indices.shape))
-                & cp.array_equal(indptr, cp.broadcast_to(target.indptr, indptr.shape))
-            )
-        elif (UniformBatchedCsrMatrix.is_torch_sparse_csr_tensor(value)
-              and value.dim() == 3):
-            indices = cp.from_dlpack(value.col_indices().contiguous()).astype(
-                target.indices.dtype, copy=False
-            )
-            indptr = cp.from_dlpack(value.crow_indices().contiguous()).astype(
-                target.indptr.dtype, copy=False
-            )
-            same = (
-                cp.array_equal(indices, cp.broadcast_to(target.indices, indices.shape))
-                & cp.array_equal(indptr, cp.broadcast_to(target.indptr, indptr.shape))
-            )
-        else:
-            same = (
-                cp.array_equal(new.indices, target.indices)
-                & cp.array_equal(new.indptr, target.indptr)
-            )
-        return bool(same)
-
     def _set_matrix_values(
         self,
         target: UniformBatchedCsrMatrix,
-        value: SparseMatrixInput,
-        check: bool,
+        value,
         name: str,
     ):
         """Common helper for set_P / set_A / set_G.
 
-        The sparse KKT matrix scatters new values positionally into fixed CSR
-        slots, so a drifted ``indices`` / ``indptr`` would silently land values
-        in the wrong places. The sparsity-pattern identity is therefore ALWAYS
-        enforced (this resolves a device-side comparison to a Python decision,
-        which synchronizes the update path -- but it runs only on user
-        ``update()``, not inside the IPM loop). ``check`` additionally gates the
-        cheap dimension/batch checks.
+        ``value`` holds only the nonzero values, laid out against the CSR
+        pattern fixed at setup(): a dense GPU array of shape ``(B, nnz)``, or
+        ``(nnz,)`` to broadcast one set of values over the whole batch. The
+        pattern itself cannot change, so no structural comparison (and no
+        device-to-host sync) is needed. The shape check only reads host-side
+        metadata and is therefore always performed.
         """
-        new = UniformBatchedCsrMatrix.from_input(
-            value,
-            dtype=self._dtype,
-            validate_shared_sparsity=False,
-        )
-        if check:
-            if new.batch_size != target.batch_size:
-                raise ValueError(
-                    f"{name} batch size mismatch: expected {target.batch_size}, "
-                    f"got {new.batch_size}"
-                )
-            if new.rows != target.rows or new.cols != target.cols:
-                raise ValueError(
-                    f"{name} shape mismatch: expected ({target.rows}, {target.cols}), "
-                    f"got ({new.rows}, {new.cols})"
-                )
-        # Structural guard against silent corruption -- always enforced.
-        if new.nnz != target.nnz:
-            raise ValueError(
-                f"{name} nnz mismatch: expected {target.nnz}, got {new.nnz} "
-                "(sparsity pattern must be preserved)."
+        if not is_cuda_array(value):
+            raise TypeError(
+                f"{name} must be a dense GPU array holding the nonzero values, "
+                f"of shape ({target.batch_size}, {target.nnz}) or "
+                f"({target.nnz},), in the CSR order of the matrix passed to "
+                f"setup(); got {type(value).__name__}. The sparsity pattern is "
+                "fixed at setup() and cannot be updated."
             )
-        if not self._same_sparsity_pattern(target, new, value):
+        values = cp.asarray(value)
+        if values.shape not in ((target.batch_size, target.nnz), (target.nnz,)):
             raise ValueError(
-                f"{name} sparsity pattern differs from setup(): "
-                "indices/indptr values must be unchanged."
+                f"{name} values shape mismatch: expected "
+                f"({target.batch_size}, {target.nnz}) or ({target.nnz},), "
+                f"got {values.shape}."
             )
-        target.update_data(new.data)
+        # In-place write keeps the buffer address stable for cuDSS / cuSPARSE.
+        target.data[...] = values
 
-    def set_P(self, value: SparseMatrixInput, check: bool = True):
-        self._set_matrix_values(self._P, value, check, "P")
+    def set_P(self, value: cp.ndarray, check: bool = True):
+        self._set_matrix_values(self._P, value, "P")
 
     def set_c(self, value: cp.ndarray, check: bool = True):
-        if check and value.shape != self._c.shape:
-            raise ValueError(f"c shape mismatch: expected {self._c.shape}, got {value.shape}")
+        if check and value.shape not in (self._c.shape, self._c.shape[1:]):
+            raise ValueError(f"c shape mismatch: expected {self._c.shape} or {self._c.shape[1:]}, got {value.shape}")
         self._c[:] = value
 
-    def set_A(self, value: SparseMatrixInput, check: bool = True):
-        self._set_matrix_values(self._A, value, check, "A")
+    def set_A(self, value: cp.ndarray, check: bool = True):
+        self._set_matrix_values(self._A, value, "A")
 
     def set_b(self, value: cp.ndarray, check: bool = True):
-        if check and value.shape != self._b.shape:
-            raise ValueError(f"b shape mismatch: expected {self._b.shape}, got {value.shape}")
+        if check and value.shape not in (self._b.shape, self._b.shape[1:]):
+            raise ValueError(f"b shape mismatch: expected {self._b.shape} or {self._b.shape[1:]}, got {value.shape}")
         self._b[:] = value
 
-    def set_G(self, value: SparseMatrixInput, check: bool = True):
-        self._set_matrix_values(self._G, value, check, "G")
+    def set_G(self, value: cp.ndarray, check: bool = True):
+        self._set_matrix_values(self._G, value, "G")
 
     def set_h_l(self, value: cp.ndarray, check: bool = True):
         if not self._has_h_l:
@@ -279,8 +229,8 @@ class SparseData(Data):
                 "Cannot set h_l: no lower-inequality block was provided at setup(). "
                 "Adding an inequality block requires a new setup()."
             )
-        if check and value.shape != self._h_l.shape:
-            raise ValueError(f"h_l shape mismatch: expected {self._h_l.shape}, got {value.shape}")
+        if check and value.shape not in (self._h_l.shape, self._h_l.shape[1:]):
+            raise ValueError(f"h_l shape mismatch: expected {self._h_l.shape} or {self._h_l.shape[1:]}, got {value.shape}")
         self._h_l[:] = value
         self._update_finite_bound_masks()
 
@@ -290,8 +240,8 @@ class SparseData(Data):
                 "Cannot set h_u: no upper-inequality block was provided at setup(). "
                 "Adding an inequality block requires a new setup()."
             )
-        if check and value.shape != self._h_u.shape:
-            raise ValueError(f"h_u shape mismatch: expected {self._h_u.shape}, got {value.shape}")
+        if check and value.shape not in (self._h_u.shape, self._h_u.shape[1:]):
+            raise ValueError(f"h_u shape mismatch: expected {self._h_u.shape} or {self._h_u.shape[1:]}, got {value.shape}")
         self._h_u[:] = value
         self._update_finite_bound_masks()
 
@@ -301,8 +251,8 @@ class SparseData(Data):
                 "Cannot set x_l: no lower box-bound block was provided at setup(). "
                 "Adding a box-bound block requires a new setup()."
             )
-        if check and value.shape != self._x_l.shape:
-            raise ValueError(f"x_l shape mismatch: expected {self._x_l.shape}, got {value.shape}")
+        if check and value.shape not in (self._x_l.shape, self._x_l.shape[1:]):
+            raise ValueError(f"x_l shape mismatch: expected {self._x_l.shape} or {self._x_l.shape[1:]}, got {value.shape}")
         self._x_l[:] = value
         self._update_finite_bound_masks()
 
@@ -312,7 +262,7 @@ class SparseData(Data):
                 "Cannot set x_u: no upper box-bound block was provided at setup(). "
                 "Adding a box-bound block requires a new setup()."
             )
-        if check and value.shape != self._x_u.shape:
-            raise ValueError(f"x_u shape mismatch: expected {self._x_u.shape}, got {value.shape}")
+        if check and value.shape not in (self._x_u.shape, self._x_u.shape[1:]):
+            raise ValueError(f"x_u shape mismatch: expected {self._x_u.shape} or {self._x_u.shape[1:]}, got {value.shape}")
         self._x_u[:] = value
         self._update_finite_bound_masks()

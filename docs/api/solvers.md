@@ -22,14 +22,10 @@ factorization used. See [Backends](../guide/backends.md) for guidance on choosin
       inherited_members: true
       members: [setup, solve, update, backward]
 
-`SparseSolver` takes a batch of sparse matrices as a single
-`UniformBatchedCsrMatrix` — cuPIQP's own batched CSR container (the preferred,
-fastest batched input; see `setup` above):
-
-::: cupiqp.UniformBatchedCsrMatrix
-    options:
-      show_if_no_docstring: true
-      members: false
+`SparseSolver.setup` takes the batch size and **one** template problem (single 2-D
+GPU CSR matrices and 1-D vectors); per-problem numbers are then set with `update`,
+passing each matrix's nonzero values as a dense `(B, nnz)` array (see `setup` and
+`update` above).
 
 ## MultistageSolver
 

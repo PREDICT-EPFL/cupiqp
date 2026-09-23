@@ -1,9 +1,10 @@
 import cupy as cp
+import numpy as np
 import warp as wp
 from cupyx.scipy.sparse import csr_matrix
 
 from ..results import Variables
-from typing import Literal, Optional, Sequence, Union
+from typing import Literal, Optional, Union
 
 from ..settings import Settings
 from ..solver import SolverBase
@@ -15,75 +16,46 @@ from .sparse_preconditioner import SparseRuizEquilibration
 from .sparse_solver_kernels import create_sparse_data_gradients_kernel
 
 
-# GPU CSR matrix inputs accepted by SparseSolver for P / A / G: a single GPU
-# CSR matrix (a cupy csr_matrix or a CUDA torch sparse-CSR tensor), cuPIQP's
-# own batched-CSR container, or a same-pattern sequence of cupy CSR matrices
-CsrMatrixInput = Union[csr_matrix, "torch.Tensor", UniformBatchedCsrMatrix, Sequence[csr_matrix]]
+# GPU CSR matrix accepted by SparseSolver.setup for P / A / G: a single 2-D GPU
+# CSR matrix (a cupy csr_matrix or a 2-D CUDA torch sparse-CSR tensor).
+CsrMatrixInput = Union[csr_matrix, "torch.Tensor"]
 
 
+def _is_2d_gpu_csr(m) -> bool:
+    """True iff ``m`` is a single 2-D **GPU CSR** matrix.
 
-def _is_sparse_csr(m) -> bool:
-    """True iff ``m`` is a **GPU CSR** sparse matrix (or list of them).
-
-    Strict CSR contract — cupiqp's sparse LDL^T backend operates on CSR,
-    so any other layout (CSC, BSR, BSC, COO, scipy.sparse anything,
-    CPU torch sparse) is rejected to avoid a silent format conversion at
-    setup. Lazy imports of ``cupy`` and ``torch`` so users with only one
-    framework installed don't pay an import-time cost.
+    Strict CSR contract: cupiqp's sparse LDL^T backend operates on CSR, so any
+    other layout (CSC, BSR, COO, scipy.sparse, CPU torch sparse) or container
+    (list, batched tensor) is rejected rather than silently converted. The
+    ``torch`` import is lazy so users without torch pay no import cost.
     """
-    try:
-        from cupyx.scipy.sparse import csr_matrix as cp_csr
-        if isinstance(m, cp_csr):
-            return True
-    except ImportError:
-        pass
-
+    if isinstance(m, csr_matrix):
+        return True
     try:
         import torch
-        # Strict: only torch CSR layout on CUDA. CSC / BSR / BSC / COO
-        # would require a silent format conversion to CSR at setup —
-        # explicit user conversion is required instead.
-        if (isinstance(m, torch.Tensor)
-                and m.layout == torch.sparse_csr
-                and m.is_cuda):
-            return True
     except ImportError:
-        pass
-
-    try:
-        from .batched_csr import UniformBatchedCsrMatrix
-        if isinstance(m, UniformBatchedCsrMatrix):
-            return True
-    except ImportError:
-        pass
-
-    if isinstance(m, (list, tuple)) and len(m) > 0:
-        return _is_sparse_csr(m[0])
-
-    return False
+        return False
+    return (isinstance(m, torch.Tensor) and m.layout == torch.sparse_csr
+            and m.is_cuda and m.dim() == 2)
 
 
 def _check_sparse(name: str, m) -> None:
-    """Validate that ``m`` is a GPU CSR sparse matrix (skip if ``None``)."""
+    """Validate that ``m`` is a single 2-D GPU CSR matrix (skip if ``None``)."""
     if m is None:
         return
-    if not _is_sparse_csr(m):
+    if not _is_2d_gpu_csr(m):
         raise TypeError(
-            f"SparseSolver requires {name} to be a GPU CSR sparse matrix "
-            f"(cupyx.scipy.sparse.csr_matrix, torch.sparse_csr_tensor on "
-            f"CUDA, list of these, or UniformBatchedCsrMatrix); "
-            f"got {type(m).__name__}. "
-            f"cupiqp is GPU-only and CSR-only — convert scipy.sparse via "
-            f"cupyx.scipy.sparse.csr_matrix({name}) first, and convert "
-            f"non-CSR sparse layouts with .tocsr() before passing."
+            f"SparseSolver requires {name} to be a single 2-D GPU CSR "
+            f"matrix (cupyx.scipy.sparse.csr_matrix or a 2-D CUDA "
+            f"torch.sparse_csr_tensor) describing one problem; got "
+            f"{type(m).__name__}. The batch size is passed separately. "
+            f"Convert scipy.sparse via cupyx.scipy.sparse.csr_matrix({name}) "
+            f"and other sparse layouts with .tocsr() first."
         )
 
 
 def _check_dense_vector(name: str, m) -> None:
-    """Validate that vector ``m`` (c, b, h_u, h_l, x_u, x_l) is a GPU
-    dense array (skip if ``None``). cupiqp's vectors are always dense
-    on the GPU regardless of the matrix backend, so this is identical
-    to the dense matrix check — only the error message differs."""
+    """Validate that ``m`` is a 1-D GPU dense array (skip if ``None``)."""
     if m is None:
         return
     if not is_cuda_array(m):
@@ -91,8 +63,27 @@ def _check_dense_vector(name: str, m) -> None:
             f"SparseSolver requires the vector {name} to be a GPU dense "
             f"array (any object exposing __cuda_array_interface__: "
             f"cupy.ndarray, dense CUDA torch.Tensor, JAX CUDA array, etc.); "
-            f"got {type(m).__name__}. "
+            f"got {type(m).__name__}."
         )
+    ndim = cp.asarray(m).ndim
+    if ndim != 1:
+        raise ValueError(
+            f"SparseSolver.setup requires {name} to be a 1-D vector describing "
+            f"one problem; got a {ndim}-D array. The batch size is passed "
+            f"separately; set per-problem values with update()."
+        )
+
+
+def _tile_csr(m, batch_size: int, dtype) -> UniformBatchedCsrMatrix:
+    """Replicate one 2-D GPU CSR matrix into a batch of ``batch_size`` copies."""
+    if isinstance(m, csr_matrix):
+        return UniformBatchedCsrMatrix.from_cupy_csr_matrix(m, batch_size=batch_size, dtype=dtype)
+    single = UniformBatchedCsrMatrix.from_torch_sparse_csr_tensor(m, dtype=dtype)
+    return UniformBatchedCsrMatrix(
+        batch_size, single.indices, single.indptr,
+        cp.broadcast_to(single.data, (batch_size, single.nnz)),
+        shape=(single.rows, single.cols), dtype=dtype,
+    )
 
 
 
@@ -113,42 +104,22 @@ class SparseSolver(SolverBase):
     factorization, running entirely on the GPU. It is built for large,
     structurally sparse ``P`` / ``A`` / ``G``.
 
-    **Inputs - CSR matrices, dense vectors.** ``P``, ``A``, ``G`` must be
-    **GPU sparse matrices in CSR layout**; the vectors (``c``, ``b``,
-    ``h_l``, ``h_u``, ``x_l``, ``x_u``) are dense GPU arrays. Accepted
-    matrix types are:
+    **Setup from one problem, then per-problem values.** ``setup`` takes the
+    batch size and **one** template problem: ``P``, ``A``, ``G`` as single 2-D
+    GPU CSR matrices (``cupyx.scipy.sparse.csr_matrix`` or a 2-D CUDA
+    ``torch.sparse_csr_tensor``) and 1-D GPU vectors. The template fixes the
+    structure shared by all ``B`` problems - sparsity patterns, which
+    constraint blocks and bound sides exist - and its values are copied into
+    every problem. ``update`` then sets per-problem values: the nonzero values
+    of each matrix as a dense ``(B, nnz)`` array in the CSR order of the
+    template, and the vectors as ``(B, k)`` arrays (or ``(nnz,)`` / ``(k,)`` to
+    share one value across the batch). The solution ``solver.result.x`` has
+    shape ``(B, n)``.
 
-    * ``cupyx.scipy.sparse.csr_matrix`` (a GPU CSR matrix),
-    * a CUDA ``torch.sparse_csr_tensor``, or
-    * a [``UniformBatchedCsrMatrix``][cupiqp.UniformBatchedCsrMatrix] -
-      cuPIQP's own container holding a batch of CSR matrices that share one
-      sparsity pattern (the efficient way to pass a batch).
-
-    A ``list`` / ``tuple`` of ``cupyx.scipy.sparse.csr_matrix`` (one per batch
-    element, all sharing the same sparsity pattern) is also accepted, but
-    **discouraged**: separate matrix objects cannot be organized with the
-    uniform stride that batched linear-algebra routines require, so cuPIQP
-    must copy them into a single contiguous
-    [``UniformBatchedCsrMatrix``][cupiqp.UniformBatchedCsrMatrix] at
-    ``setup``. Build and pass one of those yourself to avoid the copy.
-
-    cuPIQP is **GPU-only and CSR-only**, and never converts formats behind
-    your back:
-
-    * CPU sparse matrices (``scipy.sparse.*``, a CPU
-      ``torch.sparse_csr_tensor``) are rejected - lift them onto the GPU
-      first, e.g. ``cupyx.scipy.sparse.csr_matrix(P_scipy)``.
-    * Non-CSR GPU layouts (CSC, BSR, BSC, COO) are rejected - convert with
-      ``.tocsr()`` before passing.
-
-    **Batching.** Solve ``B`` independent QPs in a single GPU call by passing
-    ``P``, ``A``, ``G`` as a
-    [``UniformBatchedCsrMatrix``][cupiqp.UniformBatchedCsrMatrix] (the
-    preferred, fastest batched input), with the vectors stacked along a
-    leading batch dimension (``c`` of shape ``(B, n)``, etc.). A single
-    problem is simply ``B = 1``, and ``solver.result.x`` then has shape
-    ``(B, n)``. (A ``list`` of per-element CSR matrices also works but is
-    slower - see above.)
+    cuPIQP is **GPU-only and CSR-only** and never converts formats behind
+    your back: CPU inputs (``scipy.sparse``, ``numpy``, CPU torch) and
+    non-CSR sparse layouts are rejected - lift / convert them first, e.g.
+    ``cupyx.scipy.sparse.csr_matrix(P_scipy)`` or ``.tocsr()``.
 
     Parameters
     ----------
@@ -159,20 +130,22 @@ class SparseSolver(SolverBase):
 
     Examples
     --------
-    A sparse problem assembled on the host with SciPy, then lifted to the
-    GPU:
-
     ```python
     import scipy.sparse as sp
     import cupy as cp
     from cupyx.scipy.sparse import csr_matrix
     from cupiqp import SparseSolver
 
-    P = csr_matrix(sp.eye(4, format="csr"))     # lift scipy -> GPU CSR
-    c = cp.zeros(4)
+    B, n = 8, 4
+    P = csr_matrix(sp.eye(n, format="csr"))     # lift scipy -> GPU CSR
+    c = cp.zeros(n)
 
     solver = SparseSolver()
-    solver.setup(P=P, c=c)
+    solver.setup(B, P, c)                       # template problem, B copies
+    solver.update(
+        P=cp.random.uniform(1.0, 2.0, (B, P.nnz)),  # per-problem nonzeros
+        c=cp.random.standard_normal((B, n)),
+    )
     solver.solve()
 
     print(solver.result.info.status[0].name)    # CUPIQP_SOLVED
@@ -187,14 +160,11 @@ class SparseSolver(SolverBase):
 
     Notes
     -----
-    The problem *structure* - array shapes, the **sparsity pattern** of
-    each matrix, which constraint blocks are present, and which bounds are
-    finite vs. ``+/-inf`` - is fixed by ``setup`` and can only be set up
-    once per instance. To re-solve after changing only the *numerical
-    values* (keeping the same sparsity pattern), call ``update`` and then
-    ``solve`` again, which reuses all GPU allocations; for a different
-    structure, create a new ``SparseSolver``. Solver behaviour (tolerances,
-    verbosity, iteration cap, ...) is configured through ``solver.settings``.
+    ``setup`` can be called only once per instance; for a different
+    structure (patterns, blocks, bound sides), create a new
+    ``SparseSolver``. ``update`` reuses all GPU allocations. Solver behaviour
+    (tolerances, verbosity, iteration cap, ...) is configured through
+    ``solver.settings``.
     """
 
     def __init__(self, dtype: Literal["float32", "float64"] = "float64"):
@@ -220,18 +190,17 @@ class SparseSolver(SolverBase):
         x_u: Optional[CudaArray],
         x_l: Optional[CudaArray],
     ) -> SparseData:
-        # Matrices: CSR-style sparse. Vectors: GPU dense (always).
-        _check_sparse("P", P)
-        _check_sparse("A", A)
-        _check_sparse("G", G)
-        _check_dense_vector("c", c)
-        _check_dense_vector("b", b)
-        _check_dense_vector("h_u", h_u)
-        _check_dense_vector("h_l", h_l)
-        _check_dense_vector("x_u", x_u)
-        _check_dense_vector("x_l", x_l)
-        data = SparseData(dtype=self.settings.dtype, device=self.settings.device)
-        data.init(P, c, A, b, G, h_u, h_l, x_u, x_l)
+        # Replicate the single-problem template over the batch: matrices are
+        # tiled here, 1-D vectors are broadcast by SparseData.init.
+        B = self._setup_batch_size
+        dtype = self.settings.dtype
+        data = SparseData(dtype=dtype, device=self.settings.device)
+        data.init(
+            _tile_csr(P, B, dtype), c,
+            None if A is None else _tile_csr(A, B, dtype), b,
+            None if G is None else _tile_csr(G, B, dtype),
+            h_u, h_l, x_u, x_l,
+        )
         return data
 
     def _init_preconditioner(self) -> SparseRuizEquilibration:
@@ -247,6 +216,7 @@ class SparseSolver(SolverBase):
 
     def setup(
         self,
+        batch_size: int,
         P: CsrMatrixInput,
         c: CudaArray,
         A: Optional[CsrMatrixInput] = None,
@@ -257,6 +227,64 @@ class SparseSolver(SolverBase):
         x_u: Optional[CudaArray] = None,
         x_l: Optional[CudaArray] = None,
     ) -> None:
+        """Fix the problem structure from one template problem and allocate
+        all GPU memory for a batch of ``batch_size`` problems.
+
+        You describe a **single** problem here. Its sparsity patterns, and
+        which constraint blocks and bound sides are present, become the
+        structure shared by all ``batch_size`` problems; its values are copied
+        into every problem of the batch. Afterwards, give each problem its own
+        values with :meth:`update`, then call :meth:`solve`. Calling
+        :meth:`solve` directly after ``setup()`` solves ``batch_size`` copies of
+        the template. Call ``setup()`` once per solver instance.
+
+        Parameters
+        ----------
+        batch_size : int
+            Number of QPs ``B`` solved together.
+        P : GPU CSR matrix
+            Quadratic cost of one problem, ``(n, n)``, as a
+            ``cupyx.scipy.sparse.csr_matrix`` or a 2-D CUDA
+            ``torch.sparse_csr_tensor``. Must be symmetric positive
+            semidefinite; store the full matrix (both triangles). Required.
+        c : GPU array
+            Linear cost, 1-D of shape ``(n,)``. Required.
+        A, b : GPU CSR matrix and GPU array, optional
+            Equality constraints ``A x = b``: ``A`` of shape ``(p, n)``, ``b``
+            1-D of shape ``(p,)``. Provide both or neither.
+        G, h_l, h_u : GPU CSR matrix and GPU arrays, optional
+            Inequalities ``h_l <= G x <= h_u``: ``G`` of shape ``(m, n)``,
+            bounds 1-D of shape ``(m,)``. At least one bound is required when
+            ``G`` is given; an omitted side is absent for the lifetime of the
+            solver. Use ``-inf`` / ``+inf`` entries for one-sided rows.
+        x_l, x_u : GPU array, optional
+            Box bounds ``x_l <= x <= x_u``, 1-D of shape ``(n,)``. An omitted
+            side is absent for the lifetime of the solver.
+
+        Every matrix stored here fixes a sparsity pattern: an entry that may
+        become nonzero in *any* problem of the batch must be stored
+        (explicit zeros are fine). The number of stored entries, e.g.
+        ``P.nnz``, is the length of the values passed to :meth:`update`.
+
+        Raises
+        ------
+        RuntimeError
+            If ``setup()`` has already been called on this instance.
+        TypeError
+            If a matrix is not a single 2-D GPU CSR matrix, or a vector is
+            not a GPU array.
+        ValueError
+            If ``batch_size`` is not a positive integer or a vector is not 1-D.
+        """
+        if isinstance(batch_size, bool) or not isinstance(batch_size, (int, np.integer)) or batch_size < 1:
+            raise ValueError(f"batch_size must be a positive integer; got {batch_size!r}.")
+        _check_sparse("P", P)
+        _check_sparse("A", A)
+        _check_sparse("G", G)
+        for name, v in (("c", c), ("b", b), ("h_u", h_u), ("h_l", h_l),
+                        ("x_u", x_u), ("x_l", x_l)):
+            _check_dense_vector(name, v)
+        self._setup_batch_size = int(batch_size)
         super().setup(P, c, A, b, G, h_u, h_l, x_u, x_l)
         # Cache CSR row decompressions for the backward-pass gather.
         # Sparsity patterns are fixed at setup, so this is done once.
@@ -345,6 +373,58 @@ class SparseSolver(SolverBase):
             self._grad_P_values = self._grad_data._P.data
             self._grad_A_values = self._grad_data._A.data
             self._grad_G_values = self._grad_data._G.data
+
+    def update(
+        self,
+        P: Optional[CudaArray] = None,
+        c: Optional[CudaArray] = None,
+        A: Optional[CudaArray] = None,
+        b: Optional[CudaArray] = None,
+        G: Optional[CudaArray] = None,
+        h_u: Optional[CudaArray] = None,
+        h_l: Optional[CudaArray] = None,
+        x_u: Optional[CudaArray] = None,
+        x_l: Optional[CudaArray] = None,
+        check_validity: bool = False,
+    ) -> None:
+        """Set new numerical data, per problem or shared, then ``solve()``.
+
+        The sparsity patterns of ``P``, ``A`` and ``G`` are fixed by
+        ``setup()``, so this method takes only their **nonzero values**, not
+        sparse matrices. Any argument left as ``None`` keeps its current
+        value.
+
+        Parameters
+        ----------
+        P, A, G : GPU array, optional
+            Nonzero values of the matrix, as a dense GPU array of shape
+            ``(B, nnz)`` (one row per problem) or ``(nnz,)`` (the same values
+            for every problem). Entry ``[k, j]`` is the ``j``-th stored entry
+            of problem ``k``, in the CSR order of the matrix given to
+            ``setup()`` - for example ``M.data`` of a ``csr_matrix`` ``M`` that
+            has the setup pattern. ``solver.data.P.indices`` /
+            ``solver.data.P.indptr`` (likewise for ``A`` / ``G``) expose that
+            pattern.
+        c, b, h_u, h_l, x_u, x_l : GPU array, optional
+            New vectors, shape ``(B, k)`` (one row per problem) or ``(k,)``
+            (shared). Bound values may switch between finite and ``+/-inf``,
+            but only bound sides given at ``setup()`` can be updated.
+        check_validity : bool, default: False
+            If ``True``, also validate the vector shapes. The shapes of the
+            matrix values are always checked (this costs no GPU sync).
+
+        Examples
+        --------
+        ```python
+        solver.setup(B, P, c)                       # one template problem
+        solver.update(P=P_values, c=c_batch)        # (B, P.nnz), (B, n)
+        solver.solve()
+        ```
+        """
+        super().update(
+            P=P, c=c, A=A, b=b, G=G, h_u=h_u, h_l=h_l, x_u=x_u, x_l=x_l,
+            check_validity=check_validity,
+        )
 
     def _compute_data_gradients(self, adjoint_vector: Variables, linearization_point: Variables) -> SparseData:
         r"""Populate ``self._grad_data`` in place and return it.

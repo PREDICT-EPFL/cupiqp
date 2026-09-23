@@ -66,13 +66,22 @@ x_sol = solver.result.x[0]
 ```
 
 ### Sparse problems
-For the **sparse** problems, pass `P`, `A`, `G` as one of the following types:
-- [`cupyx.scipy.sparse.csr_matrix`](https://docs.cupy.dev/en/stable/reference/generated/cupyx.scipy.sparse.csr_matrix.html#cupyx.scipy.sparse.csr_matrix). It only works for batch size 1.
-- List or tuple of `cupyx.scipy.sparse.csr_matrix` objects. However, it is **discouraged** when the batch size is big because this can cause long setup time and low performance.
-- `UniformBatchedCsrMatrix`. This is a class introduced and used internally by cuPIQP itself to represent a batch of sparse CSR matrices with uniform sparsity. It has `indices` and `indptr` attributes which are two `cupy.ndarray` of shape (nnz,) to represent the sparsity pattern. Its `data` attribute is a `cupy.ndarray` of shape (batch_size, nnz) that stores the non-zeros values of all matrices in the batch. We **encourage** users to import it from cuPIQP to store their batched CSR matrices and pass to the `SparseSolver`.
-- [`torch.sparse_csr_tensor`](https://docs.pytorch.org/docs/2.12/generated/torch.sparse_csr_tensor.html), which is the CSR matrix representation in Torch and can express batched CSR matrices. CuPIQP requires that  `crow_indices` and `col_indices` must be identical for all matrices to enforce uniform sparsity.
+For **sparse** problems, all `B` problems share one sparsity pattern. `setup` takes the
+batch size and **one** template problem, with `P`, `A`, `G` as single 2-D GPU CSR
+matrices ([`cupyx.scipy.sparse.csr_matrix`](https://docs.cupy.dev/en/stable/reference/generated/cupyx.scipy.sparse.csr_matrix.html#cupyx.scipy.sparse.csr_matrix)
+or a 2-D CUDA [`torch.sparse_csr_tensor`](https://docs.pytorch.org/docs/2.12/generated/torch.sparse_csr_tensor.html))
+and 1-D vectors; its values are copied into every problem. Per-problem numbers are then
+set with `update`, where each matrix is given by its nonzero values as a dense
+`(B, nnz)` array in the CSR order of the template:
 
-The vectors $c, b, h_l, h_u, x_l, x_u$ stay stacked `(B, ...)` dense arrays just like the dense case.
+```python
+solver = SparseSolver()
+solver.setup(B, P=P_csr, c=c_single, G=G_csr, h_l=h_l_single, h_u=h_u_single)
+solver.update(P=P_values, c=c_batch, h_l=h_l_batch, h_u=h_u_batch)  # (B, P_csr.nnz), (B, n), (B, m)
+solver.solve()
+```
+
+In `update`, the vectors $c, b, h_l, h_u, x_l, x_u$ are stacked `(B, ...)` dense arrays just like the dense case (or 1-D to share one value across the batch).
 
 See [this example](https://github.com/PREDICT-EPFL/cupiqp/blob/main/examples/getting_started.ipynb) for more details.
 

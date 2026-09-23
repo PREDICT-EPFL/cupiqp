@@ -8,7 +8,6 @@ from .typedef import PIQP_INF
 from .dense.dense_data import DenseData
 
 from .sparse.sparse_data import SparseData
-from .sparse.batched_csr import UniformBatchedCsrMatrix
 
 from .multistage.multistage_data import MultistageData
 from .multistage.ocp_data import OcpData
@@ -52,7 +51,6 @@ __all__ = [
     "BlockTridiagMat",
     "BlockBidiagMat",
     "BlockVec",
-    "UniformBatchedCsrMatrix",
     # Configuration / results
     "Settings",
     "Result",

@@ -77,7 +77,8 @@ print("solution:", x_dense)
 ### Sparse backend
 
 `SparseSolver` expects `P`, `A`, `G` as **GPU CSR** matrices
-(`cupyx.scipy.sparse.csr_matrix`); the vectors stay as cupy arrays. We reuse the exact
+(`cupyx.scipy.sparse.csr_matrix`); the vectors stay as cupy arrays. Its `setup` takes
+the batch size first, then one problem - here the batch size is 1. We reuse the exact
 same data, just wrapping the matrices as CSR. For larger, structurally sparse problems
 this is far more efficient than the dense backend.
 
@@ -86,6 +87,7 @@ solver = SparseSolver()
 solver.settings.verbose = True
 
 solver.setup(
+    1,                                   # batch size
     P=csr_matrix(P), c=c,
     A=csr_matrix(A), b=b,
     G=csr_matrix(G), h_l=h_l, h_u=h_u,
@@ -150,28 +152,22 @@ for i, st in enumerate(dense_solver.result.info.status):
 
 ### Sparse backend (batched)
 
-For a batch, the **preferred** input is a
-[`UniformBatchedCsrMatrix`](api/solvers.md#cupiqp.UniformBatchedCsrMatrix) — cuPIQP's
-own container holding `B` matrices that share **one** sparsity pattern, with the values
-stacked as a `(B, nnz)` array. Build one from the shared pattern (`indices` / `indptr`)
-and the per-problem values; the vectors are stacked `(B, …)` just like the dense case.
+All `B` sparse problems share **one** sparsity pattern, so `setup` takes the batch size
+and just **one** template problem (2-D CSR matrices, 1-D vectors); its values are copied
+into every problem. The per-problem numbers are then set with `update`: here only `b`
+differs. Matrices would be updated through their nonzero values, a dense `(B, nnz)`
+array in the CSR order of the template (e.g. `update(P=P_values)`).
 
 ```python
-from cupiqp import UniformBatchedCsrMatrix
-
-def batched_csr(M):
-    """Pack B copies of a cupy matrix into a UniformBatchedCsrMatrix."""
-    m = csr_matrix(M)
-    values = cp.broadcast_to(m.data, (B, m.nnz)).copy()   # (B, nnz); here all equal
-    return UniformBatchedCsrMatrix(B, m.indices, m.indptr, values, shape=m.shape)
-
 sparse_solver = SparseSolver()
 sparse_solver.setup(
-    P=batched_csr(P), c=c_b,
-    A=batched_csr(A), b=b_batch,
-    G=batched_csr(G), h_l=h_l_b, h_u=h_u_b,
-    x_l=x_l_b, x_u=x_u_b,
+    B,
+    P=csr_matrix(P), c=c,
+    A=csr_matrix(A), b=b,
+    G=csr_matrix(G), h_l=h_l, h_u=h_u,
+    x_l=x_l, x_u=x_u,
 )
+sparse_solver.update(b=b_batch)          # (B, p): one target per problem
 sparse_solver.solve()
 
 X_sparse = sparse_solver.result.x.get()
@@ -179,15 +175,6 @@ assert all(st == Status.CUPIQP_SOLVED for st in sparse_solver.result.info.status
 assert cp.allclose(cp.asarray(X_dense), cp.asarray(X_sparse), atol=1e-6)
 print("All problems solved; dense and sparse batches agree.")
 ```
-
-!!! warning "Avoid passing a raw `list` of `csr_matrix`"
-    `setup` *does* also accept a plain `list` / `tuple` of
-    `cupyx.scipy.sparse.csr_matrix` (one per batch element, all sharing the same
-    pattern), but it is **discouraged**: separate matrix objects are not laid out with
-    the uniform stride that batched linear-algebra routines need, so cuPIQP has to copy
-    them into a single
-    [`UniformBatchedCsrMatrix`](api/solvers.md#cupiqp.UniformBatchedCsrMatrix) at
-    `setup`. Build and pass one yourself to skip that copy.
 
 ## Re-solving with new data
 
