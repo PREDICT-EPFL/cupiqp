@@ -58,14 +58,14 @@ x_u = cp.array([   1.0,  cp.inf])
 ### Dense backend
 
 `DenseSolver` works with **dense** cupy arrays for `P`, `A`, `G`. Create the solver,
-optionally tweak `solver.settings`, then `setup(...)` the problem and `solve()`. The
-solution and per-problem info are exposed through `solver.result`.
+optionally tweak `solver.settings`, then `setup(batch_size, ...)` the problem and
+`solve()`. The solution and per-problem info are exposed through `solver.result`.
 
 ```python
 solver = DenseSolver()
 solver.settings.verbose = True        # print the banner + interior-point iteration log
 
-solver.setup(P=P, c=c, A=A, b=b, G=G, h_l=h_l, h_u=h_u, x_l=x_l, x_u=x_u)
+solver.setup(1, P=P, c=c, A=A, b=b, G=G, h_l=h_l, h_u=h_u, x_l=x_l, x_u=x_u)   # batch size 1
 solver.solve()
 
 # result.x carries a leading batch dimension (B, n); here B = 1
@@ -107,9 +107,12 @@ print("Both backends converged to the same optimum.")
 ## Part 2 — A batch of QPs
 
 cuPIQP is **natively batched**: it solves `B` independent QPs in a *single* GPU call.
-The only rule is that **the batch size is the leading dimension** of every array:
+All `B` problems share one structure, so `setup(batch_size, ...)` takes the batch size
+and **one** template problem, whose values are copied into every problem. Per-problem
+numbers are then set with `update()`, with **the batch size as the leading dimension**
+(or the single-problem shape to share one value across the batch):
 
-| array | single | batched |
+| array | `setup` (one problem) | `update` (per problem) |
 |---|---|---|
 | `P` | `(n, n)` | `(B, n, n)` |
 | `c`, `x_l`, `x_u` | `(n,)` | `(B, n)` |
@@ -128,21 +131,18 @@ B = 4
 
 # only the equality target b differs across the batch; everything else is shared
 b_batch = cp.array([[0.9], [1.0], [1.1], [1.2]])      # shape (B, p) with p = 1
-
-# replicate the shared data along the leading batch dimension -> (B, ...)
-stack = lambda M: cp.stack([M] * B)
-P_b, c_b, A_b, G_b = stack(P), stack(c), stack(A), stack(G)
-h_l_b, h_u_b, x_l_b, x_u_b = stack(h_l), stack(h_u), stack(x_l), stack(x_u)
 ```
 
 ### Dense backend (batched)
 
-Exactly the same call as Part 1 — just hand `setup` the batched `(B, …)` arrays.
+The same call as Part 1 with batch size `B`, followed by `update` for the one block that
+differs per problem.
 
 ```python
 dense_solver = DenseSolver()
-dense_solver.setup(P=P_b, c=c_b, A=A_b, b=b_batch, G=G_b,
-                   h_l=h_l_b, h_u=h_u_b, x_l=x_l_b, x_u=x_u_b)
+dense_solver.setup(B, P=P, c=c, A=A, b=b, G=G,
+                   h_l=h_l, h_u=h_u, x_l=x_l, x_u=x_u)
+dense_solver.update(b=b_batch)                        # (B, p): one target per problem
 dense_solver.solve()
 
 X_dense = dense_solver.result.x.get()                 # (B, n)
@@ -186,7 +186,7 @@ For new numerical values with the same structure, call `update()` and solve agai
 Arguments left as `None` keep their current values:
 
 ```python
-solver.setup(P=P, c=c, A=A, b=b0)
+solver.setup(1, P=P, c=c, A=A, b=b0)
 solver.solve()
 
 for b_k in trajectory:

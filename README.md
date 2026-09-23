@@ -66,7 +66,7 @@ from cupiqp import DenseSolver
 
 solver = DenseSolver()
 solver.settings.verbose = True
-solver.setup(P=cp.eye(3), c=cp.zeros(3))
+solver.setup(1, P=cp.eye(3), c=cp.zeros(3))
 solver.solve()
 ```
 

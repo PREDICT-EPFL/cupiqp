@@ -68,8 +68,10 @@ class DenseData(Data):
         self._batch_size = B
         self._n = n
 
-        self._P = P.astype(self._dtype, copy=True)
-        self._c = c.astype(self._dtype, copy=True)
+        # order="C": the kernels assume C-contiguous (B, ...) storage, and
+        # astype would otherwise keep a non-contiguous input's layout.
+        self._P = P.astype(self._dtype, order="C", copy=True)
+        self._c = c.astype(self._dtype, order="C", copy=True)
 
         # --- equality constraints ---
         if A is not None and b is not None:
@@ -85,8 +87,8 @@ class DenseData(Data):
                 raise ValueError("Row mismatch between A and b.")
             if A.shape[2] != n:
                 raise ValueError("Column mismatch between A and P.")
-            self._A = A.astype(self._dtype, copy=True)
-            self._b = b.astype(self._dtype, copy=True)
+            self._A = A.astype(self._dtype, order="C", copy=True)
+            self._b = b.astype(self._dtype, order="C", copy=True)
         else:
             self._A = cp.zeros((B, 0, n), dtype=self._dtype)
             self._b = cp.zeros((B, 0), dtype=self._dtype)
@@ -109,7 +111,7 @@ class DenseData(Data):
                 h_u = _ensure_2d(cp.asarray(h_u))
                 if h_u.shape != (B, m):
                     raise ValueError(f"h_u must have shape ({B}, {m}), got {h_u.shape}")
-            self._G = G.astype(self._dtype, copy=True)
+            self._G = G.astype(self._dtype, order="C", copy=True)
         else:
             if h_u is not None or h_l is not None:
                 raise ValueError("h_l and h_u must be None when G is None.")
@@ -142,7 +144,7 @@ class DenseData(Data):
 
     def _as_batched_vec(self, v: Optional[cp.ndarray]) -> cp.ndarray:
         if v is not None:
-            return v.astype(self._dtype, copy=True)
+            return v.astype(self._dtype, order="C", copy=True)
         return cp.zeros((self._batch_size, 0), dtype=self._dtype)
 
     def extract_P_diag(self, diag_P: cp.ndarray):
@@ -155,29 +157,29 @@ class DenseData(Data):
     # ------------------------------------------------------------------
 
     def set_P(self, value: cp.ndarray, check: bool = True):
-        if check and value.shape != self._P.shape:
-            raise ValueError(f"P shape mismatch: expected {self._P.shape}, got {value.shape}")
-        self._P[:] = value
+        if check and value.shape not in (self._P.shape, self._P.shape[1:]):
+            raise ValueError(f"P shape mismatch: expected {self._P.shape} or {self._P.shape[1:]}, got {value.shape}")
+        self._P[:] = self._as_gpu_array(value, "P")
 
     def set_c(self, value: cp.ndarray, check: bool = True):
-        if check and value.shape != self._c.shape:
-            raise ValueError(f"c shape mismatch: expected {self._c.shape}, got {value.shape}")
-        self._c[:] = value
+        if check and value.shape not in (self._c.shape, self._c.shape[1:]):
+            raise ValueError(f"c shape mismatch: expected {self._c.shape} or {self._c.shape[1:]}, got {value.shape}")
+        self._c[:] = self._as_gpu_array(value, "c")
 
     def set_A(self, value: cp.ndarray, check: bool = True):
-        if check and value.shape != self._A.shape:
-            raise ValueError(f"A shape mismatch: expected {self._A.shape}, got {value.shape}")
-        self._A[:] = value
+        if check and value.shape not in (self._A.shape, self._A.shape[1:]):
+            raise ValueError(f"A shape mismatch: expected {self._A.shape} or {self._A.shape[1:]}, got {value.shape}")
+        self._A[:] = self._as_gpu_array(value, "A")
 
     def set_b(self, value: cp.ndarray, check: bool = True):
-        if check and value.shape != self._b.shape:
-            raise ValueError(f"b shape mismatch: expected {self._b.shape}, got {value.shape}")
-        self._b[:] = value
+        if check and value.shape not in (self._b.shape, self._b.shape[1:]):
+            raise ValueError(f"b shape mismatch: expected {self._b.shape} or {self._b.shape[1:]}, got {value.shape}")
+        self._b[:] = self._as_gpu_array(value, "b")
 
     def set_G(self, value: cp.ndarray, check: bool = True):
-        if check and value.shape != self._G.shape:
-            raise ValueError(f"G shape mismatch: expected {self._G.shape}, got {value.shape}")
-        self._G[:] = value
+        if check and value.shape not in (self._G.shape, self._G.shape[1:]):
+            raise ValueError(f"G shape mismatch: expected {self._G.shape} or {self._G.shape[1:]}, got {value.shape}")
+        self._G[:] = self._as_gpu_array(value, "G")
 
     def set_h_l(self, value: cp.ndarray, check: bool = True):
         if not self._has_h_l:
@@ -185,9 +187,9 @@ class DenseData(Data):
                 "Cannot set h_l: no lower-inequality block was provided at setup(). "
                 "Adding an inequality block requires a new setup()."
             )
-        if check and value.shape != self._h_l.shape:
-            raise ValueError(f"h_l shape mismatch: expected {self._h_l.shape}, got {value.shape}")
-        self._h_l[:] = value
+        if check and value.shape not in (self._h_l.shape, self._h_l.shape[1:]):
+            raise ValueError(f"h_l shape mismatch: expected {self._h_l.shape} or {self._h_l.shape[1:]}, got {value.shape}")
+        self._h_l[:] = self._as_gpu_array(value, "h_l")
         self._update_finite_bound_masks()
 
     def set_h_u(self, value: cp.ndarray, check: bool = True):
@@ -196,9 +198,9 @@ class DenseData(Data):
                 "Cannot set h_u: no upper-inequality block was provided at setup(). "
                 "Adding an inequality block requires a new setup()."
             )
-        if check and value.shape != self._h_u.shape:
-            raise ValueError(f"h_u shape mismatch: expected {self._h_u.shape}, got {value.shape}")
-        self._h_u[:] = value
+        if check and value.shape not in (self._h_u.shape, self._h_u.shape[1:]):
+            raise ValueError(f"h_u shape mismatch: expected {self._h_u.shape} or {self._h_u.shape[1:]}, got {value.shape}")
+        self._h_u[:] = self._as_gpu_array(value, "h_u")
         self._update_finite_bound_masks()
 
     def set_x_l(self, value: cp.ndarray, check: bool = True):
@@ -207,9 +209,9 @@ class DenseData(Data):
                 "Cannot set x_l: no lower box-bound block was provided at setup(). "
                 "Adding a box-bound block requires a new setup()."
             )
-        if check and value.shape != self._x_l.shape:
-            raise ValueError(f"x_l shape mismatch: expected {self._x_l.shape}, got {value.shape}")
-        self._x_l[:] = value
+        if check and value.shape not in (self._x_l.shape, self._x_l.shape[1:]):
+            raise ValueError(f"x_l shape mismatch: expected {self._x_l.shape} or {self._x_l.shape[1:]}, got {value.shape}")
+        self._x_l[:] = self._as_gpu_array(value, "x_l")
         self._update_finite_bound_masks()
 
     def set_x_u(self, value: cp.ndarray, check: bool = True):
@@ -218,8 +220,8 @@ class DenseData(Data):
                 "Cannot set x_u: no upper box-bound block was provided at setup(). "
                 "Adding a box-bound block requires a new setup()."
             )
-        if check and value.shape != self._x_u.shape:
-            raise ValueError(f"x_u shape mismatch: expected {self._x_u.shape}, got {value.shape}")
-        self._x_u[:] = value
+        if check and value.shape not in (self._x_u.shape, self._x_u.shape[1:]):
+            raise ValueError(f"x_u shape mismatch: expected {self._x_u.shape} or {self._x_u.shape[1:]}, got {value.shape}")
+        self._x_u[:] = self._as_gpu_array(value, "x_u")
         self._update_finite_bound_masks()
 

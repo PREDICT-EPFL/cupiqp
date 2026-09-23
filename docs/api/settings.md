@@ -10,7 +10,7 @@ solver = DenseSolver(dtype="float64")
 solver.settings.verbose = True
 solver.settings.max_iter = 100
 solver.settings.eps_abs = 1e-6
-solver.setup(P=P, c=c)
+solver.setup(1, P=P, c=c)
 solver.solve()
 ```
 

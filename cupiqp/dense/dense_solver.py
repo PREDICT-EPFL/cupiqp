@@ -1,4 +1,5 @@
 import cupy as cp
+import numpy as np
 import warp as wp
 
 from ..results import Variables
@@ -13,13 +14,15 @@ from .dense_preconditioner import DenseRuizEquilibration
 from .dense_solver_kernels import create_dense_data_gradients_kernel
 
 
-def _check_dense(name: str, m) -> None:
-    """Validate that ``m`` is a GPU dense array (skip if ``None``).
+def _check_dense(name: str, m, ndim: int) -> None:
+    """Validate that ``m`` is a GPU dense array with ``ndim`` dimensions
+    (skip if ``None``).
 
-    Used for **all** P / c / A / b / G / h_* / x_* inputs in
-    :class:`DenseSolver` — every ``setup`` argument that's not ``None``
-    must be a GPU array exposing the CUDA Array Interface protocol.
-    See :func:`cupiqp.utils.is_cuda_array`.
+    Used for **all** P / c / A / b / G / h_* / x_* inputs of
+    :meth:`DenseSolver.setup`, which describe one problem: matrices are
+    2-D and vectors 1-D. Every argument that's not ``None`` must be a GPU
+    array exposing the CUDA Array Interface protocol; see
+    :func:`cupiqp.utils.is_cuda_array`.
     """
     if m is None:
         return
@@ -29,6 +32,14 @@ def _check_dense(name: str, m) -> None:
             f"(any object exposing __cuda_array_interface__: "
             f"cupy.ndarray, dense CUDA torch.Tensor, JAX CUDA array, etc.); "
             f"got {type(m).__name__}."
+        )
+    got = cp.asarray(m).ndim
+    if got != ndim:
+        kind = "matrix" if ndim == 2 else "vector"
+        raise ValueError(
+            f"DenseSolver.setup requires {name} to be a {ndim}-D {kind} "
+            f"describing one problem; got a {got}-D array. The batch size is "
+            f"passed separately; set per-problem values with update()."
         )
 
 
@@ -57,11 +68,16 @@ class DenseSolver(SolverBase):
     CPU JAX arrays) is rejected with a ``TypeError`` rather than copied to
     the device behind your back.
 
-    **Batching.** ``DenseSolver`` is natively batched: solve ``B``
-    independent QPs in a single GPU call by giving every array a leading
-    batch dimension - ``P`` of shape ``(B, n, n)``, ``c`` of shape
-    ``(B, n)``, and so on. A single problem is simply ``B = 1``, and
-    ``solver.result.x`` then has shape ``(B, n)``.
+    **Batching - setup from one problem, then per-problem values.**
+    ``DenseSolver`` solves ``B`` independent QPs in a single GPU call.
+    ``setup`` takes the batch size and **one** template problem (2-D
+    matrices, 1-D vectors); the template fixes the structure shared by all
+    ``B`` problems - the dimensions and which constraint blocks and bound
+    sides exist - and its values are copied into every problem. ``update``
+    then sets per-problem values with a leading batch axis (``P`` of shape
+    ``(B, n, n)``, ``c`` of shape ``(B, n)``, ...), or with the unbatched
+    shape to share one value across the batch. ``solver.result.x`` has
+    shape ``(B, n)``.
 
     Parameters
     ----------
@@ -85,11 +101,20 @@ class DenseSolver(SolverBase):
     h_u = cp.array([1.0])           # x1 + x2 <= 1
 
     solver = DenseSolver()
-    solver.setup(P=P, c=c, G=G, h_l=h_l, h_u=h_u)
+    solver.setup(1, P=P, c=c, G=G, h_l=h_l, h_u=h_u)   # batch size 1
     solver.solve()
 
     print(solver.result.info.status[0].name)    # CUPIQP_SOLVED
     x = solver.result.x.get()[0]                 # bring the solution to the host
+    ```
+
+    A batch of 8 problems that differ only in ``c``:
+
+    ```python
+    solver = DenseSolver()
+    solver.setup(8, P=P, c=c, G=G, h_l=h_l, h_u=h_u)   # template, 8 copies
+    solver.update(c=cp.random.standard_normal((8, 2)))  # per-problem c
+    solver.solve()
     ```
 
     See Also
@@ -101,14 +126,12 @@ class DenseSolver(SolverBase):
 
     Notes
     -----
-    The problem *structure* - array shapes, which constraint blocks are
-    present, and which bounds are finite vs. ``+/-inf`` - is fixed by
-    ``setup`` and can only be set up once per instance. To re-solve with new
-    *numerical* values of the same structure (e.g. a moving target ``b`` in
-    receding-horizon control), call ``update`` and then ``solve`` again,
-    which reuses all GPU allocations; for a different structure, create a
-    new ``DenseSolver``. Solver behaviour (tolerances, verbosity, iteration
-    cap, ...) is configured through ``solver.settings``.
+    ``setup`` can be called only once per instance; for a different
+    structure (dimensions, constraint blocks, bound sides), create a new
+    ``DenseSolver``. ``update`` reuses all GPU allocations; bound values
+    may switch between finite and ``+/-inf``. Solver behaviour (tolerances,
+    verbosity, iteration cap, ...) is configured through
+    ``solver.settings``.
     """
 
     def __init__(self, dtype: Literal["float32", "float64"] = "float64"):
@@ -134,19 +157,16 @@ class DenseSolver(SolverBase):
         x_u: Optional[CudaArray],
         x_l: Optional[CudaArray],
     ) -> DenseData:
-        # Every non-None input must be a GPU dense array — matrices and
-        # vectors alike. cupiqp does not silently do H2D copies.
-        _check_dense("P", P)
-        _check_dense("c", c)
-        _check_dense("A", A)
-        _check_dense("b", b)
-        _check_dense("G", G)
-        _check_dense("h_u", h_u)
-        _check_dense("h_l", h_l)
-        _check_dense("x_u", x_u)
-        _check_dense("x_l", x_l)
+        # Replicate the single-problem template over the batch. broadcast_to
+        # is a view; DenseData.init copies into solver-owned (B, ...) buffers.
+        B = self._setup_batch_size
+
+        def tile(v):
+            return None if v is None else cp.broadcast_to(cp.asarray(v), (B,) + tuple(v.shape))
+
         data = DenseData(dtype=self.settings.dtype, device=self.settings.device)
-        data.init(P, c, A, b, G, h_u, h_l, x_u, x_l)
+        data.init(tile(P), tile(c), tile(A), tile(b), tile(G),
+                  tile(h_u), tile(h_l), tile(x_u), tile(x_l))
         return data
 
     def _init_preconditioner(self) -> DenseRuizEquilibration:
@@ -162,6 +182,7 @@ class DenseSolver(SolverBase):
 
     def setup(
         self,
+        batch_size: int,
         P: CudaArray,
         c: CudaArray,
         A: Optional[CudaArray] = None,
@@ -172,6 +193,59 @@ class DenseSolver(SolverBase):
         x_u: Optional[CudaArray] = None,
         x_l: Optional[CudaArray] = None,
     ) -> None:
+        """Fix the problem structure from one template problem and allocate
+        all GPU memory for a batch of ``batch_size`` problems.
+
+        You describe a **single** problem here. Its dimensions, and which
+        constraint blocks and bound sides are present, become the structure
+        shared by all ``batch_size`` problems; its values are copied into
+        every problem of the batch. Afterwards, give each problem its own
+        values with :meth:`update`, then call :meth:`solve`. Calling
+        :meth:`solve` directly after ``setup()`` solves ``batch_size`` copies
+        of the template. Call ``setup()`` once per solver instance.
+
+        Parameters
+        ----------
+        batch_size : int
+            Number of QPs ``B`` solved together.
+        P : GPU array
+            Quadratic cost of one problem, shape ``(n, n)``. Must be
+            symmetric positive semidefinite. Required.
+        c : GPU array
+            Linear cost, shape ``(n,)``. Required.
+        A, b : GPU array, optional
+            Equality constraints ``A x = b``: ``A`` of shape ``(p, n)``, ``b``
+            of shape ``(p,)``. Provide both or neither.
+        G, h_l, h_u : GPU array, optional
+            Inequalities ``h_l <= G x <= h_u``: ``G`` of shape ``(m, n)``,
+            bounds of shape ``(m,)``. At least one bound is required when
+            ``G`` is given; an omitted side is absent for the lifetime of the
+            solver. Use ``-inf`` / ``+inf`` entries for one-sided rows.
+        x_l, x_u : GPU array, optional
+            Box bounds ``x_l <= x <= x_u``, shape ``(n,)``. An omitted side is
+            absent for the lifetime of the solver.
+
+        Raises
+        ------
+        RuntimeError
+            If ``setup()`` has already been called on this instance.
+        TypeError
+            If an input is not a GPU dense array.
+        ValueError
+            If ``batch_size`` is not a positive integer, a matrix is not 2-D,
+            a vector is not 1-D, or only one of ``A`` / ``b`` is given.
+        """
+        if isinstance(batch_size, bool) or not isinstance(batch_size, (int, np.integer)) or batch_size < 1:
+            raise ValueError(f"batch_size must be a positive integer; got {batch_size!r}.")
+        # Every non-None input must be a GPU dense array describing one
+        # problem. cupiqp does not silently do H2D copies.
+        for name, v, ndim in (("P", P, 2), ("c", c, 1), ("A", A, 2), ("b", b, 1),
+                              ("G", G, 2), ("h_u", h_u, 1), ("h_l", h_l, 1),
+                              ("x_u", x_u, 1), ("x_l", x_l, 1)):
+            _check_dense(name, v, ndim)
+        if (A is None) != (b is None):
+            raise ValueError("A and b must either both be provided or both be None.")
+        self._setup_batch_size = int(batch_size)
         super().setup(P, c, A, b, G, h_u, h_l, x_u, x_l)
         if self.settings.enable_grad:
             d = self._data
@@ -191,6 +265,41 @@ class DenseSolver(SolverBase):
                 x_u=cp.zeros((B, d.n), dtype=dtype) if d.num_xu > 0 else None,
                 x_l=cp.zeros((B, d.n), dtype=dtype) if d.num_xl > 0 else None,
             )
+
+    def update(
+        self,
+        P: Optional[CudaArray] = None,
+        c: Optional[CudaArray] = None,
+        A: Optional[CudaArray] = None,
+        b: Optional[CudaArray] = None,
+        G: Optional[CudaArray] = None,
+        h_u: Optional[CudaArray] = None,
+        h_l: Optional[CudaArray] = None,
+        x_u: Optional[CudaArray] = None,
+        x_l: Optional[CudaArray] = None,
+        check_validity: bool = False,
+    ) -> None:
+        """Set new numerical data, per problem or shared, then ``solve()``.
+
+        Any argument left as ``None`` keeps its current value. Each argument
+        is either **batched** - a leading batch axis, e.g. ``P`` of shape
+        ``(B, n, n)`` or ``c`` of shape ``(B, n)``, one entry per problem - or
+        **unbatched** - the single-problem shape, e.g. ``(n, n)`` or ``(n,)``,
+        in which case the same value is used for every problem. Bound values
+        may switch between finite and ``+/-inf``, but only bound sides given
+        at ``setup()`` can be updated.
+
+        Parameters
+        ----------
+        P, c, A, b, G, h_u, h_l, x_u, x_l : GPU array, optional
+            New values for the corresponding problem block.
+        check_validity : bool, default: False
+            If ``True``, validate the shapes of the new data.
+        """
+        super().update(
+            P=P, c=c, A=A, b=b, G=G, h_u=h_u, h_l=h_l, x_u=x_u, x_l=x_l,
+            check_validity=check_validity,
+        )
 
     def _compute_data_gradients(self, adjoint_vector: Variables, linearization_point: Variables) -> DenseData:
         """Populate ``self._grad_data`` in place and return it.

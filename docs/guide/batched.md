@@ -3,19 +3,22 @@
 CuPIQP is **natively batched**. A single solver instance solves `B` independent QPs in
 one solver call. 
 
-## Batch as the leading dimension
+## Setup from one problem, batch as the leading dimension
 
-CuPIQP is natively designed to solve batched problems. Therefore, the problem data should be passed as batchl, and every array in the results has **the batch size as its leading dimension**.
+All `B` problems in a batch share one structure: the dimensions, and which constraint
+blocks and bound sides exist. So `setup(batch_size, ...)` takes the batch size and
+**one** template problem (2-D matrices, 1-D vectors); its values are copied into every
+problem. Per-problem numbers are then set with `update`, where every array carries
+**the batch size as its leading dimension** (or the single-problem shape, to share one
+value across the batch). Every array in the results has the batch size as its leading
+dimension too.
 
-| field |  shape |
-|---|---|
-| `P`, `c` |  `(B, n, n)`, `(B, n)` |
-| `A`, `b` | `(B, p, n)` , `(B, p)` |
-| `G`, `h_l`, `h_u` | `(B, m, n)` , `(B, m)`, `(B, m)` |
-| `x_l`, `x_u` | `(B, n)`, `(B, n)` |
-
-
-The solver detects the batch size at `setup()` time from the input shape.
+| field | `setup` (one problem) | `update` (per problem) |
+|---|---|---|
+| `P`, `c` | `(n, n)`, `(n,)` | `(B, n, n)`, `(B, n)` |
+| `A`, `b` | `(p, n)`, `(p,)` | `(B, p, n)`, `(B, p)` |
+| `G`, `h_l`, `h_u` | `(m, n)`, `(m,)`, `(m,)` | `(B, m, n)`, `(B, m)`, `(B, m)` |
+| `x_l`, `x_u` | `(n,)`, `(n,)` | `(B, n)`, `(B, n)` |
 
 Each problem in the batch carries its own information and converges independently. Read per-problem diagnostics from `solver.result.info` — every field
 is a `(B,)` array. See [Results & Status](../api/results.md).
@@ -24,29 +27,34 @@ is a `(B,)` array. See [Results & Status](../api/results.md).
 ```python
 solver = DenseSolver()
 solver.setup(
-  P=P_batch,       # 3-dim array, with batch size as leading dim
-  c=c_batch,       # 2-dim array, with batch size as leading dim
-  A=A_batch,       # 3-dim array, with batch size as leading dim
-  b=b_batch,       # 2-dim array, with batch size as leading dim
-  G=G_batch,       # 3-dim array, with batch size as leading dim
-  h_l=h_l_batch,   # 2-dim array, with batch size as leading dim
-  h_u=h_u_batch,   # 2-dim array, with batch size as leading dim
-  x_l=x_l_batch,   # 2-dim array, with batch size as leading dim
-  x_u=x_u_batch,   # 2-dim array, with batch size as leading dim
+  B,               # batch size
+  P=P_batch[0],    # one template problem: 2-dim matrices ...
+  c=c_batch[0],    # ... and 1-dim vectors
+  A=A_batch[0],
+  b=b_batch[0],
+  G=G_batch[0],
+  h_l=h_l_batch[0],
+  h_u=h_u_batch[0],
+  x_l=x_l_batch[0],
+  x_u=x_u_batch[0],
+  )
+solver.update(     # per-problem data, batch size as the leading dim
+  P=P_batch, c=c_batch, A=A_batch, b=b_batch, G=G_batch,
+  h_l=h_l_batch, h_u=h_u_batch, x_l=x_l_batch, x_u=x_u_batch,
   )
 solver.solve()
 
 x_sol = solver.result.x                  # cupy array of shape (B, n)
 status = solver.result.info.status       # list of length B
 for i, st in enumerate(status):
-    print(f"problem {i}: status = {status.name}, x = {x_sol[i]}")
+    print(f"problem {i}: status = {st.name}, x = {x_sol[i]}")
 ```
 
 ### Single problem case:
 
-A single problem is simply the `B=1` case. CuPIQP accepts problem data as single problem, i.e., without the batch size dimension.
-
-However, cuPIQP internally treat this case as `B=1` and **the returned result still carries the batch size 1 as the leading dimension**.
+A single problem is simply the `B=1` case: `setup(1, ...)`, with no `update` needed.
+cuPIQP internally treats it as a batch of one, so **the returned result still carries
+the batch size 1 as the leading dimension**.
 
 ```python
 P_single = cp.eye(2)                 # 2-dim array, no batch dim
@@ -56,6 +64,7 @@ b_single = cp.array([1.0])           # 1-dim array, no batch dim
 
 solver = DenseSolver()
 solver.setup(
+  1,
   P=P_single, c=c_single,
   A=A_single, b=b_single
   )

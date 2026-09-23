@@ -46,7 +46,7 @@ P = cp.eye(4)
 c = cp.zeros(4)
 
 s = DenseSolver()
-s.setup(P=P, c=c)
+s.setup(1, P=P, c=c)      # batch size, then one problem
 s.solve()
 ```
 

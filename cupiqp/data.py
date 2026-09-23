@@ -3,6 +3,7 @@ import cupy as cp
 import warp as wp
 
 from .typedef import PIQP_INF
+from .utils import is_cuda_array
 from .data_kernels import create_finite_bound_masks_kernel
 
 
@@ -27,6 +28,21 @@ class Data(ABC):
     @property
     def dtype(self):
         return self._dtype
+
+    @staticmethod
+    def _as_gpu_array(value, name: str) -> cp.ndarray:
+        """Zero-copy cupy view of a GPU array given to a ``set_*`` setter.
+
+        Accepts any object exposing ``__cuda_array_interface__`` (cupy, dense
+        CUDA torch, JAX, ...). Host arrays are rejected rather than silently
+        copied to the device.
+        """
+        if not is_cuda_array(value):
+            raise TypeError(
+                f"{name} must be a GPU dense array (any object exposing "
+                f"__cuda_array_interface__); got {type(value).__name__}."
+            )
+        return cp.asarray(value)
 
     @property
     def device(self) -> str:
