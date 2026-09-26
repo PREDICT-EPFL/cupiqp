@@ -82,7 +82,12 @@ def create_block_bidiag_gemv_n_kernel(num_blocks: int, rows_of_blocks: int, cols
                 acc += A_E[b, block_row - 1, local_row, j] * x[b, (block_row - 1) * c + j]
 
         idx = block_row * r + local_row
-        y[b, idx] = alpha * acc + beta * y[b, idx]
+        # beta == 0 must not read the output: it may hold uninitialized or
+        # stale +/-inf / NaN data, and 0 * inf is NaN.
+        if beta == dtype(0.0):
+            y[b, idx] = alpha * acc
+        else:
+            y[b, idx] = alpha * acc + beta * y[b, idx]
 
     return _block_bidiag_gemv_n_kernel
 
@@ -122,7 +127,12 @@ def create_block_bidiag_gemv_t_kernel(num_blocks: int, rows_of_blocks: int, cols
             acc += A_E[b, k, p, local_col] * y[b, (k + 1) * r + p]
 
         idx = k * c + local_col
-        z[b, idx] = alpha * acc + beta * z[b, idx]
+        # beta == 0 must not read the output: it may hold uninitialized or
+        # stale +/-inf / NaN data, and 0 * inf is NaN.
+        if beta == dtype(0.0):
+            z[b, idx] = alpha * acc
+        else:
+            z[b, idx] = alpha * acc + beta * z[b, idx]
 
     return _block_bidiag_gemv_t_kernel
 
@@ -166,7 +176,12 @@ def create_block_tridiag_gemv_kernel(num_blocks: int, block_size: int, dtype=wp.
                 acc += P_E[b, k, j, local_row] * x[b, (k + 1) * d + j]
 
         idx = k * d + local_row
-        z[b, idx] = alpha * acc + beta * z[b, idx]
+        # beta == 0 must not read the output: it may hold uninitialized or
+        # stale +/-inf / NaN data, and 0 * inf is NaN.
+        if beta == dtype(0.0):
+            z[b, idx] = alpha * acc
+        else:
+            z[b, idx] = alpha * acc + beta * z[b, idx]
 
     return _block_tridiag_gemv_kernel
 
@@ -208,14 +223,24 @@ def create_block_syrk_kernel(num_blocks: int, rows_of_blocks: int, cols_of_block
         for p in range(r):
             acc_diag += A_D[b, k, p, i] * A_D[b, k, p, j]
             acc_diag += A_E[b, k, p, i] * A_E[b, k, p, j]
-        C_D[b, k, i, j] = alpha * acc_diag + beta * C_D[b, k, i, j]
+        # beta == 0 must not read the output: it may hold uninitialized or
+        # stale +/-inf / NaN data, and 0 * inf is NaN.
+        if beta == dtype(0.0):
+            C_D[b, k, i, j] = alpha * acc_diag
+        else:
+            C_D[b, k, i, j] = alpha * acc_diag + beta * C_D[b, k, i, j]
 
         # Lower off-diagonal: alpha * D_{k+1}^T E_k
         if k < N - 1:
             acc_off = dtype(0.0)
             for p in range(r):
                 acc_off += A_D[b, k + 1, p, i] * A_E[b, k, p, j]
-            C_E[b, k, i, j] = alpha * acc_off + beta * C_E[b, k, i, j]
+            # beta == 0 must not read the output: it may hold uninitialized or
+            # stale +/-inf / NaN data, and 0 * inf is NaN.
+            if beta == dtype(0.0):
+                C_E[b, k, i, j] = alpha * acc_off
+            else:
+                C_E[b, k, i, j] = alpha * acc_off + beta * C_E[b, k, i, j]
 
     return block_syrk_kernel
 
@@ -249,13 +274,23 @@ def create_weighted_block_syrk_kernel(num_blocks: int, rows_of_blocks: int, cols
             w_ek = w[b, (k + 1) * r + p]
             acc_diag += w_dk * A_D[b, k, p, i] * A_D[b, k, p, j]
             acc_diag += w_ek * A_E[b, k, p, i] * A_E[b, k, p, j]
-        C_D[b, k, i, j] = alpha * acc_diag + beta * C_D[b, k, i, j]
+        # beta == 0 must not read the output: it may hold uninitialized or
+        # stale +/-inf / NaN data, and 0 * inf is NaN.
+        if beta == dtype(0.0):
+            C_D[b, k, i, j] = alpha * acc_diag
+        else:
+            C_D[b, k, i, j] = alpha * acc_diag + beta * C_D[b, k, i, j]
 
         if k < N - 1:
             acc_off = dtype(0.0)
             for p in range(r):
                 w_kp1 = w[b, (k + 1) * r + p]
                 acc_off += w_kp1 * A_D[b, k + 1, p, i] * A_E[b, k, p, j]
-            C_E[b, k, i, j] = alpha * acc_off + beta * C_E[b, k, i, j]
+            # beta == 0 must not read the output: it may hold uninitialized or
+            # stale +/-inf / NaN data, and 0 * inf is NaN.
+            if beta == dtype(0.0):
+                C_E[b, k, i, j] = alpha * acc_off
+            else:
+                C_E[b, k, i, j] = alpha * acc_off + beta * C_E[b, k, i, j]
 
     return weighted_block_syrk_kernel

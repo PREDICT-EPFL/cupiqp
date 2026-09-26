@@ -7,7 +7,6 @@ import warp as wp
 
 from ..typedef import CudaArray
 from ..utils import to_warp_dtype, is_cuda_array
-from .multistage_utils import BlockTridiagMat, BlockBidiagMat, BlockVec
 
 
 # Finite placeholder magnitude for a declared-but-not-yet-set bound. It must be
@@ -44,12 +43,12 @@ def _normalize_idx(spec, dim: int, name: str) -> np.ndarray:
 class OcpData:
     r"""Block-structured data of an optimal-control QP, with HPIPM-style access.
 
-    ``OcpData`` owns the multistage block containers for a single OCP structure
+    ``OcpData`` owns the multistage block storage for a single OCP structure
     (over stages ``k = 0, ..., N`` with stage variable ``y_k = [x_k; u_k]``) and
     lets you fill them field by field with :meth:`set_field`, using HPIPM field
     names.
     It is a *pure data holder*: it does not solve, scale, or clone -- the solver
-    (:class:`OcpSolver`) reads :attr:`blocks` and keeps its own scaled copy. This
+    (:class:`OcpSolver`) reads :attr:`arrays` and keeps its own scaled copy. This
     is what keeps the raw values you set separate from the Ruiz-scaled data the
     interior-point method factorizes.
 
@@ -132,37 +131,23 @@ class OcpData:
         blk_size, N_blk, B = self._d, self._N + 1, self._batch_size
         wp_dtype = to_warp_dtype(dtype)
 
-        # ---- allocate the block containers ----
-        self._P_raw = BlockTridiagMat(num_diag_blocks=N_blk, block_size=blk_size,
-                            batch_size=B, dtype=wp_dtype, device=device)
-        self._c_raw = BlockVec(num_blocks=N_blk, rows=blk_size, batch_size=B, dtype=wp_dtype, device=device)
-        self._A_raw = BlockBidiagMat(rows_of_blocks=self._nx, cols_of_blocks=blk_size, N=N_blk,
-                           batch_size=B, dtype=wp_dtype, device=device)
-        self._b_raw = BlockVec(num_blocks=N_blk + 1, rows=self._nx, batch_size=B, dtype=wp_dtype, device=device)
-
-        self._G_raw = BlockBidiagMat(rows_of_blocks=self._ng, cols_of_blocks=blk_size, N=N_blk,
-                            batch_size=B, dtype=wp_dtype, device=device)
-        self._h_l_raw = BlockVec(num_blocks=N_blk + 1, rows=self._ng, batch_size=B, dtype=wp_dtype, device=device)
-        self._h_u_raw = BlockVec(num_blocks=N_blk + 1, rows=self._ng, batch_size=B, dtype=wp_dtype, device=device)
-
-        self._x_l_raw = BlockVec(num_blocks=N_blk, rows=blk_size, batch_size=B, dtype=wp_dtype, device=device)
-        self._x_u_raw = BlockVec(num_blocks=N_blk, rows=blk_size, batch_size=B, dtype=wp_dtype, device=device)
-
-        self._blocks = {
-            "P": self._P_raw,
-            "c": self._c_raw,
-            "A": self._A_raw,
-            "b": self._b_raw,
-            "G": self._G_raw,
-            "h_l": self._h_l_raw,
-            "h_u": self._h_u_raw,
-            "x_l": self._x_l_raw,
-            "x_u": self._x_u_raw,
-        }
-        self._blocks_view = MappingProxyType(self._blocks)
+        # ---- allocate the block storage (Warp arrays, batch axis first) ----
+        zeros = lambda *shape: wp.zeros(shape, dtype=wp_dtype, device=device)
+        self._P_diag = zeros(B, N_blk, blk_size, blk_size)
+        self._P_offdiag = zeros(B, N_blk - 1, blk_size, blk_size)
+        self._c = zeros(B, N_blk, blk_size)
+        self._A_diag = zeros(B, N_blk, self._nx, blk_size)
+        self._A_offdiag = zeros(B, N_blk, self._nx, blk_size)
+        self._b = zeros(B, N_blk + 1, self._nx)
+        self._G_diag = zeros(B, N_blk, self._ng, blk_size)
+        self._G_offdiag = zeros(B, N_blk, self._ng, blk_size)
+        self._h_l = zeros(B, N_blk + 1, self._ng)
+        self._h_u = zeros(B, N_blk + 1, self._ng)
+        self._x_l = zeros(B, N_blk, blk_size)
+        self._x_u = zeros(B, N_blk, blk_size)
 
         # ---- structural defaults ----
-        A_D = cp.from_dlpack(wp.to_dlpack(self._A_raw.D))
+        A_D = cp.from_dlpack(wp.to_dlpack(self._A_diag))
         eye_nx = cp.eye(self._nx, dtype=self._cp_dtype)
         # initial-condition row 0:  [I, 0] y_0 = x0
         A_D[:, 0, :, :self._nx] = eye_nx
@@ -170,8 +155,8 @@ class OcpData:
         A_D[:, 1:, :, :self._nx] = -eye_nx
 
         # box bounds: everything free, declared components set to a finite sentinel
-        xl = cp.from_dlpack(wp.to_dlpack(self._x_l_raw.data))
-        xu = cp.from_dlpack(wp.to_dlpack(self._x_u_raw.data))
+        xl = cp.from_dlpack(wp.to_dlpack(self._x_l))
+        xu = cp.from_dlpack(wp.to_dlpack(self._x_u))
         xl[:] = -cp.inf
         xu[:] = cp.inf
         if self._idxbx.size:
@@ -187,8 +172,8 @@ class OcpData:
         if self._ng > 0:
             # all ng rows present at stages 0..N (finite sentinel); the trailing
             # padding row stays infinite so the backend drops it.
-            hl = cp.from_dlpack(wp.to_dlpack(self._h_l_raw.data))
-            hu = cp.from_dlpack(wp.to_dlpack(self._h_u_raw.data))
+            hl = cp.from_dlpack(wp.to_dlpack(self._h_l))
+            hu = cp.from_dlpack(wp.to_dlpack(self._h_u))
             hl[:] = -cp.inf
             hu[:] = cp.inf
             hl[:, :N_blk, :] = -_BOUND_SENTINEL
@@ -236,13 +221,25 @@ class OcpData:
         return self._idxbu
 
     @property
-    def blocks(self):
-        """Read-only mapping from solver block-group names to containers.
+    def arrays(self):
+        """Read-only mapping of the problem data as MultistageSolver inputs.
 
-        The mapping structure is immutable. The contained GPU buffers are owned
-        by this object and should be modified only through :meth:`set_field`.
+        Keys ``P, c, A, b, G, h_l, h_u, x_l, x_u``; matrices are
+        ``(diag, offdiag)`` pairs and vectors ``(B, num_blocks, rows)`` arrays,
+        all the Warp buffers owned by this object. Modify them only through
+        :meth:`set_field`.
         """
-        return self._blocks_view
+        return MappingProxyType({
+            "P": (self._P_diag, self._P_offdiag),
+            "c": self._c,
+            "A": (self._A_diag, self._A_offdiag),
+            "b": self._b,
+            "G": (self._G_diag, self._G_offdiag),
+            "h_l": self._h_l,
+            "h_u": self._h_u,
+            "x_l": self._x_l,
+            "x_u": self._x_u,
+        })
 
     def set_field(self, field: str, stage: int, value: CudaArray) -> None:
         """Set one block of OCP data at a given stage.
@@ -285,18 +282,18 @@ class OcpData:
         self._check_value_shape(field, val, expected_shape)
 
         if field == "x0":
-            cp.from_dlpack(wp.to_dlpack(self._b_raw.data))[:, 0, :] = val
+            cp.from_dlpack(wp.to_dlpack(self._b))[:, 0, :] = val
         elif field in ("A", "B", "E", "b"):
             if field == "A":
-                cp.from_dlpack(wp.to_dlpack(self._A_raw.E))[:, k, :, :nx] = val
+                cp.from_dlpack(wp.to_dlpack(self._A_offdiag))[:, k, :, :nx] = val
             elif field == "B":
-                cp.from_dlpack(wp.to_dlpack(self._A_raw.E))[:, k, :, nx:] = val
+                cp.from_dlpack(wp.to_dlpack(self._A_offdiag))[:, k, :, nx:] = val
             elif field == "E":
-                cp.from_dlpack(wp.to_dlpack(self._A_raw.D))[:, k + 1, :, :nx] = -val
+                cp.from_dlpack(wp.to_dlpack(self._A_diag))[:, k + 1, :, :nx] = -val
             else:
-                cp.from_dlpack(wp.to_dlpack(self._b_raw.data))[:, k + 1, :] = -val
+                cp.from_dlpack(wp.to_dlpack(self._b))[:, k + 1, :] = -val
         elif field in ("Q", "R", "S"):
-            P = cp.from_dlpack(wp.to_dlpack(self._P_raw.D))
+            P = cp.from_dlpack(wp.to_dlpack(self._P_diag))
             if field == "Q":
                 P[:, k, :nx, :nx] = val
             elif field == "R":
@@ -305,29 +302,29 @@ class OcpData:
                 P[:, k, nx:, :nx] = val
                 P[:, k, :nx, nx:] = cp.swapaxes(val, -1, -2)
         elif field in ("q", "r"):
-            c = cp.from_dlpack(wp.to_dlpack(self._c_raw.data))
+            c = cp.from_dlpack(wp.to_dlpack(self._c))
             if field == "q":
                 c[:, k, :nx] = val
             else:
                 c[:, k, nx:] = val
         elif field in ("C", "D", "lg", "ug"):
             if field == "C":
-                cp.from_dlpack(wp.to_dlpack(self._G_raw.D))[:, k, :, :nx] = val
+                cp.from_dlpack(wp.to_dlpack(self._G_diag))[:, k, :, :nx] = val
             elif field == "D":
-                cp.from_dlpack(wp.to_dlpack(self._G_raw.D))[:, k, :, nx:] = val
+                cp.from_dlpack(wp.to_dlpack(self._G_diag))[:, k, :, nx:] = val
             elif field == "lg":
-                cp.from_dlpack(wp.to_dlpack(self._h_l_raw.data))[:, k, :] = val
+                cp.from_dlpack(wp.to_dlpack(self._h_l))[:, k, :] = val
             else:
-                cp.from_dlpack(wp.to_dlpack(self._h_u_raw.data))[:, k, :] = val
+                cp.from_dlpack(wp.to_dlpack(self._h_u))[:, k, :] = val
         else:
             if field in ("lbx", "ubx"):
                 cols = cp.asarray(self._idxbx)
             else:
                 cols = cp.asarray(nx + self._idxbu)
             if field in ("lbx", "lbu"):
-                cp.from_dlpack(wp.to_dlpack(self._x_l_raw.data))[:, k, cols] = val
+                cp.from_dlpack(wp.to_dlpack(self._x_l))[:, k, cols] = val
             else:
-                cp.from_dlpack(wp.to_dlpack(self._x_u_raw.data))[:, k, cols] = val
+                cp.from_dlpack(wp.to_dlpack(self._x_u))[:, k, cols] = val
 
     def _staged(self, x_flat: cp.ndarray) -> cp.ndarray:
         return x_flat.reshape(self._batch_size, self._N + 1, self._d)

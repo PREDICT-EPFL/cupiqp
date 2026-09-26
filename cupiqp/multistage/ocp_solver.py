@@ -175,7 +175,13 @@ class OcpSolver(MultistageSolver):
             dtype=self.settings.dtype, device=self.settings.device,
             batch_size=batch_size,
         )
-        MultistageSolver.setup(self, **ocp_data.blocks)
+        # Core setup() takes the batch size plus one template problem. OcpData
+        # initializes every problem identically, so problem 0 is the template.
+        template = {
+            name: (value[0][0], value[1][0]) if isinstance(value, tuple) else value[0]
+            for name, value in self._solver_arrays(ocp_data).items()
+        }
+        MultistageSolver.setup(self, batch_size, **template)
 
         self._ocp_data = ocp_data
         self._solution_available = False
@@ -211,26 +217,26 @@ class OcpSolver(MultistageSolver):
     def solve(self) -> List[Status]:
         """Flush any pending :meth:`set` updates into the solver, then solve.
 
-        Returns the solve status (a single ``Status`` for ``batch_size == 1``,
-        otherwise a list of one ``Status`` per problem). The full solution is
+        Returns the solve status as a list with one ``Status`` per problem
+        (a list of length 1 for ``batch_size == 1``). The full solution is
         available through :meth:`get`, :attr:`x_traj`, :attr:`u_traj`, and
         ``solver.result``.
         """
         if not self._ocp_ready:
             raise RuntimeError("Call setup() before solve().")
 
-        blocks = self._ocp_data.blocks
+        arrays = self._solver_arrays(self._ocp_data)
         changed = {
-            group: block
-            for group, block in blocks.items()
-            if block is not None and group not in ("P", "A", "G")
+            group: value
+            for group, value in arrays.items()
+            if group not in ("P", "A", "G")
         }
         if self._update_P:
-            changed["P"] = blocks["P"]
+            changed["P"] = arrays["P"]
         if self._update_A:
-            changed["A"] = blocks["A"]
-        if self._update_G:
-            changed["G"] = blocks["G"]
+            changed["A"] = arrays["A"]
+        if self._update_G and "G" in arrays:
+            changed["G"] = arrays["G"]
 
         MultistageSolver.update(self, **changed)
 
@@ -266,6 +272,16 @@ class OcpSolver(MultistageSolver):
         """Input trajectory, shape ``(B, N, nu)`` (the dummy ``u_N`` is dropped)."""
         self._require_solution()
         return self._ocp_data.input_traj(self._result.x)
+
+    @staticmethod
+    def _solver_arrays(ocp_data: OcpData) -> dict:
+        """The OCP data as MultistageSolver inputs; without general inequalities
+        (``ng == 0``) the G / h blocks are omitted rather than passed empty."""
+        arrays = dict(ocp_data.arrays)
+        if ocp_data.ng == 0:
+            for name in ("G", "h_l", "h_u"):
+                del arrays[name]
+        return arrays
 
     def _require_solution(self) -> None:
         if not self._solution_available:

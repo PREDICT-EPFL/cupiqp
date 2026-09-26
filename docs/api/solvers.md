@@ -34,22 +34,7 @@ passing each matrix's nonzero values as a dense `(B, nnz)` array (see `setup` an
       inherited_members: true
       members: [setup, solve, update, backward]
 
-`MultistageSolver` takes its problem data as the block-structured objects below —
-build them, fill in their data, and pass them to `setup` (see above for which
-argument expects which type):
-
-::: cupiqp.BlockTridiagMat
-    options:
-      show_if_no_docstring: true
-      members: false
-
-::: cupiqp.BlockBidiagMat
-    options:
-      show_if_no_docstring: true
-      members: false
-
-::: cupiqp.BlockVec
-    options:
-      show_if_no_docstring: true
-      members: false
+`MultistageSolver` takes plain GPU arrays: each block-structured matrix is a
+`(diag, offdiag)` tuple and each vector an array, for one template problem at `setup`
+and per problem at `update` (see `setup` and `update` above for the block layout).
 

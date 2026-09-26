@@ -6,7 +6,6 @@ import warp as wp
 from .multistage_data import MultistageData
 from ..preconditioner import RuizEquilibration
 from ..utils import to_warp_dtype
-from .multistage_utils import BlockTridiagMat, BlockBidiagMat
 from .multistage_preconditioner_kernels import (
     create_multistage_scale_matrices_kernel,
     create_multistage_compute_kkt_norms_kernel,
@@ -19,9 +18,10 @@ USE_WARP = True
 class MultistageRuizEquilibration(RuizEquilibration):
     """Ruiz equilibration for the multistage backend, batched.
 
-    P is block-tridiagonal (BlockTridiagMat); A, G are block lower-bidiagonal
-    (BlockBidiagMat). Norms and scaling operate on the dense per-block storage
-    via DLPack bridges to Warp buffers, with a leading batch axis throughout.
+    P is block-tridiagonal and A, G are block lower-bidiagonal, stored as
+    ``(diag, offdiag)`` Warp block arrays on the data object. Norms and
+    scaling operate on that per-block storage (via DLPack bridges in the
+    cupy fallback), with a leading batch axis throughout.
     """
 
     def __init__(self, *args, data: MultistageData, **kwargs):
@@ -31,8 +31,7 @@ class MultistageRuizEquilibration(RuizEquilibration):
         # specialized warp kernels here.
         N = data.num_blocks
         d = data.block_size
-        rows_A = data.A.rows_of_blocks if self.p > 0 else 0
-        rows_G = data.G.rows_of_blocks if self.m > 0 else 0
+        rows_A, rows_G = data.A_rows, data.G_rows
         self._N, self._d, self._rows_A, self._rows_G = N, d, rows_A, rows_G
 
         self._multistage_scale_matrices_kernel = create_multistage_scale_matrices_kernel(
@@ -44,12 +43,12 @@ class MultistageRuizEquilibration(RuizEquilibration):
         self._dummy_4d = wp.zeros(
             (self.B, 1, 1, 1), dtype=to_warp_dtype(self._dtype), device="cuda"
         )
-        self._P_D = data.P.D
-        self._P_E = data.P.E
-        self._A_D = data.A.D if self.p > 0 else self._dummy_4d
-        self._A_E = data.A.E if self.p > 0 else self._dummy_4d
-        self._G_D = data.G.D if self.m > 0 else self._dummy_4d
-        self._G_E = data.G.E if self.m > 0 else self._dummy_4d
+        self._P_D = data.P_diag
+        self._P_E = data.P_offdiag
+        self._A_D = data.A_diag if self.p > 0 else self._dummy_4d
+        self._A_E = data.A_offdiag if self.p > 0 else self._dummy_4d
+        self._G_D = data.G_diag if self.m > 0 else self._dummy_4d
+        self._G_E = data.G_offdiag if self.m > 0 else self._dummy_4d
         self._c = data.c
 
         self._ones = cp.ones(self.B, dtype=self._dtype)
@@ -78,15 +77,15 @@ class MultistageRuizEquilibration(RuizEquilibration):
         # --- cupy fallback ---
         n, p, m = self.n, self.p, self.m
         # x-block (B, n): row inf-norms of P (symmetric, so row ≡ col).
-        self._tridiag_row_inf_norms(data.P, d_iter[:, :n])
+        self._tridiag_row_inf_norms(data.P_diag, data.P_offdiag, d_iter[:, :n])
         if p > 0:
-            self._bidiag_col_inf_norms(data.A, self._work_n)
+            self._bidiag_col_inf_norms(data.A_diag, data.A_offdiag, self._work_n)
             cp.maximum(d_iter[:, :n], self._work_n, out=d_iter[:, :n])
-            self._bidiag_row_inf_norms(data.A, d_iter[:, n:n + p])
+            self._bidiag_row_inf_norms(data.A_diag, data.A_offdiag, d_iter[:, n:n + p])
         if m > 0:
-            self._bidiag_col_inf_norms(data.G, self._work_n)
+            self._bidiag_col_inf_norms(data.G_diag, data.G_offdiag, self._work_n)
             cp.maximum(d_iter[:, :n], self._work_n, out=d_iter[:, :n])
-            self._bidiag_row_inf_norms(data.G, d_iter[:, n + p:n + p + m])
+            self._bidiag_row_inf_norms(data.G_diag, data.G_offdiag, d_iter[:, n + p:n + p + m])
         cp.maximum(d_iter[:, :n], self._x_b_scaling, out=d_iter[:, :n])
         d_b_iter[:] = self._x_b_scaling
 
@@ -120,8 +119,8 @@ class MultistageRuizEquilibration(RuizEquilibration):
         d_x_2d = d_x.reshape(B, N, bs)
 
         # P_D shape (B, N, d, d); P_E shape (B, N-1, d, d).
-        P_D = cp.from_dlpack(wp.to_dlpack(data.P.D))
-        P_E = cp.from_dlpack(wp.to_dlpack(data.P.E))
+        P_D = cp.from_dlpack(wp.to_dlpack(data.P_diag))
+        P_E = cp.from_dlpack(wp.to_dlpack(data.P_offdiag))
         # P <- D_x P D_x: scale columns then rows of each batch's diag blocks.
         P_D *= d_x_2d[:, :, None, :]
         P_D *= d_x_2d[:, :, :, None]
@@ -139,20 +138,20 @@ class MultistageRuizEquilibration(RuizEquilibration):
             data.c[:] *= cost_scaling_factor[:, None]
 
         if self.p > 0:
-            rows_A = data.A.rows_of_blocks
+            rows_A = data.A_rows
             d_y_2d = d_y.reshape(B, N + 1, rows_A)
-            A_D = cp.from_dlpack(wp.to_dlpack(data.A.D))
-            A_E = cp.from_dlpack(wp.to_dlpack(data.A.E))
+            A_D = cp.from_dlpack(wp.to_dlpack(data.A_diag))
+            A_E = cp.from_dlpack(wp.to_dlpack(data.A_offdiag))
             A_D *= d_x_2d[:, :, None, :]            # column scale by d_x
             A_D *= d_y_2d[:, :N, :, None]           # row scale by d_y[block k]
             A_E *= d_x_2d[:, :, None, :]
             A_E *= d_y_2d[:, 1:N + 1, :, None]      # row scale by d_y[block k+1]
 
         if self.m > 0:
-            rows_G = data.G.rows_of_blocks
+            rows_G = data.G_rows
             d_z_2d = d_z.reshape(B, N + 1, rows_G)
-            G_D = cp.from_dlpack(wp.to_dlpack(data.G.D))
-            G_E = cp.from_dlpack(wp.to_dlpack(data.G.E))
+            G_D = cp.from_dlpack(wp.to_dlpack(data.G_diag))
+            G_E = cp.from_dlpack(wp.to_dlpack(data.G_offdiag))
             G_D *= d_x_2d[:, :, None, :]
             G_D *= d_z_2d[:, :N, :, None]
             G_E *= d_x_2d[:, :, None, :]
@@ -162,8 +161,8 @@ class MultistageRuizEquilibration(RuizEquilibration):
         B = self.B
         N = data.num_blocks
         # (B, N, d, d) and (B, N-1, d, d).
-        P_D = cp.from_dlpack(wp.to_dlpack(data.P.D))
-        P_E = cp.from_dlpack(wp.to_dlpack(data.P.E))
+        P_D = cp.from_dlpack(wp.to_dlpack(data.P_diag))
+        P_E = cp.from_dlpack(wp.to_dlpack(data.P_offdiag))
 
         # Column inf-norms of upper-triangular P (symmetric → col_norm == row_norm).
         # cp.triu broadcasts over the leading (B, N) axes.
@@ -208,22 +207,23 @@ class MultistageRuizEquilibration(RuizEquilibration):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _tridiag_row_inf_norms(P: BlockTridiagMat, out: cp.ndarray):
-        """Row inf-norms of a batched block-tridiagonal matrix.
+    def _tridiag_row_inf_norms(P_diag: wp.array, P_offdiag: wp.array, out: cp.ndarray):
+        """Row inf-norms of a batched block-tridiagonal matrix given by its
+        ``(B, N, d, d)`` diagonal and ``(B, N-1, d, d)`` lower blocks.
 
         out: shape (B, N*d).
         """
         B = out.shape[0]
-        N, d = P.num_diag_blocks, P.block_size
+        N, d = int(P_diag.shape[1]), int(P_diag.shape[2])
 
-        # (B, N, d, d) — row inf-norm over the trailing axis → (B, N, d).
-        P_D = cp.from_dlpack(wp.to_dlpack(P.D))
+        # (B, N, d, d) -- row inf-norm over the trailing axis -> (B, N, d).
+        P_D = cp.from_dlpack(wp.to_dlpack(P_diag))
         out[:] = cp.linalg.norm(P_D, ord=cp.inf, axis=-1).reshape(B, N * d)
 
         if N > 1:
             # (B, N-1, d, d). Lower contributes to rows of blocks [1..N-1];
             # upper (= lower transposed) contributes to rows of blocks [0..N-2].
-            P_E = cp.from_dlpack(wp.to_dlpack(P.E))
+            P_E = cp.from_dlpack(wp.to_dlpack(P_offdiag))
             row_lower = cp.linalg.norm(P_E, ord=cp.inf, axis=-1)                # (B, N-1, d)
             row_upper = cp.linalg.norm(P_E.swapaxes(-1, -2), ord=cp.inf, axis=-1)  # (B, N-1, d)
 
@@ -232,17 +232,17 @@ class MultistageRuizEquilibration(RuizEquilibration):
             cp.maximum(out_2d[:, :-1], row_upper, out=out_2d[:, :-1])
 
     @staticmethod
-    def _bidiag_row_inf_norms(mat: BlockBidiagMat, out: cp.ndarray):
-        """Row inf-norms of a batched block lower-bidiagonal matrix.
+    def _bidiag_row_inf_norms(diag: wp.array, offdiag: wp.array, out: cp.ndarray):
+        """Row inf-norms of a batched block lower-bidiagonal matrix given by
+        its ``(B, N, r, c)`` diagonal and lower blocks.
 
         out: shape (B, (N+1)*r).
         """
         B = out.shape[0]
-        N = mat.N
-        r = mat.rows_of_blocks
+        N, r = int(diag.shape[1]), int(diag.shape[2])
 
-        D = cp.from_dlpack(wp.to_dlpack(mat.D))   # (B, N, r, c)
-        E = cp.from_dlpack(wp.to_dlpack(mat.E))   # (B, N, r, c)
+        D = cp.from_dlpack(wp.to_dlpack(diag))      # (B, N, r, c)
+        E = cp.from_dlpack(wp.to_dlpack(offdiag))   # (B, N, r, c)
         row_D = cp.linalg.norm(D, ord=cp.inf, axis=-1)   # (B, N, r)
         row_E = cp.linalg.norm(E, ord=cp.inf, axis=-1)   # (B, N, r)
 
@@ -253,17 +253,17 @@ class MultistageRuizEquilibration(RuizEquilibration):
         out_2d[:, N] = row_E[:, N - 1]
 
     @staticmethod
-    def _bidiag_col_inf_norms(mat: BlockBidiagMat, out: cp.ndarray):
-        """Column inf-norms of a batched block lower-bidiagonal matrix.
+    def _bidiag_col_inf_norms(diag: wp.array, offdiag: wp.array, out: cp.ndarray):
+        """Column inf-norms of a batched block lower-bidiagonal matrix given
+        by its ``(B, N, r, c)`` diagonal and lower blocks.
 
         out: shape (B, N*c).
         """
         B = out.shape[0]
-        N = mat.N
-        c = mat.cols_of_blocks
+        N, c = int(diag.shape[1]), int(diag.shape[3])
 
-        D = cp.from_dlpack(wp.to_dlpack(mat.D))   # (B, N, r, c)
-        E = cp.from_dlpack(wp.to_dlpack(mat.E))   # (B, N, r, c)
+        D = cp.from_dlpack(wp.to_dlpack(diag))      # (B, N, r, c)
+        E = cp.from_dlpack(wp.to_dlpack(offdiag))   # (B, N, r, c)
 
         # column inf-norm over the second-to-last axis -> (B, N, c).
         col_D = cp.linalg.norm(D, ord=cp.inf, axis=-2)

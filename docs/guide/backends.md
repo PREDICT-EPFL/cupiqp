@@ -9,7 +9,7 @@ KKT factorization and the storage category of your `P` / `A` / `G` inputs.
 |---|---|---|---|
 | [`DenseSolver`](#densesolver) | dense `cupy` arrays | dense Cholesky | small-to-medium, dense problems |
 | [`SparseSolver`](#sparsesolver) | one GPU CSR template + `(B, nnz)` values | sparse LDLᵀ (cuDSS) | large, structurally sparse problems |
-| [`MultistageSolver`](#multistagesolver) | block-structured objects | block Cholesky | block-tridiagonal/-arrow KKT (e.g. OCPs) |
+| [`MultistageSolver`](#multistagesolver) | `(diag, offdiag)` block arrays | block Cholesky | block-tridiagonal/-arrow KKT (e.g. OCPs) |
 
 All three accept GPU-resident inputs only and share the same `setup` / `solve` /
 `update` workflow and [`Settings`](../api/settings.md). See
@@ -100,32 +100,36 @@ multistage programs — with a block Cholesky factorization. It requires the
 [`socu`](https://github.com/PREDICT-EPFL/socu) extra (install with
 `pip install ".[cuda13,multistage]"`).
 
-It accepts **block-structured storage end-to-end**: generic CSR is *not* auto-promoted
-to block form, because if you have not built the block matrices the multistage solver
-cannot exploit the structure anyway.
+It takes **plain GPU arrays, block by block**: each block-structured matrix is a
+`(diag, offdiag)` tuple of arrays and each vector an array. Generic dense or CSR
+matrices are *not* converted to block form, because the structure can only be
+exploited if you provide it. With `N` stages of size `d` and `r` constraint rows per
+block row:
 
 ```python
 from cupiqp import MultistageSolver
-from cupiqp.multistage.multistage_utils import (
-    BlockTridiagMat, BlockBidiagMat, BlockVec,
-)
-
-P = BlockTridiagMat(num_diag_blocks=N, block_size=d)
-A = BlockBidiagMat(rows_of_blocks=d, cols_of_blocks=d, N=N)
-c = BlockVec(num_blocks=N, rows=d)
-b = BlockVec(num_blocks=N, rows=d)
-# ... fill block data ...
 
 s = MultistageSolver()
-s.setup(P=P, c=c, A=A, b=b)
+s.setup(
+    B,                                  # batch size, then ONE template problem
+    P=(P_diag, P_offdiag),              # (N, d, d), (N-1, d, d)
+    c=c,                                # (N, d) or flat (N*d,)
+    A=(A_diag, A_offdiag), b=b,         # (N, r, d) each; b: (N+1, r) or flat
+)
+s.update(P=(None, P_offdiag_batch))     # per-problem data (B, ...); None = unchanged
 s.solve()
 ```
 
-| Input | Type |
+| Input | Layout (one problem) |
 |---|---|
-| `P` | `BlockTridiagMat` |
-| `A`, `G` | `BlockBidiagMat` (or `None`) |
-| `c`, `b`, `h_u`, `h_l`, `x_u`, `x_l` | `BlockVec` (or `None`) |
+| `P` | `(P_diag, P_offdiag)`: symmetric block-tridiagonal, lower off-diagonal blocks |
+| `A`, `G` | `(diag, offdiag)`, both `(N, r, d)`: block lower-bidiagonal with `N + 1` block rows |
+| `c`, `x_l`, `x_u` | `(N, d)` or flat `(N*d,)` |
+| `b`, `h_l`, `h_u` | `(N + 1, r)` or flat `((N + 1) * r,)` |
+
+Block row `k` of `A` is `[A_offdiag[k-1], A_diag[k]]` acting on stages `k-1, k`; the last
+block row holds only `A_offdiag[N-1]`. Every array passed to `update` is copied once,
+in place, into the solver's buffers.
 
 ---
 

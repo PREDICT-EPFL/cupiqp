@@ -11,7 +11,6 @@ from .sparse.sparse_data import SparseData
 
 from .multistage.multistage_data import MultistageData
 from .multistage.ocp_data import OcpData
-from .multistage.multistage_utils import BlockTridiagMat, BlockBidiagMat, BlockVec
 
 
 # Type-strict, backend-specific Solver subclasses.
@@ -48,9 +47,6 @@ __all__ = [
     "SparseData",
     "MultistageData",
     "OcpData",
-    "BlockTridiagMat",
-    "BlockBidiagMat",
-    "BlockVec",
     # Configuration / results
     "Settings",
     "Result",
