@@ -179,70 +179,34 @@ class KKTSystem:
     def _update_reg_and_kkt(self, data: Data, preconditioner: PreconditionerBase, delta: cp.ndarray, rho: cp.ndarray, vars: Variables):
         """Update the regularization terms x_reg and z_reg for the condensed KKT system after eliminating slacks and duals of inequalities and box constraints.
         Also update the condensed KKT matrix with the new regularization terms."""
-        USE_WARP_IMPLEMENTATION = True
         B = self._batch_size
-        if USE_WARP_IMPLEMENTATION:
-            wp_stream = wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr)
-            wp.launch(
-                kernel=self._update_regularization_step_1_kernel,
-                dim=(B, max(data.num_ineq, 1)),
-                inputs=[vars.s_all, vars.z_all, data.finite_mask_all,
-                        self._m_s_all, self._m_z_inv_all, self._w_delta_inv_all,
-                        rho, delta, self._rho, self._delta],
-                device=self._device,
-                stream=wp_stream,
-            )
-            wp.launch(
-                kernel=self._update_regularization_step_2_kernel,
-                dim=(B, data.n + data.m),
-                inputs=[
-                    self._w_bu_delta_inv,
-                    self._w_bl_delta_inv,
-                    preconditioner.x_b_scaling,
-                    self._rho,
-                    self._x_reg,
-                    self._w_u_delta_inv,
-                    self._w_l_delta_inv,
-                    self._z_reg,
-                    self._z_reg_inv,
-                ],
-                device=self._device,
-                stream=wp_stream,
-            )
-        else:
-            self._rho[:] = rho
-            self._delta[:] = delta
-            cp.multiply(vars.s_all, data.finite_mask_all, out=self._m_s_all)
-            self._m_z_inv_all.fill(0)
-            cp.divide(1.0, vars.z_all, out=self._m_z_inv_all, where=data.finite_mask_all > 0.5)
-            cp.multiply(self._m_s_all, self._m_z_inv_all, out=self._w_delta_inv_all)
-            cp.add(self._w_delta_inv_all, self._delta[:, None], out=self._w_delta_inv_all)
-            cp.reciprocal(self._w_delta_inv_all, out=self._w_delta_inv_all)
-            cp.multiply(self._w_delta_inv_all, data.finite_mask_all, out=self._w_delta_inv_all)
-
-            xbs = preconditioner.x_b_scaling
-            # Box blocks are optional: w_bu/w_bl are (B, num_xu)/(B, num_xl),
-            # which are (B, 0) for an omitted side. Add each present side
-            # separately so a one-sided box does not broadcast (B, n) + (B, 0).
-            self._x_reg[:] = self._rho[:, None]
-            if data.num_xl > 0:
-                self._x_reg += xbs * xbs * self._w_bl_delta_inv
-            if data.num_xu > 0:
-                self._x_reg += xbs * xbs * self._w_bu_delta_inv
-            if data.m > 0:
-                # z_reg_inv = weight = w_l + w_u (condensed row weight, 0 on
-                # inactive rows). z_reg = 1 / weight (explicit augmented diagonal
-                # magnitude); inactive rows (weight == 0) get z_reg = 0. The row
-                # weight is per row of G and always (B, m); an omitted inequality
-                # side has an empty (B, 0) w_*_delta_inv, so add each present
-                # side separately to avoid broadcasting (B, m) + (B, 0).
-                self._z_reg_inv.fill(0)
-                if data.num_hu > 0:
-                    self._z_reg_inv += self._w_u_delta_inv
-                if data.num_hl > 0:
-                    self._z_reg_inv += self._w_l_delta_inv
-                self._z_reg.fill(0)
-                cp.divide(1.0, self._z_reg_inv, out=self._z_reg, where=self._z_reg_inv > 0)
+        wp_stream = wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr)
+        wp.launch(
+            kernel=self._update_regularization_step_1_kernel,
+            dim=(B, max(data.num_ineq, 1)),
+            inputs=[vars.s_all, vars.z_all, data.finite_mask_all,
+                    self._m_s_all, self._m_z_inv_all, self._w_delta_inv_all,
+                    rho, delta, self._rho, self._delta],
+            device=self._device,
+            stream=wp_stream,
+        )
+        wp.launch(
+            kernel=self._update_regularization_step_2_kernel,
+            dim=(B, data.n + data.m),
+            inputs=[
+                self._w_bu_delta_inv,
+                self._w_bl_delta_inv,
+                preconditioner.x_b_scaling,
+                self._rho,
+                self._x_reg,
+                self._w_u_delta_inv,
+                self._w_l_delta_inv,
+                self._z_reg,
+                self._z_reg_inv,
+            ],
+            device=self._device,
+            stream=wp_stream,
+        )
 
         # Update KKT matrix
         self._kkt_solver.update_kkt(data, self._delta, self._x_reg, self._z_reg, self._z_reg_inv)
@@ -341,32 +305,6 @@ class KKTSystem:
             stream=wp_stream,
         )
 
-        # # ---- ALTERNATIVE: pure CuPy implementation ----
-        # # Eliminate slacks: forward has updated_rhs_z = rhs_z - inv(Z) * rhs_s,
-        # #                   transpose has updated_rhs_z = rhs_z - (S/Z) * rhs_s.
-        # if transpose:
-        #     cp.multiply(self._m_s_all, self._m_z_inv_all, out=self._updated_rhs_z_all)
-        #     cp.multiply(self._updated_rhs_z_all, rhs.s_all, out=self._updated_rhs_z_all)
-        # else:
-        #     cp.multiply(self._m_z_inv_all, rhs.s_all, out=self._updated_rhs_z_all)
-        # cp.subtract(rhs.z_all, self._updated_rhs_z_all, out=self._updated_rhs_z_all)
-        #
-        # # Eliminate duals → rhs_x_bar, rhs_z_bar  (direction-agnostic)
-        # self._rhs_x_bar[:] = rhs.x
-        # if data.num_xu > 0:
-        #     xbs_xu = data.x_b_scaling[:, data.idx_xu]
-        #     self._rhs_x_bar[:, data.idx_xu] += xbs_xu * self._w_bu_delta_inv * self._updated_rhs_z_bu
-        # if data.num_xl > 0:
-        #     xbs_xl = data.x_b_scaling[:, data.idx_xl]
-        #     self._rhs_x_bar[:, data.idx_xl] -= xbs_xl * self._w_bl_delta_inv * self._updated_rhs_z_bl
-        #
-        # if data.m > 0:
-        #     self._rhs_z_bar[:] = 0.0
-        #     if data.num_hu > 0:
-        #         self._rhs_z_bar[:, data.idx_hu] += self._w_u_delta_inv * self._updated_rhs_z_u
-        #     if data.num_hl > 0:
-        #         self._rhs_z_bar[:, data.idx_hl] -= self._w_l_delta_inv * self._updated_rhs_z_l
-        #     self._rhs_z_bar *= self._z_reg
 
     @nvtx.annotate("KKTSystem::_recover_lhs")
     @cuda_graph_capture(key=lambda self, data, preconditioner, rhs, lhs, transpose=False: (rhs.buffer_ptr, lhs.buffer_ptr, bool(transpose)), enable=lambda self: self._settings.enable_cuda_graph)
@@ -418,42 +356,6 @@ class KKTSystem:
                     stream=wp_stream,
                 )
 
-        # # ---- ALTERNATIVE: pure CuPy implementation ----
-        # # Recover duals (direction-agnostic)
-        # if data.num_hu > 0:
-        #     lhs.z_u[:] = self._work_z[:, data.idx_hu]
-        #     lhs.z_u -= self._updated_rhs_z_u
-        #     lhs.z_u *= self._w_u_delta_inv
-        #
-        # if data.num_hl > 0:
-        #     lhs.z_l[:] = self._work_z[:, data.idx_hl]
-        #     lhs.z_l *= -1.0
-        #     lhs.z_l -= self._updated_rhs_z_l
-        #     lhs.z_l *= self._w_l_delta_inv
-        #
-        # if data.num_xu > 0:
-        #     xbs_xu = data.x_b_scaling[:, data.idx_xu]
-        #     cp.multiply(self._m_z_bu_inv, rhs.s_bu, out=lhs.z_bu)
-        #     lhs.z_bu += xbs_xu * lhs.x[:, data.idx_xu]
-        #     lhs.z_bu -= rhs.z_bu
-        #     lhs.z_bu *= self._w_bu_delta_inv
-        #
-        # if data.num_xl > 0:
-        #     xbs_xl = data.x_b_scaling[:, data.idx_xl]
-        #     cp.multiply(self._m_z_bl_inv, rhs.s_bl, out=lhs.z_bl)
-        #     lhs.z_bl -= xbs_xl * lhs.x[:, data.idx_xl]
-        #     lhs.z_bl -= rhs.z_bl
-        #     lhs.z_bl *= self._w_bl_delta_inv
-        #
-        # # Recover slacks
-        # if data.num_ineq > 0:
-        #     if transpose:
-        #         cp.subtract(rhs.s_all, lhs.z_all, out=lhs.s_all)
-        #         cp.multiply(lhs.s_all, self._m_z_inv_all, out=lhs.s_all)
-        #     else:
-        #         cp.multiply(self._m_s_all, lhs.z_all, out=lhs.s_all)
-        #         cp.subtract(rhs.s_all, lhs.s_all, out=lhs.s_all)
-        #         cp.multiply(self._m_z_inv_all, lhs.s_all, out=lhs.s_all)
 
     @nvtx.annotate("KKTSystem::iterative_refinement")
     def iterative_refinement(self, data: Data, settings: Settings,
