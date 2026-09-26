@@ -9,7 +9,7 @@ import scipy.io
 import scipy.sparse as sp
 from cupyx.scipy.sparse import csr_matrix
 
-from cupiqp import SparseLargeProblemSolver, Status
+from cupiqp import SparseSolver, Status
 
 
 def _problem_files():
@@ -34,11 +34,12 @@ def test_maros_meszaros_problem(problem_file):
     x_l = np.array(data['x_l'].flatten(), dtype=np.float64) if 'x_l' in data else None
     x_u = np.array(data['x_u'].flatten(), dtype=np.float64) if 'x_u' in data else None
 
-    solver = SparseLargeProblemSolver()
+    solver = SparseSolver()
     solver.settings.max_iter = 250
     solver.settings.eps_abs = 1e-6
     solver.settings.iterative_refinement_always_enabled = True
     solver.setup(
+        1,
         P=csr_matrix(P), c=cp.array(c),
         A=csr_matrix(A) if A is not None else None,
         b=cp.array(b) if b is not None else None,
