@@ -113,11 +113,6 @@ cuPIQP equilibrates the problem with a Ruiz preconditioner before solving.
 |---|---|---|
 | `enable_cuda_graph` | `True` | Capture the repeated IPM iteration as a CUDA graph and replay it with near-zero launch overhead. |
 | `use_deterministic_mode_for_cudss` | `False` | Bit-wise reproducible cuDSS factorizations (slower); sparse backend only. |
-| `kkt_solver` | backend-specific | KKT factorization: `"dense_cholesky"`, `"sparse_ldlt"`, or `"multistage_block_cholesky"`. Set automatically by the chosen solver class. |
-
-!!! note "`kkt_solver` is set by the solver class"
-    Each solver subclass fixes `kkt_solver` to match its backend
-    (`DenseSolver → "dense_cholesky"`, etc.). You normally do not set it by hand.
 
 ### Differentiation, diagnostics, and logging
 
@@ -133,5 +128,5 @@ cuPIQP equilibrates the problem with a Ruiz preconditioner before solving.
 ### Validation
 
 `settings.verify_settings()` returns `True` when every field is within its valid range
-(positive tolerances, `0 < tau ≤ 1`, a recognized `kkt_solver` and `dtype`, etc.). Use
+(positive tolerances, `0 < tau ≤ 1`, a recognized `dtype`, etc.). Use
 it as a quick sanity check after programmatically constructing settings.

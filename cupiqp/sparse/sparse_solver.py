@@ -5,7 +5,6 @@ import warp as wp
 from ..results import Variables
 from typing import Literal, Optional, Tuple
 
-from ..settings import Settings
 from ..solver import SolverBase
 from ..typedef import CudaArray
 from ..utils import is_cuda_array, as_warp_array
@@ -190,19 +189,19 @@ class SparseSolver(SolverBase):
 
     def __init__(self, dtype: Literal["float32", "float64"] = "float64", stream=None):
         super().__init__(dtype=dtype, stream=stream)
-        self._settings.kkt_solver = "sparse_ldlt"
         # Non-owning cupy view of the solver stream. cupy is used only at
         # setup, to build CSR patterns and index maps; running those ops on
         # the solver stream orders them with the Warp copies that consume
         # their results. The Warp stream owns the handle.
         self._cupy_stream = cp.cuda.ExternalStream(self._stream.cuda_stream)
 
-    @SolverBase.settings.setter
-    def settings(self, value: Settings) -> None:
-        # TODO: here we have to set the kkt solver back. That's pretty ugly. Should be improved in the future
-        value.kkt_solver = "sparse_ldlt"
-        self._settings = value
-
+    def _print_problem_size(self):
+        d = self._data
+        print("sparse backend:")
+        print(f"batch size B = {d.batch_size}")
+        print(f"variables n = {d.n}, nnz(P) = {d.P.nnz}")
+        print(f"equality constraints p = {d.p}, nnz(A) = {d.A.nnz}")
+        print(f"inequality constraints m = {d.m}, nnz(G) = {d.G.nnz}")
 
     def _init_data(
         self,

@@ -330,7 +330,6 @@ class TestDenseKKTSystemCondensedSolve:
         data = random_dense_qp(B=B, n=n, p=p, m=m)
 
         settings = Settings()
-        settings.kkt_solver = "dense_cholesky"
         kkt = KKTSystem()
         kkt.init(data, settings)
         preconditioner = make_preconditioner(data)
@@ -395,7 +394,6 @@ class TestDenseKKTSystemIR:
 
         # --- Without IR ---
         settings_no_ir = Settings()
-        settings_no_ir.kkt_solver = "dense_cholesky"
         settings_no_ir.iterative_refinement_max_iter = 0
         kkt_no_ir = KKTSystem()
         kkt_no_ir.init(data, settings_no_ir)
@@ -431,7 +429,6 @@ class TestDenseKKTSystemIR:
 
         # --- With IR (static reg + iterative refinement) ---
         settings_ir = Settings()
-        settings_ir.kkt_solver = "dense_cholesky"
         settings_ir.iterative_refinement_max_iter = 10
         kkt_ir = KKTSystem()
         kkt_ir.init(data, settings_ir)

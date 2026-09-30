@@ -68,8 +68,6 @@ class Settings:
 
     tau: float = 0.99
 
-    kkt_solver: Literal["sparse_ldlt", "dense_cholesky", "multistage_block_cholesky"] = "sparse_ldlt"
-
     iterative_refinement_always_enabled: bool = False
     iterative_refinement_eps_abs: float = 1e-12
     iterative_refinement_eps_rel: float = 1e-12
@@ -142,8 +140,7 @@ class Settings:
                self.iterative_refinement_max_iter >= 0 and
                self.iterative_refinement_min_improvement_rate >= 1.0 and
                self.iterative_refinement_static_regularization_eps > 0 and
-               self.iterative_refinement_static_regularization_rel >= 0 and
-               self.kkt_solver in ["dense_cholesky", "sparse_ldlt", "multistage_block_cholesky"]
+               self.iterative_refinement_static_regularization_rel >= 0
                and self.dtype in ("float32", "float64")
                and self.gradient_smoothing_mu > 0 and math.isfinite(self.gradient_smoothing_mu)
                and self.gradient_smoothing_tol > 0 and math.isfinite(self.gradient_smoothing_tol)

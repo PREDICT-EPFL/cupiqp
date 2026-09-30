@@ -30,7 +30,6 @@ def _make_random_qp(n=8, p=3, m=5, seed=42):
 def _iter_settings(max_iter=None):
     """Deterministic config (no preconditioner / cuda graph) for iter tests."""
     settings = Settings()
-    settings.kkt_solver = 'dense_cholesky'
     settings.preconditioner_iter = 0
     settings.enable_cuda_graph = False
     if max_iter is not None:
@@ -41,7 +40,6 @@ def _iter_settings(max_iter=None):
 def _solve_single(qp, settings=None):
     """Solve one QP with the existing SolverBase."""
     settings = settings or Settings()
-    settings.kkt_solver = 'dense_cholesky'
     settings.preconditioner_iter = 0
     settings.enable_cuda_graph = False
     solver = DenseSolver()
@@ -81,7 +79,6 @@ class TestBatchedSolverCorrectness:
         # Solve batched
         qps = [_make_random_qp(n, p, m, seed=s) for s in seeds]
         settings = Settings()
-        settings.kkt_solver = 'dense_cholesky'
         settings.preconditioner_iter = 0
         solver = DenseSolver()
         solver.settings = settings
@@ -112,7 +109,6 @@ class TestBatchedSolverCorrectness:
         ref_st, ref_x = _solve_single(qp)
 
         settings = Settings()
-        settings.kkt_solver = 'dense_cholesky'
         settings.preconditioner_iter = 0
         solver = DenseSolver()
         solver.settings = settings
@@ -137,7 +133,6 @@ class TestBatchedSolverCorrectness:
             bs.append(rng.standard_normal(p))
 
         settings = Settings()
-        settings.kkt_solver = 'dense_cholesky'
         settings.preconditioner_iter = 0
         solver = DenseSolver()
         solver.settings = settings
@@ -164,7 +159,6 @@ class TestBatchedSolverBasic:
             P = M @ M.T + 10 * np.eye(n)
             Ps.append((P + P.T) / 2)
         settings = Settings()
-        settings.kkt_solver = 'dense_cholesky'
         settings.preconditioner_iter = 0
         solver = DenseSolver()
         solver.settings = settings

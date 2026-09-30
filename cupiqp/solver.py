@@ -449,31 +449,7 @@ class SolverBase(ABC):
             print("(c) Fenglong Song".center(_w))
             print("Ecole Polytechnique Federale de Lausanne (EPFL) 2026".center(_w))
             print("-" * _w)
-            if self.settings.kkt_solver == "dense_cholesky":
-                print("dense backend:")
-                print(f"batch size B = {self._data.batch_size}")
-                print(f"variables n = {self._data.n}")
-                print(f"equality constraints p = {self._data.p}")
-                print(f"inequality constraints m = {self._data.m}")
-            elif self.settings.kkt_solver == "sparse_ldlt":
-                print("sparse backend:")
-                print(f"batch size B = {self._data.batch_size}")
-                print(f"variables n = {self._data.n}, nnz(P) = {self._data.P.nnz}")
-                print(f"equality constraints p = {self._data.p}, nnz(A) = {self._data.A.nnz}")
-                print(f"inequality constraints m = {self._data.m}, nnz(G) = {self._data.G.nnz}")
-            elif self.settings.kkt_solver == "multistage_block_cholesky":
-                print("multistage backend:")
-                print(f"batch size B = {self._data.batch_size}")
-                d = self._data
-                print(f"variables n = {d.n}, num_blocks(P) = {d.num_blocks}, block_size(P) = ({d.block_size}, {d.block_size})")
-                for label, dim, rows in (("equality constraints p", d.p, d.A_rows),
-                                         ("inequality constraints m", d.m, d.G_rows)):
-                    if rows == 0:
-                        print(f"{label} = {dim}")
-                    else:
-                        print(f"{label} = {dim}, num_blocks = {d.num_blocks}, block_size = ({rows}, {d.block_size})")
-            else:
-                raise ValueError(f"Unsupported kkt_solver type: {self.settings.kkt_solver}")
+            self._print_problem_size()
 
             print(f"inequality lower bounds n_h_l = {self._data.num_hl}")
             print(f"inequality upper bounds n_h_u = {self._data.num_hu}")
@@ -831,6 +807,10 @@ class SolverBase(ABC):
     @abstractmethod
     def _init_preconditioner(self):
         """Backend-specific Ruiz preconditioner construction hook."""
+
+    @abstractmethod
+    def _print_problem_size(self):
+        """Backend-specific verbose banner: backend name and problem sizes."""
 
     def _init_warp_kernels(self) -> None:
         """Create (and thus compile) every kernel of the IPM loop.

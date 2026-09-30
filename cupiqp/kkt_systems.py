@@ -102,18 +102,21 @@ class KKTSystem:
         self._norm_buf = wp.zeros((1,), dtype=self._dtype, device=self._device)
         self._norm_host = wp.zeros(1, dtype=self._dtype, device="cpu", pinned=True)
 
-        # KKT solver backend
-        if settings.kkt_solver == "dense_cholesky":
+        # KKT solver backend, selected by the data storage type
+        from .dense.dense_data import DenseData
+        from .sparse.sparse_data import SparseData
+        from .multistage.multistage_data import MultistageData
+        if isinstance(data, DenseData):
             from .dense.dense_kkt_solver import DenseKKTSolver
             self._kkt_solver = DenseKKTSolver(data)
-        elif settings.kkt_solver == "sparse_ldlt":
+        elif isinstance(data, SparseData):
             from .sparse.sparse_kkt_solver import SparseKKTSolver
             self._kkt_solver = SparseKKTSolver(data, use_deterministic_mode=settings.use_deterministic_mode_for_cudss)
-        elif settings.kkt_solver == "multistage_block_cholesky":
+        elif isinstance(data, MultistageData):
             from .multistage.multistage_kkt_solver import MultistageKKTSolver
             self._kkt_solver = MultistageKKTSolver(data)
         else:
-            raise ValueError(f"Unsupported kkt_solver: {settings.kkt_solver}")
+            raise TypeError(f"Unsupported data type: {type(data).__name__}")
 
         # Contiguous internal buffers with layout [hl | hu | xl | xu] matching s_all/z_all.
         num_ineq = data.num_hl + data.num_hu + data.num_xl + data.num_xu

@@ -97,9 +97,8 @@ s.solve()
 
 The multistage backend exploits **block-tridiagonal / block-tridiagonal-arrow** KKT
 structure — the structure that arises in optimal control problems (OCPs) and other
-multistage programs — with a block Cholesky factorization. It requires the
-[`socu`](https://github.com/PREDICT-EPFL/socu) extra (install with
-`pip install ".[cuda13,multistage]"`).
+multistage programs — with a block Cholesky factorization from
+[`socu`](https://github.com/PREDICT-EPFL/socu), which is installed with cuPIQP.
 
 It takes **plain GPU arrays, block by block**: each block-structured matrix is a
 `(diag, offdiag)` tuple of arrays and each vector an array. Generic dense or CSR

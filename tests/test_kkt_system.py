@@ -202,7 +202,6 @@ def _run_full_solve(B, n, p, m, seed=42, with_box=True):
     """Run the KKTSystem pipeline and verify against a per-problem NumPy reference."""
     data = _make_data(B, n, p, m, seed=seed, with_box=with_box)
     settings = Settings()
-    settings.kkt_solver = 'dense_cholesky'
     kkt_sys = KKTSystem()
     kkt_sys.init(data, settings)
     pc = DenseRuizEquilibration(B, data.n, data.p, data.m, has_h_l=data.has_h_l, has_h_u=data.has_h_u, has_x_l=data.has_x_l, has_x_u=data.has_x_u)
@@ -395,7 +394,6 @@ class TestKKTSystemEqualityOnly:
             b=cp.zeros((B, p)),
         )
         settings = Settings()
-        settings.kkt_solver = 'dense_cholesky'
         kkt_sys = KKTSystem()
         kkt_sys.init(data, settings)
         pc = DenseRuizEquilibration(B, data.n, data.p, data.m, has_h_l=data.has_h_l, has_h_u=data.has_h_u, has_x_l=data.has_x_l, has_x_u=data.has_x_u)
@@ -447,7 +445,6 @@ class TestKKTSystemCondensedMatvec:
     def test_K_times_lhs_recovers_rhs(self, B, n, p, m):
         data = _make_data(B, n, p, m)
         settings = Settings()
-        settings.kkt_solver = 'dense_cholesky'
         kkt_sys = KKTSystem()
         kkt_sys.init(data, settings)
         pc = DenseRuizEquilibration(B, data.n, data.p, data.m, has_h_l=data.has_h_l, has_h_u=data.has_h_u, has_x_l=data.has_x_l, has_x_u=data.has_x_u)
@@ -498,7 +495,6 @@ class TestKKTSystemMatvec:
     def test_eval_P_x(self, B, n, p, m):
         data = _make_data(B=B, n=n, p=p, m=m)
         settings = Settings()
-        settings.kkt_solver = 'dense_cholesky'
         kkt_sys = KKTSystem()
         kkt_sys.init(data, settings)
 
@@ -514,7 +510,6 @@ class TestKKTSystemMatvec:
     def test_eval_A_xn_and_AT_xt(self, B, n, p, m):
         data = _make_data(B=B, n=n, p=p, m=m)
         settings = Settings()
-        settings.kkt_solver = 'dense_cholesky'
         kkt_sys = KKTSystem()
         kkt_sys.init(data, settings)
 

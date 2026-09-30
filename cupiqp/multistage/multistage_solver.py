@@ -3,9 +3,8 @@ import warp as wp
 from ..utils import as_warp_array
 
 from ..results import Variables
-from typing import Literal, Optional
+from typing import Optional
 
-from ..settings import Settings
 from ..solver import SolverBase
 from .multistage_data import MultistageData, BlockPair
 from .multistage_preconditioner import MultistageRuizEquilibration
@@ -100,24 +99,25 @@ class MultistageSolver(SolverBase):
 
     Notes
     -----
-    Requires the ``socu`` block-solver package (install the ``multistage``
-    extra: ``pip install ".[cuda13,multistage]"``). ``setup`` can be called
-    only once per instance; for a different structure (block sizes, which
-    blocks and bound sides are present), create a new ``MultistageSolver``.
+    Uses the ``socu`` block-solver package, which is installed with cuPIQP.
+    ``setup`` can be called only once per instance; for a different structure
+    (block sizes, which blocks and bound sides are present), create a new
+    ``MultistageSolver``.
     Solver behaviour (tolerances, verbosity, iteration cap, ...) is
     configured through ``solver.settings``.
     """
 
-    def __init__(self, dtype: Literal["float32", "float64"] = "float64", stream=None):
-        super().__init__(dtype=dtype, stream=stream)
-        self._settings.kkt_solver = "multistage_block_cholesky"
-
-    @SolverBase.settings.setter
-    def settings(self, value: Settings) -> None:
-        # TODO: here we have to set the kkt solver back. That's pretty ugly. Should be improved in the future
-        value.kkt_solver = "multistage_block_cholesky"
-        self._settings = value
-
+    def _print_problem_size(self):
+        d = self._data
+        print("multistage backend:")
+        print(f"batch size B = {d.batch_size}")
+        print(f"variables n = {d.n}, num_blocks(P) = {d.num_blocks}, block_size(P) = ({d.block_size}, {d.block_size})")
+        for label, dim, rows in (("equality constraints p", d.p, d.A_rows),
+                                 ("inequality constraints m", d.m, d.G_rows)):
+            if rows == 0:
+                print(f"{label} = {dim}")
+            else:
+                print(f"{label} = {dim}, num_blocks = {d.num_blocks}, block_size = ({rows}, {d.block_size})")
 
     def _init_data(
         self,
