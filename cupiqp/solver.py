@@ -808,8 +808,25 @@ class SolverBase(ABC):
             info.status_value[still_unsolved] = Status.CUPIQP_NUMERICAL_ISSUES.value
 
     @abstractmethod
-    def _init_data(self, P, c, A, b, G, h_u, h_l, x_u, x_l):
-        """Backend-specific data construction hook."""
+    def _init_data(
+        self,
+        P: Any,
+        c: wp.array,
+        A: Optional[Any],
+        b: Optional[wp.array],
+        G: Optional[Any],
+        h_u: Optional[wp.array],
+        h_l: Optional[wp.array],
+        x_u: Optional[wp.array],
+        x_l: Optional[wp.array]
+    ) -> Data:
+        """Backend-specific data construction hook.
+
+        Receives the inputs of the public ``setup()`` after its boundary
+        conversion: vectors are Warp arrays of the solver dtype, and ``P``,
+        ``A``, ``G`` are in the backend's matrix form (a Warp array for dense,
+        a CSR triple for sparse, a ``(diag, offdiag)`` pair for multistage).
+        """
 
     @abstractmethod
     def _init_preconditioner(self):

@@ -51,20 +51,27 @@ def random_sparse_qp(
     x_l[rng.random(n) < 0.3] = -np.inf
 
     data = SparseData()
-    # Vectors are handed over as Warp arrays: Data objects take Warp only.
-    w = lambda a: wp.array(cp.array(a), copy=False)
     data.init(
-        P=csr_matrix(P), c=w(c),
-        A=csr_matrix(A), b=w(b),
-        G=csr_matrix(G), h_u=w(h_u), h_l=w(h_l),
-        x_u=w(x_u), x_l=w(x_l),
+        P=_csr(P), c=_w(c),
+        A=_csr(A), b=_w(b),
+        G=_csr(G), h_u=_w(h_u), h_l=_w(h_l),
+        x_u=_w(x_u), x_l=_w(x_l),
         )
     return data
 
 
 def _w(a):
-    """Zero-copy Warp view: the KKT internals take Warp arrays only."""
-    return wp.array(a, copy=False)
+    """Warp view of ``a`` on the GPU: the KKT internals and Data objects take
+    Warp arrays only."""
+    return wp.array(cp.asarray(a), copy=False)
+
+
+def _csr(M) -> tuple:
+    """CSR triple ``(indptr, indices, values)`` of Warp views of a GPU CSR copy
+    of ``M`` (Data objects take Warp arrays only)."""
+    M = csr_matrix(M)
+    M.sort_indices()
+    return tuple(wp.array(a, copy=False) for a in (M.indptr, M.indices, M.data))
 
 
 def random_rhs(n: int, p: int, m: int, seed: int) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray]:

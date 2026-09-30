@@ -46,13 +46,14 @@ P = cp.eye(4)
 c = cp.zeros(4)
 
 s = DenseSolver()
-s.setup(1, P=P, c=c)      # batch size, then one problem
+s.setup(P=P, c=c)      # one problem
 s.solve()
 ```
 
-- `P`, `A`, `G` must be **dense** GPU arrays (2D for a single problem, 3D `(B, …)` for a
-  batch).
-- The vector inputs (`c`, `b`, `h_l`, `h_u`, `x_l`, `x_u`) are dense GPU vectors.
+- `P`, `A`, `G` must be **dense** GPU arrays: 2D shared by every problem, or 3D `(B, …)`
+  with one matrix per problem.
+- The vector inputs (`c`, `b`, `h_l`, `h_u`, `x_l`, `x_u`) are dense GPU arrays: 1D shared,
+  or 2D `(B, k)` per problem. The batch size `B` is read from the batched inputs.
 
 ---
 
@@ -62,29 +63,29 @@ The sparse backend uses a sparse LDLᵀ direct factorization (cuDSS) and is far 
 efficient than the dense backend for large, structurally sparse problems.
 
 ```python
-from cupyx.scipy.sparse import csr_matrix
 from cupiqp import SparseSolver
 
 s = SparseSolver()
 s.setup(
-    B,                                   # batch size
-    P=csr_matrix(P), c=c,                # ONE template problem: 2-D CSR + 1-D vectors
-    A=csr_matrix(A), b=b,
-    G=csr_matrix(G), h_l=h_l, h_u=h_u,
+    P=(P_indptr, P_indices, P_values),   # values (nnz,) shared, or (B, nnz) per problem
+    c=c,                                 # (n,) or (B, n)
+    A=(A_indptr, A_indices, A_values), b=b,
+    G=(G_indptr, G_indices, G_values), h_l=h_l, h_u=h_u,
 )
-s.update(P=P_values, c=c_b)              # per-problem numbers: (B, nnz) and (B, n)
+s.solve()
+s.update(P=P_values_new, c=c_new)        # values only: (B, nnz) and (B, n)
 s.solve()
 ```
 
-- `setup(batch_size, ...)` takes **one** problem: `P`, `A`, `G` as single 2-D **GPU
-  CSR** matrices (`cupyx.scipy.sparse.csr_matrix` or a 2-D CUDA `torch.sparse_csr_tensor`)
-  and 1-D vectors. It fixes the structure shared by all `B` problems (sparsity patterns,
-  which blocks and bound sides exist) and copies its values into every problem.
-- `update` sets per-problem numbers. A matrix is given by its **nonzero values** only, a
-  dense `(B, nnz)` array in the CSR order of the template (or `(nnz,)` to share one set of
-  values); vectors are `(B, k)` or `(k,)`. The sparsity pattern never changes after
-  `setup`, so store every entry that may be nonzero in *any* problem (explicit zeros are
-  fine).
+- `P`, `A`, `G` are **CSR triples** `(indptr, indices, values)` of GPU arrays. `indptr`
+  and `indices` are `int32` or `int64`, with column indices sorted within each row; for a
+  cupyx `csr_matrix` `M` pass `(M.indptr, M.indices, M.data)`, for a CUDA torch CSR
+  tensor `T` pass `(T.crow_indices(), T.col_indices(), T.values())`. `setup` checks the
+  pattern once.
+- The pattern is shared by every problem and fixed by `setup`: store every entry that may
+  be nonzero in *any* problem (explicit zeros are fine). Values and vectors are shared
+  (`(nnz,)`, `(k,)`) or batched (`(B, nnz)`, `(B, k)`), at `setup` and at `update`;
+  `update` takes a matrix's values only.
 
 !!! tip "Bit-reproducible cuDSS"
     Set `settings.use_deterministic_mode_for_cudss = True` for bit-wise reproducible
@@ -111,11 +112,11 @@ from cupiqp import MultistageSolver
 
 s = MultistageSolver()
 s.setup(
-    B,                                  # batch size, then ONE template problem
-    P=(P_diag, P_offdiag),              # (N, d, d), (N-1, d, d)
-    c=c,                                # (N, d) or flat (N*d,)
+    P=(P_diag, P_offdiag),              # (N, d, d), (N-1, d, d): shared by every problem
+    c=c_batch,                          # (B, N, d): batched, so this is a batch of B
     A=(A_diag, A_offdiag), b=b,         # (N, r, d) each; b: (N+1, r) or flat
 )
+s.solve()
 s.update(P=(None, P_offdiag_batch))     # per-problem data (B, ...); None = unchanged
 s.solve()
 ```

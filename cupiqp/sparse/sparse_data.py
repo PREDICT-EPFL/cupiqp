@@ -1,35 +1,26 @@
-from typing import Any, Optional
+from typing import Optional, Tuple
 import warp as wp
 
 from ..data import Data
+from ..typedef import CudaArray
 from ..utils import batch_broadcast_view
 from .batched_csr import UniformBatchedCsrMatrix
 
 
-# Type alias for the accepted matrix input forms.
-# - For batched (B > 1): UniformBatchedCsrMatrix, 3-D torch.sparse_csr_tensor, or List[cupy csr_matrix].
-# - For single (B = 1): cupy csr_matrix or 2-D torch.sparse_csr_tensor.
-SparseMatrixInput = Any
+# A sparse matrix as a CSR triple (indptr, indices, values) of GPU arrays,
+# values (nnz,) shared by every problem or (B, nnz). SparseSolver.setup takes
+# any GPU arrays; SparseData.init receives Warp arrays.
+CsrTriple = Tuple[CudaArray, CudaArray, CudaArray]
 
 
 class SparseData(Data):
-    """Sparse data structure for batched QP problems.
+    """Sparse data for a batch of QPs sharing one sparsity pattern per matrix.
 
-    Matrices ``P``, ``A``, ``G`` are stored internally as
-    :class:`UniformBatchedCsrMatrix` instances -- one shared ``indptr``/``indices``
-    pair plus a packed ``(B, nnz)`` Warp values buffer. Callers may pass any of
-    the following for each matrix:
-
-    * :class:`UniformBatchedCsrMatrix` (already has a uniform structure)
-    * ``torch.sparse_csr_tensor`` -- 3-D ``(B, M, N)`` for batched,
-      2-D ``(M, N)`` for single
-    * ``list[cupy csr_matrix]`` sharing the same sparsity pattern
-    * a single cupy ``csr_matrix`` (B = 1)
-
-    Whatever the input, the normalized storage is a ``UniformBatchedCsrMatrix``
-    accessible via ``self.P`` / ``self.A`` / ``self.G``. Dense vectors
-    (``c``, ``b``, ``h_l``, ``h_u``, ``x_l``, ``x_u``) are Warp arrays with a
-    leading batch dimension ``(B, k)``.
+    Matrices ``P``, ``A``, ``G`` are stored as :class:`UniformBatchedCsrMatrix`
+    instances - one shared ``indptr`` / ``indices`` pair plus a packed
+    ``(B, nnz)`` Warp values buffer - accessible via ``self.P`` / ``self.A`` /
+    ``self.G``. Dense vectors (``c``, ``b``, ``h_l``, ``h_u``, ``x_l``,
+    ``x_u``) are Warp arrays with a leading batch dimension ``(B, k)``.
     """
 
     def __init__(self, dtype="float64", device: str = "cuda"):
@@ -37,71 +28,62 @@ class SparseData(Data):
 
     def init(
         self,
-        P: SparseMatrixInput,
-        c,
-        A: Optional[SparseMatrixInput] = None,
-        b=None,
-        G: Optional[SparseMatrixInput] = None,
-        h_u=None,
-        h_l=None,
-        x_u=None,
-        x_l=None
+        P: CsrTriple,
+        c: wp.array,
+        A: Optional[CsrTriple] = None,
+        b: Optional[wp.array] = None,
+        G: Optional[CsrTriple] = None,
+        h_u: Optional[wp.array] = None,
+        h_l: Optional[wp.array] = None,
+        x_u: Optional[wp.array] = None,
+        x_l: Optional[wp.array] = None
     ):
-        # -- P (determines B and n) -------------------------------------
-        self._P = UniformBatchedCsrMatrix.from_input(
-            P, dtype=self._dtype, device=self._device, validate_shared_sparsity=True
-        )
-        B = self._P.batch_size
-        if self._P.rows != self._P.cols:
-            raise ValueError("P must be square.")
-        n = self._P.rows
+        """Allocate and populate the batched buffers.
+
+        Matrices are CSR triples ``(indptr, indices, values)`` of Warp arrays
+        with a valid pattern (``SparseSolver`` checks it at its public
+        boundary): ``P`` is square with ``len(indptr) - 1`` rows, ``A`` and
+        ``G`` have as many columns as ``P``. Every value array and vector is
+        either **shared** (``(nnz,)``, ``(k,)``, copied into every problem) or
+        **batched** (``(B, nnz)``, ``(B, k)``). ``B`` is read from the batched
+        arrays, which must agree; with none it is ``1``.
+        """
+        if (A is None) != (b is None):
+            raise ValueError("A and b must either both be provided or both be None.")
+        if G is not None and h_l is None and h_u is None:
+            raise ValueError("Either h_l or h_u must be provided when G is given.")
+        if G is None and (h_u is not None or h_l is not None):
+            raise ValueError("h_l and h_u must be None when G is None.")
+
+        batch_dims = {}
+        for name, M in (("P", P), ("A", A), ("G", G)):
+            if M is not None:
+                batch_dims[name] = int(M[2].shape[0]) if M[2].ndim == 2 else None
+        for name, v in (("c", c), ("b", b), ("h_u", h_u), ("h_l", h_l), ("x_u", x_u), ("x_l", x_l)):
+            if v is not None:
+                batch_dims[name] = int(v.shape[0]) if v.ndim == 2 else None
+        B = self._resolve_batch_size(batch_dims)
+        n = int(P[0].shape[0]) - 1
         self._batch_size = B
         self._n = n
 
-        # -- c -----------------------------------------------------------
+        def csr(M: Optional[CsrTriple]) -> UniformBatchedCsrMatrix:
+            if M is None:
+                return UniformBatchedCsrMatrix.empty(B, 0, n, dtype=self._dtype, device=self._device)
+            indptr, indices, values = M
+            return UniformBatchedCsrMatrix(
+                B, indptr, indices, values, shape=(int(indptr.shape[0]) - 1, n),
+                dtype=self._dtype, device=self._device
+            )
+
+        self._P = csr(P)
+        self._A = csr(A)
+        self._G = csr(G)
+        p, m = self._A.rows, self._G.rows
+
         self._c = self._init_vec(c, n, "c", B)
+        self._b = self._init_vec(b, p, "b", B) if b is not None else wp.zeros((B, 0), dtype=self._dtype, device=self._device)
 
-        # -- A, b --------------------------------------------------------
-        if (A is None) != (b is None):
-            raise ValueError("A and b must either both be provided or both be None.")
-        if A is not None and b is not None:
-            self._A = UniformBatchedCsrMatrix.from_input(
-                A, dtype=self._dtype, device=self._device, validate_shared_sparsity=True
-            )
-            if self._A.batch_size != B:
-                raise ValueError(
-                    f"A batch size ({self._A.batch_size}) != P batch size ({B})"
-                )
-            if self._A.cols != n:
-                raise ValueError(
-                    f"A.cols ({self._A.cols}) != n ({n})"
-                )
-            self._b = self._init_vec(b, self._A.rows, "b", B)
-        else:
-            self._A = UniformBatchedCsrMatrix.empty(B, 0, n, dtype=self._dtype, device=self._device)
-            self._b = wp.zeros((B, 0), dtype=self._dtype, device=self._device)
-
-        # -- G, h_u, h_l ------------------------------------------------
-        if G is not None:
-            if h_l is None and h_u is None:
-                raise ValueError("Either h_l or h_u must be provided when G is given.")
-            self._G = UniformBatchedCsrMatrix.from_input(
-                G, dtype=self._dtype, device=self._device, validate_shared_sparsity=True
-            )
-            if self._G.batch_size != B:
-                raise ValueError(
-                    f"G batch size ({self._G.batch_size}) != P batch size ({B})"
-                )
-            if self._G.cols != n:
-                raise ValueError(
-                    f"G.cols ({self._G.cols}) != n ({n})"
-                )
-        else:
-            if h_u is not None or h_l is not None:
-                raise ValueError("h_l and h_u must be None when G is None.")
-            self._G = UniformBatchedCsrMatrix.empty(B, 0, n, dtype=self._dtype, device=self._device)
-
-        m = self._G.rows
         self._has_h_l = h_l is not None
         self._has_h_u = h_u is not None
         self._h_u = self._init_vec(h_u, m, "h_u", B) if h_u is not None else wp.zeros((B, 0), dtype=self._dtype, device=self._device)

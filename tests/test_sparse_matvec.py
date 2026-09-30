@@ -31,7 +31,7 @@ def _random_csr(
     A_dense = rng.standard_normal((m, n))
     A_dense[rng.random((m, n)) >= density] = 0.0
     A = sparse.csr_matrix(cp.asarray(A_dense, dtype=cp.float64))
-    return UniformBatchedCsrMatrix.from_cupy_csr_matrix(A), A
+    return UniformBatchedCsrMatrix(1, A.indptr, A.indices, A.data, shape=A.shape), A
 
 
 def _random_batched_csr(
@@ -214,7 +214,7 @@ def test_reuse_different_scalars() -> None:
 @pytest.mark.parametrize("n", [1, 2, 8, 64, 256])
 def test_identity(n: int) -> None:
     A = sparse.eye(n, dtype=cp.float64, format="csr")
-    mat = UniformBatchedCsrMatrix.from_cupy_csr_matrix(A)
+    mat = UniformBatchedCsrMatrix(1, A.indptr, A.indices, A.data, shape=A.shape)
     x = cp.arange(n, dtype=cp.float64)
     y = cp.zeros(n, dtype=cp.float64)
 

@@ -25,53 +25,45 @@ class DenseData(Data):
              h_u: Optional[wp.array] = None,
              h_l: Optional[wp.array] = None,
              x_u: Optional[wp.array] = None,
-             x_l: Optional[wp.array] = None,
-             batch_size: Optional[int] = None):
+             x_l: Optional[wp.array] = None):
         """Allocate and populate the batched buffers.
 
-        Every input is either **one problem** (``P`` of shape ``(n, n)``,
-        vectors ``(k,)``) or a **batch** with a leading batch axis
-        (``(B, n, n)``, ``(B, k)``). Single-problem inputs are copied into
-        every one of ``batch_size`` problems (``1`` when not given); batched
-        inputs must all share the batch size.
+        Every input is either **shared** - the single-problem shape (``P`` of
+        shape ``(n, n)``, vectors ``(k,)``), copied into every problem - or
+        **batched**, with a leading batch axis (``(B, n, n)``, ``(B, k)``).
+        ``B`` is read from the batched inputs, which must agree.
         """
-        P_src = P
-        c_src = c
-        if P_src.ndim == 2:
-            B = 1 if batch_size is None else int(batch_size)
-        elif P_src.ndim == 3:
-            B = int(P_src.shape[0])
-            if batch_size is not None and int(batch_size) != B:
-                raise ValueError(f"P has batch size {B}, but batch_size={batch_size} was given.")
-        else:
-            raise ValueError(f"P must have shape (n, n) or (B, n, n), got {tuple(P_src.shape)}")
-        n = int(P_src.shape[-1])
-        if P_src.shape[-2] != n:
-            raise ValueError(f"P must be square, got {tuple(P_src.shape)}")
-        if c_src.ndim not in (1, 2) or c_src.shape[-1] != n:
-            raise ValueError(f"c must have shape ({n},) or ({B}, {n}), got {tuple(c_src.shape)}")
-        if c_src.ndim == 2 and c_src.shape[0] != B:
-            raise ValueError("Batch size mismatch between P and c.")
+        if P.ndim not in (2, 3):
+            raise ValueError(f"P must have shape (n, n) or (B, n, n), got {tuple(P.shape)}")
+        n = int(P.shape[-1])
+        if P.shape[-2] != n:
+            raise ValueError(f"P must be square, got {tuple(P.shape)}")
+        # A matrix is batched when 3-D, a vector when 2-D.
+        batch_dims = {}
+        for name, v, single_ndim in (("P", P, 2), ("c", c, 1), ("A", A, 2), ("b", b, 1), ("G", G, 2),
+                                     ("h_u", h_u, 1), ("h_l", h_l, 1), ("x_u", x_u, 1), ("x_l", x_l, 1)):
+            if v is not None:
+                batch_dims[name] = int(v.shape[0]) if v.ndim == single_ndim + 1 else None
+        B = self._resolve_batch_size(batch_dims)
 
         self._batch_size = B
         self._n = n
 
         self._P = wp.zeros((B, n, n), dtype=self._dtype, device=self._device)
-        self._write(self._P, P_src, "P")
-        self._c = self._init_vec(c_src, n, "c", B)
+        self._write(self._P, P, "P")
+        self._c = self._init_vec(c, n, "c", B)
 
         # --- equality constraints ---
         if (A is None) != (b is None):
             raise ValueError("A and b must either both be provided or both be None.")
         if A is not None:
-            A_src = A
-            if A_src.ndim not in (2, 3):
-                raise ValueError(f"A must have shape (p, n) or (B, p, n), got {tuple(A_src.shape)}")
-            if A_src.shape[-1] != n:
+            if A.ndim not in (2, 3):
+                raise ValueError(f"A must have shape (p, n) or (B, p, n), got {tuple(A.shape)}")
+            if A.shape[-1] != n:
                 raise ValueError("Column mismatch between A and P.")
-            p = int(A_src.shape[-2])
+            p = int(A.shape[-2])
             self._A = wp.zeros((B, p, n), dtype=self._dtype, device=self._device)
-            self._write(self._A, A_src, "A")
+            self._write(self._A, A, "A")
             self._b = self._init_vec(b, p, "b", B)
         else:
             self._A = wp.zeros((B, 0, n), dtype=self._dtype, device=self._device)
@@ -79,16 +71,15 @@ class DenseData(Data):
 
         # --- inequality constraints ---
         if G is not None:
-            G_src = G
-            if G_src.ndim not in (2, 3):
-                raise ValueError(f"G must have shape (m, n) or (B, m, n), got {tuple(G_src.shape)}")
-            if G_src.shape[-1] != n:
+            if G.ndim not in (2, 3):
+                raise ValueError(f"G must have shape (m, n) or (B, m, n), got {tuple(G.shape)}")
+            if G.shape[-1] != n:
                 raise ValueError("Shape mismatch in G.")
             if h_l is None and h_u is None:
                 raise ValueError("Either h_l or h_u must be provided when G is given.")
-            m = int(G_src.shape[-2])
+            m = int(G.shape[-2])
             self._G = wp.zeros((B, m, n), dtype=self._dtype, device=self._device)
-            self._write(self._G, G_src, "G")
+            self._write(self._G, G, "G")
         else:
             if h_u is not None or h_l is not None:
                 raise ValueError("h_l and h_u must be None when G is None.")

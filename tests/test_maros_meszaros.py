@@ -7,10 +7,16 @@ import numpy as np
 import pytest
 import scipy.io
 import scipy.sparse as sp
-from cupyx.scipy.sparse import csr_matrix
 
 from cupiqp import SparseSolver, Status
 
+
+
+def _csr_triple(M):
+    """GPU CSR triple of a host sparse matrix, with sorted column indices."""
+    M = sp.csr_matrix(M)
+    M.sort_indices()
+    return tuple(cp.asarray(a) for a in (M.indptr, M.indices, M.data))
 
 def _problem_files():
     data_folder = os.path.join(os.path.dirname(__file__), 'data/maros_meszaros')
@@ -38,12 +44,10 @@ def test_maros_meszaros_problem(problem_file):
     solver.settings.max_iter = 250
     solver.settings.eps_abs = 1e-6
     solver.settings.iterative_refinement_always_enabled = True
-    solver.setup(
-        1,
-        P=csr_matrix(P), c=cp.array(c),
-        A=csr_matrix(A) if A is not None else None,
+    solver.setup(P=_csr_triple(P), c=cp.array(c),
+        A=_csr_triple(A) if A is not None else None,
         b=cp.array(b) if b is not None else None,
-        G=csr_matrix(G) if G is not None else None,
+        G=_csr_triple(G) if G is not None else None,
         h_u=cp.array(h_u) if h_u is not None else None,
         h_l=cp.array(h_l) if h_l is not None else None,
         x_u=cp.array(x_u) if x_u is not None else None,

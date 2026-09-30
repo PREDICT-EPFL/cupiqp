@@ -24,7 +24,7 @@ c = cp.array([-1.0, 2.0])
 
 solver = DenseSolver()
 solver.settings.enable_grad = True  # enable gradient computation
-solver.setup(1, P=P, c=c)
+solver.setup(P=P, c=c)
 
 status = solver.solve()              # always a list, one Status per problem
 assert status[0] == Status.CUPIQP_SOLVED
@@ -135,7 +135,7 @@ Enable it (with `enable_grad`) **before** `setup()`; the mode is fixed at setup:
 solver.settings.enable_grad = True
 solver.settings.gradient_smoothing = True
 solver.settings.gradient_smoothing_mu = 1e-3   # smoothing amount (default)
-solver.setup(1, P=P, c=c, x_l=x_l)
+solver.setup(P=P, c=c, x_l=x_l)
 solver.solve()
 grad = solver.backward(grad_x=grad_x)             # smoothed surrogate VJP
 ```

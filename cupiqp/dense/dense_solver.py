@@ -1,4 +1,3 @@
-import numpy as np
 import warp as wp
 
 from ..results import Variables
@@ -14,14 +13,15 @@ from .dense_solver_kernels import create_dense_data_gradients_kernel
 
 
 def _check_dense(name: str, m, ndim: int, dtype) -> Optional[wp.array]:
-    """Warp view of the ``ndim``-D GPU array ``m`` in the solver ``dtype``
-    (``None`` passes through).
+    """Warp view of the GPU array ``m`` in the solver ``dtype`` (``None``
+    passes through).
 
     Used for **all** P / c / A / b / G / h_* / x_* inputs of
-    :meth:`DenseSolver.setup`, which describe one problem: matrices are
-    2-D and vectors 1-D. Every argument that's not ``None`` must be a GPU
-    array (Warp, cupy, CUDA torch, JAX, ...) of the solver dtype; this is
-    the one place that checks it.
+    :meth:`DenseSolver.setup`. ``ndim`` is the single-problem rank (2 for a
+    matrix, 1 for a vector); one extra leading batch axis is allowed. Every
+    argument that's not ``None`` must be a GPU array (Warp, cupy, CUDA
+    torch, JAX, ...) of the solver dtype; this is the one place that checks
+    it.
     """
     if m is None:
         return None
@@ -32,12 +32,12 @@ def _check_dense(name: str, m, ndim: int, dtype) -> Optional[wp.array]:
             f"array, etc.); got {type(m).__name__}."
         )
     arr = as_warp_array(m, name, dtype=dtype)
-    if arr.ndim != ndim:
+    if arr.ndim not in (ndim, ndim + 1):
         kind = "matrix" if ndim == 2 else "vector"
         raise ValueError(
-            f"DenseSolver.setup requires {name} to be a {ndim}-D {kind} "
-            f"describing one problem; got a {arr.ndim}-D array. The batch size is "
-            f"passed separately; set per-problem values with update()."
+            f"DenseSolver.setup requires {name} to be a {kind}: {ndim}-D for one "
+            f"problem shared by the whole batch, or {ndim + 1}-D with a leading "
+            f"batch axis; got a {arr.ndim}-D array."
         )
     return arr
 
@@ -68,15 +68,14 @@ class DenseSolver(SolverBase):
     CPU JAX arrays) is rejected with a ``TypeError`` rather than copied to
     the device behind your back.
 
-    **Batching - setup from one problem, then per-problem values.**
-    ``DenseSolver`` solves ``B`` independent QPs in a single GPU call.
-    ``setup`` takes the batch size and **one** template problem (2-D
-    matrices, 1-D vectors); the template fixes the structure shared by all
-    ``B`` problems - the dimensions and which constraint blocks and bound
-    sides exist - and its values are copied into every problem. ``update``
-    then sets per-problem values with a leading batch axis (``P`` of shape
-    ``(B, n, n)``, ``c`` of shape ``(B, n)``, ...), or with the unbatched
-    shape to share one value across the batch.
+    **Batching.** ``DenseSolver`` solves ``B`` independent QPs in a single
+    GPU call. Every argument of ``setup`` and ``update`` is either
+    **batched**, with a leading batch axis (``P`` of shape ``(B, n, n)``,
+    ``c`` of shape ``(B, n)``, ...), one value per problem, or **shared**,
+    in the single-problem shape (``(n, n)``, ``(n,)``, ...), one value for
+    every problem. ``setup`` reads ``B`` from the batched arguments and fixes
+    the structure shared by all problems - the dimensions and which
+    constraint blocks and bound sides exist.
 
     **Results are Warp arrays.** ``solver.result.x`` is a ``(B, n)``
     ``warp.array`` on the GPU; use ``.numpy()`` for a host copy, or view it
@@ -109,7 +108,7 @@ class DenseSolver(SolverBase):
     h_u = cp.array([1.0])           # x1 + x2 <= 1
 
     solver = DenseSolver()
-    solver.setup(1, P=P, c=c, G=G, h_l=h_l, h_u=h_u)   # batch size 1
+    solver.setup(P=P, c=c, G=G, h_l=h_l, h_u=h_u)   # all shared: one problem
     solver.solve()
 
     print(solver.result.info.status[0].name)    # CUPIQP_SOLVED
@@ -120,8 +119,10 @@ class DenseSolver(SolverBase):
 
     ```python
     solver = DenseSolver()
-    solver.setup(8, P=P, c=c, G=G, h_l=h_l, h_u=h_u)   # template, 8 copies
-    solver.update(c=cp.random.standard_normal((8, 2)))  # per-problem c
+    solver.setup(P=P, c=cp.random.standard_normal((8, 2)),   # batched c: B = 8
+                 G=G, h_l=h_l, h_u=h_u)                       # shared by all 8
+    solver.solve()
+    solver.update(c=cp.random.standard_normal((8, 2)))      # new values, same structure
     solver.solve()
     ```
 
@@ -155,20 +156,20 @@ class DenseSolver(SolverBase):
 
     def _init_data(
         self,
-        P: CudaArray,
-        c: CudaArray,
-        A: Optional[CudaArray],
-        b: Optional[CudaArray],
-        G: Optional[CudaArray],
-        h_u: Optional[CudaArray],
-        h_l: Optional[CudaArray],
-        x_u: Optional[CudaArray],
-        x_l: Optional[CudaArray]
+        P: wp.array,
+        c: wp.array,
+        A: Optional[wp.array],
+        b: Optional[wp.array],
+        G: Optional[wp.array],
+        h_u: Optional[wp.array],
+        h_l: Optional[wp.array],
+        x_u: Optional[wp.array],
+        x_l: Optional[wp.array]
     ) -> DenseData:
-        # The single-problem template is copied into every problem of the
-        # batch by DenseData.init.
+        # DenseData.init reads the batch size from the batched inputs and
+        # copies shared inputs into every problem.
         data = DenseData(dtype=self.settings.dtype, device=self.settings.device)
-        data.init(P, c, A, b, G, h_u, h_l, x_u, x_l, batch_size=self._setup_batch_size)
+        data.init(P, c, A, b, G, h_u, h_l, x_u, x_l)
         return data
 
     def _init_preconditioner(self) -> DenseRuizEquilibration:
@@ -184,7 +185,6 @@ class DenseSolver(SolverBase):
 
     def setup(
         self,
-        batch_size: int,
         P: CudaArray,
         c: CudaArray,
         A: Optional[CudaArray] = None,
@@ -195,52 +195,55 @@ class DenseSolver(SolverBase):
         x_u: Optional[CudaArray] = None,
         x_l: Optional[CudaArray] = None
     ) -> None:
-        """Fix the problem structure from one template problem and allocate
-        all GPU memory for a batch of ``batch_size`` problems.
+        """Fix the problem structure, load the data of every problem of the
+        batch, and allocate all GPU memory.
 
-        You describe a **single** problem here. Its dimensions, and which
-        constraint blocks and bound sides are present, become the structure
-        shared by all ``batch_size`` problems; its values are copied into
-        every problem of the batch. Afterwards, give each problem its own
-        values with :meth:`update`, then call :meth:`solve`. Calling
-        :meth:`solve` directly after ``setup()`` solves ``batch_size`` copies
-        of the template. Call ``setup()`` once per solver instance.
+        Each argument is either **shared** - the shape of a single problem,
+        e.g. ``P`` of shape ``(n, n)`` or ``c`` of shape ``(n,)``, used by
+        every problem - or **batched**, with a leading batch axis, e.g. ``P``
+        of shape ``(B, n, n)`` or ``c`` of shape ``(B, n)``. The batch size
+        ``B`` is read from the batched arguments, which must agree; if every
+        argument is shared, ``B = 1``. The dimensions and which constraint
+        blocks and bound sides are present become the structure of the
+        solver. Call :meth:`solve` right away, or change values with
+        :meth:`update` first. Call ``setup()`` once per solver instance.
 
         Parameters
         ----------
-        batch_size : int
-            Number of QPs ``B`` solved together.
         P : GPU array
-            Quadratic cost of one problem, shape ``(n, n)``. Must be
-            symmetric positive semidefinite. Required.
+            Quadratic cost, ``(n, n)`` or ``(B, n, n)``. Must be symmetric
+            positive semidefinite. Required.
         c : GPU array
-            Linear cost, shape ``(n,)``. Required.
+            Linear cost, ``(n,)`` or ``(B, n)``. Required.
         A, b : GPU array, optional
-            Equality constraints ``A x = b``: ``A`` of shape ``(p, n)``, ``b``
-            of shape ``(p,)``. Provide both or neither.
+            Equality constraints ``A x = b``: ``A`` of shape ``(p, n)`` or
+            ``(B, p, n)``, ``b`` of shape ``(p,)`` or ``(B, p)``. Provide both
+            or neither.
         G, h_l, h_u : GPU array, optional
-            Inequalities ``h_l <= G x <= h_u``: ``G`` of shape ``(m, n)``,
-            bounds of shape ``(m,)``. At least one bound is required when
-            ``G`` is given; an omitted side is absent for the lifetime of the
-            solver. Use ``-inf`` / ``+inf`` entries for one-sided rows.
+            Inequalities ``h_l <= G x <= h_u``: ``G`` of shape ``(m, n)`` or
+            ``(B, m, n)``, bounds ``(m,)`` or ``(B, m)``. At least one bound
+            is required when ``G`` is given; an omitted side is absent for the
+            lifetime of the solver. Use ``-inf`` / ``+inf`` entries for
+            one-sided rows.
         x_l, x_u : GPU array, optional
-            Box bounds ``x_l <= x <= x_u``, shape ``(n,)``. An omitted side is
-            absent for the lifetime of the solver.
+            Box bounds ``x_l <= x <= x_u``, ``(n,)`` or ``(B, n)``. An omitted
+            side is absent for the lifetime of the solver.
+
+        To set up ``B`` problems that are all equal for now, give at least one
+        argument its batch axis, e.g. ``cupy.broadcast_to(c, (B, n))``.
 
         Raises
         ------
         RuntimeError
             If ``setup()`` has already been called on this instance.
         TypeError
-            If an input is not a GPU dense array.
+            If an input is not a GPU dense array of the solver dtype.
         ValueError
-            If ``batch_size`` is not a positive integer, a matrix is not 2-D,
-            a vector is not 1-D, or only one of ``A`` / ``b`` is given.
+            If an input has the wrong rank or shape, the batched inputs
+            disagree on the batch size, or only one of ``A`` / ``b`` is given.
         """
-        if isinstance(batch_size, bool) or not isinstance(batch_size, (int, np.integer)) or batch_size < 1:
-            raise ValueError(f"batch_size must be a positive integer; got {batch_size!r}.")
-        # Every non-None input must be a GPU dense array describing one
-        # problem. cupiqp does not silently do H2D copies.
+        # Every non-None input must be a GPU dense array. cupiqp does not
+        # silently do H2D copies.
         P, c, A, b, G, h_u, h_l, x_u, x_l = (
             _check_dense(name, v, ndim, self._dtype)
             for name, v, ndim in (("P", P, 2), ("c", c, 1), ("A", A, 2), ("b", b, 1),
@@ -249,7 +252,6 @@ class DenseSolver(SolverBase):
         )
         if (A is None) != (b is None):
             raise ValueError("A and b must either both be provided or both be None.")
-        self._setup_batch_size = int(batch_size)
         with wp.ScopedStream(self._stream):
             self._setup_impl(P, c, A, b, G, h_u, h_l, x_u, x_l)
             if self.settings.enable_grad:
@@ -261,19 +263,18 @@ class DenseSolver(SolverBase):
         B = d.batch_size
         self._dense_data_gradients_kernel = create_dense_data_gradients_kernel(
             d.n, d.p, d.m, d.num_hu, d.num_xu, dtype=d.dtype)
-        # Zero-initialized gradient storage with the forward structure.
+        # Zero-initialized (B, ...) gradient storage with the forward structure.
         self._grad_data = DenseData(dtype=d.dtype, device=d.device)
         self._grad_data.init(
-            P=wp.zeros((d.n, d.n), dtype=d.dtype, device=d.device),
-            c=wp.zeros((d.n,), dtype=d.dtype, device=d.device),
-            A=wp.zeros((d.p, d.n), dtype=d.dtype, device=d.device) if d.p > 0 else None,
-            b=wp.zeros((d.p,), dtype=d.dtype, device=d.device) if d.p > 0 else None,
-            G=wp.zeros((d.m, d.n), dtype=d.dtype, device=d.device) if d.m > 0 else None,
-            h_u=wp.zeros((d.m,), dtype=d.dtype, device=d.device) if d.num_hu > 0 else None,
-            h_l=wp.zeros((d.m,), dtype=d.dtype, device=d.device) if d.num_hl > 0 else None,
-            x_u=wp.zeros((d.n,), dtype=d.dtype, device=d.device) if d.num_xu > 0 else None,
-            x_l=wp.zeros((d.n,), dtype=d.dtype, device=d.device) if d.num_xl > 0 else None,
-            batch_size=B
+            P=wp.zeros((B, d.n, d.n), dtype=d.dtype, device=d.device),
+            c=wp.zeros((B, d.n), dtype=d.dtype, device=d.device),
+            A=wp.zeros((B, d.p, d.n), dtype=d.dtype, device=d.device) if d.p > 0 else None,
+            b=wp.zeros((B, d.p), dtype=d.dtype, device=d.device) if d.p > 0 else None,
+            G=wp.zeros((B, d.m, d.n), dtype=d.dtype, device=d.device) if d.m > 0 else None,
+            h_u=wp.zeros((B, d.m), dtype=d.dtype, device=d.device) if d.num_hu > 0 else None,
+            h_l=wp.zeros((B, d.m), dtype=d.dtype, device=d.device) if d.num_hl > 0 else None,
+            x_u=wp.zeros((B, d.n), dtype=d.dtype, device=d.device) if d.num_xu > 0 else None,
+            x_l=wp.zeros((B, d.n), dtype=d.dtype, device=d.device) if d.num_xl > 0 else None,
         )
 
     def update(

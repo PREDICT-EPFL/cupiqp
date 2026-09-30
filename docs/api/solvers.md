@@ -22,10 +22,10 @@ factorization used. See [Backends](../guide/backends.md) for guidance on choosin
       inherited_members: true
       members: [setup, solve, update, backward]
 
-`SparseSolver.setup` takes the batch size and **one** template problem (single 2-D
-GPU CSR matrices and 1-D vectors); per-problem numbers are then set with `update`,
-passing each matrix's nonzero values as a dense `(B, nnz)` array (see `setup` and
-`update` above).
+`SparseSolver.setup` takes `P`, `A`, `G` as CSR triples `(indptr, indices, values)` of
+GPU arrays; each value array and vector is shared or batched, and the batch size is read
+from the batched ones. `update` takes each matrix's values alone, `(nnz,)` or `(B, nnz)`
+(see `setup` and `update` above).
 
 ## MultistageSolver
 
@@ -35,6 +35,7 @@ passing each matrix's nonzero values as a dense `(B, nnz)` array (see `setup` an
       members: [setup, solve, update, backward]
 
 `MultistageSolver` takes plain GPU arrays: each block-structured matrix is a
-`(diag, offdiag)` tuple and each vector an array, for one template problem at `setup`
-and per problem at `update` (see `setup` and `update` above for the block layout).
+`(diag, offdiag)` tuple and each vector an array, shared by every problem or with a
+leading batch axis, at `setup` and at `update` (see `setup` and `update` above for the
+block layout).
 

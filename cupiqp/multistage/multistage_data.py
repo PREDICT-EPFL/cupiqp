@@ -2,11 +2,13 @@ from typing import Optional, Tuple
 import warp as wp
 
 from ..data import Data
+from ..typedef import CudaArray
 
 
-# A block matrix as the solver receives it: ``(diag, offdiag)`` blocks, either
-# of which may be None (zero at setup, unchanged in update).
-BlockPair = Tuple[Optional[wp.array], Optional[wp.array]]
+# A block-structured matrix: a (diag, offdiag) pair of GPU arrays, either of
+# which may be None (zero at setup, unchanged in update). MultistageSolver
+# takes any GPU arrays; MultistageData.init receives Warp arrays.
+BlockPair = Tuple[Optional[CudaArray], Optional[CudaArray]]
 
 
 class MultistageData(Data):
@@ -151,7 +153,6 @@ class MultistageData(Data):
 
     def init(
         self,
-        batch_size: int,
         P: BlockPair,
         c: wp.array,
         A: Optional[BlockPair] = None,
@@ -162,10 +163,10 @@ class MultistageData(Data):
         x_u: Optional[wp.array] = None,
         x_l: Optional[wp.array] = None
     ):
-        """Allocate the batched block storage and fill it from ONE template problem.
+        """Allocate the batched block storage and fill it.
 
         Matrices are ``(diag, offdiag)`` tuples of GPU arrays and vectors are
-        GPU arrays, all describing a single problem (no batch axis):
+        GPU arrays. For one problem the shapes are:
 
         * ``P``: ``(N, d, d)`` diagonal blocks and ``(N-1, d, d)`` lower
           off-diagonal blocks (``offdiag`` may be ``None`` for zero).
@@ -175,67 +176,79 @@ class MultistageData(Data):
         * ``c``, ``x_l``, ``x_u``: ``(N, d)`` or flat ``(N*d,)``;
           ``b``, ``h_l``, ``h_u``: ``(N+1, r)`` or flat ``((N+1)*r,)``.
 
-        Inputs are Warp arrays of this object's dtype (``MultistageSolver``
-        converts user arrays at its public boundary). The storage is Warp
-        arrays owned by this object; the template values are copied into all
-        ``batch_size`` problems, and the given arrays are only read, never
-        adopted.
+        Every array is either **shared** (the shape above, copied into every
+        problem) or **batched** (the same with a leading batch axis). ``B`` is
+        read from the batched arrays, which must agree. Inputs are Warp arrays of
+        this object's dtype (``MultistageSolver`` converts user arrays at its
+        public boundary); they are only read, never adopted.
         """
-        B = int(batch_size)
-
         P_diag, P_off = self._split_pair(P, "P")
-        D = P_diag
-        if D.ndim != 3 or D.shape[1] != D.shape[2]:
-            raise ValueError(f"P diag must have shape (N, d, d); got {tuple(D.shape)}.")
-        N, d = int(D.shape[0]), int(D.shape[1])
+        if P_diag.ndim not in (3, 4) or P_diag.shape[-1] != P_diag.shape[-2]:
+            raise ValueError(f"P diag must have shape (N, d, d) or (B, N, d, d); got {tuple(P_diag.shape)}.")
+        N, d = int(P_diag.shape[-3]), int(P_diag.shape[-1])
         if N < 1:
             raise ValueError("P diag must contain at least one block.")
-        P_diag_wp = wp.zeros((B, N, d, d), dtype=self._dtype, device=self._device)
-        P_off_wp = wp.zeros((B, N - 1, d, d), dtype=self._dtype, device=self._device)
-        self._write_blocks(P_diag_wp, D, "P diag", allow_batched=False)
-        if P_off is not None:
-            self._write_blocks(P_off_wp, P_off, "P offdiag", allow_batched=False)
 
-        c_wp = wp.zeros((B, N, d), dtype=self._dtype, device=self._device)
-        self._write_vec(c_wp, c, "c", allow_batched=False)
-
-        def bidiag(M: BlockPair, name: str) -> Tuple[wp.array, wp.array]:
-            """(diag, offdiag) of a block lower-bidiagonal matrix -> two (B, N, r, d) buffers."""
+        pairs = {"P": (P_diag, P_off)}
+        rows = {}
+        for name, M in (("A", A), ("G", G)):
+            if M is None:
+                rows[name] = 0
+                continue
             M_diag, M_off = self._split_pair(M, name)
-            Md = M_diag
-            if Md.ndim != 3 or Md.shape[0] != N or Md.shape[2] != d:
+            if M_diag.ndim not in (3, 4) or M_diag.shape[-3] != N or M_diag.shape[-1] != d:
                 raise ValueError(
-                    f"{name} diag must have shape ({N}, r, {d}); got {tuple(Md.shape)}."
+                    f"{name} diag must have shape ({N}, r, {d}) or (B, {N}, r, {d}); got {tuple(M_diag.shape)}."
                 )
-            r = int(Md.shape[1])
-            diag_wp, off_wp = wp.zeros((B, N, r, d), dtype=self._dtype, device=self._device), wp.zeros((B, N, r, d), dtype=self._dtype, device=self._device)
-            self._write_blocks(diag_wp, Md, f"{name} diag", allow_batched=False)
+            pairs[name] = (M_diag, M_off)
+            rows[name] = int(M_diag.shape[-2])
+
+        # Batch axis of each input: blocks are batched when 4-D; a vector
+        # when 3-D, or 2-D other than its block shape (flat and batched).
+        vectors = {"c": (c, N, d), "x_u": (x_u, N, d), "x_l": (x_l, N, d),
+                   "b": (b, N + 1, rows["A"]), "h_u": (h_u, N + 1, rows["G"]), "h_l": (h_l, N + 1, rows["G"])}
+        batch_dims = {}
+        for name, (M_diag, M_off) in pairs.items():
+            for part, arr in (("diag", M_diag), ("offdiag", M_off)):
+                if arr is not None:
+                    batch_dims[f"{name} {part}"] = int(arr.shape[0]) if arr.ndim == 4 else None
+        for name, (v, nb, r) in vectors.items():
+            if v is not None:
+                batched = v.ndim == 3 or (v.ndim == 2 and tuple(v.shape) != (nb, r))
+                batch_dims[name] = int(v.shape[0]) if batched else None
+        B = self._resolve_batch_size(batch_dims)
+
+        def blocks(M_diag, M_off, name, num_off):
+            """(diag, offdiag) of a block matrix -> two (B, N, rows, cols) buffers."""
+            r, cols = int(M_diag.shape[-2]), int(M_diag.shape[-1])
+            diag_wp = wp.zeros((B, N, r, cols), dtype=self._dtype, device=self._device)
+            off_wp = wp.zeros((B, num_off, r, cols), dtype=self._dtype, device=self._device)
+            self._write_blocks(diag_wp, M_diag, f"{name} diag")
             if M_off is not None:
-                self._write_blocks(off_wp, M_off, f"{name} offdiag", allow_batched=False)
+                self._write_blocks(off_wp, M_off, f"{name} offdiag")
             return diag_wp, off_wp
 
-        def vec(v: Optional[wp.array], name: str, num_blocks: int, rows: int) -> Optional[wp.array]:
+        def vec(v: Optional[wp.array], name: str, num_blocks: int, r: int) -> Optional[wp.array]:
             if v is None:
                 return None
-            out = wp.zeros((B, num_blocks, rows), dtype=self._dtype, device=self._device)
-            self._write_vec(out, v, name, allow_batched=False)
+            out = wp.zeros((B, num_blocks, r), dtype=self._dtype, device=self._device)
+            self._write_vec(out, v, name)
             return out
 
         if (A is None) != (b is None):
             raise ValueError("A and b must both be provided or both be None")
-        A_diag_wp, A_off_wp = bidiag(A, "A") if A is not None else (None, None)
-        r_a = int(A_diag_wp.shape[2]) if A_diag_wp is not None else 0
-        G_diag_wp, G_off_wp = bidiag(G, "G") if G is not None else (None, None)
-        r_g = int(G_diag_wp.shape[2]) if G_diag_wp is not None else 0
         if G is None and (h_u is not None or h_l is not None):
             raise ValueError("h_u and h_l must be None when G is None")
         if G is not None and h_u is None and h_l is None:
             raise ValueError("Either h_l or h_u must be provided when G is given")
 
+        P_diag_wp, P_off_wp = blocks(P_diag, P_off, "P", N - 1)
+        A_diag_wp, A_off_wp = blocks(*pairs["A"], "A", N) if A is not None else (None, None)
+        G_diag_wp, G_off_wp = blocks(*pairs["G"], "G", N) if G is not None else (None, None)
         self._adopt_storage(
-            P_diag_wp, P_off_wp, c_wp,
-            A_diag_wp, A_off_wp, vec(b, "b", N + 1, r_a),
-            G_diag_wp, G_off_wp, vec(h_u, "h_u", N + 1, r_g), vec(h_l, "h_l", N + 1, r_g),
+            P_diag_wp, P_off_wp, vec(c, "c", N, d),
+            A_diag_wp, A_off_wp, vec(b, "b", N + 1, rows["A"]),
+            G_diag_wp, G_off_wp, vec(h_u, "h_u", N + 1, rows["G"]), vec(h_l, "h_l", N + 1, rows["G"]),
             vec(x_u, "x_u", N, d), vec(x_l, "x_l", N, d)
         )
 

@@ -1,21 +1,16 @@
-import numpy as np
 import warp as wp
 
 from ..utils import as_warp_array
 
 from ..results import Variables
-from typing import Literal, Optional, Tuple
+from typing import Literal, Optional
 
 from ..settings import Settings
 from ..solver import SolverBase
-from .multistage_data import MultistageData
+from .multistage_data import MultistageData, BlockPair
 from .multistage_preconditioner import MultistageRuizEquilibration
 from .multistage_solver_kernels import create_multistage_data_gradients_kernel
 from ..typedef import CudaArray
-
-
-# A block-structured matrix input: a (diag, offdiag) pair of GPU arrays.
-BlockPair = Tuple[Optional[CudaArray], Optional[CudaArray]]
 
 
 class MultistageSolver(SolverBase):
@@ -58,15 +53,15 @@ class MultistageSolver(SolverBase):
     Only ``P`` and ``c`` are required. As with the other backends, ``+/-inf``
     entries in the bounds mark one-sided or free bounds.
 
-    **Batching - setup from one problem, then per-problem values.**
-    ``setup`` takes the batch size and **one** template problem (the shapes
-    above); its values are copied into all ``B`` problems. ``update`` then
-    sets per-problem values with a leading batch axis (e.g. ``P_diag`` of
-    shape ``(B, N, d, d)``), or with the unbatched shape to share one value
-    across the batch. Either entry of a ``(diag, offdiag)`` tuple may be
-    ``None`` to leave it unchanged. Every given array is copied once, in
-    place, into the solver's Warp buffers - no allocation, no GPU-CPU sync.
-    ``solver.result.x`` has shape ``(B, n)``.
+    **Batching.** Every array given to ``setup`` and ``update`` is either
+    **batched**, with a leading batch axis (e.g. ``P_diag`` of shape
+    ``(B, N, d, d)``, ``c`` of shape ``(B, N, d)``), one value per problem,
+    or **shared**, in the shapes above, one value for every problem.
+    ``setup`` reads ``B`` from the batched arrays and fixes the structure
+    shared by all problems. In ``update``, either entry of a
+    ``(diag, offdiag)`` tuple may be ``None`` to leave it unchanged. Every
+    given array is copied once, in place, into the solver's Warp buffers -
+    no allocation, no GPU-CPU sync. ``solver.result.x`` has shape ``(B, n)``.
 
     Parameters
     ----------
@@ -91,9 +86,9 @@ class MultistageSolver(SolverBase):
     c = cp.ones((N, d))
 
     s = MultistageSolver()
-    s.setup(8, P=(P_diag, P_offdiag), c=c,                  # template, 8 copies
+    s.setup(P=(P_diag, P_offdiag),                          # shared by all problems
+            c=cp.random.standard_normal((8, N, d)),         # batched: B = 8
             x_l=-cp.ones((N, d)), x_u=cp.ones((N, d)))
-    s.update(c=cp.random.standard_normal((8, N, d)))        # per-problem c
     s.solve()
     ```
 
@@ -124,9 +119,21 @@ class MultistageSolver(SolverBase):
         self._settings = value
 
 
-    def _init_data(self, P, c, A, b, G, h_u, h_l, x_u, x_l) -> MultistageData:
+    def _init_data(
+        self,
+        P: BlockPair,
+        c: wp.array,
+        A: Optional[BlockPair],
+        b: Optional[wp.array],
+        G: Optional[BlockPair],
+        h_u: Optional[wp.array],
+        h_l: Optional[wp.array],
+        x_u: Optional[wp.array],
+        x_l: Optional[wp.array]
+    ) -> MultistageData:
         data = MultistageData(dtype=self.settings.dtype, device=self.settings.device)
-        data.init(self._setup_batch_size, P, c, A, b, G, h_u, h_l, x_u, x_l)
+        # MultistageData.init reads the batch size from the batched inputs.
+        data.init(P, c, A, b, G, h_u, h_l, x_u, x_l)
         return data
 
     def _init_preconditioner(self) -> MultistageRuizEquilibration:
@@ -143,7 +150,6 @@ class MultistageSolver(SolverBase):
 
     def setup(
         self,
-        batch_size: int,
         P: BlockPair,
         c: CudaArray,
         A: Optional[BlockPair] = None,
@@ -154,20 +160,21 @@ class MultistageSolver(SolverBase):
         x_u: Optional[CudaArray] = None,
         x_l: Optional[CudaArray] = None
     ) -> None:
-        """Fix the problem structure from one template problem and allocate
-        all GPU memory for a batch of ``batch_size`` problems.
+        """Fix the problem structure, load the data of every problem of the
+        batch, and allocate all GPU memory.
 
-        You describe a **single** problem here (no batch axis); its block
-        sizes, and which constraint blocks and bound sides are present,
-        become the structure shared by all ``batch_size`` problems, and its
-        values are copied into every problem. Afterwards, give each problem
-        its own values with :meth:`update`, then call :meth:`solve`. Call
-        ``setup()`` once per solver instance.
+        Each array below is given in the shape of one problem, **shared** by
+        every problem, or with a leading batch axis, **batched**, one value
+        per problem. The batch size ``B`` is read from the batched arrays,
+        which must agree; if every array is shared, ``B = 1``. The block
+        sizes and which constraint blocks and bound sides are present become
+        the structure of the solver. Call :meth:`solve` right away, or change
+        values with :meth:`update` first. Call ``setup()`` once per solver
+        instance. To set up ``B`` equal problems, give at least one array its
+        batch axis, e.g. ``cupy.broadcast_to(c, (B, N, d))``.
 
         Parameters
         ----------
-        batch_size : int
-            Number of QPs ``B`` solved together.
         P : tuple of GPU arrays
             ``(P_diag, P_offdiag)``: diagonal blocks ``(N, d, d)`` and lower
             off-diagonal blocks ``(N-1, d, d)`` of the symmetric
@@ -196,12 +203,9 @@ class MultistageSolver(SolverBase):
             If a matrix is not a ``(diag, offdiag)`` tuple or an input is not
             a GPU array.
         ValueError
-            If ``batch_size`` is not a positive integer or the block shapes
-            are inconsistent.
+            If the block shapes are inconsistent or the batched arrays
+            disagree on the batch size.
         """
-        if isinstance(batch_size, bool) or not isinstance(batch_size, (int, np.integer)) or batch_size < 1:
-            raise ValueError(f"batch_size must be a positive integer; got {batch_size!r}.")
-        self._setup_batch_size = int(batch_size)
         P, c, A, b, G, h_u, h_l, x_u, x_l = self._inputs_to_warp(P, c, A, b, G, h_u, h_l, x_u, x_l)
         with wp.ScopedStream(self._stream):
             self._setup_impl(P, c, A, b, G, h_u, h_l, x_u, x_l)
@@ -232,22 +236,21 @@ class MultistageSolver(SolverBase):
         r_a, N_a = (d.A_rows, N) if d.p > 0 else (0, 0)
         r_g, N_g = (d.G_rows, N) if d.m > 0 else (0, 0)
 
-        # Zero-initialized gradient storage with the forward structure: a
-        # one-problem zero template, tiled to the batch by init(). Blocks and
-        # bound sides exist exactly when they do in the forward problem.
+        # Zero-initialized (B, ...) gradient storage with the forward
+        # structure: blocks and bound sides exist exactly when they do in the
+        # forward problem.
         has_A, has_G = d.p > 0, d.m > 0
         self._grad_data = MultistageData(dtype=dtype, device=self.settings.device)
         self._grad_data.init(
-            B,
-            P=(wp.zeros((N, d_sz, d_sz), dtype=dtype, device=d.device), None),
-            c=wp.zeros((N, d_sz), dtype=dtype, device=d.device),
-            A=(wp.zeros((N_a, r_a, d_sz), dtype=dtype, device=d.device), None) if has_A else None,
-            b=wp.zeros((N_a + 1, r_a), dtype=dtype, device=d.device) if has_A else None,
-            G=(wp.zeros((N_g, r_g, d_sz), dtype=dtype, device=d.device), None) if has_G else None,
-            h_u=wp.zeros((N_g + 1, r_g), dtype=dtype, device=d.device) if has_G and d.has_h_u else None,
-            h_l=wp.zeros((N_g + 1, r_g), dtype=dtype, device=d.device) if has_G and d.has_h_l else None,
-            x_u=wp.zeros((N, d_sz), dtype=dtype, device=d.device) if d.has_x_u else None,
-            x_l=wp.zeros((N, d_sz), dtype=dtype, device=d.device) if d.has_x_l else None
+            P=(wp.zeros((B, N, d_sz, d_sz), dtype=dtype, device=d.device), None),
+            c=wp.zeros((B, N, d_sz), dtype=dtype, device=d.device),
+            A=(wp.zeros((B, N_a, r_a, d_sz), dtype=dtype, device=d.device), None) if has_A else None,
+            b=wp.zeros((B, N_a + 1, r_a), dtype=dtype, device=d.device) if has_A else None,
+            G=(wp.zeros((B, N_g, r_g, d_sz), dtype=dtype, device=d.device), None) if has_G else None,
+            h_u=wp.zeros((B, N_g + 1, r_g), dtype=dtype, device=d.device) if has_G and d.has_h_u else None,
+            h_l=wp.zeros((B, N_g + 1, r_g), dtype=dtype, device=d.device) if has_G and d.has_h_l else None,
+            x_u=wp.zeros((B, N, d_sz), dtype=dtype, device=d.device) if d.has_x_u else None,
+            x_l=wp.zeros((B, N, d_sz), dtype=dtype, device=d.device) if d.has_x_l else None
         )
 
         # Empty placeholder warp buffers for when A or G are absent —

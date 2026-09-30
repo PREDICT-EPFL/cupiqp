@@ -181,14 +181,9 @@ class OcpSolver(MultistageSolver):
                 dtype=self.settings.dtype, device=self.settings.device,
                 batch_size=batch_size,
             )
-            # Core setup takes the batch size plus one template problem. OcpData
-            # initializes every problem identically, so problem 0 is the template.
-            template = {
-                name: (value[0][0], value[1][0]) if isinstance(value, tuple) else value[0]
-                for name, value in self._solver_arrays(ocp_data).items()
-            }
-            self._setup_batch_size = int(batch_size)
-            self._setup_impl(**template)
+            # The OcpData arrays carry the batch axis, from which the core
+            # setup reads the batch size.
+            self._setup_impl(**self._solver_arrays(ocp_data))
 
         self._ocp_data = ocp_data
         self._solution_available = False

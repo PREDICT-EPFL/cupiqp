@@ -63,6 +63,21 @@ class Data(ABC):
             return
         wp.copy(dst, src)
 
+    @staticmethod
+    def _resolve_batch_size(batch_dims: dict) -> int:
+        """Batch size ``B`` from the leading batch axes of the inputs.
+
+        ``batch_dims`` maps each input name to its batch size, or ``None``
+        for an input in the single-problem shape (shared by every problem).
+        All batched inputs must agree; with none, ``B = 1``.
+        """
+        batched = {name: B for name, B in batch_dims.items() if B is not None}
+        sizes = set(batched.values())
+        if len(sizes) > 1:
+            listed = ", ".join(f"{name}: {B}" for name, B in batched.items())
+            raise ValueError(f"Batched inputs disagree on the batch size ({listed}).")
+        return sizes.pop() if sizes else 1
+
     def _init_vec(self, value: wp.array, k: int, name: str, batch_size: int) -> wp.array:
         """A new ``(B, k)`` buffer holding ``value``: ``(k,)`` shared by every
         problem, or ``(B, k)``."""

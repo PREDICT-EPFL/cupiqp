@@ -58,14 +58,13 @@ x_u = cp.array([   1.0,  cp.inf])
 ### Dense backend
 
 `DenseSolver` works with **dense** GPU arrays for `P`, `A`, `G`. Create the solver,
-optionally tweak `solver.settings`, then `setup(batch_size, ...)` the problem and
-`solve()`. The solution and per-problem info are exposed through `solver.result`.
+optionally tweak `solver.settings`, then `setup(...)` the problem and `solve()`. The solution and per-problem info are exposed through `solver.result`.
 
 ```python
 solver = DenseSolver()
 solver.settings.verbose = True        # print the banner + interior-point iteration log
 
-solver.setup(1, P=P, c=c, A=A, b=b, G=G, h_l=h_l, h_u=h_u, x_l=x_l, x_u=x_u)   # batch size 1
+solver.setup(P=P, c=c, A=A, b=b, G=G, h_l=h_l, h_u=h_u, x_l=x_l, x_u=x_u)   # one problem
 solver.solve()
 
 # result.x carries a leading batch dimension (B, n); here B = 1
@@ -76,21 +75,25 @@ print("solution:", x_dense)
 
 ### Sparse backend
 
-`SparseSolver` expects `P`, `A`, `G` as **GPU CSR** matrices
-(`cupyx.scipy.sparse.csr_matrix`); the vectors are dense GPU arrays. Its `setup` takes
-the batch size first, then one problem - here the batch size is 1. We reuse the exact
-same data, just wrapping the matrices as CSR. For larger, structurally sparse problems
-this is far more efficient than the dense backend.
+`SparseSolver` takes `P`, `A`, `G` as **CSR triples** `(indptr, indices, values)` of
+GPU arrays; the vectors are dense GPU arrays. We reuse the exact same data, converting
+the matrices to CSR with `cupyx.scipy.sparse.csr_matrix` and passing its three arrays.
+For larger, structurally sparse problems this is far more efficient than the dense
+backend.
 
 ```python
 solver = SparseSolver()
 solver.settings.verbose = True
 
+def csr(M):
+    """CSR triple (indptr, indices, values) of a dense GPU matrix."""
+    M = csr_matrix(M)
+    return M.indptr, M.indices, M.data
+
 solver.setup(
-    1,                                   # batch size
-    P=csr_matrix(P), c=c,
-    A=csr_matrix(A), b=b,
-    G=csr_matrix(G), h_l=h_l, h_u=h_u,
+    P=csr(P), c=c,
+    A=csr(A), b=b,
+    G=csr(G), h_l=h_l, h_u=h_u,
     x_l=x_l, x_u=x_u,
 )
 solver.solve()
@@ -107,12 +110,12 @@ print("Both backends converged to the same optimum.")
 ## Part 2 — A batch of QPs
 
 cuPIQP is **natively batched**: it solves `B` independent QPs in a *single* GPU call.
-All `B` problems share one structure, so `setup(batch_size, ...)` takes the batch size
-and **one** template problem, whose values are copied into every problem. Per-problem
-numbers are then set with `update()`, with **the batch size as the leading dimension**
-(or the single-problem shape to share one value across the batch):
+All `B` problems share one structure. Every argument of `setup` is either **batched**,
+with a leading batch axis (one value per problem), or **shared**, in the shape of one
+problem (one value for every problem); `setup` reads `B` from the batched arguments.
+`update()` takes the same two forms:
 
-| array | `setup` (one problem) | `update` (per problem) |
+| array | shared | batched |
 |---|---|---|
 | `P` | `(n, n)` | `(B, n, n)` |
 | `c`, `x_l`, `x_u` | `(n,)` | `(B, n)` |
@@ -135,14 +138,13 @@ b_batch = cp.array([[0.9], [1.0], [1.1], [1.2]])      # shape (B, p) with p = 1
 
 ### Dense backend (batched)
 
-The same call as Part 1 with batch size `B`, followed by `update` for the one block that
-differs per problem.
+The same call as Part 1, with `b` batched: its leading axis makes this a batch of `B`
+problems, and every other argument is shared.
 
 ```python
 dense_solver = DenseSolver()
-dense_solver.setup(B, P=P, c=c, A=A, b=b, G=G,
-                   h_l=h_l, h_u=h_u, x_l=x_l, x_u=x_u)
-dense_solver.update(b=b_batch)                        # (B, p): one target per problem
+dense_solver.setup(P=P, c=c, A=A, b=b_batch,         # b_batch: (B, p), one target per problem
+                   G=G, h_l=h_l, h_u=h_u, x_l=x_l, x_u=x_u)
 dense_solver.solve()
 
 X_dense = dense_solver.result.x.numpy()               # (B, n)
@@ -152,22 +154,18 @@ for i, st in enumerate(dense_solver.result.info.status):
 
 ### Sparse backend (batched)
 
-All `B` sparse problems share **one** sparsity pattern, so `setup` takes the batch size
-and just **one** template problem (2-D CSR matrices, 1-D vectors); its values are copied
-into every problem. The per-problem numbers are then set with `update`: here only `b`
-differs. Matrices would be updated through their nonzero values, a dense `(B, nnz)`
-array in the CSR order of the template (e.g. `update(P=P_values)`).
+All `B` sparse problems share **one** sparsity pattern per matrix. The values of a
+CSR triple follow the same rule as the vectors: `(nnz,)` shared, or `(B, nnz)` with one
+row per problem, in the order of the pattern's `indices`. Here only `b` differs.
 
 ```python
 sparse_solver = SparseSolver()
 sparse_solver.setup(
-    B,
-    P=csr_matrix(P), c=c,
-    A=csr_matrix(A), b=b,
-    G=csr_matrix(G), h_l=h_l, h_u=h_u,
+    P=csr(P), c=c,
+    A=csr(A), b=b_batch,                 # (B, p): one target per problem
+    G=csr(G), h_l=h_l, h_u=h_u,
     x_l=x_l, x_u=x_u,
 )
-sparse_solver.update(b=b_batch)          # (B, p): one target per problem
 sparse_solver.solve()
 
 X_sparse = sparse_solver.result.x.numpy()
@@ -186,7 +184,7 @@ For new numerical values with the same structure, call `update()` and solve agai
 Arguments left as `None` keep their current values:
 
 ```python
-solver.setup(1, P=P, c=c, A=A, b=b0)
+solver.setup(P=P, c=c, A=A, b=b0)
 solver.solve()
 
 for b_k in trajectory:
