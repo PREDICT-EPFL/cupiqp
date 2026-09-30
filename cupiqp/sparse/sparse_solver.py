@@ -9,7 +9,7 @@ from typing import Literal, Optional, Union
 from ..settings import Settings
 from ..solver import SolverBase
 from ..typedef import CudaArray
-from ..utils import is_cuda_array
+from ..utils import is_cuda_array, as_warp_array
 from .batched_csr import UniformBatchedCsrMatrix
 from .sparse_data import SparseData
 from .sparse_preconditioner import SparseRuizEquilibration
@@ -54,10 +54,10 @@ def _check_sparse(name: str, m) -> None:
         )
 
 
-def _check_dense_vector(name: str, m) -> None:
-    """Validate that ``m`` is a 1-D GPU dense array (skip if ``None``)."""
+def _check_dense_vector(name: str, m, dtype) -> Optional[wp.array]:
+    """Warp view of the 1-D GPU array ``m`` in the solver ``dtype`` (``None`` passes through)."""
     if m is None:
-        return
+        return None
     if not is_cuda_array(m):
         raise TypeError(
             f"SparseSolver requires the vector {name} to be a GPU dense "
@@ -65,25 +65,21 @@ def _check_dense_vector(name: str, m) -> None:
             f"cupy.ndarray, dense CUDA torch.Tensor, JAX CUDA array, etc.); "
             f"got {type(m).__name__}."
         )
-    ndim = cp.asarray(m).ndim
-    if ndim != 1:
+    arr = as_warp_array(m, name, dtype=dtype)
+    if arr.ndim != 1:
         raise ValueError(
             f"SparseSolver.setup requires {name} to be a 1-D vector describing "
-            f"one problem; got a {ndim}-D array. The batch size is passed "
+            f"one problem; got a {arr.ndim}-D array. The batch size is passed "
             f"separately; set per-problem values with update()."
         )
+    return arr
 
 
-def _tile_csr(m, batch_size: int, dtype) -> UniformBatchedCsrMatrix:
+def _tile_csr(m, batch_size: int, dtype, device: str) -> UniformBatchedCsrMatrix:
     """Replicate one 2-D GPU CSR matrix into a batch of ``batch_size`` copies."""
     if isinstance(m, csr_matrix):
-        return UniformBatchedCsrMatrix.from_cupy_csr_matrix(m, batch_size=batch_size, dtype=dtype)
-    single = UniformBatchedCsrMatrix.from_torch_sparse_csr_tensor(m, dtype=dtype)
-    return UniformBatchedCsrMatrix(
-        batch_size, single.indices, single.indptr,
-        cp.broadcast_to(single.data, (batch_size, single.nnz)),
-        shape=(single.rows, single.cols), dtype=dtype,
-    )
+        return UniformBatchedCsrMatrix.from_cupy_csr_matrix(m, batch_size=batch_size, dtype=dtype, device=device)
+    return UniformBatchedCsrMatrix.from_torch_sparse_csr_tensor(m, batch_size=batch_size, dtype=dtype, device=device)
 
 
 
@@ -113,8 +109,12 @@ class SparseSolver(SolverBase):
     every problem. ``update`` then sets per-problem values: the nonzero values
     of each matrix as a dense ``(B, nnz)`` array in the CSR order of the
     template, and the vectors as ``(B, k)`` arrays (or ``(nnz,)`` / ``(k,)`` to
-    share one value across the batch). The solution ``solver.result.x`` has
-    shape ``(B, n)``.
+    share one value across the batch).
+
+    **Results are Warp arrays.** ``solver.result.x`` is a ``(B, n)``
+    ``warp.array`` on the GPU; use ``.numpy()`` for a host copy, or view it
+    zero-copy from another framework (``cupy.asarray(x)``,
+    ``torch.from_dlpack(x)``, ``jax.dlpack.from_dlpack(x)``).
 
     cuPIQP is **GPU-only and CSR-only** and never converts formats behind
     your back: CPU inputs (``scipy.sparse``, ``numpy``, CPU torch) and
@@ -127,6 +127,10 @@ class SparseSolver(SolverBase):
         Floating-point precision used throughout the solve. ``"float32"``
         is faster and uses less memory but converges to looser tolerances;
         the default convergence tolerances are chosen to match the dtype.
+    stream : warp.Stream, optional
+        CUDA stream to run on. By default the solver creates and owns one;
+        pass a ``warp.Stream`` to run on it instead (see the ``stream``
+        property).
 
     Examples
     --------
@@ -167,9 +171,14 @@ class SparseSolver(SolverBase):
     ``solver.settings``.
     """
 
-    def __init__(self, dtype: Literal["float32", "float64"] = "float64"):
-        super().__init__(dtype=dtype)
+    def __init__(self, dtype: Literal["float32", "float64"] = "float64", stream=None):
+        super().__init__(dtype=dtype, stream=stream)
         self._settings.kkt_solver = "sparse_ldlt"
+        # Non-owning cupy view of the solver stream. cupy is used only at
+        # setup, to build CSR patterns and index maps; running those ops on
+        # the solver stream orders them with the Warp copies that consume
+        # their results. The Warp stream owns the handle.
+        self._cupy_stream = cp.cuda.ExternalStream(self._stream.cuda_stream)
 
     @SolverBase.settings.setter
     def settings(self, value: Settings) -> None:
@@ -193,12 +202,12 @@ class SparseSolver(SolverBase):
         # Replicate the single-problem template over the batch: matrices are
         # tiled here, 1-D vectors are broadcast by SparseData.init.
         B = self._setup_batch_size
-        dtype = self.settings.dtype
-        data = SparseData(dtype=dtype, device=self.settings.device)
+        dtype, device = self._dtype, self.settings.device
+        data = SparseData(dtype=dtype, device=device)
         data.init(
-            _tile_csr(P, B, dtype), c,
-            None if A is None else _tile_csr(A, B, dtype), b,
-            None if G is None else _tile_csr(G, B, dtype),
+            _tile_csr(P, B, dtype, device), c,
+            None if A is None else _tile_csr(A, B, dtype, device), b,
+            None if G is None else _tile_csr(G, B, dtype, device),
             h_u, h_l, x_u, x_l,
         )
         return data
@@ -209,9 +218,9 @@ class SparseSolver(SolverBase):
             has_h_l=self._data.has_h_l, has_h_u=self._data.has_h_u,
             has_x_l=self._data.has_x_l, has_x_u=self._data.has_x_u,
             active_x_bound=self._data.active_x_bound,
-            use_warp_tile_kernels=(self._kernel_strategy == "warp_tile"),
             enable_cuda_graph=self.settings.enable_cuda_graph,
             dtype=self._data.dtype,
+            device=self._data.device
         )
 
     def setup(
@@ -281,98 +290,59 @@ class SparseSolver(SolverBase):
         _check_sparse("P", P)
         _check_sparse("A", A)
         _check_sparse("G", G)
-        for name, v in (("c", c), ("b", b), ("h_u", h_u), ("h_l", h_l),
-                        ("x_u", x_u), ("x_l", x_l)):
-            _check_dense_vector(name, v)
+        c, b, h_u, h_l, x_u, x_l = (
+            _check_dense_vector(name, v, self._dtype)
+            for name, v in (("c", c), ("b", b), ("h_u", h_u), ("h_l", h_l),
+                            ("x_u", x_u), ("x_l", x_l))
+        )
         self._setup_batch_size = int(batch_size)
-        super().setup(P, c, A, b, G, h_u, h_l, x_u, x_l)
-        # Cache CSR row decompressions for the backward-pass gather.
-        # Sparsity patterns are fixed at setup, so this is done once.
-        if self.settings.enable_grad:
-            d = self._data
-            B = d.batch_size
-            dtype = d.dtype
+        with wp.ScopedStream(self._stream), self._cupy_stream:
+            self._setup_impl(P, c, A, b, G, h_u, h_l, x_u, x_l)
+            if self.settings.enable_grad:
+                self._init_grad_data()
 
-            # Row indices for each nnz position (CSR-to-COO). All row/col
-            # index arrays are cast to int32 to match the warp kernel's
-            # index type (consistent with idx_hu etc.).
-            P_csr = d._P
-            nnz_P = int(P_csr.nnz)
-            self._p_rows = (cp.searchsorted(
-                P_csr.indptr,
-                cp.arange(nnz_P, dtype=P_csr.indptr.dtype),
-                side="right",
-            ) - 1).astype(cp.int32)
-            self._p_indices_arr = P_csr.indices.astype(cp.int32)
+    def _init_grad_data(self) -> None:
+        """Allocate the gradient storage and cache the CSR row decompressions
+        used by the backward-pass gather (sparsity patterns are fixed at setup)."""
+        d = self._data
+        B = d.batch_size
+        # COO row indices and column indices of every stored entry, used by
+        # the backward-pass gather (the patterns are fixed at setup).
+        P_csr, A_csr, G_csr = d.P, d.A, d.G
+        nnz_P, nnz_A, nnz_G = P_csr.nnz, A_csr.nnz, G_csr.nnz
+        self._p_rows, self._p_indices_arr = P_csr.row_indices, P_csr.indices
+        self._a_rows, self._a_indices_arr = A_csr.row_indices, A_csr.indices
+        self._g_rows, self._g_indices_arr = G_csr.row_indices, G_csr.indices
 
-            if d.p > 0:
-                A_csr = d._A
-                nnz_A = int(A_csr.nnz)
-                self._a_rows = (cp.searchsorted(
-                    A_csr.indptr,
-                    cp.arange(nnz_A, dtype=A_csr.indptr.dtype),
-                    side="right",
-                ) - 1).astype(cp.int32)
-                self._a_indices_arr = A_csr.indices.astype(cp.int32)
-            else:
-                nnz_A = 0
-                self._a_rows = cp.empty(0, dtype=cp.int32)
-                self._a_indices_arr = cp.empty(0, dtype=cp.int32)
+        # Eager-compile the fused sparse data-gradients kernel.
+        self._sparse_data_gradients_kernel = create_sparse_data_gradients_kernel(
+            nnz_P, nnz_A, nnz_G, d.p, d.m, d.n, d.num_hu, d.num_xu, dtype=d.dtype)
 
-            if d.m > 0:
-                G_csr = d._G
-                nnz_G = int(G_csr.nnz)
-                self._g_rows = (cp.searchsorted(
-                    G_csr.indptr,
-                    cp.arange(nnz_G, dtype=G_csr.indptr.dtype),
-                    side="right",
-                ) - 1).astype(cp.int32)
-                self._g_indices_arr = G_csr.indices.astype(cp.int32)
-            else:
-                nnz_G = 0
-                self._g_rows = cp.empty(0, dtype=cp.int32)
-                self._g_indices_arr = cp.empty(0, dtype=cp.int32)
+        # Pre-allocate the gradient SparseData: the matrices share the forward
+        # sparsity and their (B, nnz) value buffers are the kernel outputs.
+        # Vector grads (c, h_l, x_l) are copied in by _compute_data_gradients.
+        def grad_csr(M):
+            return UniformBatchedCsrMatrix(
+                B, M.indptr, M.indices, wp.zeros((B, M.nnz), dtype=d.dtype, device=d.device),
+                shape=(M.rows, M.cols), dtype=d.dtype, device=d.device)
 
-            # Eager-compile the fused sparse data-gradients kernel.
-            self._sparse_data_gradients_kernel = create_sparse_data_gradients_kernel(
-                nnz_P, nnz_A, nnz_G, d.p, d.m, d.n, d.num_hu, d.num_xu, dtype=dtype)
-
-            # Pre-allocate the gradient SparseData. The matrix
-            # UniformBatchedCsrMatrix views share the forward sparsity (same
-            # indices/indptr); their values buffers become the kernel-
-            # output targets. Vector grads (c, h_l, x_l) are filled via
-            # slice-assign in :meth:`_compute_data_gradients`.
-            P_grad_csr = UniformBatchedCsrMatrix(
-                B, P_csr.indices, P_csr.indptr, cp.zeros((B, nnz_P), dtype=dtype),
-                shape=(P_csr.rows, P_csr.cols), dtype=dtype,
-            )
-            A_grad_csr = (UniformBatchedCsrMatrix(
-                B, A_csr.indices, A_csr.indptr, cp.zeros((B, nnz_A), dtype=dtype),
-                shape=(A_csr.rows, A_csr.cols), dtype=dtype,
-            ) if d.p > 0 else None)
-            G_grad_csr = (UniformBatchedCsrMatrix(
-                B, G_csr.indices, G_csr.indptr, cp.zeros((B, nnz_G), dtype=dtype),
-                shape=(G_csr.rows, G_csr.cols), dtype=dtype,
-            ) if d.m > 0 else None)
-            self._grad_data = SparseData(dtype=dtype, device=self.settings.device)
-            self._grad_data.init(
-                P=P_grad_csr,
-                c=cp.zeros((B, d.n), dtype=dtype),
-                A=A_grad_csr,
-                b=cp.zeros((B, d.p), dtype=dtype) if d.p > 0 else None,
-                G=G_grad_csr,
-                h_u=cp.zeros((B, d.m), dtype=dtype) if d.num_hu > 0 else None,
-                h_l=cp.zeros((B, d.m), dtype=dtype) if d.num_hl > 0 else None,
-                x_u=cp.zeros((B, d.n), dtype=dtype) if d.num_xu > 0 else None,
-                x_l=cp.zeros((B, d.n), dtype=dtype) if d.num_xl > 0 else None,
-            )
-            # Kernel value-buffer inputs. SparseData._A / _G are always
-            # allocated (empty BatchedCsr placeholders when the
-            # corresponding block is absent), so their ``.data`` is always
-            # a (B, nnz_*) array matching the compiled kernel signature.
-            self._grad_P_values = self._grad_data._P.data
-            self._grad_A_values = self._grad_data._A.data
-            self._grad_G_values = self._grad_data._G.data
+        self._grad_data = SparseData(dtype=d.dtype, device=d.device)
+        self._grad_data.init(
+            P=grad_csr(P_csr),
+            c=wp.zeros((B, d.n), dtype=d.dtype, device=d.device),
+            A=grad_csr(A_csr) if d.p > 0 else None,
+            b=wp.zeros((B, d.p), dtype=d.dtype, device=d.device) if d.p > 0 else None,
+            G=grad_csr(G_csr) if d.m > 0 else None,
+            h_u=wp.zeros((B, d.m), dtype=d.dtype, device=d.device) if d.num_hu > 0 else None,
+            h_l=wp.zeros((B, d.m), dtype=d.dtype, device=d.device) if d.num_hl > 0 else None,
+            x_u=wp.zeros((B, d.n), dtype=d.dtype, device=d.device) if d.num_xu > 0 else None,
+            x_l=wp.zeros((B, d.n), dtype=d.dtype, device=d.device) if d.num_xl > 0 else None,
+        )
+        # SparseData always allocates A / G (empty placeholders when the block
+        # is absent), so their values are (B, nnz_*) arrays matching the kernel.
+        self._grad_P_values = self._grad_data.P.data
+        self._grad_A_values = self._grad_data.A.data
+        self._grad_G_values = self._grad_data.G.data
 
     def update(
         self,
@@ -421,17 +391,28 @@ class SparseSolver(SolverBase):
         solver.solve()
         ```
         """
-        super().update(
-            P=P, c=c, A=A, b=b, G=G, h_u=h_u, h_l=h_l, x_u=x_u, x_l=x_l,
-            check_validity=check_validity,
+        for name, v in (("P", P), ("A", A), ("G", G)):
+            if v is not None and not is_cuda_array(v):
+                raise TypeError(
+                    f"{name} must be a dense GPU array holding the nonzero values, "
+                    f"of shape (B, nnz) or (nnz,), in the CSR order of the matrix "
+                    f"passed to setup(); got {type(v).__name__}. The sparsity "
+                    "pattern is fixed at setup() and cannot be updated."
+                )
+        P, c, A, b, G, h_u, h_l, x_u, x_l = (
+            as_warp_array(v, name, self._dtype)
+            for name, v in (("P", P), ("c", c), ("A", A), ("b", b), ("G", G),
+                            ("h_u", h_u), ("h_l", h_l), ("x_u", x_u), ("x_l", x_l))
         )
+        with wp.ScopedStream(self._stream):
+            self._update_impl(P, c, A, b, G, h_u, h_l, x_u, x_l, check_validity)
 
     def _compute_data_gradients(self, adjoint_vector: Variables, linearization_point: Variables) -> SparseData:
         r"""Populate ``self._grad_data`` in place and return it.
 
         Matrix gradients are gathered directly at each structural nonzero
-        (``O(B · nnz)``) rather than materialising the full outer product
-        — written into ``self._grad_data._P/_A/_G.data``. Vector grads
+        (``O(B * nnz)``) rather than materialising the full outer product,
+        written into ``self._grad_data.P/A/G.data``. Vector grads
         ``c``, ``h_l``, ``x_l`` are copies of ``adjoint_vector.x``,
         ``self._lam_zl_full``, ``self._lam_zbl_full``.
 
@@ -442,7 +423,7 @@ class SparseSolver(SolverBase):
         grad_data = self._grad_data
         B = data.batch_size
         total = (
-            grad_data._P.nnz + grad_data._A.nnz + grad_data._G.nnz
+            grad_data.P.nnz + grad_data.A.nnz + grad_data.G.nnz
             + data.p + data.num_hu + data.num_xu
         )
         if total > 0:
@@ -459,16 +440,15 @@ class SparseSolver(SolverBase):
                     self._a_rows, self._a_indices_arr,
                     self._g_rows, self._g_indices_arr,
                     self._grad_P_values, self._grad_A_values, self._grad_G_values,
-                    grad_data._b, grad_data._h_u, grad_data._x_u,
+                    grad_data.b, grad_data.h_u, grad_data.x_u,
                 ],
-                device="cuda",
-                stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+                device=self._device
             )
 
-        grad_data._c[:] = adjoint_vector.x
+        wp.copy(grad_data.c, adjoint_vector.x)
         if data.num_hl > 0:
-            grad_data._h_l[:] = self._lam_zl_full
+            wp.copy(grad_data.h_l, self._lam_zl_full)
         if data.num_xl > 0:
-            grad_data._x_l[:] = self._lam_zbl_full
+            wp.copy(grad_data.x_l, self._lam_zbl_full)
 
         return grad_data

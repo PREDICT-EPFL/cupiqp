@@ -54,7 +54,7 @@ def csr_subblock_indices(
     B: csr_matrix,
     row_offset: int,
     col_offset: int,
-    transa: bool = False,
+    transa: bool = False
 ) -> cp.ndarray:
     """Return the positions in ``B.data`` of every non-zero of ``A`` (or ``A^T``).
 

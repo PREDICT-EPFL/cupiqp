@@ -4,6 +4,7 @@ Mirrors PIQP's C++ test (``tests/src/sparse/kkt_test.cpp::FactorizeSolve``).
 """
 import cupy as cp
 import numpy as np
+import warp as wp
 import pytest
 import scipy.sparse as sp_cpu
 from cupyx.scipy.sparse import csr_matrix
@@ -50,13 +51,20 @@ def random_sparse_qp(
     x_l[rng.random(n) < 0.3] = -np.inf
 
     data = SparseData()
+    # Vectors are handed over as Warp arrays: Data objects take Warp only.
+    w = lambda a: wp.array(cp.array(a), copy=False)
     data.init(
-        P=csr_matrix(P), c=cp.array(c),
-        A=csr_matrix(A), b=cp.array(b),
-        G=csr_matrix(G), h_u=cp.array(h_u), h_l=cp.array(h_l),
-        x_u=cp.array(x_u), x_l=cp.array(x_l),
+        P=csr_matrix(P), c=w(c),
+        A=csr_matrix(A), b=w(b),
+        G=csr_matrix(G), h_u=w(h_u), h_l=w(h_l),
+        x_u=w(x_u), x_l=w(x_l),
         )
     return data
+
+
+def _w(a):
+    """Zero-copy Warp view: the KKT internals take Warp arrays only."""
+    return wp.array(a, copy=False)
 
 
 def random_rhs(n: int, p: int, m: int, seed: int) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray]:
@@ -138,12 +146,12 @@ def test_condensed_factorize_solve(n: int, p: int, m: int) -> None:
     lhs_z = cp.zeros((1, m))
     # No public entry point yet for the condensed-only solve (KKTSystem.solve
     # always runs eliminate→condensed→recover). Use the inner solver directly.
-    kkt._kkt_solver.solve(data, rhs_x, rhs_y, rhs_z, lhs_x, lhs_y, lhs_z)
+    kkt._kkt_solver.solve(data, _w(rhs_x), _w(rhs_y), _w(rhs_z), _w(lhs_x), _w(lhs_y), _w(lhs_z))
 
     check_x = cp.zeros((1, n))
     check_y = cp.zeros((1, p))
     check_z = cp.zeros((1, m))
-    kkt.mul_condensed_kkt(data, lhs_x, lhs_y, lhs_z, check_x, check_y, check_z)
+    kkt.mul_condensed_kkt(data, _w(lhs_x), _w(lhs_y), _w(lhs_z), _w(check_x), _w(check_y), _w(check_z))
 
     atol = 1e-8
     cp.testing.assert_allclose(rhs_x, check_x, atol=atol)
@@ -167,11 +175,11 @@ def test_condensed_solve_with_ir(n: int, p: int, m: int) -> None:
     lhs_y = cp.zeros((1, p))
     lhs_z = cp.zeros((1, m))
     kkt_no_ir._kkt_solver.solve(
-        data, rhs_x.copy(), rhs_y.copy(), rhs_z.copy(), lhs_x, lhs_y, lhs_z,
+        data, _w(rhs_x.copy()), _w(rhs_y.copy()), _w(rhs_z.copy()), _w(lhs_x), _w(lhs_y), _w(lhs_z),
     )
     err_x, err_y, err_z = cp.zeros((1, n)), cp.zeros((1, p)), cp.zeros((1, m))
     error_no_ir = kkt_no_ir.get_refinement_error(
-        data, lhs_x, lhs_y, lhs_z, rhs_x, rhs_y, rhs_z, err_x, err_y, err_z,
+        data, _w(lhs_x), _w(lhs_y), _w(lhs_z), _w(rhs_x), _w(rhs_y), _w(rhs_z), _w(err_x), _w(err_y), _w(err_z),
     )
 
     # --- With IR (static reg + IR loop) --------------------------------------
@@ -183,17 +191,17 @@ def test_condensed_solve_with_ir(n: int, p: int, m: int) -> None:
     lhs_y2 = cp.zeros((1, p))
     lhs_z2 = cp.zeros((1, m))
     kkt_ir._kkt_solver.solve(
-        data, rhs_x.copy(), rhs_y.copy(), rhs_z.copy(), lhs_x2, lhs_y2, lhs_z2,
+        data, _w(rhs_x.copy()), _w(rhs_y.copy()), _w(rhs_z.copy()), _w(lhs_x2), _w(lhs_y2), _w(lhs_z2),
     )
     kkt_ir.iterative_refinement(
         data, settings_ir,
-        rhs_x.copy(), rhs_y.copy(), rhs_z.copy(),
-        lhs_x2, lhs_y2, lhs_z2,
+        _w(rhs_x.copy()), _w(rhs_y.copy()), _w(rhs_z.copy()),
+        _w(lhs_x2), _w(lhs_y2), _w(lhs_z2),
     )
     err_x2, err_y2, err_z2 = cp.zeros((1, n)), cp.zeros((1, p)), cp.zeros((1, m))
     error_ir = kkt_ir.get_refinement_error(
-        data, lhs_x2, lhs_y2, lhs_z2,
-        rhs_x, rhs_y, rhs_z, err_x2, err_y2, err_z2,
+        data, _w(lhs_x2), _w(lhs_y2), _w(lhs_z2),
+        _w(rhs_x), _w(rhs_y), _w(rhs_z), _w(err_x2), _w(err_y2), _w(err_z2),
     )
 
     # IR must not make things worse for well-conditioned problems.

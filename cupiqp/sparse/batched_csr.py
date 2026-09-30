@@ -1,107 +1,179 @@
-from typing import Optional, Sequence, Tuple, Union
+from typing import Optional, Sequence, Tuple
+
 import cupy as cp
+import numpy as np
+import warp as wp
 from cupyx.scipy.sparse import csr_matrix
 
+from ..utils import to_warp_dtype
 
 
 class UniformBatchedCsrMatrix:
     """A batch of CSR matrices that share one sparsity pattern.
 
-    A batched extension of cupy's ``cupyx.scipy.sparse.csr_matrix``: where a
-    single CSR matrix stores ``indptr``, ``indices``, and a 1-D ``data`` array
-    of length ``nnz``, this type stores **one shared** ``indptr`` / ``indices``
+    A batched extension of ``cupyx.scipy.sparse.csr_matrix``: where a single
+    CSR matrix stores ``indptr``, ``indices`` and a 1-D ``data`` array of
+    length ``nnz``, this type stores **one shared** ``indptr`` / ``indices``
     pair plus a **2-D** ``data`` buffer of shape ``(batch_size, nnz)`` - the
-    values of all matrices stacked along a leading batch axis. Every
-    matrix in the batch therefore has the *same* nonzero structure and differs
-    only in its values.
+    values of all matrices stacked along a leading batch axis. Every matrix
+    in the batch therefore has the same nonzero structure and differs only
+    in its values.
 
-    This is the storage cuPIQP uses internally for batched sparse problems, and
-    the preferred input for solving a batch with ``SparseSolver``: because the
-    values are contiguous with a uniform per-matrix stride, batched sparse
-    linear-algebra routines can sweep the whole batch with no copy (unlike a
-    Python list of separate ``csr_matrix`` objects, which must be copied into
-    this layout first).
-
+    The storage is Warp arrays owned by this object: ``indptr`` and
+    ``indices`` are ``int32`` and ``data`` has the value dtype. cuSPARSE and
+    cuDSS read them through their device pointers and the solver's Warp
+    kernels index them directly. cupy is used only while constructing the
+    pattern; ``mat[b]`` returns a zero-copy ``csr_matrix`` view of one matrix
+    for pattern algebra at setup time.
 
     Parameters
     ----------
     batch_size : int
         Number of matrices in the batch, ``B`` (must be positive).
-    indices, indptr : sequence of int
-        The shared CSR column-index and row-pointer arrays - the single
-        sparsity pattern used by every matrix in the batch.
-    data : cupy.ndarray
-        Values of shape ``(batch_size, nnz)``: row ``i`` holds the nonzeros of
-        the ``i``-th matrix, laid out against the shared ``indices`` /
-        ``indptr``.
-    shape : tuple of (int, int), optional
-        Dense ``(rows, cols)`` shape of each matrix; inferred from the pattern
-        when omitted.
-    dtype : data-type, default: ``cupy.float64``
-        Value dtype.
+    indptr, indices : int array
+        The shared CSR row-pointer and column-index arrays - the single
+        sparsity pattern used by every matrix in the batch. Any host or GPU
+        integer array; copied into ``int32`` Warp arrays.
+    data : GPU array
+        Values of shape ``(batch_size, nnz)``, row ``i`` holding the nonzeros
+        of the ``i``-th matrix in the order of ``indices``, or ``(nnz,)`` for
+        the same values in every matrix. Copied into the owned buffer.
+    shape : tuple of (int, int)
+        Dense ``(rows, cols)`` shape of each matrix.
+    dtype : Warp scalar type, default: ``wp.float64``
+        Value dtype (``wp.float32`` or ``wp.float64``).
+    device : str, default: ``"cuda"``
+        Warp device of the storage.
 
     Attributes
     ----------
     batch_size, nnz, rows, cols, shape :
         Batch size ``B``, nonzeros per matrix, and the shared dense shape.
-    indices, indptr : cupy.ndarray
+    indptr, indices : warp.array of int32
         The shared CSR sparsity pattern.
-    data : cupy.ndarray
+    data : warp.array2d
         The ``(batch_size, nnz)`` values buffer.
     """
     def __init__(
         self,
         batch_size: int,
-        indices: Sequence[int],
-        indptr: Sequence[int],
-        data: cp.ndarray,
-        shape: Optional[Tuple[int, int]] = None,
-        dtype=cp.float64,
+        indptr,
+        indices,
+        data,
+        shape: Tuple[int, int],
+        dtype=wp.float64,
+        device: str = "cuda"
     ):
-        if not batch_size > 0:
+        if isinstance(batch_size, bool) or not isinstance(batch_size, (int, np.integer)) or batch_size < 1:
             raise ValueError("batch_size must be a positive integer.")
+        batch_size = int(batch_size)
+        rows, cols = int(shape[0]), int(shape[1])
+        dtype = to_warp_dtype(dtype)
 
-        self._dtype = dtype
-        data_cp = cp.asarray(data, dtype=dtype)
-        try:
-            if shape is None:
-                self._template_matrix = csr_matrix((data_cp[0], indices, indptr))
-            else:
-                self._template_matrix = csr_matrix(
-                    (data_cp[0], indices, indptr), shape=shape,
-                )
-        except Exception as e:
+        # The pattern is validated and normalized with cupy (setup time only).
+        indptr_cp = cp.asarray(indptr, dtype=cp.int32).ravel()
+        indices_cp = cp.asarray(indices, dtype=cp.int32).ravel()
+        nnz = int(indices_cp.size)
+        if int(indptr_cp.size) != rows + 1:
             raise ValueError(
-                "Invalid indices, indptr, and data combination."
-            ) from e
+                f"indptr must have length rows + 1 = {rows + 1}; got {int(indptr_cp.size)}."
+            )
+        data_cp = cp.asarray(data, dtype=wp.dtype_to_numpy(dtype))
+        if data_cp.shape == (nnz,):
+            data_cp = cp.broadcast_to(data_cp, (batch_size, nnz))
+        if data_cp.shape != (batch_size, nnz):
+            raise ValueError(
+                f"data must have shape ({batch_size}, {nnz}) or ({nnz},), got {data_cp.shape}."
+            )
 
         self._batch_size = batch_size
-        self._indices = self._template_matrix.indices
-        self._indptr = self._template_matrix.indptr
-        self._nnz = self._template_matrix.nnz
+        self._nnz = nnz
+        self._rows = rows
+        self._cols = cols
+        self._dtype = dtype
+        self._device = device
+        self._indptr = to_wp_int32(indptr_cp, device)
+        self._indices = to_wp_int32(indices_cp, device)
+        self._data = wp.empty((batch_size, nnz), dtype=dtype, device=device)
+        if nnz > 0:
+            wp.copy(self._data, wp.array(data_cp, dtype=dtype, copy=False))
+        self._row_indices: Optional[wp.array] = None
 
-        if data_cp.shape != (batch_size, self._nnz):
-            raise ValueError(
-                f"data must have shape ({batch_size}, {self._nnz}), got {data_cp.shape}."
-            )
-        self.data = cp.empty((batch_size, self._nnz), dtype=dtype)
-        self.data[:] = data_cp
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
 
-    # TODO: consider not allocate self.data but directly point to the provided data. Also, change update_data() as a setter to point to new data
-    def update_data(self, new_data: cp.ndarray) -> None:
-        """Overwrite the internal values buffer in place.
+    @property
+    def batch_size(self) -> int:
+        return self._batch_size
 
-        ``new_data`` must be a cupy array of shape ``(batch_size, nnz)``.
-        Copies element-wise into ``self.data`` — preserves the buffer's
-        device pointer, so any cuSPARSE descriptor built on it stays valid.
+    @property
+    def nnz(self) -> int:
+        return self._nnz
+
+    @property
+    def rows(self) -> int:
+        return self._rows
+
+    @property
+    def cols(self) -> int:
+        return self._cols
+
+    @property
+    def shape(self) -> Tuple[int, int, int]:
+        return (self._batch_size, self._rows, self._cols)
+
+    @property
+    def dtype(self):
+        """Value dtype, a Warp scalar type."""
+        return self._dtype
+
+    @property
+    def device(self) -> str:
+        return self._device
+
+    @property
+    def indptr(self) -> wp.array:
+        """Shared CSR row pointers, ``(rows + 1,)`` int32."""
+        return self._indptr
+
+    @property
+    def indices(self) -> wp.array:
+        """Shared CSR column indices, ``(nnz,)`` int32."""
+        return self._indices
+
+    @property
+    def data(self) -> wp.array:
+        """Values, ``(batch_size, nnz)``."""
+        return self._data
+
+    @property
+    def row_indices(self) -> wp.array:
+        """Row index of every stored entry, ``(nnz,)`` int32 (the COO row array).
+
+        Depends only on the pattern, so it is computed once, with cupy, on
+        first use.
         """
-        new_data_cp = cp.asarray(new_data, dtype=self._dtype)
-        if new_data_cp.shape != (self._batch_size, self._nnz):
-            raise ValueError(
-                f"new_data must have shape ({self._batch_size}, {self._nnz}); "
-                f"got {new_data_cp.shape}."
-            )
-        self.data[:] = new_data_cp
+        if self._row_indices is None:
+            if self._nnz == 0:
+                self._row_indices = wp.zeros(0, dtype=wp.int32, device=self._device)
+            else:
+                indptr_cp = cp.asarray(self._indptr)
+                rows = cp.searchsorted(indptr_cp[1:], cp.arange(self._nnz, dtype=cp.int32), side="right")
+                self._row_indices = to_wp_int32(rows, self._device)
+        return self._row_indices
+
+    def __getitem__(self, key: int) -> csr_matrix:
+        """Zero-copy ``csr_matrix`` view of the ``key``-th matrix (cupy views of
+        the Warp buffers), for pattern algebra and library setup calls."""
+        return csr_matrix(
+            (cp.asarray(self._data)[key], cp.asarray(self._indices), cp.asarray(self._indptr)),
+            shape=(self._rows, self._cols)
+        )
+
+    # ------------------------------------------------------------------
+    # Constructors
+    # ------------------------------------------------------------------
 
     @staticmethod
     def is_torch_sparse_csr_tensor(obj) -> bool:
@@ -119,78 +191,83 @@ class UniformBatchedCsrMatrix:
     def from_input(
         cls,
         matrix,
-        dtype=cp.float64,
-        validate_shared_sparsity: bool = True,
+        dtype=wp.float64,
+        device: str = "cuda",
+        validate_shared_sparsity: bool = True
     ) -> "UniformBatchedCsrMatrix":
-        """Normalize one accepted sparse input form to uniform batched CSR."""
+        """Normalize one accepted sparse input form to uniform batched CSR:
+        a ``UniformBatchedCsrMatrix`` (copied), a 2-D or 3-D torch CSR
+        tensor, a list of cupy CSR matrices sharing one pattern, or a single
+        cupy CSR matrix."""
         if isinstance(matrix, cls):
             return cls(
                 batch_size=matrix.batch_size,
-                indices=matrix.indices,
                 indptr=matrix.indptr,
+                indices=matrix.indices,
                 data=matrix.data,
                 shape=(matrix.rows, matrix.cols),
                 dtype=dtype,
+                device=device
             )
         if cls.is_torch_sparse_csr_tensor(matrix):
             return cls.from_torch_sparse_csr_tensor(
-                matrix,
-                dtype=dtype,
-                validate_shared_sparsity=validate_shared_sparsity,
+                matrix, dtype=dtype, device=device,
+                validate_shared_sparsity=validate_shared_sparsity
             )
         if isinstance(matrix, (list, tuple)):
             return cls.from_cupy_csr_matrix_sequence(
-                matrix,
-                dtype=dtype,
-                validate_shared_sparsity=validate_shared_sparsity,
+                matrix, dtype=dtype, device=device,
+                validate_shared_sparsity=validate_shared_sparsity
             )
-        return cls.from_cupy_csr_matrix(matrix, dtype=dtype)
+        return cls.from_cupy_csr_matrix(matrix, dtype=dtype, device=device)
 
     @classmethod
-    def from_cupy_csr_matrix(cls, matrix, batch_size: int = 1, dtype=cp.float64) -> "UniformBatchedCsrMatrix":
-        """Build a uniform batched CSR matrix from a single CuPy CSR (or convertible) input.
-
-        The sparsity pattern (``indices``/``indptr``) is stored once and shared across the
-        whole batch; the values are replicated into ``batch_size`` identical rows. The
-        default ``batch_size=1`` wraps the input as a one-element batch.
-        """
-        matrix = csr_matrix(matrix, dtype=dtype)
+    def from_cupy_csr_matrix(
+        cls, matrix, batch_size: int = 1, dtype=wp.float64, device: str = "cuda"
+    ) -> "UniformBatchedCsrMatrix":
+        """Build from a single cupy CSR (or convertible) matrix; its values are
+        replicated into ``batch_size`` identical rows."""
+        matrix = csr_matrix(matrix, dtype=wp.dtype_to_numpy(to_warp_dtype(dtype)))
         return cls(
             batch_size=batch_size,
-            indices=matrix.indices,
             indptr=matrix.indptr,
-            data=matrix.data.reshape(1, -1) if batch_size == 1 else cp.tile(matrix.data, (batch_size, 1)),
+            indices=matrix.indices,
+            data=matrix.data,
             shape=matrix.shape,
             dtype=dtype,
+            device=device
         )
 
     @classmethod
     def from_cupy_csr_matrix_sequence(
         cls,
         matrices: Sequence[csr_matrix],
-        dtype=cp.float64,
-        validate_shared_sparsity: bool = True,
+        dtype=wp.float64,
+        device: str = "cuda",
+        validate_shared_sparsity: bool = True
     ) -> "UniformBatchedCsrMatrix":
-        """Build from a non-empty list or tuple of uniform CuPy CSR matrices."""
+        """Build from a non-empty list or tuple of cupy CSR matrices sharing one pattern."""
         if not isinstance(matrices, (list, tuple)) or len(matrices) == 0:
             raise ValueError("matrices must be a non-empty list or tuple of CuPy csr matrices.")
-        matrices = [csr_matrix(matrix, dtype=dtype) for matrix in matrices]
+        np_dtype = wp.dtype_to_numpy(to_warp_dtype(dtype))
+        matrices = [csr_matrix(matrix, dtype=np_dtype) for matrix in matrices]
         template = matrices[0]
         if validate_shared_sparsity:
             cls._require_uniform_sparsity(matrices)
         data = (
             cp.stack([matrix.data for matrix in matrices])
-            if template.nnz > 0 else cp.empty((len(matrices), 0), dtype=dtype)
-            )
+            if template.nnz > 0 else cp.empty((len(matrices), 0), dtype=np_dtype)
+        )
         return cls(
             batch_size=len(matrices),
-            indices=template.indices,
             indptr=template.indptr,
+            indices=template.indices,
             data=data,
             shape=template.shape,
             dtype=dtype,
+            device=device
         )
-    
+
     @staticmethod
     def _require_uniform_sparsity(matrices: Sequence[csr_matrix]) -> None:
         """Raise unless all CSR matrices share one shape and structure."""
@@ -215,31 +292,32 @@ class UniformBatchedCsrMatrix:
 
     @classmethod
     def empty(
-        cls, batch_size: int, rows: int, cols: int, dtype=cp.float64,
+        cls, batch_size: int, rows: int, cols: int, dtype=wp.float64, device: str = "cuda"
     ) -> "UniformBatchedCsrMatrix":
-        """Build an empty uniform CSR matrix batch with a declared shape."""
+        """Build a batch of ``(rows, cols)`` matrices with no stored entries."""
         return cls(
             batch_size=batch_size,
-            indices=cp.empty(0, dtype=cp.int32),
-            indptr=cp.zeros(rows + 1, dtype=cp.int32),
-            data=cp.empty((batch_size, 0), dtype=dtype),
+            indptr=np.zeros(rows + 1, dtype=np.int32),
+            indices=np.zeros(0, dtype=np.int32),
+            data=cp.empty((batch_size, 0), dtype=wp.dtype_to_numpy(to_warp_dtype(dtype))),
             shape=(rows, cols),
             dtype=dtype,
+            device=device
         )
 
     @classmethod
     def from_torch_sparse_csr_tensor(
-        cls, tensor, dtype=cp.float64, validate_shared_sparsity: bool = True,
+        cls, tensor, batch_size: int = 1, dtype=wp.float64, device: str = "cuda",
+        validate_shared_sparsity: bool = True
     ) -> "UniformBatchedCsrMatrix":
-        """Build a uniform batched CSR matrix from a torch CSR tensor.
+        """Build from a CUDA torch CSR tensor.
 
-        ``tensor`` may be 2-D with shape ``(M, N)`` or 3-D with shape
-        ``(B, M, N)``. For 3-D inputs, every batch must share one CSR
-        pattern; by default this is checked before using the first batch's
-        ``indptr`` / ``indices`` as the shared structure.
-
-        Device-side input buffers are imported via DLPack before values are
-        copied into solver-owned storage.
+        ``tensor`` may be 2-D with shape ``(M, N)``, whose values are then
+        replicated into ``batch_size`` rows, or 3-D with shape ``(B, M, N)``.
+        For 3-D inputs every batch must share one CSR pattern; by default
+        this is checked before using the first batch's ``indptr`` /
+        ``indices`` as the shared structure. Values are copied into
+        solver-owned storage.
         """
         import torch  # local import to avoid a hard dependency on torch
 
@@ -257,21 +335,14 @@ class UniformBatchedCsrMatrix:
 
         if tensor.dim() == 2:
             rows, cols = int(tensor.shape[0]), int(tensor.shape[1])
-            indptr = cp.from_dlpack(tensor.crow_indices().contiguous()).astype(
-                cp.int32, copy=False,
-            )
-            indices = cp.from_dlpack(tensor.col_indices().contiguous()).astype(
-                cp.int32, copy=False,
-            )
-            values = cp.from_dlpack(tensor.values().contiguous())
-            data = values.reshape(1, -1)
             return cls(
-                batch_size=1,
-                indices=indices,
-                indptr=indptr,
-                data=data,
+                batch_size=batch_size,
+                indptr=cp.from_dlpack(tensor.crow_indices().contiguous()),
+                indices=cp.from_dlpack(tensor.col_indices().contiguous()),
+                data=cp.from_dlpack(tensor.values().contiguous()),
                 shape=(rows, cols),
                 dtype=dtype,
+                device=device
             )
 
         B, rows, cols = (
@@ -297,121 +368,23 @@ class UniformBatchedCsrMatrix:
                     "All batch matrices must share the same CSR sparsity pattern."
                 )
 
-        # Zero-copy views into torch device memory, then dtype-cast as needed.
-        # Slicing crow[0] / col[0] picks the shared per-batch pattern; those
-        # rows are contiguous in the underlying 2-D buffer so DLPack works
-        # without a copy.
-        indptr = cp.from_dlpack(crow[0].contiguous()).astype(cp.int32, copy=False)
-        indices = cp.from_dlpack(col[0].contiguous()).astype(cp.int32, copy=False)
-        data = cp.from_dlpack(values.contiguous())
-
+        # crow[0] / col[0] are contiguous rows of the 2-D index buffers, so
+        # DLPack views them without a copy; the constructor copies from them.
         return cls(
             batch_size=B,
-            indices=indices,
-            indptr=indptr,
-            data=data,
+            indptr=cp.from_dlpack(crow[0].contiguous()),
+            indices=cp.from_dlpack(col[0].contiguous()),
+            data=cp.from_dlpack(values.contiguous()),
             shape=(rows, cols),
             dtype=dtype,
+            device=device
         )
 
-    @property
-    def batch_size(self) -> int: return self._batch_size
 
-    @property
-    def nnz(self) -> int: return self._nnz
-
-    @property
-    def indices(self): return self._indices
-
-    @property
-    def indptr(self): return self._indptr
-
-    @property
-    def rows(self): return self._template_matrix.shape[0]
-
-    @property
-    def cols(self): return self._template_matrix.shape[1]
-
-    @property
-    def shape(self) -> Tuple[int]: 
-        return (self.batch_size, self._template_matrix.shape[0], self._template_matrix.shape[1])
-
-    def __getitem__(self, key: int) -> csr_matrix:
-        return csr_matrix(
-            (self.data[key], self._indices, self._indptr),
-            shape=self._template_matrix.shape,
-        )
-
-    def diagonal(self) -> cp.ndarray:
-        """Batched analogue of ``cupyx.scipy.sparse.csr_matrix.diagonal``.
-
-        Returns a ``(batch_size, min(rows, cols))`` cupy float64 array whose
-        ``[b, i]`` entry is the value at position ``(i, i)`` of the ``b``-th
-        matrix, or ``0`` if that entry is not structurally stored.
-
-        Fully vectorized — no Python loop over batches. The row/column
-        mapping depends only on the shared sparsity pattern, so it is
-        computed lazily on first call and cached for reuse.
-        """
-        var_idx, csr_idx = self._diag_index_map()
-        k = min(self._template_matrix.shape)
-        out = cp.zeros((self._batch_size, k), dtype=self.data.dtype)
-        if var_idx.size > 0:
-            out[:, var_idx] = self.data[:, csr_idx]
-        return out
-
-    def _diag_index_map(self):
-        """Cached ``(var_idx, csr_idx)`` locating stored diagonal entries.
-
-        ``var_idx[j]`` is the row/col index of the j-th stored diagonal;
-        ``csr_idx[j]`` is its column in ``self.data``. Rows with no stored
-        diagonal entry are simply absent from both arrays (``diagonal()``
-        leaves those slots at 0). Computed on-device via ``cp.searchsorted``
-        + a mask — no Python loop over rows.
-        """
-        cached = getattr(self, "_diag_idx_cache", None)
-        if cached is not None:
-            return cached
-        if self._nnz == 0:
-            empty = cp.empty(0, dtype=cp.int32)
-            self._diag_idx_cache = (empty, empty)
-            return self._diag_idx_cache
-        idx_dtype = self._indptr.dtype
-        # Row index of each CSR entry (indptr is non-decreasing).
-        rows = cp.searchsorted(
-            self._indptr[1:], cp.arange(self._nnz, dtype=idx_dtype),
-            side='right',
-        )
-        is_diag = rows == self._indices
-        csr_idx = cp.where(is_diag)[0].astype(cp.int32)
-        var_idx = rows[csr_idx].astype(cp.int32)
-        self._diag_idx_cache = (var_idx, csr_idx)
-        return self._diag_idx_cache
-
-    def __setitem__(self, key: int, value: Union[csr_matrix, cp.ndarray]):
-        """Overwrite the ``key``-th matrix. ``value`` is either a csr_matrix
-        sharing the template's sparsity, or a 1D cupy array of the nnz values."""
-        if isinstance(value, csr_matrix):
-            if value.shape != self._template_matrix.shape:
-                raise ValueError(
-                    f"Shape mismatch. Expected {self._template_matrix.shape}, "
-                    f"got {value.shape}."
-                )
-            if value.nnz != self._nnz:
-                raise ValueError(
-                    f"nnz mismatch. Expected {self._nnz}, got {value.nnz}. "
-                    "Input must share the template's sparsity pattern."
-                )
-            self.data[key] = value.data
-        elif isinstance(value, cp.ndarray):
-            if value.shape != (self._nnz,):
-                raise ValueError(
-                    f"Expected cupy.ndarray of shape ({self._nnz},), "
-                    f"got {value.shape}."
-                )
-            self.data[key] = value
-        else:
-            raise TypeError(
-                f"Unsupported value type {type(value).__name__}; expected "
-                "cupyx.scipy.sparse.csr_matrix or cupy.ndarray."
-            )
+def to_wp_int32(values, device: str = "cuda") -> wp.array:
+    """Owned ``int32`` Warp copy of an integer array (host or GPU); a
+    zero-length input gives an empty array instead of a null-pointer view."""
+    values_cp = cp.asarray(values, dtype=cp.int32).ravel()
+    if values_cp.size == 0:
+        return wp.zeros(0, dtype=wp.int32, device=device)
+    return wp.array(cp.ascontiguousarray(values_cp), dtype=wp.int32, device=device)

@@ -77,3 +77,40 @@ def create_scatter_masked_G_kernel(dtype=wp.float64):
         kkt_data[b, G_indices[k]] = G_data[b, k] * active_G_row[b, row]
 
     return scatter_masked_G_kernel
+
+
+def create_scatter_values_kernel(dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
+    """``dst[b, dst_cols[k]] = src[b, k]`` for every batch ``b`` and entry
+    ``k``: scatters a block's ``(B, nnz)`` values into the ``(B, kkt_nnz)``
+    KKT buffer through a precomputed position map. Launch with ``dim=(B, nnz)``."""
+
+    @wp.kernel
+    def scatter_values_kernel(
+        src:      wp.array2d(dtype=dtype),   # type: ignore  (B, nnz)
+        dst_cols: wp.array(dtype=wp.int32),  # type: ignore  (nnz,)
+        dst:      wp.array2d(dtype=dtype),   # type: ignore  (B, kkt_nnz) in-out
+    ):
+        b, k = wp.tid()
+        dst[b, dst_cols[k]] = src[b, k]
+
+    return scatter_values_kernel
+
+
+def create_gather_scatter_values_kernel(dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
+    """``dst[b, dst_cols[k]] = src[b, src_cols[k]]``: copies selected entries
+    of a ``(B, nnz)`` values buffer into selected columns of a ``(B, n)``
+    buffer, e.g. the stored diagonal of P. Launch with ``dim=(B, num_entries)``."""
+
+    @wp.kernel
+    def gather_scatter_values_kernel(
+        src:      wp.array2d(dtype=dtype),   # type: ignore  (B, nnz)
+        src_cols: wp.array(dtype=wp.int32),  # type: ignore  (num_entries,)
+        dst_cols: wp.array(dtype=wp.int32),  # type: ignore  (num_entries,)
+        dst:      wp.array2d(dtype=dtype),   # type: ignore  (B, n) in-out
+    ):
+        b, k = wp.tid()
+        dst[b, dst_cols[k]] = src[b, src_cols[k]]
+
+    return gather_scatter_values_kernel
