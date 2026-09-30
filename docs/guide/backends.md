@@ -155,8 +155,9 @@ on other non-default streams must order themselves with `solver.stream` (for
 example with `wp.ScopedStream(solver.stream)` around the work, or Warp events).
 The framework adapters do this for you: `cupiqp.torch` orders every call with
 the `torch.cuda.Stream` given to its constructor (or torch's current stream).
-The sparse backend keeps a non-owning cupy view of the same stream for its
-cuSPARSE / cuDSS work; it is an implementation detail of that backend.
+The sparse backend enters a non-owning cupy view of the same stream during
+`setup()`, where it builds the KKT sparsity pattern with `cupyx`; it is an
+implementation detail of that backend.
 
 ## Inner-loop kernels
 
@@ -172,8 +173,10 @@ width from the array shapes, so they are compiled once per dtype and serve a
 compile time that grows with the problem width, no width-dependent code path, and
 nothing to select.
 
-The dense, multistage and OCP backends need no CuPy: problem data, iterates and
-workspaces are Warp arrays, the dense linear algebra calls cuBLAS / cuSOLVER
-directly, and CUDA graphs are captured with Warp. The sparse backend keeps its CSR
-matrices in `cupyx.scipy.sparse` (cuSPARSE / cuDSS) and reads the core's Warp
-vectors through zero-copy views.
+Every backend stores its data as Warp arrays: problem data, iterates and
+workspaces, and for the sparse backend also the CSR pattern (`int32` row pointers
+and column indices) and the `(B, nnz)` value buffers. The dense linear algebra
+calls cuBLAS / cuSOLVER and the sparse backend calls cuSPARSE / cuDSS on those
+buffers directly, and CUDA graphs are captured with Warp. CuPy appears only in
+the sparse backend at `setup()`, where `cupyx.scipy.sparse` assembles the KKT
+pattern and the index maps that the Warp kernels use afterwards.
