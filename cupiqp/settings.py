@@ -1,3 +1,4 @@
+import math
 import warnings
 from dataclasses import dataclass
 from typing import Literal
@@ -117,7 +118,7 @@ class Settings:
             warnings.warn(
                 f"Settings.{name} = {value:g} is tighter than the float32 "
                 f"recommended {_F32_DEFAULTS[name]:g}, convergence may fail.",
-                stacklevel=2,
+                stacklevel=2
             )
         super().__setattr__(name, value)
 
@@ -144,7 +145,7 @@ class Settings:
                self.iterative_refinement_static_regularization_rel >= 0 and
                self.kkt_solver in ["dense_cholesky", "sparse_ldlt", "multistage_block_cholesky"]
                and self.dtype in ("float32", "float64")
-               and self.gradient_smoothing_mu > 0
-               and self.gradient_smoothing_tol > 0
+               and self.gradient_smoothing_mu > 0 and math.isfinite(self.gradient_smoothing_mu)
+               and self.gradient_smoothing_tol > 0 and math.isfinite(self.gradient_smoothing_tol)
                and self.gradient_smoothing_max_iter > 0
                )

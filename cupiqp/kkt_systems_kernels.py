@@ -363,3 +363,93 @@ def create_recover_slacks_transposed_kernel(dtype=wp.float64):
         lhs_s_all[b, i] = m_z_inv_all[b, i] * (-lhs_z_all[b, i] + rhs_s_all[b, i])
 
     return recover_slacks_transposed_kernel
+
+def create_condensed_kkt_combine_kernel(dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
+    """Assemble the condensed KKT matrix-vector product from its pieces.
+
+    Given the backend matvecs ``P_x = P lhs_x``, ``AT_y = A^T lhs_y``,
+    ``GT_z = G^T (active * lhs_z)``, ``A_x = A lhs_x`` and ``G_x = G lhs_x``,
+    computes for every batch entry
+
+        K_x = P_x + x_reg * lhs_x + AT_y + GT_z
+        K_y = A_x - delta * lhs_y
+        K_z = active * G_x - (z_reg * lhs_z  on active rows, lhs_z on inactive rows)
+
+    Inactive inequality rows (``z_reg == 0``) are decoupled with a ``-1``
+    diagonal, matching the factorized augmented KKT. With ``residual == 0``
+    the products are written to ``out_*``; with ``residual == 1`` the kernel
+    writes ``out_* = rhs_* - K_*`` and accumulates ``max |out_*|`` into the
+    one-element ``norm_out`` (atomic; zero it first). Launch with
+    ``dim=(B, n + p + m)``.
+    """
+    @wp.kernel
+    def condensed_kkt_combine_kernel(
+        P_x:   wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        x_reg: wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        lhs_x: wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        AT_y:  wp.array2d(dtype=dtype),  # type: ignore  (B, n)   (unused if p == 0)
+        GT_z:  wp.array2d(dtype=dtype),  # type: ignore  (B, n)   (unused if m == 0)
+        A_x:   wp.array2d(dtype=dtype),  # type: ignore  (B, p)
+        lhs_y: wp.array2d(dtype=dtype),  # type: ignore  (B, p)
+        delta: wp.array(dtype=dtype),    # type: ignore  (B,)
+        G_x:   wp.array2d(dtype=dtype),  # type: ignore  (B, m)
+        active_G_row: wp.array2d(dtype=dtype),  # type: ignore  (B, m)
+        z_reg: wp.array2d(dtype=dtype),  # type: ignore  (B, m)
+        lhs_z: wp.array2d(dtype=dtype),  # type: ignore  (B, m)
+        rhs_x: wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        rhs_y: wp.array2d(dtype=dtype),  # type: ignore  (B, p)
+        rhs_z: wp.array2d(dtype=dtype),  # type: ignore  (B, m)
+        residual: wp.int32,              # type: ignore
+        out_x: wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        out_y: wp.array2d(dtype=dtype),  # type: ignore  (B, p)
+        out_z: wp.array2d(dtype=dtype),  # type: ignore  (B, m)
+        norm_out: wp.array(dtype=dtype), # type: ignore  (1,)
+    ):
+        b, t = wp.tid()
+        n = lhs_x.shape[1]
+        p = lhs_y.shape[1]
+        m = lhs_z.shape[1]
+        if t < n:
+            v = P_x[b, t] + x_reg[b, t] * lhs_x[b, t]
+            if p > 0:
+                v = v + AT_y[b, t]
+            if m > 0:
+                v = v + GT_z[b, t]
+            if residual == wp.int32(1):
+                v = rhs_x[b, t] - v
+                wp.atomic_max(norm_out, 0, wp.abs(v))
+            out_x[b, t] = v
+        elif t < n + p:
+            k = t - n
+            v = A_x[b, k] - delta[b] * lhs_y[b, k]
+            if residual == wp.int32(1):
+                v = rhs_y[b, k] - v
+                wp.atomic_max(norm_out, 0, wp.abs(v))
+            out_y[b, k] = v
+        elif t < n + p + m:
+            k = t - n - p
+            zr = z_reg[b, k]
+            diag_term = lhs_z[b, k]
+            if zr > dtype(0.0):
+                diag_term = zr * lhs_z[b, k]
+            v = active_G_row[b, k] * G_x[b, k] - diag_term
+            if residual == wp.int32(1):
+                v = rhs_z[b, k] - v
+                wp.atomic_max(norm_out, 0, wp.abs(v))
+            out_z[b, k] = v
+
+    return condensed_kkt_combine_kernel
+
+
+def create_inf_norm_2d_kernel(dtype=wp.float64):
+    """``out[0] = max(out[0], max |a|)`` over a ``(B, k)`` array (atomic; zero ``out`` first).
+    Launch with ``dim=a.shape``. Used by the iterative-refinement error norm."""
+    dtype = to_warp_dtype(dtype)
+
+    @wp.kernel
+    def inf_norm_2d(a: wp.array2d(dtype=dtype), out: wp.array(dtype=dtype)):  # type: ignore
+        i, j = wp.tid()
+        wp.atomic_max(out, 0, wp.abs(a[i, j]))
+
+    return inf_norm_2d

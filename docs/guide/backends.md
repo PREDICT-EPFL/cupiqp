@@ -133,36 +133,47 @@ in place, into the solver's buffers.
 
 ---
 
-## Kernel strategy
+## Streams
 
-cuPIQP runs the same interior-point algorithm at every problem size; only the
-inner-loop kernel implementation changes, and the solver picks it automatically at
-`setup()` — there is no setting to tune and nothing to change in your code. The inner
-loop (step length, barrier parameter `mu`, centering `sigma`, residual and merit
-evaluation) is evaluated one of two ways:
+Each solver instance runs on **one CUDA stream** of its own: `setup`, `update`,
+`solve`, `backward` (and `OcpSolver.set`) make it Warp's current stream for their
+duration, so every kernel, copy, library call and CUDA graph of the solver is
+issued there. The stream is exposed as `solver.stream` (a `warp.Stream`).
 
-- **Fused Warp tile kernels** — JIT-compiled and specialized to the problem dimensions,
-  very fast per launch, and they amortize across a batch and across IPM iterations.
-  The catch is the compile step: because the kernels are specialized to the problem
-  width, the **first-solve compile time grows with the problem** and eventually
-  dominates — you can spend more time compiling kernels than actually solving.
-- **CuPy axis-reduction kernels** (`cp.min`, `cp.sum`, `cp.max` over the data axis) —
-  generic, so they need no shape-specialized compilation and the compile cliff
-  disappears. They carry more per-launch overhead, but over a long reduction axis — i.e.
-  a wide problem — that overhead is amortized and the trade is worth it. This path also
-  builds the Ruiz preconditioner with the tile kernels switched off, for the same reason.
+By default the solver creates the stream. It is created blocking with respect to
+the legacy default stream, so plain cupy / torch / numba code on the default stream
+is ordered with the solver automatically. To run the solver on a stream of your own,
+pass a `warp.Stream` to the constructor:
 
-The choice is made from the problem width at `setup()`: with
-`tile_width = max(n + p + m, p + num_ineq)`, the solver uses the CuPy axis-reduction
-kernels when `tile_width >= 1024` and the fused Warp tile kernels otherwise, where
-`num_ineq` is the total number of finite inequality + box-bound rows. It depends
-on width only — independent of batch size and dtype, because the thing it avoids
-(tile-kernel compile time) depends on shape, not on how many problems you batch. The
-threshold is an internal heuristic, not a precisely calibrated constant, and both paths
-run the same algorithm and agree to solver tolerance.
+```python
+stream = wp.Stream("cuda:0")
+solver = DenseSolver(stream=stream)      # borrowed: the solver never destroys it
+```
 
-!!! note "Batched workloads use the tile kernels"
-    The selection is by problem width, not batch size: a large batch of moderately-wide
-    problems still uses the fused tile kernels (they amortize across the batch), which is
-    the intended behavior. The CuPy path targets a single (or small-batch) wide
-    problem where compile time of warp tile-based kernels would dominate the run time.
+Only `warp.Stream` objects are accepted by the core solvers. Producers or consumers
+on other non-default streams must order themselves with `solver.stream` (for
+example with `wp.ScopedStream(solver.stream)` around the work, or Warp events).
+The framework adapters do this for you: `cupiqp.torch` orders every call with
+the `torch.cuda.Stream` given to its constructor (or torch's current stream).
+The sparse backend keeps a non-owning cupy view of the same stream for its
+cuSPARSE / cuDSS work; it is an implementation detail of that backend.
+
+## Inner-loop kernels
+
+cuPIQP runs the same interior-point algorithm at every problem size, with one set
+of Warp kernels. The per-element steps of the iteration (variable updates, the
+Newton right-hand sides, the regularization terms) are Warp kernels specialized to
+the block widths fixed at `setup()`, and every reduction of the iteration (step
+lengths, the barrier parameter `mu`, the centering parameter `sigma`, residual norms
+and objectives) is a fixed-size block reduction: one CUDA block per problem of the
+batch, each thread striding over the row. These reduction kernels read the problem
+width from the array shapes, so they are compiled once per dtype and serve a
+3-variable QP and a QP whose KKT width is in the thousands alike - there is no
+compile time that grows with the problem width, no width-dependent code path, and
+nothing to select.
+
+The dense, multistage and OCP backends need no CuPy: problem data, iterates and
+workspaces are Warp arrays, the dense linear algebra calls cuBLAS / cuSOLVER
+directly, and CUDA graphs are captured with Warp. The sparse backend keeps its CSR
+matrices in `cupyx.scipy.sparse` (cuSPARSE / cuDSS) and reads the core's Warp
+vectors through zero-copy views.

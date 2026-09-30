@@ -1,20 +1,27 @@
 """Graph-safe cuBLAS wrappers via nvmath-python bindings.
 
 Both single-precision (``s*``) and double-precision (``d*``) variants
-are exposed as separate public functions — each hardcoded to one
+are exposed as separate public functions -- each hardcoded to one
 precision and using the matching ``ctypes.c_float`` / ``ctypes.c_double``
 alpha/beta scalar type. Callers pick the right variant once based on
 their dtype (e.g. ``DenseKKTSolver`` does a lazy import in ``__init__``)
 so there is zero per-call dispatch overhead.
+
+Array arguments are C-contiguous (row-major) Warp arrays of the wrapper's
+dtype. Batched operands may have an arbitrary batch stride (row-strided
+views). Only the address, shape and batch stride are read; nothing is
+validated: the solver checks user data once at setup/update.
 """
 
 import ctypes
+from typing import Union
 
+import warp as wp
 from nvmath.bindings import cublas
 
 
 # ---------------------------------------------------------------------------
-# Constants (cuBLAS C enum values — kept as ints for backward compat with
+# Constants (cuBLAS C enum values -- kept as ints for backward compat with
 # call sites that imported them by name).
 # ---------------------------------------------------------------------------
 OP_N = 0            # CUBLAS_OP_N  (non-transpose)
@@ -26,102 +33,95 @@ POINTER_DEVICE = 1  # CUBLAS_POINTER_MODE_DEVICE
 
 
 # ---------------------------------------------------------------------------
-# Handle/stream management — independent of dtype
+# Handle/stream management -- independent of dtype
 # ---------------------------------------------------------------------------
-def cublas_create_handle():
+def cublas_create_handle() -> int:
     """Create a new cuBLAS handle (thread-safe, independent of CuPy's shared handle)."""
     return cublas.create()
 
 
-def cublas_destroy_handle(handle):
+def cublas_destroy_handle(handle: int) -> None:
     """Destroy a cuBLAS handle created by :func:`cublas_create_handle`."""
     cublas.destroy(handle)
 
 
-def cublas_set_stream(handle, cuda_stream):
+def cublas_set_stream(handle: int, cuda_stream: int) -> None:
     """Associate a CUDA stream with the cuBLAS handle."""
     cublas.set_stream(handle, cuda_stream)
 
 
-def set_pointer_mode(handle, mode):
+def set_pointer_mode(handle: int, mode: int) -> None:
     """Set cuBLAS pointer mode (``POINTER_HOST`` or ``POINTER_DEVICE``)."""
     cublas.set_pointer_mode(handle, mode)
 
 
 # ---------------------------------------------------------------------------
-# Helper used by the two GEMV wrappers to compute (m, n, lda, op) from
-# a matrix's contiguity and the user's transpose flag.
+# Layout helpers. cuBLAS is column-major, so it sees each row-major matrix
+# as its transpose with ``ld = cols``; the wrappers below flip the operation
+# flags accordingly.
 # ---------------------------------------------------------------------------
-def _gemv_layout(mat, transa):
-    rows, cols = mat.shape
-    if mat.flags["F_CONTIGUOUS"]:
-        m, n, lda = rows, cols, rows
-        op = OP_N if not transa else OP_T
-    else:
-        m, n, lda = cols, rows, cols
-        op = OP_T if not transa else OP_N
-    return m, n, lda, op
+def _gemv_layout(mat: wp.array2d, transa: bool) -> tuple:
+    """``(ptr, m, n, lda, op)`` for a row-major ``(rows, cols)`` matrix."""
+    rows, cols = int(mat.shape[0]), int(mat.shape[1])
+    op = OP_T if not transa else OP_N
+    return mat.ptr, cols, rows, max(cols, 1), op
 
 
-# ---------------------------------------------------------------------------
-# Helper used by the two GEMM-strided wrappers to compute the cuBLAS
-# (column-major) dimensions/strides from row-major (Python) layout.
-# Returns the tuple of arguments threaded to cuBLAS.
-# ---------------------------------------------------------------------------
-def _gemm_strided_layout(A, B, C, transa, transb):
-    batch = A.shape[0]
-    rA, cA = A.shape[1], A.shape[2]
-    rB, cB = B.shape[1], B.shape[2]
+def _batched_matrix(a: wp.array3d) -> tuple:
+    """``(ptr, rows, cols, ld, batch_stride, batch)`` of a row-major ``(B, rows, cols)`` array (elements)."""
+    rows, cols = int(a.shape[1]), int(a.shape[2])
+    itemsize = wp.types.type_size_in_bytes(a.dtype)
+    return a.ptr, rows, cols, max(cols, 1), a.strides[0] // itemsize, int(a.shape[0])
 
+
+def _batched_vector(x: wp.array2d) -> tuple:
+    """``(ptr, rows, cols, ld, batch_stride, batch)`` of a ``(B, k)`` vector batch, described to cuBLAS as ``(B, k, 1)`` column matrices."""
+    itemsize = wp.types.type_size_in_bytes(x.dtype)
+    return x.ptr, int(x.shape[1]), 1, 1, x.strides[0] // itemsize, int(x.shape[0])
+
+
+def _gemm_strided_args(A: tuple, B: tuple, C: tuple, transa: bool, transb: bool) -> tuple:
+    """cuBLAS arguments for the batched ``C_i = op(A_i) op(B_i)`` on row-major
+    operands (each a ``(ptr, rows, cols, ld, batch_stride, batch)`` tuple).
+
+    Row-major ``C = op(A) op(B)`` is column-major ``C^T = op(B)^T op(A)^T``,
+    so the operands are swapped and cuBLAS' ``m, n, k`` are ``C``'s cols,
+    rows and the contraction length.
+    """
+    a_ptr, rA, cA, lda, sA, batch = A
+    b_ptr, rB, cB, ldb, sB, _ = B
+    c_ptr, _, _, ldc, sC, _ = C
     op_a_cm = OP_N if not transa else OP_T
     op_b_cm = OP_N if not transb else OP_T
-
-    if not transb:
-        m_blas, k_blas = cB, rB
-    else:
-        m_blas, k_blas = rB, cB
-
-    if not transa:
-        n_blas = rA
-    else:
-        n_blas = cA
-
-    lda_blas = cB
-    ldb_blas = cA
-    ldc_blas = C.shape[2]
-
-    # Strides in *elements* — itemsize is dtype-dependent (4 for f32, 8 for f64)
-    strideA_blas = B.strides[0] // B.itemsize
-    strideB_blas = A.strides[0] // A.itemsize
-    strideC_blas = C.strides[0] // C.itemsize
-
+    m_blas, k_blas = (cB, rB) if not transb else (rB, cB)
+    n_blas = rA if not transa else cA
     return (op_b_cm, op_a_cm, m_blas, n_blas, k_blas,
-            lda_blas, strideA_blas, ldb_blas, strideB_blas,
-            ldc_blas, strideC_blas, batch)
+            b_ptr, ldb, sB, a_ptr, lda, sA, c_ptr, ldc, sC, batch)
 
 
 # ===========================================================================
 # Double-precision (float64) wrappers
 # ===========================================================================
-def dgemv(handle, mat, x, y, transa=False, alpha=1.0, beta=0.0):
+def dgemv(handle: int, mat: wp.array2d, x: wp.array1d, y: wp.array1d,
+          transa: bool = False, alpha: float = 1.0, beta: float = 0.0) -> None:
     """``y = alpha * op(mat) * x + beta * y`` for float64 arrays."""
-    m, n, lda, op = _gemv_layout(mat, transa)
+    ptr, m, n, lda, op = _gemv_layout(mat, transa)
     _alpha = ctypes.c_double(alpha)
     _beta = ctypes.c_double(beta)
     cublas.dgemv(
         handle, op, m, n,
-        ctypes.addressof(_alpha), mat.data.ptr, lda,
-        x.data.ptr, 1,
-        ctypes.addressof(_beta), y.data.ptr, 1,
+        ctypes.addressof(_alpha), ptr, lda,
+        x.ptr, 1,
+        ctypes.addressof(_beta), y.ptr, 1,
     )
 
 
-def dcopy(handle, n, x_ptr, incx, y_ptr, incy):
+def dcopy(handle: int, n: int, x_ptr: int, incx: int, y_ptr: int, incy: int) -> None:
     """``y = x`` (float64 buffers)."""
     cublas.dcopy(handle, n, x_ptr, incx, y_ptr, incy)
 
 
-def daxpy(handle, n, alpha, x_ptr, incx, y_ptr, incy):
+def daxpy(handle: int, n: int, alpha: Union[float, int], x_ptr: int, incx: int, y_ptr: int, incy: int) -> None:
     """``y = alpha * x + y`` (float64). ``alpha`` is a host float or a
     device pointer; the latter triggers POINTER_DEVICE mode."""
     if isinstance(alpha, float):
@@ -133,7 +133,8 @@ def daxpy(handle, n, alpha, x_ptr, incx, y_ptr, incy):
         cublas.set_pointer_mode(handle, POINTER_HOST)
 
 
-def dsyrk(handle, uplo, trans, n, k, alpha, a_ptr, lda, beta, c_ptr, ldc):
+def dsyrk(handle: int, uplo: int, trans: int, n: int, k: int, alpha: float, a_ptr: int, lda: int,
+          beta: float, c_ptr: int, ldc: int) -> None:
     """``C = alpha * op(A) * op(A)^T + beta * C`` (float64)."""
     _alpha = ctypes.c_double(alpha)
     _beta = ctypes.c_double(beta)
@@ -144,77 +145,68 @@ def dsyrk(handle, uplo, trans, n, k, alpha, a_ptr, lda, beta, c_ptr, ldc):
     )
 
 
-def ddgmm(handle, mode, m, n, a_ptr, lda, x_ptr, incx, c_ptr, ldc):
+def ddgmm(handle: int, mode: int, m: int, n: int, a_ptr: int, lda: int, x_ptr: int, incx: int,
+          c_ptr: int, ldc: int) -> None:
     """``C = diag(x) * A`` or ``A * diag(x)`` (float64)."""
     cublas.ddgmm(handle, mode, m, n, a_ptr, lda, x_ptr, incx, c_ptr, ldc)
 
 
-def ddot(handle, n, x_ptr, incx, y_ptr, incy, result_ptr):
+def ddot(handle: int, n: int, x_ptr: int, incx: int, y_ptr: int, incy: int, result_ptr: int) -> None:
     """``result = x^T * y`` (float64, result is a device pointer)."""
     cublas.ddot(handle, n, x_ptr, incx, y_ptr, incy, result_ptr)
 
 
-def dgemm_strided_batched(handle, A, B, C,
-                          transa=False, transb=False,
-                          alpha=1.0, beta=0.0):
-    r"""Batched GEMM on C-contiguous 3-D float64 arrays.
-
-    .. math::
-
-        C_i = \alpha\;\mathrm{op}(A_i)\;B_i + \beta\;C_i
-        \qquad i = 0 \ldots \text{batch}-1
-    """
+def _dgemm_strided(handle: int, A: tuple, B: tuple, C: tuple,
+                   transa: bool, transb: bool, alpha: float, beta: float) -> None:
     (op_b_cm, op_a_cm, m_blas, n_blas, k_blas,
-     lda_blas, strideA_blas, ldb_blas, strideB_blas,
-     ldc_blas, strideC_blas, batch) = _gemm_strided_layout(A, B, C, transa, transb)
-
+     b_ptr, ldb, sB, a_ptr, lda, sA, c_ptr, ldc, sC, batch) = _gemm_strided_args(A, B, C, transa, transb)
     _alpha = ctypes.c_double(alpha)
     _beta = ctypes.c_double(beta)
     cublas.dgemm_strided_batched(
-        handle,
-        op_b_cm, op_a_cm,
-        m_blas, n_blas, k_blas,
-        ctypes.addressof(_alpha),
-        B.data.ptr, lda_blas, strideA_blas,
-        A.data.ptr, ldb_blas, strideB_blas,
-        ctypes.addressof(_beta),
-        C.data.ptr, ldc_blas, strideC_blas,
-        batch,
+        handle, op_b_cm, op_a_cm, m_blas, n_blas, k_blas,
+        ctypes.addressof(_alpha), b_ptr, ldb, sB, a_ptr, lda, sA,
+        ctypes.addressof(_beta), c_ptr, ldc, sC, batch,
     )
 
 
-def dgemv_strided_batched(handle, mat, x, y,
-                          transa=False, alpha=1.0, beta=0.0):
+def dgemm_strided_batched(handle: int, A: wp.array3d, B: wp.array3d, C: wp.array3d,
+                          transa: bool = False, transb: bool = False,
+                          alpha: float = 1.0, beta: float = 0.0) -> None:
+    r"""Batched GEMM on row-major 3-D float64 arrays: ``C_i = alpha * op(A_i) op(B_i) + beta * C_i``."""
+    _dgemm_strided(handle, _batched_matrix(A), _batched_matrix(B), _batched_matrix(C),
+                   transa, transb, alpha, beta)
+
+
+def dgemv_strided_batched(handle: int, mat: wp.array3d, x: wp.array2d, y: wp.array2d,
+                          transa: bool = False, alpha: float = 1.0, beta: float = 0.0) -> None:
     r"""Batched matrix-vector product via strided batched GEMM (float64)."""
-    batch = mat.shape[0]
-    x3 = x.reshape(batch, x.shape[1], 1)
-    y3 = y.reshape(batch, y.shape[1], 1)
-    dgemm_strided_batched(handle, mat, x3, y3,
-                          transa=transa, alpha=alpha, beta=beta)
+    _dgemm_strided(handle, _batched_matrix(mat), _batched_vector(x), _batched_vector(y),
+                   transa, False, alpha, beta)
 
 
 # ===========================================================================
 # Single-precision (float32) wrappers
 # ===========================================================================
-def sgemv(handle, mat, x, y, transa=False, alpha=1.0, beta=0.0):
+def sgemv(handle: int, mat: wp.array2d, x: wp.array1d, y: wp.array1d,
+          transa: bool = False, alpha: float = 1.0, beta: float = 0.0) -> None:
     """``y = alpha * op(mat) * x + beta * y`` for float32 arrays."""
-    m, n, lda, op = _gemv_layout(mat, transa)
+    ptr, m, n, lda, op = _gemv_layout(mat, transa)
     _alpha = ctypes.c_float(alpha)
     _beta = ctypes.c_float(beta)
     cublas.sgemv(
         handle, op, m, n,
-        ctypes.addressof(_alpha), mat.data.ptr, lda,
-        x.data.ptr, 1,
-        ctypes.addressof(_beta), y.data.ptr, 1,
+        ctypes.addressof(_alpha), ptr, lda,
+        x.ptr, 1,
+        ctypes.addressof(_beta), y.ptr, 1,
     )
 
 
-def scopy(handle, n, x_ptr, incx, y_ptr, incy):
+def scopy(handle: int, n: int, x_ptr: int, incx: int, y_ptr: int, incy: int) -> None:
     """``y = x`` (float32 buffers)."""
     cublas.scopy(handle, n, x_ptr, incx, y_ptr, incy)
 
 
-def saxpy(handle, n, alpha, x_ptr, incx, y_ptr, incy):
+def saxpy(handle: int, n: int, alpha: Union[float, int], x_ptr: int, incx: int, y_ptr: int, incy: int) -> None:
     """``y = alpha * x + y`` (float32). ``alpha`` is a host float or a
     device pointer; the latter triggers POINTER_DEVICE mode."""
     if isinstance(alpha, float):
@@ -226,7 +218,8 @@ def saxpy(handle, n, alpha, x_ptr, incx, y_ptr, incy):
         cublas.set_pointer_mode(handle, POINTER_HOST)
 
 
-def ssyrk(handle, uplo, trans, n, k, alpha, a_ptr, lda, beta, c_ptr, ldc):
+def ssyrk(handle: int, uplo: int, trans: int, n: int, k: int, alpha: float, a_ptr: int, lda: int,
+          beta: float, c_ptr: int, ldc: int) -> None:
     """``C = alpha * op(A) * op(A)^T + beta * C`` (float32)."""
     _alpha = ctypes.c_float(alpha)
     _beta = ctypes.c_float(beta)
@@ -237,44 +230,40 @@ def ssyrk(handle, uplo, trans, n, k, alpha, a_ptr, lda, beta, c_ptr, ldc):
     )
 
 
-def sdgmm(handle, mode, m, n, a_ptr, lda, x_ptr, incx, c_ptr, ldc):
+def sdgmm(handle: int, mode: int, m: int, n: int, a_ptr: int, lda: int, x_ptr: int, incx: int,
+          c_ptr: int, ldc: int) -> None:
     """``C = diag(x) * A`` or ``A * diag(x)`` (float32)."""
     cublas.sdgmm(handle, mode, m, n, a_ptr, lda, x_ptr, incx, c_ptr, ldc)
 
 
-def sdot(handle, n, x_ptr, incx, y_ptr, incy, result_ptr):
+def sdot(handle: int, n: int, x_ptr: int, incx: int, y_ptr: int, incy: int, result_ptr: int) -> None:
     """``result = x^T * y`` (float32, result is a device pointer)."""
     cublas.sdot(handle, n, x_ptr, incx, y_ptr, incy, result_ptr)
 
 
-def sgemm_strided_batched(handle, A, B, C,
-                          transa=False, transb=False,
-                          alpha=1.0, beta=0.0):
-    r"""Batched GEMM on C-contiguous 3-D float32 arrays."""
+def _sgemm_strided(handle: int, A: tuple, B: tuple, C: tuple,
+                   transa: bool, transb: bool, alpha: float, beta: float) -> None:
     (op_b_cm, op_a_cm, m_blas, n_blas, k_blas,
-     lda_blas, strideA_blas, ldb_blas, strideB_blas,
-     ldc_blas, strideC_blas, batch) = _gemm_strided_layout(A, B, C, transa, transb)
-
+     b_ptr, ldb, sB, a_ptr, lda, sA, c_ptr, ldc, sC, batch) = _gemm_strided_args(A, B, C, transa, transb)
     _alpha = ctypes.c_float(alpha)
     _beta = ctypes.c_float(beta)
     cublas.sgemm_strided_batched(
-        handle,
-        op_b_cm, op_a_cm,
-        m_blas, n_blas, k_blas,
-        ctypes.addressof(_alpha),
-        B.data.ptr, lda_blas, strideA_blas,
-        A.data.ptr, ldb_blas, strideB_blas,
-        ctypes.addressof(_beta),
-        C.data.ptr, ldc_blas, strideC_blas,
-        batch,
+        handle, op_b_cm, op_a_cm, m_blas, n_blas, k_blas,
+        ctypes.addressof(_alpha), b_ptr, ldb, sB, a_ptr, lda, sA,
+        ctypes.addressof(_beta), c_ptr, ldc, sC, batch,
     )
 
 
-def sgemv_strided_batched(handle, mat, x, y,
-                          transa=False, alpha=1.0, beta=0.0):
+def sgemm_strided_batched(handle: int, A: wp.array3d, B: wp.array3d, C: wp.array3d,
+                          transa: bool = False, transb: bool = False,
+                          alpha: float = 1.0, beta: float = 0.0) -> None:
+    r"""Batched GEMM on row-major 3-D float32 arrays: ``C_i = alpha * op(A_i) op(B_i) + beta * C_i``."""
+    _sgemm_strided(handle, _batched_matrix(A), _batched_matrix(B), _batched_matrix(C),
+                   transa, transb, alpha, beta)
+
+
+def sgemv_strided_batched(handle: int, mat: wp.array3d, x: wp.array2d, y: wp.array2d,
+                          transa: bool = False, alpha: float = 1.0, beta: float = 0.0) -> None:
     r"""Batched matrix-vector product via strided batched GEMM (float32)."""
-    batch = mat.shape[0]
-    x3 = x.reshape(batch, x.shape[1], 1)
-    y3 = y.reshape(batch, y.shape[1], 1)
-    sgemm_strided_batched(handle, mat, x3, y3,
-                          transa=transa, alpha=alpha, beta=beta)
+    _sgemm_strided(handle, _batched_matrix(mat), _batched_vector(x), _batched_vector(y),
+                   transa, False, alpha, beta)

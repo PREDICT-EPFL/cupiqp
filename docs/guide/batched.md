@@ -44,7 +44,7 @@ solver.update(     # per-problem data, batch size as the leading dim
   )
 solver.solve()
 
-x_sol = solver.result.x                  # cupy array of shape (B, n)
+x_sol = solver.result.x                  # warp.array of shape (B, n) on the GPU
 status = solver.result.info.status       # list of length B
 for i, st in enumerate(status):
     print(f"problem {i}: status = {st.name}, x = {x_sol[i]}")

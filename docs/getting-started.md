@@ -25,7 +25,7 @@ $$
 
 Note the **one-sided** pieces: the inequality $2x_1 \le -1$ has no lower bound
 ($h_l = -\infty$), and each variable is bounded on only one side. We build everything
-**directly as cupy arrays** so the data already lives on the GPU.
+**directly as GPU arrays** (cupy here; Warp, CUDA torch or JAX arrays work the same way) so the data already lives on the GPU. Results come back as `warp.array` objects on the GPU; call `.numpy()` for a host copy or view them from your framework of choice (`cupy.asarray(x)`, `torch.from_dlpack(x)`).
 
 ```python
 import cupy as cp
@@ -57,7 +57,7 @@ x_u = cp.array([   1.0,  cp.inf])
 
 ### Dense backend
 
-`DenseSolver` works with **dense** cupy arrays for `P`, `A`, `G`. Create the solver,
+`DenseSolver` works with **dense** GPU arrays for `P`, `A`, `G`. Create the solver,
 optionally tweak `solver.settings`, then `setup(batch_size, ...)` the problem and
 `solve()`. The solution and per-problem info are exposed through `solver.result`.
 
@@ -69,7 +69,7 @@ solver.setup(1, P=P, c=c, A=A, b=b, G=G, h_l=h_l, h_u=h_u, x_l=x_l, x_u=x_u)   #
 solver.solve()
 
 # result.x carries a leading batch dimension (B, n); here B = 1
-x_dense = solver.result.x.get()[0]
+x_dense = solver.result.x.numpy()[0]        # result.x is a warp.array on the GPU
 print("status  :", solver.result.info.status[0].name)
 print("solution:", x_dense)
 ```
@@ -77,7 +77,7 @@ print("solution:", x_dense)
 ### Sparse backend
 
 `SparseSolver` expects `P`, `A`, `G` as **GPU CSR** matrices
-(`cupyx.scipy.sparse.csr_matrix`); the vectors stay as cupy arrays. Its `setup` takes
+(`cupyx.scipy.sparse.csr_matrix`); the vectors are dense GPU arrays. Its `setup` takes
 the batch size first, then one problem - here the batch size is 1. We reuse the exact
 same data, just wrapping the matrices as CSR. For larger, structurally sparse problems
 this is far more efficient than the dense backend.
@@ -95,7 +95,7 @@ solver.setup(
 )
 solver.solve()
 
-x_sparse = solver.result.x.get()[0]
+x_sparse = solver.result.x.numpy()[0]
 print("status  :", solver.result.info.status[0].name)
 print("solution:", x_sparse)
 
@@ -145,7 +145,7 @@ dense_solver.setup(B, P=P, c=c, A=A, b=b, G=G,
 dense_solver.update(b=b_batch)                        # (B, p): one target per problem
 dense_solver.solve()
 
-X_dense = dense_solver.result.x.get()                 # (B, n)
+X_dense = dense_solver.result.x.numpy()               # (B, n)
 for i, st in enumerate(dense_solver.result.info.status):
     print(f"problem {i}:  b = {float(b_batch[i, 0]):.1f}   status = {st.name}   x = {X_dense[i]}")
 ```
@@ -170,7 +170,7 @@ sparse_solver.setup(
 sparse_solver.update(b=b_batch)          # (B, p): one target per problem
 sparse_solver.solve()
 
-X_sparse = sparse_solver.result.x.get()
+X_sparse = sparse_solver.result.x.numpy()
 assert all(st == Status.CUPIQP_SOLVED for st in sparse_solver.result.info.status)
 assert cp.allclose(cp.asarray(X_dense), cp.asarray(X_sparse), atol=1e-6)
 print("All problems solved; dense and sparse batches agree.")

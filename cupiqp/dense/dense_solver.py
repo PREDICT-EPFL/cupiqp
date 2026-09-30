@@ -1,4 +1,3 @@
-import cupy as cp
 import numpy as np
 import warp as wp
 
@@ -8,43 +7,43 @@ from typing import Literal, Optional
 from ..settings import Settings
 from ..solver import SolverBase
 from ..typedef import CudaArray
-from ..utils import is_cuda_array
+from ..utils import is_cuda_array, as_warp_array
 from .dense_data import DenseData
 from .dense_preconditioner import DenseRuizEquilibration
 from .dense_solver_kernels import create_dense_data_gradients_kernel
 
 
-def _check_dense(name: str, m, ndim: int) -> None:
-    """Validate that ``m`` is a GPU dense array with ``ndim`` dimensions
-    (skip if ``None``).
+def _check_dense(name: str, m, ndim: int, dtype) -> Optional[wp.array]:
+    """Warp view of the ``ndim``-D GPU array ``m`` in the solver ``dtype``
+    (``None`` passes through).
 
     Used for **all** P / c / A / b / G / h_* / x_* inputs of
     :meth:`DenseSolver.setup`, which describe one problem: matrices are
     2-D and vectors 1-D. Every argument that's not ``None`` must be a GPU
-    array exposing the CUDA Array Interface protocol; see
-    :func:`cupiqp.utils.is_cuda_array`.
+    array (Warp, cupy, CUDA torch, JAX, ...) of the solver dtype; this is
+    the one place that checks it.
     """
     if m is None:
-        return
+        return None
     if not is_cuda_array(m):
         raise TypeError(
             f"DenseSolver requires {name} to be a GPU dense array "
-            f"(any object exposing __cuda_array_interface__: "
-            f"cupy.ndarray, dense CUDA torch.Tensor, JAX CUDA array, etc.); "
-            f"got {type(m).__name__}."
+            f"(a warp.array, cupy.ndarray, dense CUDA torch.Tensor, JAX CUDA "
+            f"array, etc.); got {type(m).__name__}."
         )
-    got = cp.asarray(m).ndim
-    if got != ndim:
+    arr = as_warp_array(m, name, dtype=dtype)
+    if arr.ndim != ndim:
         kind = "matrix" if ndim == 2 else "vector"
         raise ValueError(
             f"DenseSolver.setup requires {name} to be a {ndim}-D {kind} "
-            f"describing one problem; got a {got}-D array. The batch size is "
+            f"describing one problem; got a {arr.ndim}-D array. The batch size is "
             f"passed separately; set per-problem values with update()."
         )
+    return arr
 
 
 class DenseSolver(SolverBase):
-    r"""GPU solver for general dense convex quadratic programs that 
+    r"""GPU solver for general dense convex quadratic programs that
     solves a QP - or a whole batch of QPs - of the form
 
     $$
@@ -59,10 +58,11 @@ class DenseSolver(SolverBase):
     using the proximal interior-point method, running entirely on the GPU.
 
     **Inputs.** ``P``, ``A``, ``G`` and every vector (``c``, ``b``, ``h_l``,
-    ``h_u``, ``x_l``, ``x_u``) must be **dense arrays that live on the GPU**.
-    Any object exposing the ``__cuda_array_interface__`` protocol is
-    accepted - a ``cupy.ndarray``, a CUDA ``torch.Tensor``, a CUDA JAX
-    array, a Numba device array, and so on.
+    ``h_u``, ``x_l``, ``x_u``) must be **dense arrays that live on the GPU**:
+    a ``warp.array``, a ``cupy.ndarray``, a CUDA ``torch.Tensor``, a CUDA
+    JAX array, or any other object exposing DLPack or the
+    ``__cuda_array_interface__`` protocol. Values are copied into the
+    solver's own Warp buffers and cast to the solver dtype.
 
     cuPIQP is **GPU-only**: CPU data (``numpy.ndarray``, CPU torch tensors,
     CPU JAX arrays) is rejected with a ``TypeError`` rather than copied to
@@ -76,8 +76,12 @@ class DenseSolver(SolverBase):
     sides exist - and its values are copied into every problem. ``update``
     then sets per-problem values with a leading batch axis (``P`` of shape
     ``(B, n, n)``, ``c`` of shape ``(B, n)``, ...), or with the unbatched
-    shape to share one value across the batch. ``solver.result.x`` has
-    shape ``(B, n)``.
+    shape to share one value across the batch.
+
+    **Results are Warp arrays.** ``solver.result.x`` is a ``(B, n)``
+    ``warp.array`` on the GPU; use ``.numpy()`` for a host copy, or view it
+    zero-copy from another framework (``cupy.asarray(x)``,
+    ``torch.from_dlpack(x)``, ``jax.dlpack.from_dlpack(x)``).
 
     Parameters
     ----------
@@ -85,6 +89,10 @@ class DenseSolver(SolverBase):
         Floating-point precision used throughout the solve. ``"float32"``
         is faster and uses less memory but converges to looser tolerances;
         the default convergence tolerances are chosen to match the dtype.
+    stream : warp.Stream, optional
+        CUDA stream to run on. By default the solver creates and owns one;
+        pass a ``warp.Stream`` to run on it instead (see the ``stream``
+        property).
 
     Examples
     --------
@@ -105,7 +113,7 @@ class DenseSolver(SolverBase):
     solver.solve()
 
     print(solver.result.info.status[0].name)    # CUPIQP_SOLVED
-    x = solver.result.x.get()[0]                 # bring the solution to the host
+    x = solver.result.x.numpy()[0]              # bring the solution to the host
     ```
 
     A batch of 8 problems that differ only in ``c``:
@@ -134,8 +142,8 @@ class DenseSolver(SolverBase):
     ``solver.settings``.
     """
 
-    def __init__(self, dtype: Literal["float32", "float64"] = "float64"):
-        super().__init__(dtype=dtype)
+    def __init__(self, dtype: Literal["float32", "float64"] = "float64", stream=None):
+        super().__init__(dtype=dtype, stream=stream)
         self._settings.kkt_solver = "dense_cholesky"
 
     @SolverBase.settings.setter
@@ -155,18 +163,12 @@ class DenseSolver(SolverBase):
         h_u: Optional[CudaArray],
         h_l: Optional[CudaArray],
         x_u: Optional[CudaArray],
-        x_l: Optional[CudaArray],
+        x_l: Optional[CudaArray]
     ) -> DenseData:
-        # Replicate the single-problem template over the batch. broadcast_to
-        # is a view; DenseData.init copies into solver-owned (B, ...) buffers.
-        B = self._setup_batch_size
-
-        def tile(v):
-            return None if v is None else cp.broadcast_to(cp.asarray(v), (B,) + tuple(v.shape))
-
+        # The single-problem template is copied into every problem of the
+        # batch by DenseData.init.
         data = DenseData(dtype=self.settings.dtype, device=self.settings.device)
-        data.init(tile(P), tile(c), tile(A), tile(b), tile(G),
-                  tile(h_u), tile(h_l), tile(x_u), tile(x_l))
+        data.init(P, c, A, b, G, h_u, h_l, x_u, x_l, batch_size=self._setup_batch_size)
         return data
 
     def _init_preconditioner(self) -> DenseRuizEquilibration:
@@ -175,9 +177,9 @@ class DenseSolver(SolverBase):
             has_h_l=self._data.has_h_l, has_h_u=self._data.has_h_u,
             has_x_l=self._data.has_x_l, has_x_u=self._data.has_x_u,
             active_x_bound=self._data.active_x_bound,
-            use_warp_tile_kernels=(self._kernel_strategy == "warp_tile"),
             enable_cuda_graph=self.settings.enable_cuda_graph,
             dtype=self._data.dtype,
+            device=self._data.device
         )
 
     def setup(
@@ -191,7 +193,7 @@ class DenseSolver(SolverBase):
         h_u: Optional[CudaArray] = None,
         h_l: Optional[CudaArray] = None,
         x_u: Optional[CudaArray] = None,
-        x_l: Optional[CudaArray] = None,
+        x_l: Optional[CudaArray] = None
     ) -> None:
         """Fix the problem structure from one template problem and allocate
         all GPU memory for a batch of ``batch_size`` problems.
@@ -239,32 +241,40 @@ class DenseSolver(SolverBase):
             raise ValueError(f"batch_size must be a positive integer; got {batch_size!r}.")
         # Every non-None input must be a GPU dense array describing one
         # problem. cupiqp does not silently do H2D copies.
-        for name, v, ndim in (("P", P, 2), ("c", c, 1), ("A", A, 2), ("b", b, 1),
-                              ("G", G, 2), ("h_u", h_u, 1), ("h_l", h_l, 1),
-                              ("x_u", x_u, 1), ("x_l", x_l, 1)):
-            _check_dense(name, v, ndim)
+        P, c, A, b, G, h_u, h_l, x_u, x_l = (
+            _check_dense(name, v, ndim, self._dtype)
+            for name, v, ndim in (("P", P, 2), ("c", c, 1), ("A", A, 2), ("b", b, 1),
+                                  ("G", G, 2), ("h_u", h_u, 1), ("h_l", h_l, 1),
+                                  ("x_u", x_u, 1), ("x_l", x_l, 1))
+        )
         if (A is None) != (b is None):
             raise ValueError("A and b must either both be provided or both be None.")
         self._setup_batch_size = int(batch_size)
-        super().setup(P, c, A, b, G, h_u, h_l, x_u, x_l)
-        if self.settings.enable_grad:
-            d = self._data
-            B = d.batch_size
-            dtype = d.dtype
-            self._dense_data_gradients_kernel = create_dense_data_gradients_kernel(
-                d.n, d.p, d.m, d.num_hu, d.num_xu, dtype=dtype)
-            self._grad_data = DenseData(dtype=dtype, device=self.settings.device)
-            self._grad_data.init(
-                P=cp.zeros((B, d.n, d.n), dtype=dtype),
-                c=cp.zeros((B, d.n), dtype=dtype),
-                A=cp.zeros((B, d.p, d.n), dtype=dtype) if d.p > 0 else None,
-                b=cp.zeros((B, d.p), dtype=dtype) if d.p > 0 else None,
-                G=cp.zeros((B, d.m, d.n), dtype=dtype) if d.m > 0 else None,
-                h_u=cp.zeros((B, d.m), dtype=dtype) if d.num_hu > 0 else None,
-                h_l=cp.zeros((B, d.m), dtype=dtype) if d.num_hl > 0 else None,
-                x_u=cp.zeros((B, d.n), dtype=dtype) if d.num_xu > 0 else None,
-                x_l=cp.zeros((B, d.n), dtype=dtype) if d.num_xl > 0 else None,
-            )
+        with wp.ScopedStream(self._stream):
+            self._setup_impl(P, c, A, b, G, h_u, h_l, x_u, x_l)
+            if self.settings.enable_grad:
+                self._init_grad_data()
+
+    def _init_grad_data(self) -> None:
+        """Allocate the zero-initialized gradient storage (forward structure)."""
+        d = self._data
+        B = d.batch_size
+        self._dense_data_gradients_kernel = create_dense_data_gradients_kernel(
+            d.n, d.p, d.m, d.num_hu, d.num_xu, dtype=d.dtype)
+        # Zero-initialized gradient storage with the forward structure.
+        self._grad_data = DenseData(dtype=d.dtype, device=d.device)
+        self._grad_data.init(
+            P=wp.zeros((d.n, d.n), dtype=d.dtype, device=d.device),
+            c=wp.zeros((d.n,), dtype=d.dtype, device=d.device),
+            A=wp.zeros((d.p, d.n), dtype=d.dtype, device=d.device) if d.p > 0 else None,
+            b=wp.zeros((d.p,), dtype=d.dtype, device=d.device) if d.p > 0 else None,
+            G=wp.zeros((d.m, d.n), dtype=d.dtype, device=d.device) if d.m > 0 else None,
+            h_u=wp.zeros((d.m,), dtype=d.dtype, device=d.device) if d.num_hu > 0 else None,
+            h_l=wp.zeros((d.m,), dtype=d.dtype, device=d.device) if d.num_hl > 0 else None,
+            x_u=wp.zeros((d.n,), dtype=d.dtype, device=d.device) if d.num_xu > 0 else None,
+            x_l=wp.zeros((d.n,), dtype=d.dtype, device=d.device) if d.num_xl > 0 else None,
+            batch_size=B
+        )
 
     def update(
         self,
@@ -277,7 +287,7 @@ class DenseSolver(SolverBase):
         h_l: Optional[CudaArray] = None,
         x_u: Optional[CudaArray] = None,
         x_l: Optional[CudaArray] = None,
-        check_validity: bool = False,
+        check_validity: bool = False
     ) -> None:
         """Set new numerical data, per problem or shared, then ``solve()``.
 
@@ -294,12 +304,16 @@ class DenseSolver(SolverBase):
         P, c, A, b, G, h_u, h_l, x_u, x_l : GPU array, optional
             New values for the corresponding problem block.
         check_validity : bool, default: False
-            If ``True``, validate the shapes of the new data.
+            Unused by this backend: shapes are always checked (metadata only,
+            no GPU sync).
         """
-        super().update(
-            P=P, c=c, A=A, b=b, G=G, h_u=h_u, h_l=h_l, x_u=x_u, x_l=x_l,
-            check_validity=check_validity,
+        P, c, A, b, G, h_u, h_l, x_u, x_l = (
+            as_warp_array(v, name, self._dtype)
+            for name, v in (("P", P), ("c", c), ("A", A), ("b", b), ("G", G),
+                            ("h_u", h_u), ("h_l", h_l), ("x_u", x_u), ("x_l", x_l))
         )
+        with wp.ScopedStream(self._stream):
+            self._update_impl(P, c, A, b, G, h_u, h_l, x_u, x_l, check_validity)
 
     def _compute_data_gradients(self, adjoint_vector: Variables, linearization_point: Variables) -> DenseData:
         """Populate ``self._grad_data`` in place and return it.
@@ -323,18 +337,17 @@ class DenseSolver(SolverBase):
                     self._lam_zbu_full,
                     self._zu_full, self._zl_full,
                     linearization_point.x, linearization_point.y,
-                    grad_data._P, grad_data._A, grad_data._G,
-                    grad_data._b, grad_data._h_u, grad_data._x_u,
+                    grad_data.P, grad_data.A, grad_data.G,
+                    grad_data.b, grad_data.h_u, grad_data.x_u,
                 ],
-                device="cuda",
-                stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+                device=self._device
             )
 
-        # Vector grads that are aliases of solver-internal buffers — copy in.
-        grad_data._c[:] = adjoint_vector.x
+        # Vector grads that are aliases of solver-internal buffers -- copy in.
+        wp.copy(grad_data.c, adjoint_vector.x)
         if data.num_hl > 0:
-            grad_data._h_l[:] = self._lam_zl_full
+            wp.copy(grad_data.h_l, self._lam_zl_full)
         if data.num_xl > 0:
-            grad_data._x_l[:] = self._lam_zbl_full
+            wp.copy(grad_data.x_l, self._lam_zbl_full)
 
         return grad_data
