@@ -184,3 +184,84 @@ def create_multistage_compute_kkt_norms_kernel(N: int, d: int, rows_A: int, rows
                 d_iter[b, j] = v
 
     return multistage_compute_kkt_norms_kernel
+
+
+def create_multistage_P_col_norms_kernel(N: int, d: int, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
+    """Column inf-norms of the symmetric block-tridiagonal P, per variable.
+
+    Per ``(b, j)`` thread (grid (B, n)), with ``j = k*d + i``::
+
+        out[b, j] = max( max_col |P_D[b, k, i, col]|,
+                         max_col |P_E[b, k-1, i, col]|   (k > 0,   lower block (k, k-1))
+                         max_row |P_E[b, k, row, i]|     (k < N-1, upper block (k, k+1) = E_k^T) )
+
+    the same P contribution as ``create_multistage_compute_kkt_norms_kernel``.
+    """
+    @wp.kernel
+    def multistage_P_col_norms_kernel(
+        P_D: wp.array4d(dtype=dtype),  # type: ignore  (B, N, d, d)
+        P_E: wp.array4d(dtype=dtype),  # type: ignore  (B, N-1, d, d)
+        out: wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+    ):
+        b, j = wp.tid()
+        N_static = wp.static(N)
+        d_static = wp.static(d)
+        k_blk = j // d_static
+        i = j - k_blk * d_static
+        v = dtype(0.0)
+        for col in range(d_static):
+            v = wp.max(v, wp.abs(P_D[b, k_blk, i, col]))
+        if k_blk > 0:
+            for col in range(d_static):
+                v = wp.max(v, wp.abs(P_E[b, k_blk - 1, i, col]))
+        if k_blk < N_static - 1:
+            for col in range(d_static):
+                v = wp.max(v, wp.abs(P_E[b, k_blk, col, i]))
+        out[b, j] = v
+
+    return multistage_P_col_norms_kernel
+
+
+def create_gamma_from_norms_kernel(min_scaling: float, max_scaling: float, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
+    """Per-batch Ruiz cost-scaling factor from column norms and the linear cost.
+
+        g = mean_j(col_norms[b, j]);  g = limit(g)
+        g = max(g, max_j |c[b, j]|);  g = limit(g)
+        gamma[b] = 1 / g
+
+    where ``limit`` resets values below ``min_scaling`` to 1 and clamps at
+    ``max_scaling``. One thread per batch entry; launch with ``dim=(B,)``.
+    """
+    lo = float(min_scaling)
+    hi = float(max_scaling)
+
+    @wp.func
+    def _ruiz_limit_scaling(v: dtype, min_scaling: dtype, max_scaling: dtype) -> dtype:  # type: ignore
+        if v < min_scaling:
+            return dtype(1.0)
+        if v > max_scaling:
+            return max_scaling
+        return v
+
+    @wp.kernel
+    def gamma_from_norms_kernel(
+        col_norms: wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        c:         wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        gamma:     wp.array(dtype=dtype),    # type: ignore  (B,) output
+    ):
+        b = wp.tid()
+        n = col_norms.shape[1]
+        total = dtype(0.0)
+        cn = dtype(0.0)
+        for j in range(n):
+            total = total + col_norms[b, j]
+            cn = wp.max(cn, wp.abs(c[b, j]))
+        g = total / dtype(n)
+        g = _ruiz_limit_scaling(g, dtype(lo), dtype(hi))
+        g = wp.max(g, cn)
+        g = _ruiz_limit_scaling(g, dtype(lo), dtype(hi))
+        gamma[b] = dtype(1.0) / g
+
+    return gamma_from_norms_kernel

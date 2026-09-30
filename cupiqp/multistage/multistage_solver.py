@@ -1,6 +1,7 @@
-import cupy as cp
 import numpy as np
 import warp as wp
+
+from ..utils import as_warp_array
 
 from ..results import Variables
 from typing import Literal, Optional, Tuple
@@ -11,7 +12,6 @@ from .multistage_data import MultistageData
 from .multistage_preconditioner import MultistageRuizEquilibration
 from .multistage_solver_kernels import create_multistage_data_gradients_kernel
 from ..typedef import CudaArray
-from ..utils import to_warp_dtype
 
 
 # A block-structured matrix input: a (diag, offdiag) pair of GPU arrays.
@@ -39,9 +39,10 @@ class MultistageSolver(SolverBase):
 
     **Inputs - plain GPU arrays, block by block.** A block-structured matrix
     is passed as a ``(diag, offdiag)`` tuple of GPU arrays (Warp, cupy, CUDA
-    torch, JAX, ... - anything supporting DLPack) and vectors are GPU arrays,
-    all of the solver dtype (``float64`` by default). With ``N`` stages of
-    size ``d`` (``n = N*d``):
+    torch, JAX, ... - anything supporting DLPack) and vectors are GPU arrays;
+    values are copied into the solver's Warp buffers and cast to the solver
+    dtype (``float64`` by default). With ``N`` stages of size ``d``
+    (``n = N*d``):
 
     * ``P = (P_diag, P_offdiag)``: symmetric block-tridiagonal, with diagonal
       blocks ``(N, d, d)`` and lower off-diagonal blocks ``(N-1, d, d)``
@@ -73,6 +74,10 @@ class MultistageSolver(SolverBase):
         Floating-point precision used throughout the solve. ``"float32"``
         is faster and uses less memory but converges to looser tolerances;
         the default convergence tolerances are chosen to match the dtype.
+    stream : warp.Stream, optional
+        CUDA stream to run on. By default the solver creates and owns one;
+        pass a ``warp.Stream`` to run on it instead (see the ``stream``
+        property).
 
     Examples
     --------
@@ -108,8 +113,8 @@ class MultistageSolver(SolverBase):
     configured through ``solver.settings``.
     """
 
-    def __init__(self, dtype: Literal["float32", "float64"] = "float64"):
-        super().__init__(dtype=dtype)
+    def __init__(self, dtype: Literal["float32", "float64"] = "float64", stream=None):
+        super().__init__(dtype=dtype, stream=stream)
         self._settings.kkt_solver = "multistage_block_cholesky"
 
     @SolverBase.settings.setter
@@ -131,9 +136,9 @@ class MultistageSolver(SolverBase):
             has_x_l=self._data.has_x_l, has_x_u=self._data.has_x_u,
             active_x_bound=self._data.active_x_bound,
             data=self._data,
-            use_warp_tile_kernels=(self._kernel_strategy == "warp_tile"),
             enable_cuda_graph=self.settings.enable_cuda_graph,
             dtype=self._data.dtype,
+            device=self._data.device
         )
 
     def setup(
@@ -147,7 +152,7 @@ class MultistageSolver(SolverBase):
         h_u: Optional[CudaArray] = None,
         h_l: Optional[CudaArray] = None,
         x_u: Optional[CudaArray] = None,
-        x_l: Optional[CudaArray] = None,
+        x_l: Optional[CudaArray] = None
     ) -> None:
         """Fix the problem structure from one template problem and allocate
         all GPU memory for a batch of ``batch_size`` problems.
@@ -197,49 +202,67 @@ class MultistageSolver(SolverBase):
         if isinstance(batch_size, bool) or not isinstance(batch_size, (int, np.integer)) or batch_size < 1:
             raise ValueError(f"batch_size must be a positive integer; got {batch_size!r}.")
         self._setup_batch_size = int(batch_size)
-        super().setup(P, c, A, b, G, h_u, h_l, x_u, x_l)
-        if self.settings.enable_grad:
-            d = self._data
-            B = d.batch_size
-            N = d.num_blocks
-            d_sz = d.block_size
-            dtype = d.dtype
-            wp_dtype = to_warp_dtype(dtype)
+        P, c, A, b, G, h_u, h_l, x_u, x_l = self._inputs_to_warp(P, c, A, b, G, h_u, h_l, x_u, x_l)
+        with wp.ScopedStream(self._stream):
+            self._setup_impl(P, c, A, b, G, h_u, h_l, x_u, x_l)
+            if self.settings.enable_grad:
+                self._init_grad_data()
 
-            r_a, N_a = (d.A_rows, N) if d.p > 0 else (0, 0)
-            r_g, N_g = (d.G_rows, N) if d.m > 0 else (0, 0)
+    def _inputs_to_warp(self, P, c, A, b, G, h_u, h_l, x_u, x_l) -> tuple:
+        """Warp views of the user inputs, checked against the solver dtype.
+        Matrices are ``(diag, offdiag)`` tuples whose entries may be ``None``;
+        anything that is not such a tuple is passed through for
+        ``MultistageData`` to reject."""
+        def pair(value, name):
+            if isinstance(value, (tuple, list)) and len(value) == 2:
+                return (as_warp_array(value[0], f"{name} diag", self._dtype), as_warp_array(value[1], f"{name} offdiag", self._dtype))
+            return value
+        return (pair(P, "P"), as_warp_array(c, "c", self._dtype), pair(A, "A"), as_warp_array(b, "b", self._dtype), pair(G, "G"),
+                as_warp_array(h_u, "h_u", self._dtype), as_warp_array(h_l, "h_l", self._dtype),
+                as_warp_array(x_u, "x_u", self._dtype), as_warp_array(x_l, "x_l", self._dtype))
 
-            # Zero-initialized gradient storage with the forward structure: a
-            # one-problem zero template, tiled to the batch by init(). Blocks and
-            # bound sides exist exactly when they do in the forward problem.
-            z = lambda *shape: cp.zeros(shape, dtype=dtype)
-            has_A, has_G = d.p > 0, d.m > 0
-            self._grad_data = MultistageData(dtype=dtype, device=self.settings.device)
-            self._grad_data.init(
-                B,
-                P=(z(N, d_sz, d_sz), None), c=z(N, d_sz),
-                A=(z(N_a, r_a, d_sz), None) if has_A else None,
-                b=z(N_a + 1, r_a) if has_A else None,
-                G=(z(N_g, r_g, d_sz), None) if has_G else None,
-                h_u=z(N_g + 1, r_g) if has_G and d.has_h_u else None,
-                h_l=z(N_g + 1, r_g) if has_G and d.has_h_l else None,
-                x_u=z(N, d_sz) if d.has_x_u else None,
-                x_l=z(N, d_sz) if d.has_x_l else None,
-            )
+    def _init_grad_data(self) -> None:
+        """Allocate the zero-initialized gradient storage and its kernel."""
+        d = self._data
+        B = d.batch_size
+        N = d.num_blocks
+        d_sz = d.block_size
+        dtype = d.dtype
 
-            # Empty placeholder warp buffers for when A or G are absent —
-            # the kernel still needs valid array arguments even though its
-            # corresponding dispatch sub-range collapses to size 0.
-            empty_blocks = wp.zeros((B, 0, 0, 0), dtype=wp_dtype, device="cuda")
-            g = self._grad_data
-            self._grad_dA_D = g.A_diag if g.A_diag is not None else empty_blocks
-            self._grad_dA_E = g.A_offdiag if g.A_diag is not None else empty_blocks
-            self._grad_dG_D = g.G_diag if g.G_diag is not None else empty_blocks
-            self._grad_dG_E = g.G_offdiag if g.G_diag is not None else empty_blocks
+        r_a, N_a = (d.A_rows, N) if d.p > 0 else (0, 0)
+        r_g, N_g = (d.G_rows, N) if d.m > 0 else (0, 0)
 
-            # Eager-compile the fused multistage data-gradients kernel.
-            self._multistage_data_gradients_kernel = create_multistage_data_gradients_kernel(
-                N, d_sz, N_a, r_a, N_g, r_g, d.p, d.m, d.n, d.num_hu, d.num_hl, d.num_xu, d.num_xl, dtype=dtype)
+        # Zero-initialized gradient storage with the forward structure: a
+        # one-problem zero template, tiled to the batch by init(). Blocks and
+        # bound sides exist exactly when they do in the forward problem.
+        has_A, has_G = d.p > 0, d.m > 0
+        self._grad_data = MultistageData(dtype=dtype, device=self.settings.device)
+        self._grad_data.init(
+            B,
+            P=(wp.zeros((N, d_sz, d_sz), dtype=dtype, device=d.device), None),
+            c=wp.zeros((N, d_sz), dtype=dtype, device=d.device),
+            A=(wp.zeros((N_a, r_a, d_sz), dtype=dtype, device=d.device), None) if has_A else None,
+            b=wp.zeros((N_a + 1, r_a), dtype=dtype, device=d.device) if has_A else None,
+            G=(wp.zeros((N_g, r_g, d_sz), dtype=dtype, device=d.device), None) if has_G else None,
+            h_u=wp.zeros((N_g + 1, r_g), dtype=dtype, device=d.device) if has_G and d.has_h_u else None,
+            h_l=wp.zeros((N_g + 1, r_g), dtype=dtype, device=d.device) if has_G and d.has_h_l else None,
+            x_u=wp.zeros((N, d_sz), dtype=dtype, device=d.device) if d.has_x_u else None,
+            x_l=wp.zeros((N, d_sz), dtype=dtype, device=d.device) if d.has_x_l else None
+        )
+
+        # Empty placeholder warp buffers for when A or G are absent —
+        # the kernel still needs valid array arguments even though its
+        # corresponding dispatch sub-range collapses to size 0.
+        empty_blocks = wp.zeros((B, 0, 0, 0), dtype=dtype, device="cuda")
+        g = self._grad_data
+        self._grad_dA_D = g.A_diag if g.A_diag is not None else empty_blocks
+        self._grad_dA_E = g.A_offdiag if g.A_diag is not None else empty_blocks
+        self._grad_dG_D = g.G_diag if g.G_diag is not None else empty_blocks
+        self._grad_dG_E = g.G_offdiag if g.G_diag is not None else empty_blocks
+
+        # Eager-compile the fused multistage data-gradients kernel.
+        self._multistage_data_gradients_kernel = create_multistage_data_gradients_kernel(
+            N, d_sz, N_a, r_a, N_g, r_g, d.p, d.m, d.n, d.num_hu, d.num_hl, d.num_xu, d.num_xl, dtype=dtype)
 
     def update(
         self,
@@ -252,7 +275,7 @@ class MultistageSolver(SolverBase):
         h_l: Optional[CudaArray] = None,
         x_u: Optional[CudaArray] = None,
         x_l: Optional[CudaArray] = None,
-        check_validity: bool = False,
+        check_validity: bool = False
     ) -> None:
         """Set new numerical data, per problem or shared, then ``solve()``.
 
@@ -277,10 +300,9 @@ class MultistageSolver(SolverBase):
             Unused by this backend: shapes are always checked (metadata only,
             no GPU sync).
         """
-        super().update(
-            P=P, c=c, A=A, b=b, G=G, h_u=h_u, h_l=h_l, x_u=x_u, x_l=x_l,
-            check_validity=check_validity,
-        )
+        P, c, A, b, G, h_u, h_l, x_u, x_l = self._inputs_to_warp(P, c, A, b, G, h_u, h_l, x_u, x_l)
+        with wp.ScopedStream(self._stream):
+            self._update_impl(P, c, A, b, G, h_u, h_l, x_u, x_l, check_validity)
 
     def _compute_data_gradients(self, adjoint_vector: Variables, linearization_point: Variables) -> MultistageData:
         r"""Populate ``self._grad_data`` in place and return it.
@@ -327,8 +349,7 @@ class MultistageSolver(SolverBase):
                     grad_data._h_u, grad_data._h_l,
                     grad_data._x_u, grad_data._x_l,
                 ],
-                device="cuda",
-                stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+                device="cuda"
             )
 
         return grad_data

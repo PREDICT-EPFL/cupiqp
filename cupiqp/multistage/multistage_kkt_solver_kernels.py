@@ -1,3 +1,5 @@
+from typing import Any
+
 import warp as wp
 from ..utils import to_warp_dtype
 
@@ -86,3 +88,49 @@ def create_update_kkt_kernel(num_blocks: int, block_size: int,
             KKT_E[b, k, i, j] = v_E
 
     return update_kkt_kernel
+
+
+def create_add_scaled_rows_kernel(dtype=wp.float64):
+    """``out[b, :] += scale[b] * x[b, :]`` on ``(B, n)`` buffers with a per-problem scale."""
+    dtype = to_warp_dtype(dtype)
+
+    @wp.kernel
+    def add_scaled_rows(out: wp.array2d(dtype=dtype), scale: wp.array(dtype=dtype), x: wp.array2d(dtype=dtype)):  # type: ignore
+        i, j = wp.tid()
+        out[i, j] = out[i, j] + scale[i] * x[i, j]
+
+    return add_scaled_rows
+
+
+def create_sub_scale_rows_kernel(dtype=wp.float64):
+    """``out[b, :] = (out[b, :] - x[b, :]) * scale[b]`` on ``(B, n)`` buffers with a per-problem scale."""
+    dtype = to_warp_dtype(dtype)
+
+    @wp.kernel
+    def sub_scale_rows(out: wp.array2d(dtype=dtype), x: wp.array2d(dtype=dtype), scale: wp.array(dtype=dtype)):  # type: ignore
+        i, j = wp.tid()
+        out[i, j] = (out[i, j] - x[i, j]) * scale[i]
+
+    return sub_scale_rows
+
+
+@wp.func
+def sub_mul(o: Any, x: Any, w: Any):
+    # element-wise (o - x) * w, applied with wp.map. A Warp function with
+    # generic argument types works for float32 and float64 and, unlike a plain
+    # Python function, is not re-parsed on every wp.map call.
+    return (o - x) * w
+
+
+def create_has_nan_1d_kernel(dtype=wp.float64):
+    """Sets ``flag[0] = 1`` if any entry of the flat array ``a`` is NaN. Launch with ``dim=a.shape``.
+    Used to detect a failed block Cholesky factorization."""
+    dtype = to_warp_dtype(dtype)
+
+    @wp.kernel
+    def has_nan_1d(a: wp.array(dtype=dtype), flag: wp.array(dtype=wp.int32)):  # type: ignore
+        i = wp.tid()
+        if wp.isnan(a[i]):
+            flag[0] = wp.int32(1)
+
+    return has_nan_1d
