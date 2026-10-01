@@ -17,7 +17,7 @@ class Data(ABC):
     re-checks or casts them.
     """
 
-    def __init__(self, dtype="float64", device: str = "cuda"):
+    def __init__(self, dtype=wp.float64, device: str = "cuda"):
         self._dtype = to_warp_dtype(dtype)
         self._device = device
 

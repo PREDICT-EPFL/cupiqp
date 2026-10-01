@@ -1,4 +1,4 @@
-from typing import Literal, Sequence, Union, List
+from typing import Sequence, Union, List
 
 import warp as wp
 
@@ -77,7 +77,7 @@ class OcpSolver(MultistageSolver):
 
     Parameters
     ----------
-    dtype : {"float64", "float32"}, default: "float64"
+    dtype : {wp.float64, wp.float32}, default: wp.float64
         Floating-point precision used throughout the solve.
 
     Examples
@@ -111,7 +111,7 @@ class OcpSolver(MultistageSolver):
     For differentiable QPs use ``DenseSolver``, ``SparseSolver`` or ``MultistageSolver``.
     """
 
-    def __init__(self, dtype: Literal["float32", "float64"] = "float64", stream=None) -> None:
+    def __init__(self, dtype: Union[type[wp.float32], type[wp.float64]] = wp.float64, stream=None) -> None:
         super().__init__(dtype=dtype, stream=stream)
         self._ocp_data = None
         self._ocp_ready = False
@@ -178,7 +178,7 @@ class OcpSolver(MultistageSolver):
         with wp.ScopedStream(self._stream):
             ocp_data = OcpData(
                 N, nx, nu, ng=ng, idxbx=idxbx, idxbu=idxbu,
-                dtype=self.settings.dtype, device=self.settings.device,
+                dtype=self.settings.dtype, device=self._device,
                 batch_size=batch_size,
             )
             # The OcpData arrays carry the batch axis, from which the core
@@ -207,16 +207,18 @@ class OcpSolver(MultistageSolver):
         if not self._ocp_ready:
             raise RuntimeError("Call setup() before set().")
 
+        value = as_warp_array(value, f"field {field!r}", self._dtype)
+        with wp.ScopedStream(self._stream):
+            self._ocp_data.set_field(field, stage, value)
+
+        # Mark dirty only after a successful write; the old solution is stale.
         if field in ("Q", "R", "S"):
             self._update_P = True
         elif field in ("A", "B", "E"):
             self._update_A = True
         elif field in ("C", "D"):
             self._update_G = True
-
-        value = as_warp_array(value, f"field {field!r}", self._dtype)
-        with wp.ScopedStream(self._stream):
-            self._ocp_data.set_field(field, stage, value)
+        self._solution_available = False
 
     def solve(self) -> List[Status]:
         """Flush any pending :meth:`set` updates into the solver, then solve.

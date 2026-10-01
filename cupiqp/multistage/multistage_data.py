@@ -58,7 +58,7 @@ class MultistageData(Data):
     ``b``, ``h_l``, ...) used by the interior-point iteration alias them.
     """
 
-    def __init__(self, dtype="float64", device: str = "cuda"):
+    def __init__(self, dtype=wp.float64, device: str = "cuda"):
         super().__init__(dtype=dtype, device=device)
 
     def _adopt_storage(self, P_diag: wp.array, P_offdiag: wp.array, c: wp.array,

@@ -1,9 +1,10 @@
 import math
 import warnings
 from dataclasses import dataclass
-from typing import Literal
+from typing import Union
 
 import numpy as np
+import warp as wp
 
 
 _F32_DEFAULTS = {
@@ -39,8 +40,7 @@ assert _F32_DEFAULTS.keys() == _F64_DEFAULTS.keys(), (
 
 @dataclass
 class Settings:
-    dtype: Literal["float32", "float64"] = "float64"
-    device: str = "cuda"
+    dtype: Union[type[wp.float32], type[wp.float64]] = wp.float64
 
     rho_init: float = 1e-6
     delta_init: float = 1e-4
@@ -90,14 +90,14 @@ class Settings:
 
 
     @classmethod
-    def for_dtype(cls, dtype) -> "Settings":
-        if dtype == "float32":
+    def for_dtype(cls, dtype: Union[type[wp.float32], type[wp.float64]]) -> "Settings":
+        if dtype is wp.float32:
             defaults = _F32_DEFAULTS
-        elif dtype == "float64":
+        elif dtype is wp.float64:
             defaults = _F64_DEFAULTS
         else:
             raise ValueError(
-                f"Unsupported dtype {dtype!r}; expected 'float32' or 'float64'."
+                f"Unsupported dtype {dtype!r}; expected wp.float32 or wp.float64."
             )
         return cls(dtype=dtype, **defaults)
 
@@ -109,7 +109,7 @@ class Settings:
                 "to the solver constructor."
             )
         if (name in _F32_DEFAULTS
-                and self.__dict__.get("dtype") == "float32"
+                and self.__dict__.get("dtype") is wp.float32
                 and isinstance(value, (int, float))
                 and not isinstance(value, bool)
                 and 0 < value < _F32_DEFAULTS[name]):
@@ -141,7 +141,7 @@ class Settings:
                self.iterative_refinement_min_improvement_rate >= 1.0 and
                self.iterative_refinement_static_regularization_eps > 0 and
                self.iterative_refinement_static_regularization_rel >= 0
-               and self.dtype in ("float32", "float64")
+               and self.dtype in (wp.float32, wp.float64)
                and self.gradient_smoothing_mu > 0 and math.isfinite(self.gradient_smoothing_mu)
                and self.gradient_smoothing_tol > 0 and math.isfinite(self.gradient_smoothing_tol)
                and self.gradient_smoothing_max_iter > 0

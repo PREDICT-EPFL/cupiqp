@@ -13,7 +13,7 @@ class DenseData(Data):
     (``DenseSolver`` converts user arrays at its public boundary) and are
     copied in.
     """
-    def __init__(self, dtype="float64", device: str = "cuda"):
+    def __init__(self, dtype=wp.float64, device: str = "cuda"):
         super().__init__(dtype=dtype, device=device)
 
     def init(self,

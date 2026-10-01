@@ -3,7 +3,7 @@ import numpy as np
 import warp as wp
 
 from ..results import Variables
-from typing import Literal, Optional, Tuple
+from typing import Optional, Tuple, Union
 
 from ..solver import SolverBase
 from ..typedef import CudaArray
@@ -141,8 +141,8 @@ class SparseSolver(SolverBase):
 
     Parameters
     ----------
-    dtype : {"float64", "float32"}, default: "float64"
-        Floating-point precision used throughout the solve. ``"float32"``
+    dtype : {wp.float64, wp.float32}, default: wp.float64
+        Floating-point precision used throughout the solve. ``wp.float32``
         is faster and uses less memory but converges to looser tolerances;
         the default convergence tolerances are chosen to match the dtype.
     stream : warp.Stream, optional
@@ -187,7 +187,7 @@ class SparseSolver(SolverBase):
     ``solver.settings``.
     """
 
-    def __init__(self, dtype: Literal["float32", "float64"] = "float64", stream=None):
+    def __init__(self, dtype: Union[type[wp.float32], type[wp.float64]] = wp.float64, stream=None):
         super().__init__(dtype=dtype, stream=stream)
         # Non-owning cupy view of the solver stream. cupy is used only at
         # setup, to build CSR patterns and index maps; running those ops on
@@ -217,7 +217,7 @@ class SparseSolver(SolverBase):
     ) -> SparseData:
         # SparseData.init reads the batch size from the batched inputs and
         # copies shared inputs into every problem.
-        data = SparseData(dtype=self._dtype, device=self.settings.device)
+        data = SparseData(dtype=self._dtype, device=self._device)
         data.init(P, c, A, b, G, h_u, h_l, x_u, x_l)
         return data
 

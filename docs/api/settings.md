@@ -6,7 +6,10 @@ Every solver owns a `Settings` dataclass at `solver.settings`. Mutate its fields
 `setup()` or between solves:
 
 ```python
-solver = DenseSolver(dtype="float64")
+import warp as wp
+from cupiqp import DenseSolver
+
+solver = DenseSolver(dtype=wp.float64)
 solver.settings.verbose = True
 solver.settings.max_iter = 100
 solver.settings.eps_abs = 1e-6
@@ -19,9 +22,10 @@ You can also build a `Settings` object directly. The factory
 defaults** (see [Precision](#precision-and-dtype)):
 
 ```python
+import warp as wp
 from cupiqp import Settings
 
-settings = Settings.for_dtype("float32")
+settings = Settings.for_dtype(wp.float32)
 settings.max_iter = 200
 ```
 
@@ -34,11 +38,10 @@ settings.max_iter = 200
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `dtype` | `"float32"` \| `"float64"` | `"float64"` | Solver arithmetic precision (fixed at construction). |
-| `device` | `str` | `"cuda"` | Compute device. |
+| `dtype` | `wp.float32` \| `wp.float64` | `wp.float64` | Solver arithmetic precision (fixed at construction). |
 
 `float32` and `float64` carry **different default tolerances**, since you cannot ask for
-`float64`-level accuracy in `float32` arithmetic. `Settings.for_dtype("float32")` loosens
+`float64`-level accuracy in `float32` arithmetic. `Settings.for_dtype(wp.float32)` loosens
 the tolerances accordingly. If you tighten a `float32` tolerance below its recommended
 floor, the solver emits a warning that convergence may fail.
 

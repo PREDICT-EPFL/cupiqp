@@ -328,7 +328,7 @@ class Info:
         self.no_primal_update = self._counters[0]
         self.no_dual_update = self._counters[1]
 
-    def init(self, dtype="float64", device: str = "cuda"):
+    def init(self, dtype=wp.float64, device: str = "cuda"):
         self._buffer = wp.zeros((len(InfoIdx), self._batch_size), dtype=to_warp_dtype(dtype), device=device)
         self._views = {idx: self._buffer[int(idx)] for idx in InfoIdx}
 

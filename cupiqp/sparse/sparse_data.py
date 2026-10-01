@@ -23,7 +23,7 @@ class SparseData(Data):
     ``x_u``) are Warp arrays with a leading batch dimension ``(B, k)``.
     """
 
-    def __init__(self, dtype="float64", device: str = "cuda"):
+    def __init__(self, dtype=wp.float64, device: str = "cuda"):
         super().__init__(dtype=dtype, device=device)
 
     def init(

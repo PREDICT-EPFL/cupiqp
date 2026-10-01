@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Optional, Any, Literal, List
+from typing import Optional, Any, List, Union
 
 import numpy as np
 import warp as wp
@@ -9,7 +9,7 @@ from .settings import Settings
 from .data import Data
 from .results import Result, Status, Variables, InfoHost
 from .kkt_systems import KKTSystem
-from .utils import cuda_graph_capture, to_warp_dtype
+from .utils import cuda_graph_capture
 from .solver_kernels import (
     REDUCTION_BLOCK_DIM,
     create_init_guess_rhs_kernel,
@@ -48,10 +48,10 @@ wp.init()
 class SolverBase(ABC):
     """Abstract base for the cuPIQP solver."""
 
-    def __init__(self, dtype: Literal["float32", "float64"] = "float64", stream=None):
-        if dtype not in ("float32", "float64"):
-            raise ValueError(
-                f"Solver dtype must be 'float32' or 'float64'; got {dtype!r}."
+    def __init__(self, dtype: Union[type[wp.float32], type[wp.float64]] = wp.float64, stream=None):
+        if dtype is not wp.float32 and dtype is not wp.float64:
+            raise TypeError(
+                f"Solver dtype must be wp.float32 or wp.float64; got {dtype!r}."
             )
         # One CUDA stream per solver instance: every public entry point makes
         # it Warp's current stream, so all kernels, copies, library calls and
@@ -66,8 +66,10 @@ class SolverBase(ABC):
             )
         self._stream = stream if stream is not None else wp.Stream("cuda")
         self._owns_stream = stream is None
+        # All solver data lives on the device of the solver stream.
+        self._device = self._stream.device
+        self._dtype = dtype
         self._settings = Settings.for_dtype(dtype)
-        self._dtype = to_warp_dtype(dtype)
         self._data: Data = None
         self._result = Result()    # store the values of primal, dual and slack variables of current iteration, and other information
         self._step = Variables()   # used to store the step direction of primal and dual variables
@@ -216,7 +218,6 @@ class SolverBase(ABC):
 
         data = self._data
         B = data.batch_size
-        self._device = data.device
 
         self._result = Result(B)
         self._result.init(self._data)

@@ -83,8 +83,8 @@ class DenseSolver(SolverBase):
 
     Parameters
     ----------
-    dtype : {"float64", "float32"}, default: "float64"
-        Floating-point precision used throughout the solve. ``"float32"``
+    dtype : {wp.float64, wp.float32}, default: wp.float64
+        Floating-point precision used throughout the solve. ``wp.float32``
         is faster and uses less memory but converges to looser tolerances;
         the default convergence tolerances are chosen to match the dtype.
     stream : warp.Stream, optional
@@ -164,7 +164,7 @@ class DenseSolver(SolverBase):
     ) -> DenseData:
         # DenseData.init reads the batch size from the batched inputs and
         # copies shared inputs into every problem.
-        data = DenseData(dtype=self.settings.dtype, device=self.settings.device)
+        data = DenseData(dtype=self.settings.dtype, device=self._device)
         data.init(P, c, A, b, G, h_u, h_l, x_u, x_l)
         return data
 

@@ -64,8 +64,8 @@ class MultistageSolver(SolverBase):
 
     Parameters
     ----------
-    dtype : {"float64", "float32"}, default: "float64"
-        Floating-point precision used throughout the solve. ``"float32"``
+    dtype : {wp.float64, wp.float32}, default: wp.float64
+        Floating-point precision used throughout the solve. ``wp.float32``
         is faster and uses less memory but converges to looser tolerances;
         the default convergence tolerances are chosen to match the dtype.
     stream : warp.Stream, optional
@@ -131,7 +131,7 @@ class MultistageSolver(SolverBase):
         x_u: Optional[wp.array],
         x_l: Optional[wp.array]
     ) -> MultistageData:
-        data = MultistageData(dtype=self.settings.dtype, device=self.settings.device)
+        data = MultistageData(dtype=self.settings.dtype, device=self._device)
         # MultistageData.init reads the batch size from the batched inputs.
         data.init(P, c, A, b, G, h_u, h_l, x_u, x_l)
         return data
@@ -240,7 +240,7 @@ class MultistageSolver(SolverBase):
         # structure: blocks and bound sides exist exactly when they do in the
         # forward problem.
         has_A, has_G = d.p > 0, d.m > 0
-        self._grad_data = MultistageData(dtype=dtype, device=self.settings.device)
+        self._grad_data = MultistageData(dtype=dtype, device=self._device)
         self._grad_data.init(
             P=(wp.zeros((B, N, d_sz, d_sz), dtype=dtype, device=d.device), None),
             c=wp.zeros((B, N, d_sz), dtype=dtype, device=d.device),

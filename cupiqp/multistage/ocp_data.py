@@ -1,5 +1,5 @@
 from types import MappingProxyType
-from typing import Sequence, Union, Literal
+from typing import Sequence, Union
 
 import numpy as np
 import warp as wp
@@ -80,7 +80,7 @@ class OcpData:
         a single ``2``), in ``[0, nx)`` / ``[0, nu)``. ``None`` (default) means no
         box bounds for that category. State bounds apply at stages ``0..N``;
         input bounds apply at control stages ``0..N-1``.
-    dtype : {"float64", "float32"}, default: "float64"
+    dtype : {wp.float64, wp.float32}, default: wp.float64
     device : str, default: "cuda"
     batch_size : int, default: 1
         Number of OCPs stored together (leading batch axis).
@@ -89,7 +89,7 @@ class OcpData:
     def __init__(self, N: int, nx: int, nu: int, ng: int = 0,
                  idxbx: Union[int, Sequence[int], None] = None,
                  idxbu: Union[int, Sequence[int], None] = None,
-                 dtype: Literal["float32", "float64"] = "float64",
+                 dtype: Union[type[wp.float32], type[wp.float64]] = wp.float64,
                  device: str = "cuda",
                  batch_size: int = 1) -> None:
         assert isinstance(N, (int, np.integer)) and N >= 1, "N must be an integer >= 1."
