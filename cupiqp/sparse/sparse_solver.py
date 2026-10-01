@@ -13,71 +13,76 @@ from .sparse_preconditioner import SparseRuizEquilibration
 from .sparse_solver_kernels import create_sparse_data_gradients_kernel
 
 
-def _check_csr(name: str, value, dtype, cols: Optional[int] = None) -> Optional[Tuple[wp.array, wp.array, wp.array]]:
-    """Warp views of a CSR triple ``(indptr, indices, values)`` (``None`` passes through).
+def _to_host(arr) -> np.ndarray:
+    """NumPy copy of a host or device array."""
+    return as_warp_array(arr).numpy() if is_cuda_array(arr) else np.ascontiguousarray(arr)
 
-    ``indptr`` and ``indices`` are 1-D GPU integer arrays; ``values`` holds the
-    stored entries in the solver ``dtype``, ``(nnz,)`` shared by every
-    problem or ``(B, nnz)`` per problem. The matrix has ``len(indptr) - 1``
-    rows and ``cols`` columns (as many as rows when ``cols`` is None). The
-    pattern is checked here, once: ``indptr`` starts at 0, never decreases
-    and ends at ``nnz``; column indices are in range and strictly increasing
-    within each row.
+
+def _check_csr(name: str, value, dtype, device, cols: Optional[int] = None) -> Optional[Tuple[wp.array, wp.array, wp.array]]:
+    """Device Warp arrays of a CSR triple ``(indptr, indices, values)`` (``None`` passes through).
+
+    ``indptr`` and ``indices`` are 1-D integer arrays on the host or the device;
+    they are checked on the host and copied to ``device`` once. ``values`` is a
+    device array of the stored entries in the solver ``dtype``, ``(nnz,)``
+    shared by every problem or ``(B, nnz)`` per problem. The matrix has
+    ``len(indptr) - 1`` rows and ``cols`` columns (as many as rows when ``cols``
+    is None).
     """
     if value is None:
         return None
     if not (isinstance(value, (tuple, list)) and len(value) == 3):
         raise TypeError(
-            f"SparseSolver requires {name} as a CSR triple (indptr, indices, values) "
-            f"of GPU arrays; got {type(value).__name__}. For a cupyx csr_matrix M pass "
-            f"(M.indptr, M.indices, M.data); for a CUDA torch CSR tensor T pass "
-            f"(T.crow_indices(), T.col_indices(), T.values())."
+            f"SparseSolver requires {name} as a CSR triple (indptr, indices, values); "
+            f"got {type(value).__name__}. For a scipy or cupyx csr_matrix M pass "
+            f"(M.indptr, M.indices, M.data) with M.data on the device; for a CUDA torch "
+            f"CSR tensor T pass (T.crow_indices(), T.col_indices(), T.values())."
         )
-    for part, arr in (("indptr", value[0]), ("indices", value[1]), ("values", value[2])):
-        if not is_cuda_array(arr):
-            raise TypeError(
-                f"SparseSolver requires {name} {part} to be a GPU array; got {type(arr).__name__}."
-            )
-    indptr = as_warp_array(value[0], f"{name} indptr")
-    indices = as_warp_array(value[1], f"{name} indices")
-    values = as_warp_array(value[2], f"{name} values", dtype)
-    for part, arr in (("indptr", indptr), ("indices", indices)):
-        if arr.dtype not in (wp.int32, wp.int64):
-            raise TypeError(f"{name} {part} must be int32 or int64; got {arr.dtype.__name__}.")
+    indptr, indices, values = value
+
+    # The values are numerical data: they must already be on the device.
+    if not is_cuda_array(values):
+        raise TypeError(
+            f"SparseSolver requires {name} values to be a GPU array; got "
+            f"{type(values).__name__}. The pattern (indptr, indices) may be on the "
+            f"host, but the values must be on the device."
+        )
+    values = as_warp_array(values, f"{name} values", dtype)
+
+    # The pattern is checked on the host.
+    indptr_host, indices_host = _to_host(indptr), _to_host(indices)
+    for part, arr in (("indptr", indptr_host), ("indices", indices_host)):
+        if arr.dtype not in (np.int32, np.int64):
+            raise TypeError(f"{name} {part} must be int32 or int64; got {arr.dtype}.")
         if arr.ndim != 1:
-            raise ValueError(f"{name} {part} must be 1-D; got shape {tuple(arr.shape)}.")
-    rows = int(indptr.shape[0]) - 1
+            raise ValueError(f"{name} {part} must be 1-D; got shape {arr.shape}.")
+    rows, nnz = len(indptr_host) - 1, len(indices_host)
     cols = rows if cols is None else cols
-    nnz = int(indices.shape[0])
     if rows < 0:
         raise ValueError(f"{name} indptr must have at least one entry.")
     if nnz >= 2 ** 31:
         raise ValueError(f"{name} has {nnz} stored entries; at most 2**31 - 1 are supported.")
-    if values.ndim not in (1, 2) or int(values.shape[-1]) != nnz:
+    if values.ndim not in (1, 2) or values.shape[-1] != nnz:
         raise ValueError(
             f"{name} values must have shape ({nnz},) or (B, {nnz}) to match indices; "
-            f"got {tuple(values.shape)}."
+            f"got {values.shape}."
         )
-    # Pattern check on a host copy of the index arrays (setup only).
-    ptr, idx = indptr.numpy().astype(np.int64), indices.numpy().astype(np.int64)
-    if ptr[0] != 0 or ptr[-1] != nnz or np.any(np.diff(ptr) < 0):
+    if indptr_host[0] != 0 or indptr_host[-1] != nnz or np.any(np.diff(indptr_host) < 0):
         raise ValueError(
             f"{name} indptr must start at 0, never decrease, and end at nnz = {nnz}."
         )
-    if nnz > 0 and (idx.min() < 0 or idx.max() >= cols):
+    if np.any(indices_host < 0) or np.any(indices_host >= cols):
         raise ValueError(f"{name} column indices must lie in [0, {cols}).")
-    if nnz > 1:
-        within_row = np.ones(nnz - 1, dtype=bool)
-        row_starts = ptr[1:-1]
-        within_row[row_starts[(row_starts > 0) & (row_starts < nnz)] - 1] = False
-        if np.any(np.diff(idx)[within_row] <= 0):
-            raise ValueError(
-                f"{name} column indices must be strictly increasing within each row "
-                f"(sorted, no duplicates). Products and stacks of scipy sparse matrices "
-                f"can leave them unsorted; call sort_indices() on the scipy matrix "
-                f"before moving it to the GPU."
-            )
-    return indptr, indices, values
+    row = np.repeat(np.arange(rows), np.diff(indptr_host))     # row of every stored entry
+    same_row = row[1:] == row[:-1]
+    if np.any(np.diff(indices_host)[same_row] <= 0):
+        raise ValueError(
+            f"{name} column indices must be strictly increasing within each row "
+            f"(sorted, no duplicates). Products and stacks of scipy sparse matrices "
+            f"can leave them unsorted; call sort_indices() on the scipy matrix "
+            f"before passing its pattern."
+        )
+
+    return wp.array(indptr_host, device=device), wp.array(indices_host, device=device), values
 
 
 def _check_dense_vector(name: str, m, dtype) -> Optional[wp.array]:
@@ -120,9 +125,10 @@ class SparseSolver(SolverBase):
     structurally sparse ``P`` / ``A`` / ``G``.
 
     **Matrices are CSR triples.** ``P``, ``A`` and ``G`` are given to
-    ``setup`` as ``(indptr, indices, values)`` of GPU arrays. The pattern
-    (``indptr``, ``indices``) is shared by every problem of the batch and is
-    fixed by ``setup``; ``update`` then takes the ``values`` alone.
+    ``setup`` as ``(indptr, indices, values)``. The pattern (``indptr``,
+    ``indices``) may be on the host or the device; it is shared by every problem
+    of the batch and fixed by ``setup``. The ``values`` must be on the device;
+    ``update`` then takes the ``values`` alone.
 
     **Batching.** Every value array of ``setup`` and ``update`` is either
     **batched**, with a leading batch axis (matrix values ``(B, nnz)``,
@@ -259,7 +265,7 @@ class SparseSolver(SolverBase):
 
         Parameters
         ----------
-        P : CSR triple of GPU arrays
+        P : CSR triple
             Quadratic cost, ``(n, n)`` with ``n = len(indptr) - 1``; values
             ``(nnz,)`` or ``(B, nnz)``. Must be symmetric positive
             semidefinite; store the full matrix (both triangles). Required.
@@ -279,12 +285,15 @@ class SparseSolver(SolverBase):
             Box bounds ``x_l <= x <= x_u``, ``(n,)`` or ``(B, n)``. An omitted
             side is absent for the lifetime of the solver.
 
-        ``indptr`` and ``indices`` are ``int32`` or ``int64``; column
-        indices must be sorted within each row, without duplicates. Every
-        pattern fixes which entries are stored: an entry that may become
-        nonzero in *any* problem must be stored (explicit zeros are fine).
-        The number of stored entries ``nnz`` is the length of the values
-        passed to :meth:`update`. For a cupyx ``csr_matrix`` ``M`` pass
+        ``indptr`` and ``indices`` are 1-D ``int32`` or ``int64`` arrays on the
+        host (e.g. numpy) or the device; a host pattern is copied to the device
+        once. The values must be device arrays of the solver dtype. Column
+        indices must be sorted within each row, without duplicates. Every pattern fixes
+        which entries are stored: an entry that may become nonzero in *any*
+        problem must be stored (explicit zeros are fine). The number of stored
+        entries ``nnz`` is the length of the values passed to :meth:`update`.
+        For a scipy ``csr_matrix`` ``M`` pass ``(M.indptr, M.indices, values)``
+        with ``values`` on the device; for a cupyx ``csr_matrix`` ``M``,
         ``(M.indptr, M.indices, M.data)``; for a CUDA torch CSR tensor ``T``,
         ``(T.crow_indices(), T.col_indices(), T.values())``. To set up ``B``
         equal problems, give at least one value array its batch axis, e.g.
@@ -295,19 +304,18 @@ class SparseSolver(SolverBase):
         RuntimeError
             If ``setup()`` has already been called on this instance.
         TypeError
-            If a matrix is not a CSR triple of GPU arrays, an index array is
-            not integer, or a value array is not a GPU array of the solver
-            dtype.
+            If a matrix is not a CSR triple, an index array is not integer,
+            or a value array is not a GPU array of the solver dtype.
         ValueError
             If a pattern is invalid, a value array has the wrong shape, or
             the batched arrays disagree on the batch size.
         """
         if P is None:
             raise TypeError("SparseSolver.setup requires P.")
-        P = _check_csr("P", P, self._dtype)
+        P = _check_csr("P", P, self._dtype, self._device)
         n = int(P[0].shape[0]) - 1
-        A = _check_csr("A", A, self._dtype, cols=n)
-        G = _check_csr("G", G, self._dtype, cols=n)
+        A = _check_csr("A", A, self._dtype, self._device, cols=n)
+        G = _check_csr("G", G, self._dtype, self._device, cols=n)
         c, b, h_u, h_l, x_u, x_l = (
             _check_dense_vector(name, v, self._dtype)
             for name, v in (("c", c), ("b", b), ("h_u", h_u), ("h_l", h_l),

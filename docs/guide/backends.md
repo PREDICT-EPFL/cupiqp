@@ -77,8 +77,10 @@ s.update(P=P_values_new, c=c_new)        # values only: (B, nnz) and (B, n)
 s.solve()
 ```
 
-- `P`, `A`, `G` are **CSR triples** `(indptr, indices, values)` of GPU arrays. `indptr`
-  and `indices` are `int32` or `int64`, with column indices sorted within each row; for a
+- `P`, `A`, `G` are **CSR triples** `(indptr, indices, values)`. The pattern `indptr`,
+  `indices` is 1-D `int32` or `int64`, with column indices sorted within each row, and may
+  be on the host (e.g. straight from scipy) or the device; the values must be on the device. For
+  a scipy `csr_matrix` `M` pass `(M.indptr, M.indices, values)` with `values` on the device, for a
   cupyx `csr_matrix` `M` pass `(M.indptr, M.indices, M.data)`, for a CUDA torch CSR
   tensor `T` pass `(T.crow_indices(), T.col_indices(), T.values())`. `setup` checks the
   pattern once.

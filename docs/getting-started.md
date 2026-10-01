@@ -75,8 +75,9 @@ print("solution:", x_dense)
 
 ### Sparse backend
 
-`SparseSolver` takes `P`, `A`, `G` as **CSR triples** `(indptr, indices, values)` of
-GPU arrays; the vectors are dense GPU arrays. We reuse the exact same data, converting
+`SparseSolver` takes `P`, `A`, `G` as **CSR triples** `(indptr, indices, values)`: the
+pattern `indptr`, `indices` may be on the host or the device, the values must be on the device,
+and the vectors are dense GPU arrays. We reuse the exact same data, converting
 the matrices to CSR with `cupyx.scipy.sparse.csr_matrix` and passing its three arrays.
 For larger, structurally sparse problems this is far more efficient than the dense
 backend.

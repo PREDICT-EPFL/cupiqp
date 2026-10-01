@@ -22,8 +22,8 @@ factorization used. See [Backends](../guide/backends.md) for guidance on choosin
       inherited_members: true
       members: [setup, solve, update, backward]
 
-`SparseSolver.setup` takes `P`, `A`, `G` as CSR triples `(indptr, indices, values)` of
-GPU arrays; each value array and vector is shared or batched, and the batch size is read
+`SparseSolver.setup` takes `P`, `A`, `G` as CSR triples `(indptr, indices, values)`, with
+the pattern on the host or the device and the values on the device; each value array and vector is shared or batched, and the batch size is read
 from the batched ones. `update` takes each matrix's values alone, `(nnz,)` or `(B, nnz)`
 (see `setup` and `update` above).
 
