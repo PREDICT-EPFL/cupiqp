@@ -438,6 +438,9 @@ class SolverBase(ABC):
 
     def _solve_impl(self) -> List[Status]:
         """Body of :meth:`solve`; the caller holds the solver's stream scope."""
+        if not self._setup_done:
+            raise RuntimeError("Solver not setup yet. Call setup() first.")
+
         if self.settings.verbose:
             try:
                 from importlib.metadata import version
