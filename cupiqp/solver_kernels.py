@@ -1247,10 +1247,26 @@ def create_prepare_zu_minus_zl_and_zbu_minus_zbl_kernel(m: int, n: int,
     return prepare_zu_minus_zl_and_zbu_minus_zbl_kernel
 
 
-def create_update_rho_delta_with_ineq_kernel(n: int, num_duals: int, dtype=wp.float64):
-    dtype = to_warp_dtype(dtype)
-    """Fused adaptive-regularization update for the inequality-constrained path.
+@functools.lru_cache(maxsize=None)
+def create_update_rho_delta_with_ineq_kernel(dtype=wp.float64):
+    """Adaptive-regularization update for the inequality-constrained path.
+
+    Per batch entry, the improvement flags are decided from the current
+    (pre-update) ``rho`` / ``delta``::
+
+        dual_improved   = dual_res < 0.95 * prev_dual_res  or  dual_res < eps_abs
+                          or dual_res_rel < eps_rel
+                          or (rho == reg_finetune_lower and dual_prox_inf < infeas_thresh)
+        primal_improved = the same with the primal quantities and delta
+
+    then ``rho`` / ``delta`` and the stagnation counters are updated, and the
+    two flags are stored for ``update_prox_vars_kernel``, which must be launched
+    right after this one.
+
+    Launch with ``dim=(B,)``.
     """
+    dtype = to_warp_dtype(dtype)
+
     @wp.kernel
     def update_rho_delta_with_ineq_kernel(
         active_mask:           wp.array(dtype=wp.bool), # type: ignore
@@ -1263,82 +1279,107 @@ def create_update_rho_delta_with_ineq_kernel(n: int, num_duals: int, dtype=wp.fl
         info_primal_res_rel:   wp.array(dtype=dtype),   # type: ignore
         info_primal_prox_inf:  wp.array(dtype=dtype),   # type: ignore
         info_reg_limit:        wp.array(dtype=dtype),   # type: ignore
-        info_rho:              wp.array(dtype=dtype),   # type: ignore
-        info_delta:            wp.array(dtype=dtype),   # type: ignore
+        info_rho:              wp.array(dtype=dtype),   # type: ignore  in-out (B,)
+        info_delta:            wp.array(dtype=dtype),   # type: ignore  in-out (B,)
         info_no_primal_update: wp.array(dtype=wp.int32),     # type: ignore  in-out (B,)
         info_no_dual_update:   wp.array(dtype=wp.int32),     # type: ignore  in-out (B,)
-        result_x:              wp.array2d(dtype=dtype), # type: ignore
-        prox_x:                wp.array2d(dtype=dtype), # type: ignore
-        result_duals:          wp.array2d(dtype=dtype), # type: ignore
-        prox_duals:            wp.array2d(dtype=dtype), # type: ignore
+        dual_improved_out:     wp.array(dtype=wp.bool), # type: ignore  output (B,)
+        primal_improved_out:   wp.array(dtype=wp.bool), # type: ignore  output (B,)
         settings_eps_abs:              dtype,           # type: ignore
         settings_eps_rel:              dtype,           # type: ignore
         settings_reg_finetune_lower:   dtype,           # type: ignore
         settings_infeas_thresh:        dtype,           # type: ignore
         current_iter:                  wp.int32
     ):
-        b, i = wp.tid()
+        b = wp.tid()
         if not active_mask[b]:
             return
-        n_static = wp.static(n)
-        num_duals_static = wp.static(num_duals)
         iter_under_5 = (current_iter < wp.int32(5))
+        old_rho = info_rho[b]
+        old_delta = info_delta[b]
         dual_improved = (
             (info_dual_res[b] < dtype(0.95) * info_prev_dual_res[b])
             or (info_dual_res[b] < settings_eps_abs)
             or (info_dual_res_rel[b] < settings_eps_rel)
-            or ((info_rho[b] == settings_reg_finetune_lower) and (info_dual_prox_inf[b] < settings_infeas_thresh))
+            or ((old_rho == settings_reg_finetune_lower) and (info_dual_prox_inf[b] < settings_infeas_thresh))
         )
         primal_improved = (
             (info_primal_res[b] < dtype(0.95) * info_prev_primal_res[b])
             or (info_primal_res[b] < settings_eps_abs)
             or (info_primal_res_rel[b] < settings_eps_rel)
-            or ((info_delta[b] == settings_reg_finetune_lower) and (info_primal_prox_inf[b] < settings_infeas_thresh))
+            or ((old_delta == settings_reg_finetune_lower) and (info_primal_prox_inf[b] < settings_infeas_thresh))
         )
+        dual_improved_out[b] = dual_improved
+        primal_improved_out[b] = primal_improved
 
-        if i == 0:
-            old_rho = info_rho[b]
-            rho_fast = wp.max(info_reg_limit[b], dtype(0.1) * old_rho)
-            rho_slow = wp.max(info_reg_limit[b], dtype(0.5) * old_rho)
-            rho_slow_ok = (not dual_improved) and (
-                iter_under_5 or (info_dual_prox_inf[b] < settings_infeas_thresh)
-            )
-            if dual_improved:
-                info_rho[b] = rho_fast
-            elif rho_slow_ok:
-                info_rho[b] = rho_slow
-            else:
-                pass
+        rho_fast = wp.max(info_reg_limit[b], dtype(0.1) * old_rho)
+        rho_slow = wp.max(info_reg_limit[b], dtype(0.5) * old_rho)
+        rho_slow_ok = (not dual_improved) and (
+            iter_under_5 or (info_dual_prox_inf[b] < settings_infeas_thresh)
+        )
+        if dual_improved:
+            info_rho[b] = rho_fast
+        elif rho_slow_ok:
+            info_rho[b] = rho_slow
+        else:
+            pass
 
-            old_delta = info_delta[b]
-            delta_fast = wp.max(info_reg_limit[b], dtype(0.1) * old_delta)
-            delta_slow = wp.max(info_reg_limit[b], dtype(0.5) * old_delta)
-            delta_slow_ok = (not primal_improved) and (
-                iter_under_5 or (info_primal_prox_inf[b] < settings_infeas_thresh)
-            )
-            if primal_improved:
-                info_delta[b] = delta_fast
-            elif delta_slow_ok:
-                info_delta[b] = delta_slow
-            else:
-                pass
+        delta_fast = wp.max(info_reg_limit[b], dtype(0.1) * old_delta)
+        delta_slow = wp.max(info_reg_limit[b], dtype(0.5) * old_delta)
+        delta_slow_ok = (not primal_improved) and (
+            iter_under_5 or (info_primal_prox_inf[b] < settings_infeas_thresh)
+        )
+        if primal_improved:
+            info_delta[b] = delta_fast
+        elif delta_slow_ok:
+            info_delta[b] = delta_slow
+        else:
+            pass
 
-            if dual_improved:
-                info_no_primal_update[b] = wp.int32(0)
-            else:
-                info_no_primal_update[b] = info_no_primal_update[b] + wp.int32(1)
-            if primal_improved:
-                info_no_dual_update[b] = wp.int32(0)
-            else:
-                info_no_dual_update[b] = info_no_dual_update[b] + wp.int32(1)
-
-        if i < n_static:
-            prox_x[b, i] = wp.where(dual_improved, result_x[b, i], prox_x[b, i])
-        elif i < n_static + num_duals_static:
-            t = i - n_static
-            prox_duals[b, t] = wp.where(primal_improved, result_duals[b, t], prox_duals[b, t])
+        if dual_improved:
+            info_no_primal_update[b] = wp.int32(0)
+        else:
+            info_no_primal_update[b] = info_no_primal_update[b] + wp.int32(1)
+        if primal_improved:
+            info_no_dual_update[b] = wp.int32(0)
+        else:
+            info_no_dual_update[b] = info_no_dual_update[b] + wp.int32(1)
 
     return update_rho_delta_with_ineq_kernel
+
+
+def create_update_prox_vars_kernel(n: int, num_duals: int, dtype=wp.float64):
+    """Proximal-center update from the flags of ``update_rho_delta_with_ineq_kernel``::
+
+        prox_x[b, :]     = result_x[b, :]      if dual_improved[b]
+        prox_duals[b, :] = result_duals[b, :]  if primal_improved[b]
+
+    Launch with ``dim=(B, n + num_duals)`` after ``update_rho_delta_with_ineq_kernel``.
+    """
+    dtype = to_warp_dtype(dtype)
+
+    @wp.kernel
+    def update_prox_vars_kernel(
+        active_mask:           wp.array(dtype=wp.bool), # type: ignore
+        dual_improved:         wp.array(dtype=wp.bool), # type: ignore  (B,)
+        primal_improved:       wp.array(dtype=wp.bool), # type: ignore  (B,)
+        result_x:              wp.array2d(dtype=dtype), # type: ignore
+        prox_x:                wp.array2d(dtype=dtype), # type: ignore
+        result_duals:          wp.array2d(dtype=dtype), # type: ignore
+        prox_duals:            wp.array2d(dtype=dtype), # type: ignore
+    ):
+        b, i = wp.tid()
+        if not active_mask[b]:
+            return
+        n_static = wp.static(n)
+        num_duals_static = wp.static(num_duals)
+        if i < n_static:
+            prox_x[b, i] = wp.where(dual_improved[b], result_x[b, i], prox_x[b, i])
+        elif i < n_static + num_duals_static:
+            t = i - n_static
+            prox_duals[b, t] = wp.where(primal_improved[b], result_duals[b, t], prox_duals[b, t])
+
+    return update_prox_vars_kernel
 
 
 def create_update_rho_delta_without_ineq_kernel(n: int, p: int, dtype=wp.float64):
@@ -1376,6 +1417,9 @@ def create_update_rho_delta_without_ineq_kernel(n: int, p: int, dtype=wp.float64
         n_static = wp.static(n)
         p_static = wp.static(p)
         iter_under_5 = (current_iter < wp.int32(5))
+        # Unlike the inequality path, these flags never read rho / delta, which
+        # thread (b, 0) overwrites below, so every thread of row b sees the same
+        # flags and the update can stay fused in one launch.
         dual_improved = (
             (info_dual_res[b] < dtype(0.95) * info_prev_dual_res[b])
             or (info_dual_res[b] < settings_eps_abs)

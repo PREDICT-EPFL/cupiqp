@@ -28,6 +28,7 @@ from .solver_kernels import (
     create_smoothing_prepare_kernel,
     create_smoothing_apply_step_kernel,
     create_update_rho_delta_with_ineq_kernel,
+    create_update_prox_vars_kernel,
     create_update_rho_delta_without_ineq_kernel,
     create_run_full_newton_step_kernel,
     create_factor_retry_kernel,
@@ -234,6 +235,9 @@ class SolverBase(ABC):
         # Problems in the batch that have terminated must not evolve while other problems continue iterating.
         self._unsolved_mask = wp.full(B, True, dtype=wp.bool, device=self._device)
         self._finetune_mask = wp.zeros(B, dtype=wp.bool, device=self._device)
+        # Per-iteration improvement flags, passed from the rho/delta update to the prox update.
+        self._dual_improved = wp.zeros(B, dtype=wp.bool, device=self._device)
+        self._primal_improved = wp.zeros(B, dtype=wp.bool, device=self._device)
 
         self._work_z_1 = wp.empty((B, data.m), dtype=self._dtype, device=self._device)  # used to store intermediate results in _update_residuals_nr
         self._work_z_2 = wp.empty((B, data.m), dtype=self._dtype, device=self._device)  # used to store intermediate results in _update_residuals_nr
@@ -835,7 +839,8 @@ class SolverBase(ABC):
             self._calculate_sigma_kernel = create_calculate_sigma_kernel(dtype)
             self._calculate_step_kernel = create_calculate_step_kernel(dtype)
             self._calculate_mu_kernel = create_calculate_mu_kernel(dtype)
-            self._update_rho_delta_with_ineq_kernel = create_update_rho_delta_with_ineq_kernel(
+            self._update_rho_delta_with_ineq_kernel = create_update_rho_delta_with_ineq_kernel(dtype)
+            self._update_prox_vars_kernel = create_update_prox_vars_kernel(
                 d.n, d.p + d.num_ineq, dtype=dtype)
         else:
             self._run_full_newton_step_kernel = create_run_full_newton_step_kernel(d.n, d.p, dtype=dtype)
@@ -1195,9 +1200,12 @@ class SolverBase(ABC):
         settings = self.settings
         n = self._data.n
         num_duals = self._data.p + self._data.num_ineq
+        # Two launches: the improvement flags read rho/delta, so they are decided
+        # once per problem, before rho/delta are overwritten, and then handed to
+        # the element-wise prox update.
         wp.launch(
             kernel=self._update_rho_delta_with_ineq_kernel,
-            dim=(self._data.batch_size, n + num_duals),
+            dim=(self._data.batch_size,),
             inputs=[
                 self._unsolved_mask,
                 info.dual_res, info.prev_dual_res, info.dual_res_rel, info.dual_prox_inf,
@@ -1205,13 +1213,23 @@ class SolverBase(ABC):
                 info.reg_limit,
                 info.rho, info.delta,
                 info.no_primal_update, info.no_dual_update,
+                self._dual_improved, self._primal_improved,
+                self._dtype(settings.eps_abs),
+                self._dtype(settings.eps_rel),
+                self._dtype(settings.reg_finetune_lower_limit),
+                self._dtype(settings.infeasibility_threshold),
+                wp.int32(self._iter),
+            ],
+            device=self._device
+        )
+        wp.launch(
+            kernel=self._update_prox_vars_kernel,
+            dim=(self._data.batch_size, n + num_duals),
+            inputs=[
+                self._unsolved_mask,
+                self._dual_improved, self._primal_improved,
                 self._result.x, self._prox_vars.x,
                 self._result.duals_all, self._prox_vars.duals_all,
-                settings.eps_abs,
-                settings.eps_rel,
-                settings.reg_finetune_lower_limit,
-                settings.infeasibility_threshold,
-                wp.int32(self._iter),
             ],
             device=self._device
         )
@@ -1234,9 +1252,9 @@ class SolverBase(ABC):
                 info.no_primal_update, info.no_dual_update,
                 self._result.x, self._prox_vars.x,
                 self._result.y, self._prox_vars.y,
-                settings.eps_abs,
-                settings.eps_rel,
-                settings.infeasibility_threshold,
+                self._dtype(settings.eps_abs),
+                self._dtype(settings.eps_rel),
+                self._dtype(settings.infeasibility_threshold),
                 wp.int32(self._iter),  # self._iter is int64, need to convert to int32
             ],
             device=self._device
