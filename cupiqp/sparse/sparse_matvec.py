@@ -16,13 +16,12 @@ from nvmath.bindings import cusparse
 from .batched_csr import UniformBatchedCsrMatrix, to_wp_int32
 
 
-# cudaDataType_t values for the two supported value types.
-_CUDA_R_64F = 1
-_CUDA_R_32F = 2
-
 
 def _value_type(dtype):
     """``(cuda_data_type, ctypes scalar)`` for a Warp value dtype."""
+    # cudaDataType_t values for the two supported value types.
+    _CUDA_R_64F = 1
+    _CUDA_R_32F = 0
     if dtype is wp.float64:
         return _CUDA_R_64F, ctypes.c_double
     if dtype is wp.float32:
