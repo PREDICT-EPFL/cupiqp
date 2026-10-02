@@ -18,6 +18,7 @@ from nvmath.bindings import cudss as cudss_bindings
 from .batched_csr import UniformBatchedCsrMatrix
 
 
+
 class SparseDirectSolver(ABC):
     """Abstract base for sparse direct solvers - natively supports batching.
 
@@ -185,38 +186,67 @@ class CudssSparseDirectSolver(SparseDirectSolver):
 
     @nvtx.annotate("CudssSparseDirectSolver::factor")
     def factor(self, cuda_stream: int) -> None:
-        # cuDSS reports its factorization information on the host only, so
-        # this synchronizes once and writes the batch-wide outcome to every
-        # problem of the device status.
-        self._factor_status.fill_(0 if self._factor_ok(cuda_stream) else 1)
+        """Numerical factorization (cuDSS ``FACTORIZATION`` phase), launched on
+        the given stream without waiting for it.
 
-    def _factor_ok(self, cuda_stream: int) -> bool:
-        try:
-            fac_info = self._cudss_solver.factorize(stream=cuda_stream)
-
-            if self._batch_size > 1:
-                return fac_info.info == 0
-
-            # NOTE: this causes a D2H synchronization, which can be inefficient. More importantly, this prevents us from capturing cuda graphs.
-            if fac_info.info != 0:
-                return False
-
-            # For ExecuteCUDA, check the diagonal entries of the factorization to detect potential numerical issues.
-            # If any diagonal entry is very small, it may indicate the matrix is close to singular or indefinite,
-            # which can lead to very inaccurate results in subsequent computations.
-            # For ExecuteHybrid we cannot do this because fac_info.diag are always all zeros.
-            if isinstance(self._cudss_solver.execution_options, ExecutionCUDA):
-                if np.any(np.abs(fac_info.diag) < 1e-12):  # NOTE: the threshold here may need to be tuned based on the problem
-                    return False
-
-        except Exception as e:
-            print(f"Factorization failed: {e}")
-            return False
-
-        return True
+        IMPORTANT: the factorization is ALWAYS ASSUMED TO SUCCEED. Nothing is
+        checked and ``factor_status`` stays zero for every problem, because
+        cuDSS reports its factorization outcome only through blocking host
+        queries (see the comment below). Consequently the solver never retries
+        a sparse factorization with raised regularization. A factorization
+        that does fail shows up per problem only through the finite check of
+        the solution (``solve_status``), since a zero pivot gives a non-finite
+        solve; a factorization that is merely inaccurate is not detected.
+        """
+        # Earlier versions checked the outcome on the host after factorize():
+        #
+        #   if self._batch_size > 1:
+        #       return fac_info.info == 0
+        #   # NOTE: this causes a D2H synchronization, which can be inefficient.
+        #   # More importantly, this prevents us from capturing cuda graphs.
+        #   if fac_info.info != 0:
+        #       return False
+        #   # For ExecuteCUDA, check the diagonal entries of the factorization to
+        #   # detect potential numerical issues. If any diagonal entry is very
+        #   # small, it may indicate the matrix is close to singular or
+        #   # indefinite, which can lead to very inaccurate results in
+        #   # subsequent computations.
+        #   # For ExecuteHybrid we cannot do this because fac_info.diag are
+        #   # always all zeros.
+        #   if isinstance(self._cudss_solver.execution_options, ExecutionCUDA):
+        #       # NOTE: the threshold here may need to be tuned based on the problem
+        #       if np.any(np.abs(fac_info.diag) < 1e-12):
+        #           return False
+        #
+        # Why it was dropped (measured with cuDSS 0.8):
+        # - CUDSS_DATA_INFO and CUDSS_DATA_DIAG are read with cudssDataGet,
+        #   which waits for all work queued on the stream, even when DIAG is
+        #   written to a device buffer, and fails inside a stream capture. Any
+        #   such check rules out CUDA graphs.
+        # - Under uniform batching DIAG returns the diagonal of one matrix only
+        #   (dim values, not B * dim), so it cannot give a per-problem status.
+        # - The reorderings the documentation lists for DIAG (COLAMD,
+        #   BTF_COLAMD) are rejected for symmetric matrices; DIAG does work
+        #   with DEFAULT, AMD, NESTED_DISSECTION and NONE.
+        # - An absolute pivot threshold misfires on these KKT matrices: the
+        #   -delta * I block has pivots of size delta by design (down to
+        #   reg_finetune_lower_limit = 1e-13), so 1e-12 would reject healthy,
+        #   quasi-definite factorizations after regularization finetuning.
+        cudss_bindings.set_stream(self._cudss_handle, cuda_stream)
+        cudss_bindings.execute(
+            self._cudss_handle, cudss_bindings.Phase.FACTORIZATION,
+            self._cudss_config, self._cudss_data,
+            self._cudss_a, self._cudss_x, self._cudss_b
+        )
 
     @nvtx.annotate("CudssSparseDirectSolver::solve")
     def solve(self, cuda_stream: int) -> None:
+        """Solve phase, launched on the given stream. It captures into a CUDA graph, but not
+        into a conditional graph node: cuDSS issues small host-to-device
+        copies from pageable memory inside the solve phase, which conditional
+        node bodies reject (verified with cuDSS 0.8 for single, uniform-batch
+        and explicit-batch matrices). The factorization phase has no such
+        copies."""
         # Bypass nvmath's solve() which allocates B fresh arrays every call.
         # x_ptr already points at self._sol (set once in __init__), so cuDSS
         # writes directly into our buffer - zero allocation, zero copy.
