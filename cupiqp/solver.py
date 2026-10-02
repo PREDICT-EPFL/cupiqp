@@ -5,11 +5,12 @@ import numpy as np
 import warp as wp
 import nvtx
 
-from .settings import Settings
+from .settings import Settings, DeviceSettings
 from .data import Data
-from .results import Result, Status, Variables, InfoHost
+from .results import Result, Status, Variables, InfoFloatIdx
 from .kkt_systems import KKTSystem
 from .utils import cuda_graph_capture
+from .typedef import STATUS_MAX_ITER_REACHED, STATUS_NUMERICAL_ISSUES
 from .solver_kernels import (
     REDUCTION_BLOCK_DIM,
     create_init_guess_rhs_kernel,
@@ -32,12 +33,19 @@ from .solver_kernels import (
     create_update_rho_delta_without_ineq_kernel,
     create_run_full_newton_step_kernel,
     create_factor_retry_kernel,
+    any_flag_kernel,
+    mark_failed_kernel,
     create_apply_finetune_kernel,
     create_backward_assemble_rhs_kernel,
     create_backward_unscale_lhs_kernel,
     create_backward_compute_vector_grad_kernel,
     create_backward_copy_kernel,
-    create_backward_pack_full_layout_kernel
+    create_backward_pack_full_layout_kernel,
+    create_update_termination_kernel,
+    create_reset_solve_state_kernel,
+    update_continue_flag_kernel,
+    terminate_active_kernel,
+    advance_iteration_kernel,
 )
 
 
@@ -231,13 +239,24 @@ class SolverBase(ABC):
         self._prox_vars.init(self._data)
 
         self._kkt_system.init(self._data, self.settings)
-        self._info_host = InfoHost(B, dtype=self._data.dtype)
         # Problems in the batch that have terminated must not evolve while other problems continue iterating.
         self._unsolved_mask = wp.full(B, True, dtype=wp.bool, device=self._device)
         self._finetune_mask = wp.zeros(B, dtype=wp.bool, device=self._device)
         # Per-iteration improvement flags, passed from the rho/delta update to the prox update.
         self._dual_improved = wp.zeros(B, dtype=wp.bool, device=self._device)
         self._primal_improved = wp.zeros(B, dtype=wp.bool, device=self._device)
+
+        # Loop control on the device: [current_iter, continue_flag] in one
+        # buffer so a single copy reads both; the pinned mirror is read once
+        # per solve (and once per iteration in verbose mode).
+        self._loop_state = wp.zeros(2, dtype=wp.int32, device=self._device)
+        self._current_iter = self._loop_state[0:1]
+        self._continue_flag = self._loop_state[1:2]
+        self._loop_state_host = wp.zeros(2, dtype=wp.int32, device="cpu", pinned=True)
+        # Factorization retry: per-problem request flags and their batch reduction,
+        # the loop condition of the device retry loop.
+        self._needs_retry = wp.zeros(B, dtype=wp.int32, device=self._device)
+        self._any_retry = wp.zeros(1, dtype=wp.int32, device=self._device)
 
         self._work_z_1 = wp.empty((B, data.m), dtype=self._dtype, device=self._device)  # used to store intermediate results in _update_residuals_nr
         self._work_z_2 = wp.empty((B, data.m), dtype=self._dtype, device=self._device)  # used to store intermediate results in _update_residuals_nr
@@ -248,8 +267,8 @@ class SolverBase(ABC):
 
         self._work_x = wp.empty((B, data.n), dtype=self._dtype, device=self._device)
 
-        self._tau_device = wp.full(1, self.settings.tau, dtype=self._dtype, device=self._device)  # device copy used by warp kernels
-        self._tau_host = float(self.settings.tau)  # host cache -- only H2D when tau actually changes
+        # Runtime settings read by the kernels; refreshed from self.settings at every solve.
+        self._device_settings = DeviceSettings(self._dtype, self._device)
 
         if self.settings.enable_grad:
             # Working variables for implicit differentiation
@@ -289,6 +308,8 @@ class SolverBase(ABC):
             self._smoothing_residual_norm = wp.zeros((1,), dtype=self._dtype, device=self._device)
             self._smoothing_residual_norm_host = wp.zeros(1, dtype=self._dtype, device="cpu", pinned=True)
 
+        # Iterative refinement is a fixed configuration: the host-driven
+        # refinement loop cannot be switched on by a device-side decision.
         self._enable_iterative_refinement = self.settings.iterative_refinement_always_enabled
 
         # Unscaled-RHS inf-norm. When preconditioner_iter == 0 the stored
@@ -350,7 +371,7 @@ class SolverBase(ABC):
             raise RuntimeError("Solver not setup yet. Call setup() first.")
 
         # TODO: in the future should allow only update some problems of the whole batch, and only marks the updated ones as unsolved
-        self._result.info.status_value[:] = Status.CUPIQP_UNSOLVED.value
+        self._result.info.reset_status()
 
         if self.settings.preconditioner_iter > 0:
             self._preconditioner.unscale_data(self._data)
@@ -466,173 +487,40 @@ class SolverBase(ABC):
             print("")
 
         info = self._result.info
-        info.status_value[:] = Status.CUPIQP_UNSOLVED.value
-        self._unsolved_mask.fill_(True)
-        info.iter[:] = 0
+        # Device prelude: upload the runtime settings, then reset the
+        # per-problem state from them with one kernel. Both are plain stream
+        # operations, so a captured prelude follows later Settings changes.
+        self._device_settings.upload(self.settings)
+        self._reset_solve_state()
+        self._loop_state.zero_()
         info.iter_total = 0
-        self._iter = 0  # global IPM iteration counter (host scalar)
-        info.reg_limit = self.settings.reg_lower_limit
-        # Refresh tau only if the user changed settings.tau between solves because it requires H2D memcpy
-        if self._tau_host != self.settings.tau:
-            self._tau_device.fill_(self.settings.tau)
-            self._tau_host = float(self.settings.tau)
-        info.factor_retires[:] = 0
-        info.no_primal_update.zero_()
-        info.no_dual_update.zero_()
-        info.mu = 0.
-        info.primal_step = 0.
-        info.dual_step = 0.
-        info.rho = self.settings.rho_init
-        info.delta = self.settings.delta_init
 
         if self.settings.verbose:
-            if self._data.batch_size == 1:
-                print("iter  prim_obj       dual_obj       duality_gap   prim_res      dual_res      rho         delta       mu          p_step   d_step")
-            else:
-                # Match the column widths used in ``_print_iteration_info``
-                # so header + data right-align to the same edge.
-                B = self._data.batch_size
-                counter_w = max(2 * len(str(B)) + 1, len("solved"))
-                print(
-                    f"{'iter':>4}  "
-                    f"{'solved':>{counter_w}}  "
-                    f"{'gap_max':>12}  "
-                    f"{'p_res_max':>12}  "
-                    f"{'d_res_max':>12}  "
-                    f"{'rho_max':>10}  "
-                    f"{'delta_max':>10}  "
-                    f"{'mu_max':>10}  "
-                    f"{'p_step':>6}  "
-                    f"{'d_step':>6}"
-                )
+            self._print_header()
 
-        ## ----------- initial iteration --------------
+        # Initial guess, its residuals and the first termination check; from
+        # here on the GPU alone decides which problems keep iterating.
         self._initial_guess()
-        still_unsolved = np.ones(self._data.batch_size, dtype=np.bool_)
+        self._update_residuals_nr()
+        wp.copy(info.prev_primal_res, info.primal_res)
+        wp.copy(info.prev_dual_res, info.dual_res)
+        self._update_residuals_r()
+        self._update_termination()
 
-        ## ---------------------------------------------
-        ## ---------- remaining iterations -------------
-        ## ---------------------------------------------
-        for iter in range(self.settings.max_iter):
-            with nvtx.annotate(f"Solver::ipm_iteration"):
-                self._iter = iter
-                info.iter[still_unsolved] = iter
-                if iter == 0:
-                    self._update_residuals_nr()
-                    wp.copy(info.prev_primal_res, info.primal_res)
-                    wp.copy(info.prev_dual_res, info.dual_res)
+        if self.settings.verbose:
+            # Verbose mode reads the device state every iteration and is the
+            # only reason the loop ever synchronizes before it ends.
+            while self._read_continue_flag():
+                self._print_iteration_info()
+                self._run_one_iteration()
+        else:
+            wp.capture_while(self._continue_flag, self._run_one_iteration)
 
-                self._update_residuals_r()
-
-                # fetch all info to host all at once, at the cost of one D2H memcpy
-                info.to_host(self._info_host)  # CPU: numpy (num_fields, B) buffer
-                info_host = self._info_host
-
-                # ============================================================
-                # Per-problem termination check -- ALL ON CPU (host-side numpy)
-                # h = info_host (numpy mirror), status/no_*_update are numpy arrays.
-                # Vectorized over batch: no Python loops, just numpy boolean ops.
-                # All problems keep running until every one has terminated.
-                # ============================================================
-                settings = self.settings
-
-                # convergence check
-                primal_ok = (info_host.primal_res < settings.eps_abs) | (info_host.primal_res_rel < settings.eps_rel)
-                dual_ok = (info_host.dual_res < settings.eps_abs) | (info_host.dual_res_rel < settings.eps_rel)
-                converged = primal_ok & dual_ok
-                if settings.check_duality_gap:
-                    gap_ok = (info_host.duality_gap < settings.eps_duality_gap_abs) | (info_host.duality_gap_rel < settings.eps_duality_gap_rel)
-                    converged &= gap_ok
-                solved = still_unsolved & converged
-                info.status_value[solved] = Status.CUPIQP_SOLVED.value  # CPU write
-
-                # primal infeasibility check
-                primal_infeasible = still_unsolved & ~converged & (
-                    (info_host.no_dual_update > min(5, settings.reg_finetune_dual_update_threshold)) &
-                    (info_host.primal_prox_inf > settings.infeasibility_threshold) &
-                    ((info_host.primal_res_reg < settings.eps_abs) | (info_host.primal_res_reg_rel < settings.eps_rel))
-                )
-                info.status_value[primal_infeasible] = Status.CUPIQP_PRIMAL_INFEASIBLE.value  # CPU write
-
-                # dual infeasibility check
-                dual_infeasible = still_unsolved & ~converged & ~primal_infeasible & (
-                    (info_host.no_primal_update > min(5, settings.reg_finetune_primal_update_threshold)) &
-                    (info_host.dual_prox_inf > settings.infeasibility_threshold) &
-                    ((info_host.dual_res_reg < settings.eps_abs) | (info_host.dual_res_reg_rel < settings.eps_rel))
-                )
-                info.status_value[dual_infeasible] = Status.CUPIQP_DUAL_INFEASIBLE.value  # CPU write
-
-                newly_terminated = solved | primal_infeasible | dual_infeasible
-                mask_changed = np.any(newly_terminated)
-                if mask_changed:
-                    still_unsolved[newly_terminated] = False
-
-                if self.settings.verbose:
-                    self._print_iteration_info()
-
-                if mask_changed:
-                    # No subsequent GPU work is launched when the entire batch is done.
-                    if not np.any(still_unsolved):
-                        break
-                    self._upload_mask(self._unsolved_mask, still_unsolved)
-
-                # avoid getting too close to boundary which can result in a division by zero
-                if self._data.num_ineq > 0:
-                    wp.launch(
-                        kernel=self._boundary_shift_kernel,
-                        dim=(self._data.batch_size,
-                             self._data.num_hl + self._data.num_hu
-                             + self._data.num_xl + self._data.num_xu),
-                        inputs=[
-                            self._unsolved_mask,
-                            self._data.finite_mask_hl, self._data.finite_mask_hu,
-                            self._data.finite_mask_xl, self._data.finite_mask_xu,
-                            self._result.z_l, self._result.z_u,
-                            self._result.z_bl, self._result.z_bu,
-                        ],
-                        device=self._device
-                    )
-                    self._calculate_mu()
-
-                # avoid possibility of converging to a local minimum -> decrease the minimum regularization value (vectorized)
-                finetune_mask = (
-                    ((info_host.no_primal_update > self.settings.reg_finetune_primal_update_threshold) &
-                     (info_host.rho == info_host.reg_limit) &
-                     (info_host.reg_limit != self.settings.reg_finetune_lower_limit)) |
-                    ((info_host.no_dual_update > self.settings.reg_finetune_dual_update_threshold) &
-                     (info_host.delta == info_host.reg_limit) &
-                     (info_host.reg_limit != self.settings.reg_finetune_lower_limit))
-                )
-                finetune_mask &= (info_host.dual_prox_inf < self.settings.infeasibility_threshold) & (info_host.primal_prox_inf < self.settings.infeasibility_threshold)
-                finetune_mask &= still_unsolved
-                if np.any(finetune_mask):
-                    self._upload_mask(self._finetune_mask, finetune_mask)
-                    wp.launch(
-                        kernel=self._apply_finetune_kernel,
-                        dim=(self._data.batch_size,),
-                        inputs=[self._finetune_mask, info.reg_limit,
-                                info.no_primal_update, info.no_dual_update,
-                                self._dtype(self.settings.reg_finetune_lower_limit)],
-                        device=self._device
-                    )
-
-                self._update_and_factorize_kkt()
-                if np.any(info.status_value == Status.CUPIQP_NUMERICAL_ISSUES.value):
-                    break
-
-                if self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu == 0:
-                    # since there are no inequalities we can take full Newton steps
-                    self._run_full_newton_step()
-                    self._update_residuals_nr()
-                    self._update_rho_delta_without_ineq()
-                else:
-                    self._run_predictor_corrector()
-                    self._update_residuals_nr()
-                    self._update_rho_delta_with_ineq()
-
-        info.iter_total = int(self._iter)
-        # Mark remaining unsolved as max iter reached
-        info.status_value[info.status_value == Status.CUPIQP_UNSOLVED.value] = Status.CUPIQP_MAX_ITER_REACHED.value
+        # Everything still active ran out of iterations.
+        self._terminate_active(STATUS_MAX_ITER_REACHED)
+        wp.copy(self._loop_state_host, self._loop_state)
+        info.to_host()  # one D2H of the info buffers, then one synchronization
+        info.iter_total = int(self._loop_state_host.numpy()[0])
         if self.settings.verbose:
             self._print_summary()
         # Capture the converged iterate in SCALED coordinates before it is
@@ -644,14 +532,136 @@ class SolverBase(ABC):
             self._result_scaled.copy_from(self._result)
         if self.settings.preconditioner_iter > 0:
             self._preconditioner.unscale_solution(self._result, self._data)
-        statuses = info.status
 
-        return statuses
+        return info.status
 
-    @staticmethod
-    def _upload_mask(device_mask: wp.array, host_mask: np.ndarray) -> None:
-        """Copy a host boolean batch mask into its device counterpart."""
-        wp.copy(device_mask, wp.array(host_mask, dtype=wp.bool, device="cpu", copy=False))
+    @nvtx.annotate("Solver::_run_one_iteration")
+    def _run_one_iteration(self) -> None:
+        """One IPM iteration on the active problems, device work only.
+
+        The sequence is fixed and reads no host value, so the whole method can
+        be captured into a CUDA graph (``with wp.ScopedCapture(): self._run_one_iteration()``)
+        and replayed. It ends with the termination kernel, which updates the
+        active and finetune masks, the per-problem status and iteration, and
+        the loop condition ``_continue_flag`` for the next iteration.
+        """
+        info = self._result.info
+        # avoid getting too close to boundary which can result in a division by zero
+        if self._data.num_ineq > 0:
+            wp.launch(
+                kernel=self._boundary_shift_kernel,
+                dim=(self._data.batch_size,
+                     self._data.num_hl + self._data.num_hu
+                     + self._data.num_xl + self._data.num_xu),
+                inputs=[
+                    self._unsolved_mask,
+                    self._data.finite_mask_hl, self._data.finite_mask_hu,
+                    self._data.finite_mask_xl, self._data.finite_mask_xu,
+                    self._result.z_l, self._result.z_u,
+                    self._result.z_bl, self._result.z_bu,
+                ],
+                device=self._device
+            )
+            self._calculate_mu()
+
+        # avoid possibility of converging to a local minimum -> decrease the
+        # minimum regularization value of the problems the termination kernel flagged
+        wp.launch(
+            kernel=self._apply_finetune_kernel,
+            dim=(self._data.batch_size,),
+            inputs=[self._finetune_mask, info.reg_limit,
+                    info.no_primal_update, info.no_dual_update,
+                    self._device_settings.floats],
+            device=self._device
+        )
+
+        self._update_and_factorize_kkt()
+
+        if self._data.num_hl + self._data.num_hu + self._data.num_xl + self._data.num_xu == 0:
+            # since there are no inequalities we can take full Newton steps
+            self._run_full_newton_step()
+            self._update_residuals_nr()
+            self._update_rho_delta_without_ineq()
+        else:
+            self._run_predictor_corrector()
+            self._update_residuals_nr()
+            self._update_rho_delta_with_ineq()
+
+        self._update_residuals_r()
+        wp.launch(advance_iteration_kernel, dim=1, inputs=[self._current_iter], device=self._device)
+        self._update_termination()
+
+    def _read_continue_flag(self) -> bool:
+        """Copy the loop condition to the host and wait for it (verbose mode only)."""
+        wp.copy(self._loop_state_host, self._loop_state)
+        wp.synchronize_stream(wp.get_stream("cuda"))
+        return bool(self._loop_state_host.numpy()[1])
+
+    @nvtx.annotate("Solver::_update_termination")
+    def _update_termination(self) -> None:
+        """Device termination and finetune decisions of the current iteration.
+
+        Updates ``status_device`` / ``iter_device``, the device active and
+        finetune masks, and the loop condition, from the residuals of
+        ``_update_residuals_r``. Reads the iteration from ``_current_iter``.
+        """
+        info = self._result.info
+        settings = self.settings
+        dt = self._dtype
+        wp.launch(
+            kernel=self._update_termination_kernel,
+            dim=(self._data.batch_size,),
+            inputs=[
+                info.primal_res, info.primal_res_rel,
+                info.dual_res, info.dual_res_rel,
+                info.duality_gap, info.duality_gap_rel,
+                info.primal_res_reg, info.primal_res_reg_rel,
+                info.dual_res_reg, info.dual_res_reg_rel,
+                info.primal_prox_inf, info.dual_prox_inf,
+                info.rho, info.delta, info.reg_limit,
+                info.no_primal_update, info.no_dual_update,
+                self._current_iter,
+                self._device_settings.floats, self._device_settings.ints,
+                self._unsolved_mask, info.status_device, info.iter_device,
+                self._finetune_mask,
+            ],
+            device=self._device
+        )
+        wp.launch_tiled(
+            kernel=update_continue_flag_kernel,
+            dim=[1],
+            inputs=[self._unsolved_mask, self._current_iter,
+                    self._device_settings.ints, self._continue_flag],
+            block_dim=REDUCTION_BLOCK_DIM,
+            device=self._device
+        )
+
+    def _reset_solve_state(self) -> None:
+        """Reset the per-problem device state for a new solve from the
+        uploaded configuration (rho, delta, reg_limit, steps, counters,
+        status, iteration and the active mask)."""
+        info = self._result.info
+        wp.launch(
+            kernel=self._reset_solve_state_kernel,
+            dim=(self._data.batch_size,),
+            inputs=[self._device_settings.floats,
+                    info.rho, info.delta, info.reg_limit,
+                    info.mu, info.primal_step, info.dual_step,
+                    info.no_primal_update, info.no_dual_update,
+                    info.status_device, info.iter_device, info.factor_retries_device,
+                    self._unsolved_mask],
+            device=self._device
+        )
+
+    def _terminate_active(self, status: int) -> None:
+        """Give every problem still active on the device ``status``."""
+        wp.launch(
+            kernel=terminate_active_kernel,
+            dim=(self._data.batch_size,),
+            inputs=[self._unsolved_mask, self._current_iter, wp.int32(status),
+                    self._result.info.status_device, self._result.info.iter_device],
+            device=self._device
+        )
 
     @nvtx.annotate("Solver::_initial_guess")
     def _initial_guess(self):
@@ -661,15 +671,9 @@ class SolverBase(ABC):
         self._result.s_all.fill_(1.0)
         self._result.z_all.fill_(1.0)
 
-        self._kkt_system.update_scalings_and_factor(
-            self._data,
-            self._preconditioner,
-            self.settings,
-            self._enable_iterative_refinement,
-            self._result.info.rho,
-            self._result.info.delta,
-            self._result
-        )
+        # Checked like every later factorization: retries with raised
+        # regularization, and NUMERICAL_ISSUES once the retries are exhausted.
+        self._update_and_factorize_kkt()
 
         total_t = (self._data.n + self._data.p
                    + self._data.num_hl + self._data.num_hu
@@ -708,43 +712,68 @@ class SolverBase(ABC):
 
         self._prox_vars.copy_from(self._result)
 
+    def _print_header(self) -> None:
+        if self._data.batch_size == 1:
+            print("iter  prim_obj       dual_obj       duality_gap   prim_res      dual_res      rho         delta       mu          p_step   d_step")
+        else:
+            # Match the column widths used in ``_print_iteration_info``
+            # so header + data right-align to the same edge.
+            B = self._data.batch_size
+            counter_w = max(2 * len(str(B)) + 1, len("solved"))
+            print(
+                f"{'iter':>4}  "
+                f"{'solved':>{counter_w}}  "
+                f"{'gap_max':>12}  "
+                f"{'p_res_max':>12}  "
+                f"{'d_res_max':>12}  "
+                f"{'rho_max':>10}  "
+                f"{'delta_max':>10}  "
+                f"{'mu_max':>10}  "
+                f"{'p_step':>6}  "
+                f"{'d_step':>6}"
+            )
+
     @nvtx.annotate("Solver::_print_iteration_info")
     def _print_iteration_info(self):
-        """Print iteration verbose info."""
-        info_host = self._info_host
+        """Print the verbose line of the current iteration from a fresh host snapshot."""
+        info = self._result.info
+        info.to_host()
+        h = info.host
+        F = InfoFloatIdx
+        iteration = int(self._loop_state_host.numpy()[0])
         B = self._data.batch_size
 
         if B == 1:
             print(
-                f"{self._iter:3d}   "
-                f"{info_host.primal_obj[0]: .5e}   "
-                f"{info_host.dual_obj[0]: .5e}  "
-                f"{info_host.duality_gap[0]: .5e}  "
-                f"{info_host.primal_res[0]: .5e}  "
-                f"{info_host.dual_res[0]: .5e}  "
-                f"{info_host.rho[0]: .3e}  "
-                f"{info_host.delta[0]: .3e}  "
-                f"{info_host.mu[0]: .3e}  "
-                f"{info_host.primal_step[0]: .4f}  "
-                f"{info_host.dual_step[0]: .4f}",
+                f"{iteration:3d}   "
+                f"{h[0, F.primal_obj]: .5e}   "
+                f"{h[0, F.dual_obj]: .5e}  "
+                f"{h[0, F.duality_gap]: .5e}  "
+                f"{h[0, F.primal_res]: .5e}  "
+                f"{h[0, F.dual_res]: .5e}  "
+                f"{h[0, F.rho]: .3e}  "
+                f"{h[0, F.delta]: .3e}  "
+                f"{h[0, F.mu]: .3e}  "
+                f"{h[0, F.primal_step]: .4f}  "
+                f"{h[0, F.dual_step]: .4f}",
                 flush=True
             )
 
         else:
-            solved  = B - int((self._result.info.status_value == Status.CUPIQP_UNSOLVED.value).sum())
+            solved  = B - int((info.status_value == Status.CUPIQP_UNSOLVED.value).sum())
             counter = f"{solved}/{B}"
             counter_w = max(2 * len(str(B)) + 1, len("solved"))
             print(
-                f"{self._iter:>4d}  "
+                f"{iteration:>4d}  "
                 f"{counter:>{counter_w}}  "
-                f"{info_host.duality_gap.max():>12.5e}  "
-                f"{info_host.primal_res.max():>12.5e}  "
-                f"{info_host.dual_res.max():>12.5e}  "
-                f"{info_host.rho.max():>10.3e}  "
-                f"{info_host.delta.max():>10.3e}  "
-                f"{info_host.mu.max():>10.3e}  "
-                f"{info_host.primal_step.min():>6.4f}  "
-                f"{info_host.dual_step.min():>6.4f}",
+                f"{h[:, F.duality_gap].max():>12.5e}  "
+                f"{h[:, F.primal_res].max():>12.5e}  "
+                f"{h[:, F.dual_res].max():>12.5e}  "
+                f"{h[:, F.rho].max():>10.3e}  "
+                f"{h[:, F.delta].max():>10.3e}  "
+                f"{h[:, F.mu].max():>10.3e}  "
+                f"{h[:, F.primal_step].min():>6.4f}  "
+                f"{h[:, F.dual_step].min():>6.4f}",
                 flush=True
             )
 
@@ -766,30 +795,50 @@ class SolverBase(ABC):
 
     @nvtx.annotate("Solver::_update_and_factorize_kkt")
     def _update_and_factorize_kkt(self) -> None:
-        """Update the KKT matrix and refactorize."""
-        info = self._result.info
-        retries = 0
-        while retries < self.settings.max_factor_retires:
-            factor_succeeded = self._kkt_system.update_scalings_and_factor(
-                self._data, self._preconditioner, self.settings, self._enable_iterative_refinement,
-                info.rho, info.delta, self._result)
-            if factor_succeeded:
-                break
-            else:
-                if not self._enable_iterative_refinement:
-                    self._enable_iterative_refinement = True
-                retries += 1
-                wp.launch(
-                    kernel=self._factor_retry_kernel,
-                    dim=(self._data.batch_size,),
-                    inputs=[info.rho, info.delta, info.reg_limit, self._dtype(self.settings.eps_abs)],
-                    device=self._device
-                )
+        """Update the KKT matrix and refactor, with per-problem retries decided
+        on the device.
 
-        if retries >= self.settings.max_factor_retires:
-            # Mark all still-unsolved problems as numerical issues
-            still_unsolved = (info.status_value == Status.CUPIQP_UNSOLVED.value)
-            info.status_value[still_unsolved] = Status.CUPIQP_NUMERICAL_ISSUES.value
+        After each factorization the retry kernel raises rho and delta of the
+        active problems whose factorization failed, or marks them
+        ``NUMERICAL_ISSUES`` once ``max_factor_retires`` is reached, and the
+        batch is refactored while any problem asks for it. The retry loop is
+        a ``wp.capture_while``: a conditional graph node under capture, a host
+        loop otherwise.
+        """
+        self._factor_once()
+        wp.capture_while(self._any_retry, self._factor_once)
+
+    def _mark_solve_failures(self) -> None:
+        """Deactivate the active problems whose last KKT solution is not finite."""
+        wp.launch(
+            kernel=mark_failed_kernel,
+            dim=(self._data.batch_size,),
+            inputs=[self._kkt_system.solve_status, self._current_iter,
+                    self._unsolved_mask, self._result.info.status_device, self._result.info.iter_device],
+            device=self._device
+        )
+
+    def _factor_once(self) -> None:
+        info = self._result.info
+        self._kkt_system.update_scalings_and_factor(
+            self._data, self._preconditioner, self.settings, self._enable_iterative_refinement,
+            info.rho, info.delta, self._result)
+        wp.launch(
+            kernel=self._factor_retry_kernel,
+            dim=(self._data.batch_size,),
+            inputs=[self._kkt_system.factor_status, self._current_iter,
+                    self._device_settings.floats, self._device_settings.ints,
+                    self._unsolved_mask, info.status_device, info.iter_device, info.factor_retries_device,
+                    info.rho, info.delta, info.reg_limit, self._needs_retry],
+            device=self._device
+        )
+        wp.launch_tiled(
+            kernel=any_flag_kernel,
+            dim=[1],
+            inputs=[self._needs_retry, self._any_retry],
+            block_dim=REDUCTION_BLOCK_DIM,
+            device=self._device
+        )
 
     @abstractmethod
     def _init_data(
@@ -855,6 +904,8 @@ class SolverBase(ABC):
         self._update_residual_nr_kernel = create_update_residual_nr_kernel(dtype)
         self._factor_retry_kernel = create_factor_retry_kernel(dtype)
         self._apply_finetune_kernel = create_apply_finetune_kernel(dtype)
+        self._update_termination_kernel = create_update_termination_kernel(dtype)
+        self._reset_solve_state_kernel = create_reset_solve_state_kernel(dtype)
 
         if self.settings.enable_grad and self.settings.gradient_smoothing:
             self._update_smoothing_residual_nr_kernel = create_update_smoothing_residual_nr_kernel(dtype)
@@ -883,6 +934,7 @@ class SolverBase(ABC):
     @nvtx.annotate("Solver::_run_full_newton_step")
     def _run_full_newton_step(self):
         self._kkt_system.solve(self._data, self._preconditioner, self.settings, self._res, self._step)
+        self._mark_solve_failures()
         wp.launch(
             kernel=self._run_full_newton_step_kernel,
             dim=(self._data.batch_size, self._data.n + self._data.p),
@@ -937,6 +989,9 @@ class SolverBase(ABC):
         )
 
         self._kkt_system.solve(self._data, self._preconditioner, self.settings, self._res, self._step)
+        # a non-finite step (poisoned data) ends that problem; the masked
+        # update below then leaves its iterate untouched
+        self._mark_solve_failures()
 
         # step in the non-negative orthant
         self._calculate_step()
@@ -975,7 +1030,7 @@ class SolverBase(ABC):
                 self._result.s_all, self._result.z_all,
                 self._data.finite_mask_all,
                 self._step.s_all, self._step.z_all,
-                self._tau_device,
+                self._device_settings.floats,
                 self._result.info.primal_step, self._result.info.dual_step,
             ],
             block_dim=REDUCTION_BLOCK_DIM,
@@ -1214,11 +1269,8 @@ class SolverBase(ABC):
                 info.rho, info.delta,
                 info.no_primal_update, info.no_dual_update,
                 self._dual_improved, self._primal_improved,
-                self._dtype(settings.eps_abs),
-                self._dtype(settings.eps_rel),
-                self._dtype(settings.reg_finetune_lower_limit),
-                self._dtype(settings.infeasibility_threshold),
-                wp.int32(self._iter),
+                self._device_settings.floats,
+                self._current_iter,
             ],
             device=self._device
         )
@@ -1252,10 +1304,8 @@ class SolverBase(ABC):
                 info.no_primal_update, info.no_dual_update,
                 self._result.x, self._prox_vars.x,
                 self._result.y, self._prox_vars.y,
-                self._dtype(settings.eps_abs),
-                self._dtype(settings.eps_rel),
-                self._dtype(settings.infeasibility_threshold),
-                wp.int32(self._iter),  # self._iter is int64, need to convert to int32
+                self._device_settings.floats,
+                self._current_iter,
             ],
             device=self._device
         )
@@ -1408,7 +1458,7 @@ class SolverBase(ABC):
                 dim=[data.batch_size],
                 inputs=[
                     rv.s_all, rv.z_all, data.finite_mask_all,
-                    step.s_all, step.z_all, self._tau_device,
+                    step.s_all, step.z_all, self._device_settings.floats,
                     self._smoothing_alpha_s, self._smoothing_alpha_z,
                 ],
                 block_dim=REDUCTION_BLOCK_DIM,
@@ -1419,7 +1469,7 @@ class SolverBase(ABC):
             kernel=self._smoothing_apply_step_kernel,
             dim=(data.batch_size, data.n + data.p + 2 * data.num_ineq),
             inputs=[
-                self._smoothing_alpha_s, self._smoothing_alpha_z, self._dtype(self.settings.tau),
+                self._smoothing_alpha_s, self._smoothing_alpha_z, self._device_settings.floats,
                 data.finite_mask_all,
                 step.x, step.y, step.s_all, step.z_all,
                 rv.x, rv.y, rv.s_all, rv.z_all,

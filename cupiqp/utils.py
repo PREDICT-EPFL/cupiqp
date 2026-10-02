@@ -180,6 +180,12 @@ def cuda_graph_capture(key: Optional[Callable] = None, enable: Optional[Callable
             k = key(self, *args, **kwargs) if key is not None else None
 
             stream = wp.get_stream("cuda")
+            if stream.is_capturing:
+                # Inside an outer capture (a whole iteration or solve): a
+                # graph cannot be launched into a capture, so the kernels
+                # are recorded directly into the outer graph.
+                return fn(self, *args, **kwargs)
+
             if k not in cache:
                 with wp.ScopedCapture(stream=stream) as capture:
                     fn(self, *args, **kwargs)

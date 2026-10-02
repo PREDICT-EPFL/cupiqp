@@ -20,15 +20,15 @@ from .multistage_kkt_solver_kernels import (
     create_add_scaled_rows_kernel,
     create_sub_scale_rows_kernel,
     sub_mul,
-    create_has_nan_1d_kernel,
+    create_has_nan_rows_kernel,
 )
 
 
 class MultistageKKTSolver(KKTSolverBase):
     """Multistage KKT solver with block-tridiagonal Cholesky factorization, batched."""
     def __init__(self, data: MultistageData):
-        super().__init__()
         B = data.batch_size
+        super().__init__(B, data.dtype, data.device)
         N = data.num_blocks
         d = data.block_size
 
@@ -49,23 +49,38 @@ class MultistageKKTSolver(KKTSolverBase):
         # The (B, n) flat view of the rhs buffer the IPM vectors are copied to/from.
         self._kkt_rhs_flat = self._kkt_rhs.reshape((B, data.n))
 
+        # Two launchers each: the graph-backed one for ordinary launches and
+        # the raw one for use inside an outer CUDA graph capture, where a
+        # graph cannot be launched (see _launch_capturable).
         self._cholesky_factor_launch = create_cholesky_factor_launch(
             self._kkt_diag_blocks, self._kkt_offdiag_blocks,
             device="cuda", dtype=self._dtype, use_cuda_graph=True
+        )
+        self._cholesky_factor_launch_raw = create_cholesky_factor_launch(
+            self._kkt_diag_blocks, self._kkt_offdiag_blocks,
+            device="cuda", dtype=self._dtype, use_cuda_graph=False
         )
         self._cholesky_solve_launch = create_cholesky_solve_launch(
             self._kkt_diag_blocks, self._kkt_offdiag_blocks, self._kkt_rhs,
             device="cuda", dtype=self._dtype, use_cuda_graph=True
         )
+        self._cholesky_solve_launch_raw = create_cholesky_solve_launch(
+            self._kkt_diag_blocks, self._kkt_offdiag_blocks, self._kkt_rhs,
+            device="cuda", dtype=self._dtype, use_cuda_graph=False
+        )
 
         # Workspace for matvec-then-scale steps in solve().
         self._work_n = wp.zeros((B, data.n), dtype=self._dtype, device=self._device)
-        # NaN scan of the factor (one host read per factorization).
-        self._nan_flag = wp.zeros(1, dtype=wp.int32, device=self._device)
-        self._nan_flag_host = wp.zeros(1, dtype=wp.int32, device="cpu", pinned=True)
+        # Per-problem factorization status: the block Cholesky (socu) reports
+        # nothing, so a NaN scan of each problem's factor blocks writes it.
+        # The (B, rows) views keep one problem per row for the scan kernel.
+        self._factor_scan_views = [
+            blocks.reshape((B, blocks.size // B)) for blocks in (self._kkt_diag_blocks, self._kkt_offdiag_blocks)
+            if blocks.size > 0
+        ]
         self._add_scaled_rows_kernel = create_add_scaled_rows_kernel(dtype)
         self._sub_scale_rows_kernel = create_sub_scale_rows_kernel(dtype)
-        self._has_nan_1d_kernel = create_has_nan_1d_kernel(dtype)
+        self._has_nan_rows_kernel = create_has_nan_rows_kernel(dtype)
 
         # Precompute A^T A as block-tridiagonal (A is fixed across iterations).
         if data.p > 0:
@@ -156,22 +171,22 @@ class MultistageKKTSolver(KKTSolverBase):
             ]
         )
 
+    @staticmethod
+    def _launch_capturable(graph_launch, raw_launch) -> None:
+        """Run the raw kernel sequence when the current stream is being captured
+        into an outer graph, the socu graph replay otherwise."""
+        if wp.get_stream("cuda").is_capturing:
+            raw_launch()
+        else:
+            graph_launch()
+
     @nvtx.annotate("MultistageKKTSolver::factor")
-    def factor(self) -> bool:
-        self._cholesky_factor_launch()
-        # socu doesn't expose per-batch info; fall back to a NaN scan over
-        # the whole 4-D buffer (one bool for the whole batch -- same convention
-        # as the dense backend's batched factor).
-        stream = wp.get_stream("cuda")
-        self._nan_flag.zero_()
-        for blocks in (self._kkt_diag_blocks, self._kkt_offdiag_blocks):
-            flat = blocks.flatten()
-            if flat.shape[0] > 0:
-                wp.launch(self._has_nan_1d_kernel, dim=flat.shape[0], inputs=[flat, self._nan_flag],
-                          device=self._device)
-        wp.copy(self._nan_flag_host, self._nan_flag)
-        wp.synchronize_stream(stream)
-        return int(self._nan_flag_host.numpy()[0]) == 0
+    def factor(self) -> None:
+        self._launch_capturable(self._cholesky_factor_launch, self._cholesky_factor_launch_raw)
+        self._factor_status.zero_()
+        for view in self._factor_scan_views:
+            wp.launch(self._has_nan_rows_kernel, dim=view.shape, inputs=[view, self._factor_status],
+                      device=self._device)
 
     @nvtx.annotate("MultistageKKTSolver::solve")
     def solve(self, data: MultistageData,
@@ -216,7 +231,7 @@ class MultistageKKTSolver(KKTSolverBase):
 
         # Stage rhs into the (B, N, d, 1) socu buffer (zero-copy reshape view).
         wp.copy(self._kkt_rhs_flat, delta_x)
-        self._cholesky_solve_launch()
+        self._launch_capturable(self._cholesky_solve_launch, self._cholesky_solve_launch_raw)
         wp.copy(delta_x, self._kkt_rhs_flat)
 
         # delta_y = (A * delta_x - rhs_y) / delta
@@ -249,6 +264,7 @@ class MultistageKKTSolver(KKTSolverBase):
                 ]
             )
             wp.map(sub_mul, delta_z, rhs_z, self._z_reg_inv, out=delta_z)
+        self._write_solve_status(delta_x, delta_y, delta_z)
 
     @nvtx.annotate("MultistageKKTSolver::eval_P_x")
     def eval_P_x(self, data: MultistageData, alpha: float, x: wp.array, z: wp.array):

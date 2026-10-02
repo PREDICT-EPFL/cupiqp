@@ -24,10 +24,9 @@ class DenseKKTSolver(KKTSolverBase):
     (P + diag(x_reg) + (1/delta)*A^T*A + G^T*diag(z_reg_inv)*G) Delta_x = rhs.
     """
     def __init__(self, data: DenseData):
-        super().__init__()
-
         n, p, m = data.n, data.p, data.m
         B = data.batch_size
+        super().__init__(B, data.dtype, data.device)
         self._batch_size = B
         self._dtype = data.dtype
         self._device = data.device
@@ -82,6 +81,10 @@ class DenseKKTSolver(KKTSolverBase):
                 handle, 1, 0, A.shape[-1], A.shape[-2],  # FILL_UPPER, OP_N, n, k
                 alpha, device_ptr(A), A.shape[-1], beta, device_ptr(C), C.shape[-1])
 
+        # cuSOLVER writes one info entry per matrix ((1,) for the single
+        # solver) straight into the status buffer.
+        self._factor_status = self._cholesky_solver.factor_status
+
         if p > 0:
             self._compute_AtA(data)
 
@@ -121,9 +124,10 @@ class DenseKKTSolver(KKTSolverBase):
             self._syrk(self._cublas_handle, self._G_scaled, self._kkt_mat, 1.0, 1.0)
 
     @nvtx.annotate("DenseKKTSolver::factor")
-    def factor(self) -> bool:
+    def factor(self) -> None:
         # B=1: CholeskyInplaceSolver expects (n, n); B>1: BatchedCholeskyInplaceSolver expects (B, n, n)
-        return bool(self._cholesky_solver.factorize(self._kkt_mat[0] if self._batch_size == 1 else self._kkt_mat))
+        factor_input = self._kkt_mat[0] if self._batch_size == 1 else self._kkt_mat
+        self._cholesky_solver.factorize(factor_input)
 
     @nvtx.annotate("DenseKKTSolver::solve")
     def solve(self, data: DenseData, rhs_x, rhs_y, rhs_z, delta_x, delta_y, delta_z):
@@ -166,23 +170,24 @@ class DenseKKTSolver(KKTSolverBase):
                         delta_y, delta_z],
                 device=self._device
             )
+        self._write_solve_status(delta_x, delta_y, delta_z)
 
     @nvtx.annotate("DenseKKTSolver::eval_P_x")
-    def eval_P_x(self, data: DenseData, alpha: float, x, z):
+    def eval_P_x(self, data: DenseData, alpha: float, x: wp.array, z: wp.array):
         self._gemv(self._cublas_handle, data.P, x, z, transa=False, alpha=alpha, beta=0.0)
 
     @nvtx.annotate("DenseKKTSolver::eval_A_xn")
-    def eval_A_xn(self, data: DenseData, alpha_n: float, xn, zn):
+    def eval_A_xn(self, data: DenseData, alpha_n: float, xn: wp.array, zn: wp.array):
         self._gemv(self._cublas_handle, data.A, xn, zn, transa=False, alpha=alpha_n, beta=0.0)
 
     @nvtx.annotate("DenseKKTSolver::eval_AT_xt")
-    def eval_AT_xt(self, data: DenseData, alpha_t: float, xt, zt):
+    def eval_AT_xt(self, data: DenseData, alpha_t: float, xt: wp.array, zt: wp.array):
         self._gemv(self._cublas_handle, data.A, xt, zt, transa=True, alpha=alpha_t, beta=0.0)
 
     @nvtx.annotate("DenseKKTSolver::eval_G_xn")
-    def eval_G_xn(self, data: DenseData, alpha_n: float, xn, zn):
+    def eval_G_xn(self, data: DenseData, alpha_n: float, xn: wp.array, zn: wp.array):
         self._gemv(self._cublas_handle, data.G, xn, zn, transa=False, alpha=alpha_n, beta=0.0)
 
     @nvtx.annotate("DenseKKTSolver::eval_GT_xt")
-    def eval_GT_xt(self, data: DenseData, alpha_t: float, xt, zt):
+    def eval_GT_xt(self, data: DenseData, alpha_t: float, xt: wp.array, zt: wp.array):
         self._gemv(self._cublas_handle, data.G, xt, zt, transa=True, alpha=alpha_t, beta=0.0)

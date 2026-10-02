@@ -9,6 +9,11 @@ import functools
 
 import warp as wp
 from .utils import to_warp_dtype
+from .typedef import (
+    STATUS_SOLVED, STATUS_PRIMAL_INFEASIBLE, STATUS_DUAL_INFEASIBLE, STATUS_UNSOLVED,
+    STATUS_NUMERICAL_ISSUES,
+)
+from .settings import SettingsFloatIdx, SettingsIntIdx
 
 
 # Threads per batch entry in the block-reduction kernels below. Each thread
@@ -29,7 +34,7 @@ def create_calculate_step_kernel(dtype=wp.float64):
     Inactive entries have mask value 0.0 and contribute candidate step 1.0,
     so they never restrict the line search.
 
-    Dispatch with ``wp.launch_tiled(..., dim=[B], block_dim=REDUCTION_BLOCK_DIM)``:
+    ``tau`` is read from the device configuration. Dispatch with ``wp.launch_tiled(..., dim=[B], block_dim=REDUCTION_BLOCK_DIM)``:
     one CUDA block per batch entry; every thread reduces a strided subset of
     the row, then the block combines the partial minima.
     """
@@ -50,7 +55,7 @@ def create_calculate_step_kernel(dtype=wp.float64):
         finite_mask_all: wp.array2d(dtype=dtype),   # (B, num_ineq)  # type: ignore
         step_s_all: wp.array2d(dtype=dtype),   # (B, num_ineq)  # type: ignore
         step_z_all: wp.array2d(dtype=dtype),   # (B, num_ineq)  # type: ignore
-        tau: wp.array(dtype=dtype),            # (1,)           # type: ignore
+        settings: wp.array(dtype=dtype),            # DeviceSettings.floats  # type: ignore
         alpha_s: wp.array(dtype=dtype),        # (B,) output    # type: ignore
         alpha_z: wp.array(dtype=dtype),        # (B,) output    # type: ignore
     ):
@@ -65,8 +70,9 @@ def create_calculate_step_kernel(dtype=wp.float64):
         red_s = wp.tile_min(wp.tile(min_s))
         red_z = wp.tile_min(wp.tile(min_z))
         if i == 0:
-            alpha_s[b] = red_s[0] * tau[0]
-            alpha_z[b] = red_z[0] * tau[0]
+            tau = settings[SettingsFloatIdx.tau]
+            alpha_s[b] = red_s[0] * tau
+            alpha_z[b] = red_z[0] * tau
 
     return calculate_step_kernel
 
@@ -871,7 +877,7 @@ def create_smoothing_apply_step_kernel(dtype=wp.float64):
     def smoothing_apply_step_kernel(
         alpha_s:  wp.array(dtype=dtype),     # type: ignore  (B,)
         alpha_z:  wp.array(dtype=dtype),     # type: ignore  (B,)
-        tau:      dtype,                     # type: ignore
+        settings:      wp.array(dtype=dtype),     # type: ignore  DeviceSettings.floats
         finite_mask_all: wp.array2d(dtype=dtype),  # type: ignore  (B, num_ineq)
         step_x:   wp.array2d(dtype=dtype),   # type: ignore  (B, n)
         step_y:   wp.array2d(dtype=dtype),   # type: ignore  (B, p)
@@ -886,6 +892,7 @@ def create_smoothing_apply_step_kernel(dtype=wp.float64):
         n = x.shape[1]
         p = y.shape[1]
         num_ineq = s_all.shape[1]
+        tau = settings[SettingsFloatIdx.tau]
         a = wp.min(wp.min(alpha_s[b], tau), wp.min(alpha_z[b], tau)) * tau
         if t < n:
             x[b, t] = x[b, t] + a * step_x[b, t]
@@ -903,35 +910,10 @@ def create_smoothing_apply_step_kernel(dtype=wp.float64):
 
 
 @functools.lru_cache(maxsize=None)
-def create_factor_retry_kernel(dtype=wp.float64):
-    """Regularization bump after a failed factorization, per batch entry::
-
-        rho *= 100;  delta *= 100;  reg_limit = min(10 * reg_limit, eps_abs)
-
-    Launch with ``dim=(B,)``.
-    """
-    dtype = to_warp_dtype(dtype)
-
-    @wp.kernel
-    def factor_retry_kernel(
-        rho:       wp.array(dtype=dtype),  # type: ignore  (B,) in-out
-        delta:     wp.array(dtype=dtype),  # type: ignore  (B,) in-out
-        reg_limit: wp.array(dtype=dtype),  # type: ignore  (B,) in-out
-        eps_abs:   dtype,                  # type: ignore
-    ):
-        b = wp.tid()
-        rho[b] = rho[b] * dtype(100.0)
-        delta[b] = delta[b] * dtype(100.0)
-        reg_limit[b] = wp.min(dtype(10.0) * reg_limit[b], eps_abs)
-
-    return factor_retry_kernel
-
-
-@functools.lru_cache(maxsize=None)
 def create_apply_finetune_kernel(dtype=wp.float64):
     """Regularization fine-tuning on the problems selected by ``mask``::
 
-        reg_limit = value;  no_primal_update = 0;  no_dual_update = 0
+        reg_limit = reg_finetune_lower_limit;  no_primal_update = 0;  no_dual_update = 0
 
     Launch with ``dim=(B,)``.
     """
@@ -943,15 +925,370 @@ def create_apply_finetune_kernel(dtype=wp.float64):
         reg_limit:        wp.array(dtype=dtype),     # type: ignore  (B,) in-out
         no_primal_update: wp.array(dtype=wp.int32),  # type: ignore  (B,) in-out
         no_dual_update:   wp.array(dtype=wp.int32),  # type: ignore  (B,) in-out
-        value:            dtype,                     # type: ignore
+        settings:              wp.array(dtype=dtype),     # type: ignore  DeviceSettings.floats
     ):
         b = wp.tid()
         if mask[b]:
-            reg_limit[b] = value
+            reg_limit[b] = settings[SettingsFloatIdx.reg_finetune_lower_limit]
             no_primal_update[b] = wp.int32(0)
             no_dual_update[b] = wp.int32(0)
 
     return apply_finetune_kernel
+
+
+@functools.lru_cache(maxsize=None)
+def create_reset_solve_state_kernel(dtype=wp.float64):
+    """Per-problem state reset at the start of a solve, from the device
+    configuration::
+
+        rho = rho_init;  delta = delta_init;  reg_limit = reg_lower_limit
+        mu = primal_step = dual_step = 0
+        no_primal_update = no_dual_update = 0
+        status = UNSOLVED;  iteration = 0;  retries = 0;  active = True
+
+    Reading the initial values from the configuration array keeps a captured
+    prelude valid when the user changes ``Settings`` between replays. Launch
+    with ``dim=(B,)``.
+    """
+    dtype = to_warp_dtype(dtype)
+
+    @wp.kernel
+    def reset_solve_state_kernel(
+        settings:              wp.array(dtype=dtype),     # type: ignore  DeviceSettings.floats
+        rho:              wp.array(dtype=dtype),     # type: ignore  (B,)
+        delta:            wp.array(dtype=dtype),     # type: ignore  (B,)
+        reg_limit:        wp.array(dtype=dtype),     # type: ignore  (B,)
+        mu:               wp.array(dtype=dtype),     # type: ignore  (B,)
+        primal_step:      wp.array(dtype=dtype),     # type: ignore  (B,)
+        dual_step:        wp.array(dtype=dtype),     # type: ignore  (B,)
+        no_primal_update: wp.array(dtype=wp.int32),  # type: ignore  (B,)
+        no_dual_update:   wp.array(dtype=wp.int32),  # type: ignore  (B,)
+        status:           wp.array(dtype=wp.int32),  # type: ignore  (B,)
+        iteration:        wp.array(dtype=wp.int32),  # type: ignore  (B,)
+        retries:          wp.array(dtype=wp.int32),  # type: ignore  (B,)
+        active:           wp.array(dtype=wp.bool),   # type: ignore  (B,)
+    ):
+        b = wp.tid()
+        rho[b] = settings[SettingsFloatIdx.rho_init]
+        delta[b] = settings[SettingsFloatIdx.delta_init]
+        reg_limit[b] = settings[SettingsFloatIdx.reg_lower_limit]
+        mu[b] = dtype(0.0)
+        primal_step[b] = dtype(0.0)
+        dual_step[b] = dtype(0.0)
+        no_primal_update[b] = wp.int32(0)
+        no_dual_update[b] = wp.int32(0)
+        status[b] = wp.static(STATUS_UNSOLVED)
+        iteration[b] = wp.int32(0)
+        retries[b] = wp.int32(0)
+        active[b] = True
+
+    return reset_solve_state_kernel
+
+
+@functools.lru_cache(maxsize=None)
+def create_update_termination_kernel(dtype=wp.float64):
+    """Per-problem termination and finetune decisions of one IPM iteration.
+
+    For every batch entry ``b`` that is still active::
+
+        iteration[b] = current_iter[0]
+        converged = primal_ok and dual_ok [and gap_ok if check_duality_gap]
+        if converged:                  status = SOLVED
+        elif primal infeasible:        status = PRIMAL_INFEASIBLE
+        elif dual infeasible:          status = DUAL_INFEASIBLE
+        active[b] = (status == UNSOLVED)
+
+    where, with ``thr_p = min(5, primal_update_threshold)`` and
+    ``thr_d = min(5, dual_update_threshold)``::
+
+        primal_ok         = primal_res < eps_abs  or primal_res_rel < eps_rel
+        dual_ok           = dual_res   < eps_abs  or dual_res_rel   < eps_rel
+        gap_ok            = gap < eps_gap_abs     or gap_rel < eps_gap_rel
+        primal infeasible = no_dual_update > thr_d and primal_prox_inf > infeas
+                            and (primal_res_reg < eps_abs or primal_res_reg_rel < eps_rel)
+        dual infeasible   = no_primal_update > thr_p and dual_prox_inf > infeas
+                            and (dual_res_reg < eps_abs or dual_res_reg_rel < eps_rel)
+
+    Then, for the entries that are still active after this update::
+
+        finetune[b] = ((no_primal_update > primal_update_threshold and rho == reg_limit)
+                       or (no_dual_update > dual_update_threshold and delta == reg_limit))
+                      and reg_limit != reg_finetune_lower
+                      and dual_prox_inf < infeas and primal_prox_inf < infeas
+
+    and ``finetune[b] = False`` otherwise. These are the decisions the host
+    loop of ``SolverBase.solve`` makes; the tolerances come from the device
+    configuration and are compared in the solver dtype, as NumPy compares the
+    host mirror. Launch with ``dim=(B,)``.
+    """
+    dtype = to_warp_dtype(dtype)
+
+    @wp.kernel
+    def update_termination_kernel(
+        primal_res:         wp.array(dtype=dtype),     # type: ignore  (B,)
+        primal_res_rel:     wp.array(dtype=dtype),     # type: ignore  (B,)
+        dual_res:           wp.array(dtype=dtype),     # type: ignore  (B,)
+        dual_res_rel:       wp.array(dtype=dtype),     # type: ignore  (B,)
+        duality_gap:        wp.array(dtype=dtype),     # type: ignore  (B,)
+        duality_gap_rel:    wp.array(dtype=dtype),     # type: ignore  (B,)
+        primal_res_reg:     wp.array(dtype=dtype),     # type: ignore  (B,)
+        primal_res_reg_rel: wp.array(dtype=dtype),     # type: ignore  (B,)
+        dual_res_reg:       wp.array(dtype=dtype),     # type: ignore  (B,)
+        dual_res_reg_rel:   wp.array(dtype=dtype),     # type: ignore  (B,)
+        primal_prox_inf:    wp.array(dtype=dtype),     # type: ignore  (B,)
+        dual_prox_inf:      wp.array(dtype=dtype),     # type: ignore  (B,)
+        rho:                wp.array(dtype=dtype),     # type: ignore  (B,)
+        delta:              wp.array(dtype=dtype),     # type: ignore  (B,)
+        reg_limit:          wp.array(dtype=dtype),     # type: ignore  (B,)
+        no_primal_update:   wp.array(dtype=wp.int32),  # type: ignore  (B,)
+        no_dual_update:     wp.array(dtype=wp.int32),  # type: ignore  (B,)
+        current_iter:       wp.array(dtype=wp.int32),  # type: ignore  (1,)
+        settings_f:              wp.array(dtype=dtype),     # type: ignore  DeviceSettings.floats
+        settings_i:              wp.array(dtype=wp.int32),  # type: ignore  DeviceSettings.ints
+        active:             wp.array(dtype=wp.bool),   # type: ignore  (B,) in-out
+        status:             wp.array(dtype=wp.int32),  # type: ignore  (B,) in-out
+        iteration:          wp.array(dtype=wp.int32),  # type: ignore  (B,) in-out
+        finetune:           wp.array(dtype=wp.bool),   # type: ignore  (B,) output
+    ):
+        b = wp.tid()
+        if not active[b]:
+            finetune[b] = False
+            return
+        iteration[b] = current_iter[0]
+        eps_abs = settings_f[SettingsFloatIdx.eps_abs]
+        eps_rel = settings_f[SettingsFloatIdx.eps_rel]
+        check_duality_gap = settings_i[SettingsIntIdx.check_duality_gap]
+        eps_gap_abs = settings_f[SettingsFloatIdx.eps_duality_gap_abs]
+        eps_gap_rel = settings_f[SettingsFloatIdx.eps_duality_gap_rel]
+        infeas_thresh = settings_f[SettingsFloatIdx.infeasibility_threshold]
+        primal_update_threshold = settings_i[SettingsIntIdx.reg_finetune_primal_update_threshold]
+        dual_update_threshold = settings_i[SettingsIntIdx.reg_finetune_dual_update_threshold]
+        reg_finetune_lower = settings_f[SettingsFloatIdx.reg_finetune_lower_limit]
+
+        primal_ok = (primal_res[b] < eps_abs) or (primal_res_rel[b] < eps_rel)
+        dual_ok = (dual_res[b] < eps_abs) or (dual_res_rel[b] < eps_rel)
+        converged = primal_ok and dual_ok
+        if check_duality_gap != 0:
+            gap_ok = (duality_gap[b] < eps_gap_abs) or (duality_gap_rel[b] < eps_gap_rel)
+            converged = converged and gap_ok
+
+        primal_infeasible = (
+            (no_dual_update[b] > wp.min(wp.int32(5), dual_update_threshold))
+            and (primal_prox_inf[b] > infeas_thresh)
+            and ((primal_res_reg[b] < eps_abs) or (primal_res_reg_rel[b] < eps_rel))
+        )
+        dual_infeasible = (
+            (no_primal_update[b] > wp.min(wp.int32(5), primal_update_threshold))
+            and (dual_prox_inf[b] > infeas_thresh)
+            and ((dual_res_reg[b] < eps_abs) or (dual_res_reg_rel[b] < eps_rel))
+        )
+
+        if converged:
+            status[b] = wp.static(STATUS_SOLVED)
+            active[b] = False
+        elif primal_infeasible:
+            status[b] = wp.static(STATUS_PRIMAL_INFEASIBLE)
+            active[b] = False
+        elif dual_infeasible:
+            status[b] = wp.static(STATUS_DUAL_INFEASIBLE)
+            active[b] = False
+
+        if not active[b]:
+            finetune[b] = False
+            return
+        regs_tunable = (
+            (reg_limit[b] != reg_finetune_lower)
+            and (dual_prox_inf[b] < infeas_thresh)
+            and (primal_prox_inf[b] < infeas_thresh)
+        )
+        finetune[b] = regs_tunable and (
+            ((no_primal_update[b] > primal_update_threshold) and (rho[b] == reg_limit[b]))
+            or ((no_dual_update[b] > dual_update_threshold) and (delta[b] == reg_limit[b]))
+        )
+
+    return update_termination_kernel
+
+
+@wp.kernel
+def update_continue_flag_kernel(
+    active:        wp.array(dtype=wp.bool),   # type: ignore  (B,)
+    current_iter:  wp.array(dtype=wp.int32),  # type: ignore  (1,)
+    settings_i:         wp.array(dtype=wp.int32),  # type: ignore  DeviceSettings.ints
+    continue_flag: wp.array(dtype=wp.int32),  # type: ignore  (1,) output
+):
+    """``continue_flag[0] = 1`` if any problem is active and
+    ``current_iter[0] < max_iter`` (read from the device configuration), else ``0``.
+
+    One block reduces the whole batch, so no cross-block reset/atomic pattern
+    is needed. Dispatch with
+    ``wp.launch_tiled(..., dim=[1], block_dim=REDUCTION_BLOCK_DIM)``.
+    """
+    _, i = wp.tid()
+    any_active = wp.int32(0)
+    for k in range(i, active.shape[0], wp.block_dim()):
+        if active[k]:
+            any_active = wp.int32(1)
+    total = wp.tile_max(wp.tile(any_active))
+    if i == 0:
+        if total[0] > wp.int32(0) and current_iter[0] < settings_i[SettingsIntIdx.max_iter]:
+            continue_flag[0] = wp.int32(1)
+        else:
+            continue_flag[0] = wp.int32(0)
+
+
+@functools.lru_cache(maxsize=None)
+def create_factor_retry_kernel(dtype=wp.float64):
+    """Per-problem reaction to the backend's factorization status.
+
+    For an active problem ``b`` whose ``factor_status[b]`` is nonzero::
+
+        retries[b] += 1
+        if retries[b] >= max_factor_retires:
+            status = NUMERICAL_ISSUES;  iteration = current_iter;  active = False
+        else:
+            rho *= 100;  delta *= 100;  reg_limit = min(10 * reg_limit, eps_abs)
+            needs_retry[b] = 1
+
+    ``needs_retry[b]`` is 0 for every other problem, so a reduction over it
+    tells whether the batch must be refactored. Inactive problems are ignored
+    whatever their factor status: they still pass through the batched
+    factorization after terminating. Launch with ``dim=(B,)``.
+    """
+    dtype = to_warp_dtype(dtype)
+
+    @wp.kernel
+    def factor_retry_kernel(
+        factor_status: wp.array(dtype=wp.int32),  # type: ignore  (B,) backend factor status
+        current_iter:  wp.array(dtype=wp.int32),  # type: ignore  (1,)
+        settings_f:         wp.array(dtype=dtype),     # type: ignore  DeviceSettings.floats
+        settings_i:         wp.array(dtype=wp.int32),  # type: ignore  DeviceSettings.ints
+        active:        wp.array(dtype=wp.bool),   # type: ignore  (B,) in-out
+        status:        wp.array(dtype=wp.int32),  # type: ignore  (B,) in-out
+        iteration:     wp.array(dtype=wp.int32),  # type: ignore  (B,) in-out
+        retries:       wp.array(dtype=wp.int32),  # type: ignore  (B,) in-out
+        rho:           wp.array(dtype=dtype),     # type: ignore  (B,) in-out
+        delta:         wp.array(dtype=dtype),     # type: ignore  (B,) in-out
+        reg_limit:     wp.array(dtype=dtype),     # type: ignore  (B,) in-out
+        needs_retry:   wp.array(dtype=wp.int32),  # type: ignore  (B,) output
+    ):
+        b = wp.tid()
+        needs_retry[b] = wp.int32(0)
+        if active[b] and factor_status[b] != wp.int32(0):
+            retries[b] = retries[b] + wp.int32(1)
+            if retries[b] >= settings_i[SettingsIntIdx.max_factor_retires]:
+                status[b] = wp.static(STATUS_NUMERICAL_ISSUES)
+                iteration[b] = current_iter[0]
+                active[b] = False
+            else:
+                rho[b] = rho[b] * dtype(100.0)
+                delta[b] = delta[b] * dtype(100.0)
+                reg_limit[b] = wp.min(dtype(10.0) * reg_limit[b], settings_f[SettingsFloatIdx.eps_abs])
+                needs_retry[b] = wp.int32(1)
+
+    return factor_retry_kernel
+
+
+@wp.kernel
+def mark_failed_kernel(
+    failed:       wp.array(dtype=wp.int32),  # type: ignore  (B,) nonzero = failed
+    current_iter: wp.array(dtype=wp.int32),  # type: ignore  (1,)
+    active:       wp.array(dtype=wp.bool),   # type: ignore  (B,) in-out
+    status:       wp.array(dtype=wp.int32),  # type: ignore  (B,) in-out
+    iteration:    wp.array(dtype=wp.int32),  # type: ignore  (B,) in-out
+):
+    """Active problems with a nonzero ``failed`` flag become ``NUMERICAL_ISSUES``,
+    record ``current_iter`` and leave the active set. Used after a KKT solve
+    whose solution is not finite. Launch with ``dim=(B,)``.
+    """
+    b = wp.tid()
+    if active[b] and failed[b] != wp.int32(0):
+        status[b] = wp.static(STATUS_NUMERICAL_ISSUES)
+        iteration[b] = current_iter[0]
+        active[b] = False
+
+
+@functools.lru_cache(maxsize=None)
+def create_solution_finite_kernel(dtype=wp.float64):
+    """``status[b] = 1`` if any entry of row ``b`` of ``x``, ``y`` or ``z`` is
+    not finite, ``0`` otherwise. ``wp.isfinite`` is false for NaN and for
+    +inf / -inf alike, so one test covers both failure modes.
+
+    Block reduction, one CUDA block per batch entry: every thread strides over
+    the concatenated row and the block combines the flags, so the status is
+    written exactly once and needs no clearing beforehand. Dispatch with
+    ``wp.launch_tiled(..., dim=[B], block_dim=REDUCTION_BLOCK_DIM)``.
+    """
+    dtype = to_warp_dtype(dtype)
+
+    @wp.kernel
+    def solution_finite_kernel(
+        x:      wp.array2d(dtype=dtype),     # type: ignore  (B, n)
+        y:      wp.array2d(dtype=dtype),     # type: ignore  (B, p)
+        z:      wp.array2d(dtype=dtype),     # type: ignore  (B, m)
+        status: wp.array(dtype=wp.int32),    # type: ignore  (B,) output
+    ):
+        b, i = wp.tid()
+        n = x.shape[1]
+        p = y.shape[1]
+        total = n + p + z.shape[1]
+        bad = wp.int32(0)
+        for t in range(i, total, wp.block_dim()):
+            if t < n:
+                v = x[b, t]
+            elif t < n + p:
+                v = y[b, t - n]
+            else:
+                v = z[b, t - n - p]
+            if not wp.isfinite(v):  # false for NaN, +inf and -inf
+                bad = wp.int32(1)
+        any_bad = wp.tile_max(wp.tile(bad))
+        if i == 0:
+            status[b] = any_bad[0]
+
+    return solution_finite_kernel
+
+
+@wp.kernel
+def any_flag_kernel(
+    flags: wp.array(dtype=wp.int32),  # type: ignore  (B,)
+    out:   wp.array(dtype=wp.int32),  # type: ignore  (1,) output
+):
+    """``out[0] = 1`` if any ``flags[b]`` is nonzero, else ``0``. One block
+    reduces the whole batch; dispatch with
+    ``wp.launch_tiled(..., dim=[1], block_dim=REDUCTION_BLOCK_DIM)``.
+    """
+    _, i = wp.tid()
+    acc = wp.int32(0)
+    for k in range(i, flags.shape[0], wp.block_dim()):
+        if flags[k] != wp.int32(0):
+            acc = wp.int32(1)
+    total = wp.tile_max(wp.tile(acc))
+    if i == 0:
+        out[0] = total[0]
+
+
+@wp.kernel
+def terminate_active_kernel(
+    active:       wp.array(dtype=wp.bool),   # type: ignore  (B,) in-out
+    current_iter: wp.array(dtype=wp.int32),  # type: ignore  (1,)
+    new_status:   wp.int32,
+    status:       wp.array(dtype=wp.int32),  # type: ignore  (B,) in-out
+    iteration:    wp.array(dtype=wp.int32),  # type: ignore  (B,) in-out
+):
+    """Give every still-active problem ``new_status``, record ``current_iter``
+    as its termination iteration and deactivate it. Launch with ``dim=(B,)``.
+    """
+    b = wp.tid()
+    if active[b]:
+        status[b] = new_status
+        iteration[b] = current_iter[0]
+        active[b] = False
+
+
+@wp.kernel
+def advance_iteration_kernel(current_iter: wp.array(dtype=wp.int32)):  # type: ignore
+    """``current_iter[0] += 1``. Launch with ``dim=1``."""
+    current_iter[0] = current_iter[0] + wp.int32(1)
 
 
 def create_init_guess_rhs_kernel(n: int, p: int,
@@ -1285,16 +1622,17 @@ def create_update_rho_delta_with_ineq_kernel(dtype=wp.float64):
         info_no_dual_update:   wp.array(dtype=wp.int32),     # type: ignore  in-out (B,)
         dual_improved_out:     wp.array(dtype=wp.bool), # type: ignore  output (B,)
         primal_improved_out:   wp.array(dtype=wp.bool), # type: ignore  output (B,)
-        settings_eps_abs:              dtype,           # type: ignore
-        settings_eps_rel:              dtype,           # type: ignore
-        settings_reg_finetune_lower:   dtype,           # type: ignore
-        settings_infeas_thresh:        dtype,           # type: ignore
-        current_iter:                  wp.int32
+        settings:                           wp.array(dtype=dtype),  # type: ignore  DeviceSettings.floats
+        current_iter:          wp.array(dtype=wp.int32),     # type: ignore  (1,)
     ):
         b = wp.tid()
+        settings_eps_abs = settings[SettingsFloatIdx.eps_abs]
+        settings_eps_rel = settings[SettingsFloatIdx.eps_rel]
+        settings_reg_finetune_lower = settings[SettingsFloatIdx.reg_finetune_lower_limit]
+        settings_infeas_thresh = settings[SettingsFloatIdx.infeasibility_threshold]
         if not active_mask[b]:
             return
-        iter_under_5 = (current_iter < wp.int32(5))
+        iter_under_5 = (current_iter[0] < wp.int32(5))
         old_rho = info_rho[b]
         old_delta = info_delta[b]
         dual_improved = (
@@ -1406,17 +1744,18 @@ def create_update_rho_delta_without_ineq_kernel(n: int, p: int, dtype=wp.float64
         prox_x:                wp.array2d(dtype=dtype), # type: ignore
         result_y:              wp.array2d(dtype=dtype), # type: ignore
         prox_y:                wp.array2d(dtype=dtype), # type: ignore
-        settings_eps_abs:              dtype,           # type: ignore
-        settings_eps_rel:              dtype,           # type: ignore
-        settings_infeas_thresh:        dtype,           # type: ignore
-        current_iter:                  wp.int32
+        settings:                           wp.array(dtype=dtype),  # type: ignore  DeviceSettings.floats
+        current_iter:          wp.array(dtype=wp.int32),     # type: ignore  (1,)
     ):
         b, i = wp.tid()
+        settings_eps_abs = settings[SettingsFloatIdx.eps_abs]
+        settings_eps_rel = settings[SettingsFloatIdx.eps_rel]
+        settings_infeas_thresh = settings[SettingsFloatIdx.infeasibility_threshold]
         if not active_mask[b]:
             return
         n_static = wp.static(n)
         p_static = wp.static(p)
-        iter_under_5 = (current_iter < wp.int32(5))
+        iter_under_5 = (current_iter[0] < wp.int32(5))
         # Unlike the inequality path, these flags never read rho / delta, which
         # thread (b, 0) overwrites below, so every thread of row b sees the same
         # flags and the update can stay fused in one launch.

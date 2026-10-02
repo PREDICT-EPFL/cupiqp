@@ -32,8 +32,8 @@ class SparseKKTSolver(KKTSolverBase):
     """
 
     def __init__(self, data: SparseData, use_deterministic_mode: bool = False):
-        super().__init__()
         B = data.batch_size
+        super().__init__(B, data.dtype, data.device)
         self._batch_size = B
         n, p, m = data.n, data.p, data.m
         self._dtype = data.dtype
@@ -120,6 +120,8 @@ class SparseKKTSolver(KKTSolverBase):
         )
         if not self._lin_sys_solver.plan(cuda_stream=wp.get_stream("cuda").cuda_stream):
             raise RuntimeError("Sparse direct solver planning failed.")
+
+        self._factor_status = self._lin_sys_solver.factor_status
 
     def _refresh_P_diag_buffer(self, P: UniformBatchedCsrMatrix) -> None:
         """P_diag[b, col] = P.data[b, pos] for every stored diagonal entry."""
@@ -238,8 +240,15 @@ class SparseKKTSolver(KKTSolverBase):
         )
 
     @nvtx.annotate("SparseKKTSolver::factor")
-    def factor(self) -> bool:
-        return self._lin_sys_solver.factor(cuda_stream=wp.get_stream("cuda").cuda_stream)
+    def factor(self) -> None:
+        """Factor and record the outcome in ``factor_status``.
+
+        cuDSS reports its factorization information on the host only, so this
+        backend synchronizes once per factorization and writes the batch-wide
+        outcome to every problem of the device status. It is therefore not
+        capturable into a CUDA graph.
+        """
+        self._lin_sys_solver.factor(cuda_stream=wp.get_stream("cuda").cuda_stream)
 
     @nvtx.annotate("SparseKKTSolver::solve")
     def solve(self, data: SparseData, rhs_x: wp.array, rhs_y: wp.array, rhs_z: wp.array,
@@ -251,6 +260,7 @@ class SparseKKTSolver(KKTSolverBase):
         n, p, m = data.n, data.p, data.m
         rhs, sol = self._lin_sys_solver.rhs, self._lin_sys_solver.sol
 
+        # TODO: merge these 3 kernels
         # Assemble [rhs_x | rhs_y | rhs_z] into the solver's (B, dim) rhs buffer.
         wp.copy(column_slice(rhs, 0, n), rhs_x)
         if p > 0:
@@ -260,12 +270,14 @@ class SparseKKTSolver(KKTSolverBase):
 
         self._lin_sys_solver.solve(cuda_stream=wp.get_stream("cuda").cuda_stream)
 
+        # TODO: merge these 3 kernels
         # Disassemble the solver's (B, dim) sol buffer into [delta_x, delta_y, delta_z].
         wp.copy(delta_x, column_slice(sol, 0, n))
         if p > 0:
             wp.copy(delta_y, column_slice(sol, n, n + p))
         if m > 0:
             wp.copy(delta_z, column_slice(sol, n + p, n + p + m))
+        self._write_solve_status(delta_x, delta_y, delta_z)
 
     @nvtx.annotate("SparseKKTSolver::eval_P_x")
     def eval_P_x(self, data: SparseData, alpha: float, x: wp.array, z: wp.array):

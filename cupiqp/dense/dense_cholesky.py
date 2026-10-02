@@ -63,11 +63,11 @@ class CholeskyInplaceSolver:
         else:
             raise ValueError(f"Unsupported dtype: {dtype}")
 
-        self._dev_info = wp.zeros(1, dtype=wp.int32, device="cuda")
-        self._dev_info_host = wp.zeros(1, dtype=wp.int32, device="cpu", pinned=True)
+        self._factor_status = wp.zeros(1, dtype=wp.int32, device="cuda")
         self._buffersize = buffer_func(self._cusolver_handle, self._uplo, n, 0, n)
         self._workspace = wp.empty(max(self._buffersize, 1), dtype=dtype, device="cuda")
 
+        self._solve_info = wp.zeros(1, dtype=wp.int32, device="cuda")  # potrs argument check, unused
         self._factor_ptr = None
         self._ctx_A = None  # holds reference to A
 
@@ -79,8 +79,16 @@ class CholeskyInplaceSolver:
             except Exception:
                 pass
 
-    def factorize(self, A: wp.array) -> bool:
-        """In-place Cholesky factorization of the C-contiguous ``(n, n)`` matrix ``A``."""
+    @property
+    def factor_status(self) -> wp.array:
+        """``(1,)`` int32 device array: cuSOLVER's ``info`` of the last
+        ``factorize()``; zero means the factorization succeeded. Written on
+        the device, never read on the host by this class."""
+        return self._factor_status
+
+    def factorize(self, A: wp.array) -> None:
+        """Enqueue the in-place Cholesky factorization of the C-contiguous
+        ``(n, n)`` matrix ``A``; the outcome is left in ``factor_status``."""
         # Keep A alive!
         self._ctx_A = A
         self._factor_ptr = A.ptr
@@ -93,13 +101,8 @@ class CholeskyInplaceSolver:
             self.n,
             self._workspace.ptr,
             self._buffersize,
-            self._dev_info.ptr
+            self._factor_status.ptr
         )
-
-        # dev_info == 0 indicates success (one D2H copy and sync)
-        wp.copy(self._dev_info_host, self._dev_info, stream=self._stream)
-        wp.synchronize_stream(self._stream)
-        return bool(self._dev_info_host.numpy()[0] == 0)
 
     def solve(self, B: wp.array):
         """Combined forward and backward substitution to solve Ax = B in place, B of shape ``(n,)``."""
@@ -115,7 +118,7 @@ class CholeskyInplaceSolver:
             self.n,
             B.ptr,
             self.n,
-            self._dev_info.ptr
+            self._solve_info.ptr
         )
 
 
@@ -157,9 +160,8 @@ class BatchedCholeskyInplaceSolver:
         else:
             raise ValueError(f"Unsupported dtype: {dtype}")
 
-        self._dev_info = wp.zeros(batch_size, dtype=wp.int32, device="cuda")
-        self._dev_info_host = wp.zeros(batch_size, dtype=wp.int32, device="cpu", pinned=True)
-        self._dev_info_potrs = wp.zeros(1, dtype=wp.int32, device="cuda")
+        self._factor_status = wp.zeros(batch_size, dtype=wp.int32, device="cuda")
+        self._solve_info = wp.zeros(1, dtype=wp.int32, device="cuda")  # potrsBatched argument check, unused
 
         # Preallocated device pointer arrays and their source-layout keys.
         self._A_ptrs = wp.zeros(batch_size, dtype=wp.int64, device="cuda")  # store the pointer to each batch
@@ -205,8 +207,16 @@ class BatchedCholeskyInplaceSolver:
     def batch_size(self) -> int:
         return self._batch_size
 
-    def factorize(self, A: wp.array) -> bool:
-        """In-place Cholesky factorization of all B matrices.
+    @property
+    def factor_status(self) -> wp.array:
+        """``(batch_size,)`` int32 device array: cuSOLVER's per-matrix
+        ``info`` of the last ``factorize()``; zero where the factorization
+        of that matrix succeeded. Written on the device, never read on the
+        host by this class."""
+        return self._factor_status
+
+    def factorize(self, A: wp.array) -> None:
+        """Enqueue the in-place Cholesky factorization of all B matrices.
 
         Parameters
         ----------
@@ -214,6 +224,9 @@ class BatchedCholeskyInplaceSolver:
             Overwritten with Cholesky factors. Each ``(n, n)`` matrix is
             C-contiguous; the outer batch stride may be arbitrary (the
             per-matrix pointer kernel uses ``strides[0]`` directly).
+
+        The per-matrix outcome is left in ``factor_status``; nothing is read
+        on the host.
         """
         self._A_ptr_key = self._ensure_ptrs(A, self._A_ptrs, self._A_ptr_key)
         self._ctx_A = A
@@ -224,15 +237,10 @@ class BatchedCholeskyInplaceSolver:
             self.n,
             self._A_ptrs.ptr,
             self.n,
-            self._dev_info.ptr,
+            self._factor_status.ptr,
             self.batch_size,
         )
         self._factorized = True
-
-        # dev_info == 0 for every matrix indicates success (one D2H copy and sync)
-        wp.copy(self._dev_info_host, self._dev_info, stream=self._stream)
-        wp.synchronize_stream(self._stream)
-        return bool((self._dev_info_host.numpy() == 0).all())
 
     def solve(self, B: wp.array):
         """In-place Cholesky solve.
@@ -258,6 +266,6 @@ class BatchedCholeskyInplaceSolver:
             self.n,
             self._B_ptrs.ptr,
             self.n,
-            self._dev_info_potrs.ptr,
+            self._solve_info.ptr,
             self.batch_size,
         )

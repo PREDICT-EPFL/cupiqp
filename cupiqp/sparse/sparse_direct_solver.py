@@ -40,6 +40,14 @@ class SparseDirectSolver(ABC):
         # rhs/sol must match the matrix dtype - cuDSS rejects a dtype mismatch.
         self._rhs = wp.empty((self._batch_size, self._dim), dtype=matrix.dtype, device=matrix.device)
         self._sol = wp.empty((self._batch_size, self._dim), dtype=matrix.dtype, device=matrix.device)
+        # Per-problem outcome of the last factor(): 0 = success, nonzero = failed.
+        self._factor_status = wp.zeros(self._batch_size, dtype=wp.int32, device=matrix.device)
+
+    @property
+    def factor_status(self) -> wp.array:
+        """``(B,)`` int32 device array written by ``factor()``: zero where the
+        factorization of that problem succeeded, nonzero where it failed."""
+        return self._factor_status
 
     @nvtx.annotate("SparseDirectSolver::plan")
     @abstractmethod
@@ -49,8 +57,9 @@ class SparseDirectSolver(ABC):
 
     @nvtx.annotate("SparseDirectSolver::factor")
     @abstractmethod
-    def factor(self, cuda_stream: int) -> bool:
-        """Numerical factorization of the matrix. Should be called after plan() and before solve()."""
+    def factor(self, cuda_stream: int) -> None:
+        """Numerical factorization of the matrix; the per-problem outcome is
+        written to ``factor_status``. Call after plan() and before solve()."""
         pass
 
     @nvtx.annotate("SparseDirectSolver::solve")
@@ -175,7 +184,13 @@ class CudssSparseDirectSolver(SparseDirectSolver):
         return True
 
     @nvtx.annotate("CudssSparseDirectSolver::factor")
-    def factor(self, cuda_stream: int) -> bool:
+    def factor(self, cuda_stream: int) -> None:
+        # cuDSS reports its factorization information on the host only, so
+        # this synchronizes once and writes the batch-wide outcome to every
+        # problem of the device status.
+        self._factor_status.fill_(0 if self._factor_ok(cuda_stream) else 1)
+
+    def _factor_ok(self, cuda_stream: int) -> bool:
         try:
             fac_info = self._cudss_solver.factorize(stream=cuda_stream)
 

@@ -122,15 +122,18 @@ def sub_mul(o: Any, x: Any, w: Any):
     return (o - x) * w
 
 
-def create_has_nan_1d_kernel(dtype=wp.float64):
-    """Sets ``flag[0] = 1`` if any entry of the flat array ``a`` is NaN. Launch with ``dim=a.shape``.
-    Used to detect a failed block Cholesky factorization."""
+def create_has_nan_rows_kernel(dtype=wp.float64):
+    """Sets ``flag[b] = 1`` for every row ``b`` of ``a`` that contains a NaN;
+    rows without NaN are left untouched, so clear ``flag`` first. Launch
+    with ``dim=a.shape``. Used to detect, per problem, a failed block
+    Cholesky factorization (the block factorization writes NaN where a
+    pivot block is not positive definite)."""
     dtype = to_warp_dtype(dtype)
 
     @wp.kernel
-    def has_nan_1d(a: wp.array(dtype=dtype), flag: wp.array(dtype=wp.int32)):  # type: ignore
-        i = wp.tid()
-        if wp.isnan(a[i]):
-            flag[0] = wp.int32(1)
+    def has_nan_rows(a: wp.array2d(dtype=dtype), flag: wp.array(dtype=wp.int32)):  # type: ignore
+        b, i = wp.tid()
+        if wp.isnan(a[b, i]):
+            flag[b] = wp.int32(1)
 
-    return has_nan_1d
+    return has_nan_rows

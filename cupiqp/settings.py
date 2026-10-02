@@ -1,10 +1,13 @@
 import math
 import warnings
 from dataclasses import dataclass
-from typing import Union
+from enum import IntEnum
+from typing import Optional, Union
 
 import numpy as np
 import warp as wp
+
+from .utils import to_warp_dtype
 
 
 _F32_DEFAULTS = {
@@ -146,3 +149,77 @@ class Settings:
                and self.gradient_smoothing_tol > 0 and math.isfinite(self.gradient_smoothing_tol)
                and self.gradient_smoothing_max_iter > 0
                )
+
+
+class SettingsFloatIdx(IntEnum):
+    """Index of each floating-point setting in ``DeviceSettings.floats``."""
+    rho_init = 0
+    delta_init = 1
+    eps_abs = 2
+    eps_rel = 3
+    eps_duality_gap_abs = 4
+    eps_duality_gap_rel = 5
+    infeasibility_threshold = 6
+    reg_lower_limit = 7
+    reg_finetune_lower_limit = 8
+    tau = 9
+
+
+class SettingsIntIdx(IntEnum):
+    """Index of each integer setting in ``DeviceSettings.ints``."""
+    check_duality_gap = 0
+    reg_finetune_primal_update_threshold = 1
+    reg_finetune_dual_update_threshold = 2
+    max_iter = 3
+    max_factor_retires = 4
+
+
+class DeviceSettings:
+    """The runtime subset of ``Settings`` as two GPU arrays.
+
+    ``floats`` holds the ``SettingsFloatIdx`` values in the solver dtype and
+    ``ints`` the ``SettingsIntIdx`` values as ``int32``. Both keep the same
+    address for the lifetime of the solver, so kernels and captured graphs
+    can hold on to them. ``upload()`` refreshes them from a ``Settings``
+    object through pinned host staging buffers, which makes the transfer an
+    asynchronous, capturable stream operation.
+    """
+
+    def __init__(self, dtype, device):
+        dtype = to_warp_dtype(dtype)
+        self.floats = wp.zeros(len(SettingsFloatIdx), dtype=dtype, device=device)
+        self.ints = wp.zeros(len(SettingsIntIdx), dtype=wp.int32, device=device)
+        # Pinned staging: an H2D copy from pageable memory synchronizes the
+        # stream, a copy from pinned memory does not.
+        self._floats_host = wp.zeros(len(SettingsFloatIdx), dtype=dtype, device="cpu", pinned=True)
+        self._ints_host = wp.zeros(len(SettingsIntIdx), dtype=wp.int32, device="cpu", pinned=True)
+        self._floats_np = self._floats_host.numpy()
+        self._ints_np = self._ints_host.numpy()
+
+    def upload(self, settings: Settings, max_iter: Optional[int] = None) -> None:
+        """Queue a copy of the runtime values of ``settings`` to the device.
+
+        ``max_iter`` overrides ``settings.max_iter`` when given. The copy is
+        enqueued on the current stream and does not wait for it; the staging
+        buffers must not be rewritten before that copy has run, which holds
+        as long as at most one solve is outstanding.
+        """
+        f = self._floats_np
+        f[SettingsFloatIdx.rho_init] = settings.rho_init
+        f[SettingsFloatIdx.delta_init] = settings.delta_init
+        f[SettingsFloatIdx.eps_abs] = settings.eps_abs
+        f[SettingsFloatIdx.eps_rel] = settings.eps_rel
+        f[SettingsFloatIdx.eps_duality_gap_abs] = settings.eps_duality_gap_abs
+        f[SettingsFloatIdx.eps_duality_gap_rel] = settings.eps_duality_gap_rel
+        f[SettingsFloatIdx.infeasibility_threshold] = settings.infeasibility_threshold
+        f[SettingsFloatIdx.reg_lower_limit] = settings.reg_lower_limit
+        f[SettingsFloatIdx.reg_finetune_lower_limit] = settings.reg_finetune_lower_limit
+        f[SettingsFloatIdx.tau] = settings.tau
+        i = self._ints_np
+        i[SettingsIntIdx.check_duality_gap] = 1 if settings.check_duality_gap else 0
+        i[SettingsIntIdx.reg_finetune_primal_update_threshold] = settings.reg_finetune_primal_update_threshold
+        i[SettingsIntIdx.reg_finetune_dual_update_threshold] = settings.reg_finetune_dual_update_threshold
+        i[SettingsIntIdx.max_iter] = settings.max_iter if max_iter is None else int(max_iter)
+        i[SettingsIntIdx.max_factor_retires] = settings.max_factor_retires
+        wp.copy(self.floats, self._floats_host)
+        wp.copy(self.ints, self._ints_host)

@@ -6,15 +6,24 @@ import nvtx
 
 from .data import Data
 from .utils import to_warp_dtype, as_warp_array, column_slice
+from .typedef import (
+    STATUS_UNSOLVED,
+    STATUS_SOLVED,
+    STATUS_MAX_ITER_REACHED,
+    STATUS_PRIMAL_INFEASIBLE,
+    STATUS_DUAL_INFEASIBLE,
+    STATUS_NUMERICAL_ISSUES,
+)
 
 
 class Status(Enum):
-    CUPIQP_UNSOLVED = -1
-    CUPIQP_SOLVED = 0
-    CUPIQP_MAX_ITER_REACHED = 1
-    CUPIQP_PRIMAL_INFEASIBLE = 2
-    CUPIQP_DUAL_INFEASIBLE = 3
-    CUPIQP_NUMERICAL_ISSUES = 4
+    """Per-problem solver status; values are the codes in ``cupiqp.typedef``."""
+    CUPIQP_UNSOLVED = STATUS_UNSOLVED
+    CUPIQP_SOLVED = STATUS_SOLVED
+    CUPIQP_MAX_ITER_REACHED = STATUS_MAX_ITER_REACHED
+    CUPIQP_PRIMAL_INFEASIBLE = STATUS_PRIMAL_INFEASIBLE
+    CUPIQP_DUAL_INFEASIBLE = STATUS_DUAL_INFEASIBLE
+    CUPIQP_NUMERICAL_ISSUES = STATUS_NUMERICAL_ISSUES
 
 
 class Variables:
@@ -229,8 +238,8 @@ class Variables:
         put(self._s_bu, rng.rand(*self._s_bu.shape) + 1.0)
         put(self._s_bl, rng.rand(*self._s_bl.shape) + 1.0)
 
-class InfoIdx(IntEnum):
-    """Row index of each scalar field in the contiguous Info buffer."""
+class InfoFloatIdx(IntEnum):
+    """Column index of each scalar field in the ``(B, num_fields)`` Info buffer."""
     rho = 0
     delta = 1
     mu = 2
@@ -254,15 +263,24 @@ class InfoIdx(IntEnum):
     duality_gap = 20
     duality_gap_rel = 21
     reg_limit = 22
-    setup_time = 23
-    update_time = 24
-    solve_time = 25
-    kkt_factor_time = 26
-    kkt_solve_time = 27
-    run_time = 28
+    # setup_time = 23
+    # update_time = 24
+    # solve_time = 25
+    # kkt_factor_time = 26
+    # kkt_solve_time = 27
+    # run_time = 28
 
 
-def _info_field(idx: InfoIdx):
+class InfoIntIdx(IntEnum):
+    """Column index of each int32 field in the ``(B, num_int_fields)`` Info counter buffer."""
+    no_primal_update = 0
+    no_dual_update = 1
+    status = 2
+    iter = 3
+    factor_retries = 4
+
+
+def _info_field(idx: InfoFloatIdx):
     """A ``(B,)`` Warp view of one field; assignment fills or copies in place."""
     def getter(self):
         return self._views[idx]
@@ -277,145 +295,124 @@ def _info_field(idx: InfoIdx):
     return property(getter, setter)
 
 
-class Info:
-    """Per-problem solver info: a ``(num_fields, B)`` GPU buffer.
+def _info_counter(idx: InfoIntIdx):
+    """A ``(B,)`` int32 Warp view of one counter column."""
+    def getter(self):
+        return self._counter_views[idx]
+    return property(getter)
 
-    Each problem independently tracks rho, delta, mu, residuals, etc. Every
-    field is a contiguous ``(B,)`` Warp view of one row of the buffer, so a
-    single device-to-host copy fetches all of them.
+
+class Info:
+    """Per-problem solver info, resident on the GPU.
+
+    Two buffers with batch as the leading dimension, so row ``b`` is the
+    complete record of problem ``b``: a ``(B, num_fields)`` buffer of the
+    solver dtype for rho, delta, mu, residuals, objectives and so on, and a
+    ``(B, num_int_fields)`` int32 buffer for the stagnation counters, the
+    status code (a ``Status`` value), the termination iteration and the
+    factorization retries. Every named attribute (``info.rho``,
+    ``info.status_device``, ...) is a ``(B,)`` Warp view into one column, so
+    kernels read and write the fields in place and nothing is copied.
+
+    The solver decides everything on the device and never reads these
+    buffers during a solve. ``solve()`` copies them to a pinned host snapshot
+    once at the end; the host-side accessors ``status``, ``status_value``,
+    ``iter``, ``factor_retires`` and ``host`` read that snapshot and do not
+    touch the GPU. Call ``to_host()`` to refresh the snapshot yourself after
+    launching your own kernels on the solver stream; it synchronizes the
+    current stream.
     """
 
-    rho = _info_field(InfoIdx.rho)
-    delta = _info_field(InfoIdx.delta)
-    mu = _info_field(InfoIdx.mu)
-    sigma = _info_field(InfoIdx.sigma)
-    primal_step = _info_field(InfoIdx.primal_step)
-    dual_step = _info_field(InfoIdx.dual_step)
-    primal_res = _info_field(InfoIdx.primal_res)
-    primal_res_rel = _info_field(InfoIdx.primal_res_rel)
-    dual_res = _info_field(InfoIdx.dual_res)
-    dual_res_rel = _info_field(InfoIdx.dual_res_rel)
-    primal_res_reg = _info_field(InfoIdx.primal_res_reg)
-    primal_res_reg_rel = _info_field(InfoIdx.primal_res_reg_rel)
-    dual_res_reg = _info_field(InfoIdx.dual_res_reg)
-    dual_res_reg_rel = _info_field(InfoIdx.dual_res_reg_rel)
-    primal_prox_inf = _info_field(InfoIdx.primal_prox_inf)
-    dual_prox_inf = _info_field(InfoIdx.dual_prox_inf)
-    prev_primal_res = _info_field(InfoIdx.prev_primal_res)
-    prev_dual_res = _info_field(InfoIdx.prev_dual_res)
-    primal_obj = _info_field(InfoIdx.primal_obj)
-    dual_obj = _info_field(InfoIdx.dual_obj)
-    duality_gap = _info_field(InfoIdx.duality_gap)
-    duality_gap_rel = _info_field(InfoIdx.duality_gap_rel)
-    reg_limit = _info_field(InfoIdx.reg_limit)
-    setup_time = _info_field(InfoIdx.setup_time)
-    update_time = _info_field(InfoIdx.update_time)
-    solve_time = _info_field(InfoIdx.solve_time)
-    kkt_factor_time = _info_field(InfoIdx.kkt_factor_time)
-    kkt_solve_time = _info_field(InfoIdx.kkt_solve_time)
-    run_time = _info_field(InfoIdx.run_time)
+    rho = _info_field(InfoFloatIdx.rho)
+    delta = _info_field(InfoFloatIdx.delta)
+    mu = _info_field(InfoFloatIdx.mu)
+    sigma = _info_field(InfoFloatIdx.sigma)
+    primal_step = _info_field(InfoFloatIdx.primal_step)
+    dual_step = _info_field(InfoFloatIdx.dual_step)
+    primal_res = _info_field(InfoFloatIdx.primal_res)
+    primal_res_rel = _info_field(InfoFloatIdx.primal_res_rel)
+    dual_res = _info_field(InfoFloatIdx.dual_res)
+    dual_res_rel = _info_field(InfoFloatIdx.dual_res_rel)
+    primal_res_reg = _info_field(InfoFloatIdx.primal_res_reg)
+    primal_res_reg_rel = _info_field(InfoFloatIdx.primal_res_reg_rel)
+    dual_res_reg = _info_field(InfoFloatIdx.dual_res_reg)
+    dual_res_reg_rel = _info_field(InfoFloatIdx.dual_res_reg_rel)
+    primal_prox_inf = _info_field(InfoFloatIdx.primal_prox_inf)
+    dual_prox_inf = _info_field(InfoFloatIdx.dual_prox_inf)
+    prev_primal_res = _info_field(InfoFloatIdx.prev_primal_res)
+    prev_dual_res = _info_field(InfoFloatIdx.prev_dual_res)
+    primal_obj = _info_field(InfoFloatIdx.primal_obj)
+    dual_obj = _info_field(InfoFloatIdx.dual_obj)
+    duality_gap = _info_field(InfoFloatIdx.duality_gap)
+    duality_gap_rel = _info_field(InfoFloatIdx.duality_gap_rel)
+    reg_limit = _info_field(InfoFloatIdx.reg_limit)
+
+    no_primal_update = _info_counter(InfoIntIdx.no_primal_update)
+    no_dual_update = _info_counter(InfoIntIdx.no_dual_update)
+    status_device = _info_counter(InfoIntIdx.status)
+    iter_device = _info_counter(InfoIntIdx.iter)
+    factor_retries_device = _info_counter(InfoIntIdx.factor_retries)
 
     def __init__(self, batch_size: int = 1):
         self._batch_size = batch_size
-        self._status_value = np.full(batch_size, Status.CUPIQP_UNSOLVED.value, dtype=np.int32)
-        self.iter = np.zeros(batch_size, dtype=np.int32)  # individual iter counts for each problem in the batch
-        self.iter_total = 0  # total iterations the solver runs for this batch (the slowest problem's count)
-        self.factor_retires = np.zeros(batch_size, dtype=np.int32)
-        # Per-batch "no update" counters live on device (int32). Source of truth;
-        # the rho/delta kernels reset on improved, increment on stagnated.
-        # to_host() syncs them into the InfoHost mirror once per IPM iteration.
-        self._counters = wp.zeros((2, batch_size), dtype=wp.int32, device="cuda")
-        self.no_primal_update = self._counters[0]
-        self.no_dual_update = self._counters[1]
+        self.iter_total = 0  # iterations the solver ran for this batch (the slowest problem's count)
 
     def init(self, dtype=wp.float64, device: str = "cuda"):
-        self._buffer = wp.zeros((len(InfoIdx), self._batch_size), dtype=to_warp_dtype(dtype), device=device)
-        self._views = {idx: self._buffer[int(idx)] for idx in InfoIdx}
+        dtype = to_warp_dtype(dtype)
+        B = self._batch_size
+        self._buffer = wp.zeros((B, len(InfoFloatIdx)), dtype=dtype, device=device)
+        self._views = {idx: self._buffer[:, int(idx)] for idx in InfoFloatIdx}
+        self._counters = wp.zeros((B, len(InfoIntIdx)), dtype=wp.int32, device=device)
+        self._counter_views = {idx: self._counters[:, int(idx)] for idx in InfoIntIdx}
+        # Pinned host snapshot of both buffers: the D2H copies are asynchronous
+        # on the solver stream and completed with one stream synchronization.
+        self._buffer_host = wp.zeros((B, len(InfoFloatIdx)), dtype=dtype, device="cpu", pinned=True)
+        self._counters_host = wp.zeros((B, len(InfoIntIdx)), dtype=wp.int32, device="cpu", pinned=True)
+        self._np = self._buffer_host.numpy()
+        self._np_counters = self._counters_host.numpy()
+        self.reset_status()
+
+    def reset_status(self) -> None:
+        """Mark every problem ``CUPIQP_UNSOLVED`` on the device and in the snapshot."""
+        self.status_device.fill_(Status.CUPIQP_UNSOLVED.value)
+        self._np_counters[:, int(InfoIntIdx.status)] = Status.CUPIQP_UNSOLVED.value
+
+    @nvtx.annotate("Info:to_host")
+    def to_host(self) -> None:
+        """Copy both device buffers into the host snapshot and wait for them."""
+        wp.copy(self._buffer_host, self._buffer)
+        wp.copy(self._counters_host, self._counters)
+        wp.synchronize_stream(wp.get_stream("cuda"))
+
+    @property
+    def host(self) -> np.ndarray:
+        """Snapshot of the float fields as a ``(B, num_fields)`` NumPy array,
+        indexed by ``InfoFloatIdx`` along the last axis."""
+        return self._np
 
     @property
     def status(self) -> List[Status]:
-        """Per-problem status as a list of Status enums."""
-        return [Status(v) for v in self._status_value]
+        """Per-problem status as a list of Status enums (from the snapshot)."""
+        return [Status(v) for v in self._np_counters[:, int(InfoIntIdx.status)]]
 
     @property
     def status_value(self) -> np.ndarray:
-        """Per-problem status as a writable (B,) int32 array of Status values."""
-        return self._status_value
+        """Per-problem status as a ``(B,)`` int32 array of Status values (from the snapshot)."""
+        return self._np_counters[:, int(InfoIntIdx.status)]
 
-    @nvtx.annotate("Info:to_host")
-    def to_host(self, info_host: 'InfoHost'):
-        """Copy every device field into the pinned host mirror and wait for it."""
-        stream = wp.get_stream("cuda")
-        wp.copy(info_host._buffer, self._buffer)
-        wp.copy(info_host._counters, self._counters)
-        wp.synchronize_stream(stream)
+    @property
+    def iter(self) -> np.ndarray:
+        """Per-problem iteration at which each problem terminated (from the snapshot)."""
+        return self._np_counters[:, int(InfoIntIdx.iter)]
+
+    @property
+    def factor_retires(self) -> np.ndarray:
+        """Per-problem number of factorization retries (from the snapshot)."""
+        return self._np_counters[:, int(InfoIntIdx.factor_retries)]
 
     @property
     def batch_size(self) -> int:
         return self._batch_size
-
-
-def _host_field(idx: InfoIdx):
-    def getter(self):
-        return self._np[int(idx)]
-    return property(getter)
-
-
-class InfoHost:
-    """
-    A mirror of Info on the host side (CPU). The purpose is to fetch all device-side info to host all at once, instead of multiple time to reduce overhead.
-
-    Each property returns a ``(B,)`` NumPy array (a view of pinned host memory).
-    """
-    __slots__ = ('_buffer', '_counters', '_np', '_np_counters', '_batch_size')
-
-    rho = _host_field(InfoIdx.rho)
-    delta = _host_field(InfoIdx.delta)
-    mu = _host_field(InfoIdx.mu)
-    sigma = _host_field(InfoIdx.sigma)
-    primal_step = _host_field(InfoIdx.primal_step)
-    dual_step = _host_field(InfoIdx.dual_step)
-    primal_res = _host_field(InfoIdx.primal_res)
-    primal_res_rel = _host_field(InfoIdx.primal_res_rel)
-    dual_res = _host_field(InfoIdx.dual_res)
-    dual_res_rel = _host_field(InfoIdx.dual_res_rel)
-    primal_res_reg = _host_field(InfoIdx.primal_res_reg)
-    primal_res_reg_rel = _host_field(InfoIdx.primal_res_reg_rel)
-    dual_res_reg = _host_field(InfoIdx.dual_res_reg)
-    dual_res_reg_rel = _host_field(InfoIdx.dual_res_reg_rel)
-    primal_prox_inf = _host_field(InfoIdx.primal_prox_inf)
-    dual_prox_inf = _host_field(InfoIdx.dual_prox_inf)
-    prev_primal_res = _host_field(InfoIdx.prev_primal_res)
-    prev_dual_res = _host_field(InfoIdx.prev_dual_res)
-    primal_obj = _host_field(InfoIdx.primal_obj)
-    dual_obj = _host_field(InfoIdx.dual_obj)
-    duality_gap = _host_field(InfoIdx.duality_gap)
-    duality_gap_rel = _host_field(InfoIdx.duality_gap_rel)
-    reg_limit = _host_field(InfoIdx.reg_limit)
-    setup_time = _host_field(InfoIdx.setup_time)
-    update_time = _host_field(InfoIdx.update_time)
-    solve_time = _host_field(InfoIdx.solve_time)
-    kkt_factor_time = _host_field(InfoIdx.kkt_factor_time)
-    kkt_solve_time = _host_field(InfoIdx.kkt_solve_time)
-    run_time = _host_field(InfoIdx.run_time)
-
-    @property
-    def no_primal_update(self):
-        return self._np_counters[0]
-
-    @property
-    def no_dual_update(self):
-        return self._np_counters[1]
-
-    def __init__(self, batch_size: int = 1, dtype=np.float64):
-        self._batch_size = batch_size
-        # Pinned host memory: the device-to-host copy is asynchronous on the
-        # solver stream and completed with one stream synchronization.
-        self._buffer = wp.zeros((len(InfoIdx), batch_size), dtype=to_warp_dtype(dtype), device="cpu", pinned=True)
-        self._counters = wp.zeros((2, batch_size), dtype=wp.int32, device="cpu", pinned=True)
-        self._np = self._buffer.numpy()
-        self._np_counters = self._counters.numpy()
-
 
 
 class Result(Variables):
