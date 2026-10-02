@@ -177,8 +177,8 @@ class KKTSystem:
 
     @nvtx.annotate("KKTSystem::update_scalings_and_factor")
     def update_scalings_and_factor(self, data: Data, preconditioner: PreconditionerBase, settings: Settings, iterative_refinement: bool, rho: wp.array, delta: wp.array, vars: Variables) -> None:
-        """Update regularization terms and enqueue the factorization of the KKT
-        matrix; its per-problem outcome is left in ``factor_status``.
+        """Update regularization terms and factor the KKT matrix, without
+        waiting for the GPU; the per-problem outcome is left in ``factor_status``.
 
         TODO: When iterative_refinement (IR) is True, adds static regularization to improve factorization stability. The solve() method will then run IR.
 
@@ -187,6 +187,11 @@ class KKTSystem:
         self._update_reg_and_kkt(data, preconditioner, delta, rho, vars)
         self._use_iterative_refinement = iterative_refinement
         self._kkt_solver.factor()
+
+    @property
+    def supports_conditional_capture(self) -> bool:
+        """Whether the backend's KKT solve can run inside a conditional CUDA graph node."""
+        return self._kkt_solver.supports_conditional_capture
 
     @property
     def factor_status(self) -> wp.array:

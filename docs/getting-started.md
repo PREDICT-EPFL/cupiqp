@@ -69,7 +69,7 @@ solver.solve()
 
 # result.x carries a leading batch dimension (B, n); here B = 1
 x_dense = solver.result.x.numpy()[0]        # result.x is a warp.array on the GPU
-print("status  :", solver.result.info.status[0].name)
+print("status  :", Status(solver.result.info.status.numpy()[0]).name)
 print("solution:", x_dense)
 ```
 
@@ -100,10 +100,10 @@ solver.setup(
 solver.solve()
 
 x_sparse = solver.result.x.numpy()[0]
-print("status  :", solver.result.info.status[0].name)
+print("status  :", Status(solver.result.info.status.numpy()[0]).name)
 print("solution:", x_sparse)
 
-assert solver.result.info.status[0] == Status.CUPIQP_SOLVED
+assert solver.result.info.status.numpy()[0] == Status.CUPIQP_SOLVED
 assert cp.allclose(cp.asarray(x_dense), cp.asarray(x_sparse), atol=1e-6)
 print("Both backends converged to the same optimum.")
 ```
@@ -123,8 +123,8 @@ problem (one value for every problem); `setup` reads `B` from the batched argume
 | `A` / `G` | `(p, n)` / `(m, n)` | `(B, p, n)` / `(B, m, n)` |
 | `b`, `h_l`, `h_u` | `(p,)` / `(m,)` | `(B, p)` / `(B, m)` |
 
-`solver.result.x` then has shape `(B, n)` and `solver.result.info.status` is a list of
-`B` statuses (one per problem).
+`solver.result.x` then has shape `(B, n)` and `solver.result.info.status` has shape
+`(B,)`, one status code per problem.
 
 Here we reuse the **same QP structure** from Part 1 but give each problem a different
 **equality target** `b` — like solving the same controller for several set-points at
@@ -149,8 +149,8 @@ dense_solver.setup(P=P, c=c, A=A, b=b_batch,         # b_batch: (B, p), one targ
 dense_solver.solve()
 
 X_dense = dense_solver.result.x.numpy()               # (B, n)
-for i, st in enumerate(dense_solver.result.info.status):
-    print(f"problem {i}:  b = {float(b_batch[i, 0]):.1f}   status = {st.name}   x = {X_dense[i]}")
+for i, st in enumerate(dense_solver.result.info.status.numpy()):
+    print(f"problem {i}:  b = {float(b_batch[i, 0]):.1f}   status = {Status(st).name}   x = {X_dense[i]}")
 ```
 
 ### Sparse backend (batched)
@@ -170,7 +170,7 @@ sparse_solver.setup(
 sparse_solver.solve()
 
 X_sparse = sparse_solver.result.x.numpy()
-assert all(st == Status.CUPIQP_SOLVED for st in sparse_solver.result.info.status)
+assert (sparse_solver.result.info.status.numpy() == Status.CUPIQP_SOLVED).all()
 assert cp.allclose(cp.asarray(X_dense), cp.asarray(X_sparse), atol=1e-6)
 print("All problems solved; dense and sparse batches agree.")
 ```

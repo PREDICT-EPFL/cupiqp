@@ -33,10 +33,10 @@ solver.setup(
   )
 solver.solve()
 
-x_sol = solver.result.x                  # warp.array of shape (B, n) on the GPU
-status = solver.result.info.status       # list of length B
+x_sol = solver.result.x.numpy()                # (B, n); result.x is a warp.array on the GPU
+status = solver.result.info.status.numpy()     # (B,) Status codes
 for i, st in enumerate(status):
-    print(f"problem {i}: status = {st.name}, x = {x_sol[i]}")
+    print(f"problem {i}: status = {Status(st).name}, x = {x_sol[i]}")
 ```
 
 To change values later, pass new arrays in the same shared or batched form to

@@ -135,7 +135,7 @@ def test_sparse_matches_piqp(name):
 
     x_ref = _solve_piqp(qp)
     s = _solve_sparse(qp)
-    assert int(np.asarray(s.result.info.status_value)[0]) == Status.CUPIQP_SOLVED.value
+    assert int(s.result.info.to_host().status_value[0]) == Status.CUPIQP_SOLVED.value
 
     x = cp.asnumpy(s.result.x)[0]
     # Cross-solver primal agreement (both stop on residuals, not on x directly).
@@ -248,7 +248,7 @@ def test_sparse_update_toggles_active_inequality_rows():
     # Reuse the same solver: only the bound vectors change.
     s1.update(h_l=cp.asarray(qp2['h_l']), h_u=cp.asarray(qp2['h_u']))
     s1.solve()
-    assert int(np.asarray(s1.result.info.status_value)[0]) == Status.CUPIQP_SOLVED.value
+    assert int(s1.result.info.to_host().status_value[0]) == Status.CUPIQP_SOLVED.value
     np.testing.assert_allclose(cp.asnumpy(s1.result.x[0]), x_ref, atol=2e-5, rtol=1e-4)
 
     # The now-inactive row's upper dual must be exactly 0; the now-active row's
@@ -289,3 +289,18 @@ def test_sparse_batched_update_toggles_active_inequality_rows():
     s.solve()
     for i in range(B):
         np.testing.assert_allclose(cp.asnumpy(s.result.x[i]), refs[i], atol=2e-5, rtol=1e-4)
+
+
+def test_sparse_float32_box_qp():
+    """Sparse float32 end to end (the sparse matvec once passed the half
+    precision type code to cuSPARSE for float32 and failed at setup)."""
+    import warp as wp
+    n, B = 4, 3
+    P = csr_matrix(cp.eye(n, dtype=cp.float32))
+    c = cp.asarray(np.linspace(-2.0, 2.0, B * n).reshape(B, n), dtype=cp.float32)
+    solver = SparseSolver(dtype=wp.float32)
+    solver.setup(P=(P.indptr, P.indices, P.data), c=c,
+                 x_l=-cp.ones(n, dtype=cp.float32), x_u=cp.ones(n, dtype=cp.float32))
+    solver.solve()
+    assert all(st == Status.CUPIQP_SOLVED for st in solver.result.info.to_host().status)
+    np.testing.assert_allclose(solver.result.x.numpy(), np.clip(-cp.asnumpy(c), -1.0, 1.0), atol=1e-3)

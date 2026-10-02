@@ -1,7 +1,7 @@
 import numpy as np
 import warp as wp
 from typing import List
-from enum import Enum, IntEnum
+from enum import IntEnum
 import nvtx
 
 from .data import Data
@@ -16,8 +16,16 @@ from .typedef import (
 )
 
 
-class Status(Enum):
-    """Per-problem solver status; values are the codes in ``cupiqp.typedef``."""
+class Status(IntEnum):
+    """Per-problem solver status; values are the codes in ``cupiqp.typedef``.
+
+    An ``IntEnum``, so the int32 codes in ``solver.result.info.status``
+    compare directly with its members::
+
+        status = solver.result.info.status.numpy()
+        (status == Status.CUPIQP_SOLVED).all()
+        Status(status[0]).name      # 'CUPIQP_SOLVED'
+    """
     CUPIQP_UNSOLVED = STATUS_UNSOLVED
     CUPIQP_SOLVED = STATUS_SOLVED
     CUPIQP_MAX_ITER_REACHED = STATUS_MAX_ITER_REACHED
@@ -302,25 +310,104 @@ def _info_counter(idx: InfoIntIdx):
     return property(getter)
 
 
+def _snapshot_field(idx: InfoFloatIdx):
+    """A ``(B,)`` NumPy column of the snapshot's float fields."""
+    def getter(self):
+        return self._floats[:, int(idx)]
+    return property(getter)
+
+
+def _snapshot_counter(idx: InfoIntIdx):
+    """A ``(B,)`` NumPy column of the snapshot's int32 fields."""
+    def getter(self):
+        return self._ints[:, int(idx)]
+    return property(getter)
+
+
+class InfoSnapshot:
+    """Host copy of the solver info, taken by ``Info.to_host()``.
+
+    Every field of ``Info`` is available under the same name as a ``(B,)``
+    NumPy array, with row ``b`` belonging to problem ``b``. ``status`` is a
+    list of ``Status`` enums and ``iter_total`` a plain ``int``. The snapshot
+    owns its data: later solves do not change it.
+    """
+
+    rho = _snapshot_field(InfoFloatIdx.rho)
+    delta = _snapshot_field(InfoFloatIdx.delta)
+    mu = _snapshot_field(InfoFloatIdx.mu)
+    sigma = _snapshot_field(InfoFloatIdx.sigma)
+    primal_step = _snapshot_field(InfoFloatIdx.primal_step)
+    dual_step = _snapshot_field(InfoFloatIdx.dual_step)
+    primal_res = _snapshot_field(InfoFloatIdx.primal_res)
+    primal_res_rel = _snapshot_field(InfoFloatIdx.primal_res_rel)
+    dual_res = _snapshot_field(InfoFloatIdx.dual_res)
+    dual_res_rel = _snapshot_field(InfoFloatIdx.dual_res_rel)
+    primal_res_reg = _snapshot_field(InfoFloatIdx.primal_res_reg)
+    primal_res_reg_rel = _snapshot_field(InfoFloatIdx.primal_res_reg_rel)
+    dual_res_reg = _snapshot_field(InfoFloatIdx.dual_res_reg)
+    dual_res_reg_rel = _snapshot_field(InfoFloatIdx.dual_res_reg_rel)
+    primal_prox_inf = _snapshot_field(InfoFloatIdx.primal_prox_inf)
+    dual_prox_inf = _snapshot_field(InfoFloatIdx.dual_prox_inf)
+    prev_primal_res = _snapshot_field(InfoFloatIdx.prev_primal_res)
+    prev_dual_res = _snapshot_field(InfoFloatIdx.prev_dual_res)
+    primal_obj = _snapshot_field(InfoFloatIdx.primal_obj)
+    dual_obj = _snapshot_field(InfoFloatIdx.dual_obj)
+    duality_gap = _snapshot_field(InfoFloatIdx.duality_gap)
+    duality_gap_rel = _snapshot_field(InfoFloatIdx.duality_gap_rel)
+    reg_limit = _snapshot_field(InfoFloatIdx.reg_limit)
+
+    no_primal_update = _snapshot_counter(InfoIntIdx.no_primal_update)
+    no_dual_update = _snapshot_counter(InfoIntIdx.no_dual_update)
+    status_value = _snapshot_counter(InfoIntIdx.status)
+    iter = _snapshot_counter(InfoIntIdx.iter)
+    factor_retries = _snapshot_counter(InfoIntIdx.factor_retries)
+
+    def __init__(self, floats: np.ndarray, ints: np.ndarray, iter_total: int):
+        self._floats = floats
+        self._ints = ints
+        self.iter_total = iter_total
+
+    @property
+    def status(self) -> List[Status]:
+        """Per-problem status as a list of ``Status`` enums."""
+        return [Status(v) for v in self.status_value]
+
+    @property
+    def batch_size(self) -> int:
+        return self._ints.shape[0]
+
+
 class Info:
     """Per-problem solver info, resident on the GPU.
 
-    Two buffers with batch as the leading dimension, so row ``b`` is the
-    complete record of problem ``b``: a ``(B, num_fields)`` buffer of the
-    solver dtype for rho, delta, mu, residuals, objectives and so on, and a
-    ``(B, num_int_fields)`` int32 buffer for the stagnation counters, the
-    status code (a ``Status`` value), the termination iteration and the
-    factorization retries. Every named attribute (``info.rho``,
-    ``info.status_device``, ...) is a ``(B,)`` Warp view into one column, so
-    kernels read and write the fields in place and nothing is copied.
+    Every field is a ``(B,)`` Warp array on the solver's device, with entry
+    ``b`` belonging to problem ``b``:
 
-    The solver decides everything on the device and never reads these
-    buffers during a solve. ``solve()`` copies them to a pinned host snapshot
-    once at the end; the host-side accessors ``status``, ``status_value``,
-    ``iter``, ``factor_retires`` and ``host`` read that snapshot and do not
-    touch the GPU. Call ``to_host()`` to refresh the snapshot yourself after
-    launching your own kernels on the solver stream; it synchronizes the
-    current stream.
+    * ``status`` -- the solve status, as an int32 ``Status`` value
+      (compare with ``Status.CUPIQP_SOLVED.value``).
+    * ``iter`` -- the iteration at which each problem terminated.
+    * ``factor_retries`` -- the KKT factorization retries of each problem.
+    * ``rho``, ``delta``, ``mu``, the residuals, objectives, duality gap and
+      step lengths, in the solver dtype.
+
+    ``iter_total`` is a ``(1,)`` int32 array holding the iterations the whole
+    batch ran (the slowest problem's count).
+
+    As for ``solver.result.x``, call ``.numpy()`` on a field to read it on
+    the host; this waits for the solve::
+
+        solver.solve()
+        status = solver.result.info.status.numpy()
+        print(Status(status[0]).name)       # CUPIQP_SOLVED
+
+    ``to_host()`` copies every field at once (one synchronization) and
+    returns an ``InfoSnapshot``, whose ``status`` is a list of ``Status``.
+
+    The fields keep their addresses for the lifetime of the solver and are
+    updated in stream order, so your own kernels (or CUDA graphs) launched on
+    the solver stream after ``solve()`` can read them directly, without any
+    synchronization.
     """
 
     rho = _info_field(InfoFloatIdx.rho)
@@ -349,66 +436,61 @@ class Info:
 
     no_primal_update = _info_counter(InfoIntIdx.no_primal_update)
     no_dual_update = _info_counter(InfoIntIdx.no_dual_update)
-    status_device = _info_counter(InfoIntIdx.status)
-    iter_device = _info_counter(InfoIntIdx.iter)
-    factor_retries_device = _info_counter(InfoIntIdx.factor_retries)
+    status = _info_counter(InfoIntIdx.status)
+    iter = _info_counter(InfoIntIdx.iter)
+    factor_retries = _info_counter(InfoIntIdx.factor_retries)
 
     def __init__(self, batch_size: int = 1):
         self._batch_size = batch_size
-        self.iter_total = 0  # iterations the solver ran for this batch (the slowest problem's count)
 
-    def init(self, dtype=wp.float64, device: str = "cuda"):
+    def init(self, dtype=wp.float64, stream: wp.Stream = None):
         dtype = to_warp_dtype(dtype)
         B = self._batch_size
+        self._stream = stream if stream is not None else wp.get_stream("cuda")
+        device = self._stream.device
         self._buffer = wp.zeros((B, len(InfoFloatIdx)), dtype=dtype, device=device)
         self._views = {idx: self._buffer[:, int(idx)] for idx in InfoFloatIdx}
         self._counters = wp.zeros((B, len(InfoIntIdx)), dtype=wp.int32, device=device)
         self._counter_views = {idx: self._counters[:, int(idx)] for idx in InfoIntIdx}
-        # Pinned host snapshot of both buffers: the D2H copies are asynchronous
-        # on the solver stream and completed with one stream synchronization.
+        self._iter_total = wp.zeros(1, dtype=wp.int32, device=device)
+        # Pinned staging for to_host(): the D2H copies are asynchronous on the
+        # solver stream and completed with one stream synchronization.
         self._buffer_host = wp.zeros((B, len(InfoFloatIdx)), dtype=dtype, device="cpu", pinned=True)
         self._counters_host = wp.zeros((B, len(InfoIntIdx)), dtype=wp.int32, device="cpu", pinned=True)
-        self._np = self._buffer_host.numpy()
-        self._np_counters = self._counters_host.numpy()
+        self._iter_total_host = wp.zeros(1, dtype=wp.int32, device="cpu", pinned=True)
         self.reset_status()
 
+    @property
+    def iter_total(self) -> wp.array:
+        """``(1,)`` int32 array: the iterations the whole batch ran."""
+        return self._iter_total
+
     def reset_status(self) -> None:
-        """Mark every problem ``CUPIQP_UNSOLVED`` on the device and in the snapshot."""
-        self.status_device.fill_(Status.CUPIQP_UNSOLVED.value)
-        self._np_counters[:, int(InfoIntIdx.status)] = Status.CUPIQP_UNSOLVED.value
+        """Mark every problem ``CUPIQP_UNSOLVED`` (a device fill on the current stream)."""
+        self.status.fill_(Status.CUPIQP_UNSOLVED.value)
 
     @nvtx.annotate("Info:to_host")
-    def to_host(self) -> None:
-        """Copy both device buffers into the host snapshot and wait for them."""
-        wp.copy(self._buffer_host, self._buffer)
-        wp.copy(self._counters_host, self._counters)
-        wp.synchronize_stream(wp.get_stream("cuda"))
+    def to_host(self) -> InfoSnapshot:
+        """Wait for the solver stream and return a host copy of every field.
 
-    @property
-    def host(self) -> np.ndarray:
-        """Snapshot of the float fields as a ``(B, num_fields)`` NumPy array,
-        indexed by ``InfoFloatIdx`` along the last axis."""
-        return self._np
-
-    @property
-    def status(self) -> List[Status]:
-        """Per-problem status as a list of Status enums (from the snapshot)."""
-        return [Status(v) for v in self._np_counters[:, int(InfoIntIdx.status)]]
-
-    @property
-    def status_value(self) -> np.ndarray:
-        """Per-problem status as a ``(B,)`` int32 array of Status values (from the snapshot)."""
-        return self._np_counters[:, int(InfoIntIdx.status)]
-
-    @property
-    def iter(self) -> np.ndarray:
-        """Per-problem iteration at which each problem terminated (from the snapshot)."""
-        return self._np_counters[:, int(InfoIntIdx.iter)]
-
-    @property
-    def factor_retires(self) -> np.ndarray:
-        """Per-problem number of factorization retries (from the snapshot)."""
-        return self._np_counters[:, int(InfoIntIdx.factor_retries)]
+        Synchronizes the solver stream once. Not allowed while the solver
+        stream is being captured into a CUDA graph, since the copy would only
+        run when the graph is launched.
+        """
+        if self._stream.is_capturing:
+            raise RuntimeError(
+                "Info.to_host() cannot be called while the solver stream is "
+                "being captured into a CUDA graph; read the device fields of "
+                "Info in your graph instead, or call to_host() after launching it."
+            )
+        with wp.ScopedStream(self._stream, sync_enter=False):
+            wp.copy(self._buffer_host, self._buffer)
+            wp.copy(self._counters_host, self._counters)
+            wp.copy(self._iter_total_host, self._iter_total)
+        wp.synchronize_stream(self._stream)
+        return InfoSnapshot(self._buffer_host.numpy().copy(),
+                            self._counters_host.numpy().copy(),
+                            int(self._iter_total_host.numpy()[0]))
 
     @property
     def batch_size(self) -> int:
@@ -421,8 +503,8 @@ class Result(Variables):
         super().__init__()
         self.info = Info(batch_size)
 
-    def init(self, data):
+    def init(self, data, stream: wp.Stream = None):
         assert data.batch_size == self.info.batch_size, \
             f"batch_size mismatch: Result({self.info.batch_size}) vs data({data.batch_size})"
         super().init(data)
-        self.info.init(dtype=data.dtype, device=data.device)
+        self.info.init(dtype=data.dtype, stream=stream)

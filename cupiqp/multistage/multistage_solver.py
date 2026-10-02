@@ -207,7 +207,7 @@ class MultistageSolver(SolverBase):
             disagree on the batch size.
         """
         P, c, A, b, G, h_u, h_l, x_u, x_l = self._inputs_to_warp(P, c, A, b, G, h_u, h_l, x_u, x_l)
-        with wp.ScopedStream(self._stream):
+        with wp.ScopedStream(self._stream, sync_enter=not self._stream.is_capturing):
             self._setup_impl(P, c, A, b, G, h_u, h_l, x_u, x_l)
             if self.settings.enable_grad:
                 self._init_grad_data()
@@ -304,7 +304,7 @@ class MultistageSolver(SolverBase):
             no GPU sync).
         """
         P, c, A, b, G, h_u, h_l, x_u, x_l = self._inputs_to_warp(P, c, A, b, G, h_u, h_l, x_u, x_l)
-        with wp.ScopedStream(self._stream):
+        with wp.ScopedStream(self._stream, sync_enter=not self._stream.is_capturing):
             self._update_impl(P, c, A, b, G, h_u, h_l, x_u, x_l, check_validity)
 
     def _compute_data_gradients(self, adjoint_vector: Variables, linearization_point: Variables) -> MultistageData:

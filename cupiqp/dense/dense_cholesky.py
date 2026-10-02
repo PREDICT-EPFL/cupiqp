@@ -87,8 +87,9 @@ class CholeskyInplaceSolver:
         return self._factor_status
 
     def factorize(self, A: wp.array) -> None:
-        """Enqueue the in-place Cholesky factorization of the C-contiguous
-        ``(n, n)`` matrix ``A``; the outcome is left in ``factor_status``."""
+        """In-place Cholesky factorization of the C-contiguous ``(n, n)``
+        matrix ``A``, launched on the current stream without waiting for it;
+        the outcome is left in ``factor_status``."""
         # Keep A alive!
         self._ctx_A = A
         self._factor_ptr = A.ptr
@@ -128,9 +129,9 @@ class BatchedCholeskyInplaceSolver:
     Uses ``cusolverDnDpotrfBatched`` / ``cusolverDnDpotrsBatched`` to
     process all B matrices in a single kernel launch.
 
-    The batched API takes a device array of pointers (one per matrix).
-    Pointer arrays are cached and rebuilt when the base address changes
-    or when the outer batch stride changes.
+    The batched API takes a device array of pointers (one per matrix),
+    rebuilt by a small kernel on every call so the class keeps no host-side
+    state that a CUDA graph replay could invalidate.
 
     Parameters
     ----------
@@ -163,33 +164,30 @@ class BatchedCholeskyInplaceSolver:
         self._factor_status = wp.zeros(batch_size, dtype=wp.int32, device="cuda")
         self._solve_info = wp.zeros(1, dtype=wp.int32, device="cuda")  # potrsBatched argument check, unused
 
-        # Preallocated device pointer arrays and their source-layout keys.
-        self._A_ptrs = wp.zeros(batch_size, dtype=wp.int64, device="cuda")  # store the pointer to each batch
-        self._A_ptr_key = None
+        # Preallocated device pointer arrays (one pointer per matrix / rhs row).
+        # They are refilled on every factorize() / solve() rather than cached
+        # against a host-side record of the last buffer: a CUDA graph replay
+        # rewrites them on the device without the host knowing, so any such
+        # record goes stale and a later uncaptured call would skip a needed
+        # refill (the initial guess solved into the step buffer that way).
+        self._A_ptrs = wp.zeros(batch_size, dtype=wp.int64, device="cuda")
         self._B_ptrs = wp.zeros(batch_size, dtype=wp.int64, device="cuda")
-        self._B_ptr_key = None
 
         self._ctx_A = None
         self._ctx_B = None
         self._factorized = False
 
-    def _ensure_ptrs(self, arr: wp.array, ptrs: wp.array,
-                     cached_key: tuple) -> tuple:
-        """Rebuild pointers if the base address or batch stride changed.
-
-        Returns the current source-layout key for caching.
-        """
-        key = (arr.ptr, arr.strides[0])
-        if key != cached_key:
-            wp.launch(
-                _fill_ptrs_kernel,
-                dim=self._batch_size,
-                inputs=[wp.int64(arr.ptr), wp.int64(arr.strides[0])],
-                outputs=[ptrs],
-                device="cuda",
-                stream=self._stream,
-            )
-        return key
+    def _fill_ptrs(self, arr: wp.array, ptrs: wp.array) -> None:
+        """Write the device address of every matrix / row of ``arr`` into ``ptrs``
+        (one tiny kernel, from the base address and the outer batch stride)."""
+        wp.launch(
+            _fill_ptrs_kernel,
+            dim=self._batch_size,
+            inputs=[wp.int64(arr.ptr), wp.int64(arr.strides[0])],
+            outputs=[ptrs],
+            device="cuda",
+            stream=self._stream,
+        )
 
     def __del__(self):
         handle = getattr(self, "_cusolver_handle", None)
@@ -216,7 +214,8 @@ class BatchedCholeskyInplaceSolver:
         return self._factor_status
 
     def factorize(self, A: wp.array) -> None:
-        """Enqueue the in-place Cholesky factorization of all B matrices.
+        """In-place Cholesky factorization of all B matrices, launched on the
+        current stream without waiting for it.
 
         Parameters
         ----------
@@ -228,7 +227,7 @@ class BatchedCholeskyInplaceSolver:
         The per-matrix outcome is left in ``factor_status``; nothing is read
         on the host.
         """
-        self._A_ptr_key = self._ensure_ptrs(A, self._A_ptrs, self._A_ptr_key)
+        self._fill_ptrs(A, self._A_ptrs)
         self._ctx_A = A
 
         self._potrf_batched(
@@ -254,7 +253,7 @@ class BatchedCholeskyInplaceSolver:
         if not self._factorized:
             raise RuntimeError("You must call factorize() before solve().")
 
-        self._B_ptr_key = self._ensure_ptrs(B, self._B_ptrs, self._B_ptr_key)
+        self._fill_ptrs(B, self._B_ptrs)
         self._ctx_B = B
 
         self._potrs_batched(

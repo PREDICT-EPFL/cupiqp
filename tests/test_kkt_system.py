@@ -211,8 +211,9 @@ def _run_full_solve(B, n, p, m, seed=42, with_box=True):
     rho = cp.array(np.abs(rng.standard_normal(B)) + 0.1)
     delta = cp.array(np.abs(rng.standard_normal(B)) + 0.1)
 
-    ok = kkt_sys.update_scalings_and_factor(data, pc, settings, False, rho, delta, vars)
-    assert ok, "Cholesky factorization failed"
+    kkt_sys.update_scalings_and_factor(data, pc, settings, False, rho, delta, vars)
+
+    assert not kkt_sys.factor_status.numpy().any(), "Cholesky factorization failed"
 
     rhs = Variables()
     rhs.init(data)
@@ -404,8 +405,8 @@ class TestKKTSystemEqualityOnly:
 
         rho = cp.full(B, 1e-4)
         delta = cp.full(B, 1e-4)
-        ok = kkt_sys.update_scalings_and_factor(data, pc, settings, False, rho, delta, vars)
-        assert ok
+        kkt_sys.update_scalings_and_factor(data, pc, settings, False, rho, delta, vars)
+        assert not kkt_sys.factor_status.numpy().any()
 
         rhs = Variables(); rhs.init(data)
         rhs.x = cp.array(rng.standard_normal((B, n)))

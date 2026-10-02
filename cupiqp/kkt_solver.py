@@ -36,12 +36,23 @@ class KKTSolverBase(ABC):
 
     @abstractmethod
     def factor(self) -> None:
-        """Enqueue the factorization of the KKT matrix.
+        """Factor the KKT matrix, launched on the current stream without
+        waiting for it.
 
-        Nothing is read on the host; once the enqueued work has run,
-        ``factor_status`` holds one entry per problem.
+        Nothing is read on the host; once the factorization has run on the
+        GPU, ``factor_status`` holds one entry per problem.
         """
         pass
+
+    @property
+    def supports_conditional_capture(self) -> bool:
+        """Whether ``solve()`` can be captured inside a conditional CUDA graph
+        node (the body of ``wp.capture_while``). ``factor()`` and ``solve()``
+        of every backend capture into a plain graph; a conditional node
+        additionally rejects copies from pageable host memory, which some
+        libraries issue internally. Without it the solver captures one IPM
+        iteration and drives the loop from the host."""
+        return True
 
     @property
     def factor_status(self) -> wp.array:

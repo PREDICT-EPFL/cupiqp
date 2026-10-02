@@ -195,31 +195,60 @@ class DeviceSettings:
         self._ints_host = wp.zeros(len(SettingsIntIdx), dtype=wp.int32, device="cpu", pinned=True)
         self._floats_np = self._floats_host.numpy()
         self._ints_np = self._ints_host.numpy()
+        # The values on the device (None before the first upload), and an
+        # event recorded after the copies that put them there.
+        self._uploaded = None
+        self._copied = wp.Event(device)
 
     def upload(self, settings: Settings, max_iter: Optional[int] = None) -> None:
         """Queue a copy of the runtime values of ``settings`` to the device.
 
-        ``max_iter`` overrides ``settings.max_iter`` when given. The copy is
-        enqueued on the current stream and does not wait for it; the staging
-        buffers must not be rewritten before that copy has run, which holds
-        as long as at most one solve is outstanding.
+        ``max_iter`` overrides ``settings.max_iter`` when given. Nothing is
+        copied when the values equal the ones already on the device. Otherwise
+        the copy is issued on the current stream without waiting for it; the
+        host only waits for the previous upload's copy, which must have read
+        the staging buffers before they are rewritten.
+
+        Raises ``RuntimeError`` when the values changed while the current
+        stream is being captured: a captured copy would read the staging
+        buffers when the graph is launched, not now.
         """
-        f = self._floats_np
-        f[SettingsFloatIdx.rho_init] = settings.rho_init
-        f[SettingsFloatIdx.delta_init] = settings.delta_init
-        f[SettingsFloatIdx.eps_abs] = settings.eps_abs
-        f[SettingsFloatIdx.eps_rel] = settings.eps_rel
-        f[SettingsFloatIdx.eps_duality_gap_abs] = settings.eps_duality_gap_abs
-        f[SettingsFloatIdx.eps_duality_gap_rel] = settings.eps_duality_gap_rel
-        f[SettingsFloatIdx.infeasibility_threshold] = settings.infeasibility_threshold
-        f[SettingsFloatIdx.reg_lower_limit] = settings.reg_lower_limit
-        f[SettingsFloatIdx.reg_finetune_lower_limit] = settings.reg_finetune_lower_limit
-        f[SettingsFloatIdx.tau] = settings.tau
-        i = self._ints_np
-        i[SettingsIntIdx.check_duality_gap] = 1 if settings.check_duality_gap else 0
-        i[SettingsIntIdx.reg_finetune_primal_update_threshold] = settings.reg_finetune_primal_update_threshold
-        i[SettingsIntIdx.reg_finetune_dual_update_threshold] = settings.reg_finetune_dual_update_threshold
-        i[SettingsIntIdx.max_iter] = settings.max_iter if max_iter is None else int(max_iter)
-        i[SettingsIntIdx.max_factor_retires] = settings.max_factor_retires
+        F, I = SettingsFloatIdx, SettingsIntIdx
+        floats = {
+            F.rho_init: settings.rho_init,
+            F.delta_init: settings.delta_init,
+            F.eps_abs: settings.eps_abs,
+            F.eps_rel: settings.eps_rel,
+            F.eps_duality_gap_abs: settings.eps_duality_gap_abs,
+            F.eps_duality_gap_rel: settings.eps_duality_gap_rel,
+            F.infeasibility_threshold: settings.infeasibility_threshold,
+            F.reg_lower_limit: settings.reg_lower_limit,
+            F.reg_finetune_lower_limit: settings.reg_finetune_lower_limit,
+            F.tau: settings.tau,
+        }
+        ints = {
+            I.check_duality_gap: 1 if settings.check_duality_gap else 0,
+            I.reg_finetune_primal_update_threshold: settings.reg_finetune_primal_update_threshold,
+            I.reg_finetune_dual_update_threshold: settings.reg_finetune_dual_update_threshold,
+            I.max_iter: settings.max_iter if max_iter is None else int(max_iter),
+            I.max_factor_retires: settings.max_factor_retires,
+        }
+        values = (tuple(floats.items()), tuple(ints.items()))
+        if values == self._uploaded:
+            return
+        if wp.get_stream(self.floats.device).is_capturing:
+            raise RuntimeError(
+                "The solver settings changed while the solver stream is being "
+                "captured into a CUDA graph. The settings of a captured solve "
+                "are the ones of the last solve() before the capture: set them, "
+                "call solve() once, then capture."
+            )
+        wp.synchronize_event(self._copied)
+        for idx, value in floats.items():
+            self._floats_np[idx] = value
+        for idx, value in ints.items():
+            self._ints_np[idx] = value
         wp.copy(self.floats, self._floats_host)
         wp.copy(self.ints, self._ints_host)
+        wp.record_event(self._copied)
+        self._uploaded = values

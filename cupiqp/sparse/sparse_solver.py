@@ -162,7 +162,7 @@ class SparseSolver(SolverBase):
     import scipy.sparse as sp
     import cupy as cp
     from cupyx.scipy.sparse import csr_matrix
-    from cupiqp import SparseSolver
+    from cupiqp import SparseSolver, Status
 
     B, n = 8, 4
     P = csr_matrix(sp.eye(n, format="csr"))     # lift scipy -> GPU CSR
@@ -174,7 +174,7 @@ class SparseSolver(SolverBase):
     )
     solver.solve()
 
-    print(solver.result.info.status[0].name)    # CUPIQP_SOLVED
+    print(Status(solver.result.info.status.numpy()[0]).name)    # CUPIQP_SOLVED
     ```
 
     See Also
@@ -321,7 +321,7 @@ class SparseSolver(SolverBase):
             for name, v in (("c", c), ("b", b), ("h_u", h_u), ("h_l", h_l),
                             ("x_u", x_u), ("x_l", x_l))
         )
-        with wp.ScopedStream(self._stream), self._cupy_stream:
+        with wp.ScopedStream(self._stream, sync_enter=not self._stream.is_capturing), self._cupy_stream:
             self._setup_impl(P, c, A, b, G, h_u, h_l, x_u, x_l)
             if self.settings.enable_grad:
                 self._init_grad_data()
@@ -426,7 +426,7 @@ class SparseSolver(SolverBase):
             for name, v in (("P", P), ("c", c), ("A", A), ("b", b), ("G", G),
                             ("h_u", h_u), ("h_l", h_l), ("x_u", x_u), ("x_l", x_l))
         )
-        with wp.ScopedStream(self._stream):
+        with wp.ScopedStream(self._stream, sync_enter=not self._stream.is_capturing):
             self._update_impl(P, c, A, b, G, h_u, h_l, x_u, x_l, check_validity)
 
     def _compute_data_gradients(self, adjoint_vector: Variables, linearization_point: Variables) -> SparseData:

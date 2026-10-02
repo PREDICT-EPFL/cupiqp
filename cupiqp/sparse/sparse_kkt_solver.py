@@ -239,15 +239,14 @@ class SparseKKTSolver(KKTSolverBase):
             device=self._device
         )
 
+    @property
+    def supports_conditional_capture(self) -> bool:
+        # The cuDSS solve phase copies from pageable host memory, which a
+        # conditional graph node rejects (see CudssSparseDirectSolver.solve).
+        return False
+
     @nvtx.annotate("SparseKKTSolver::factor")
     def factor(self) -> None:
-        """Factor and record the outcome in ``factor_status``.
-
-        cuDSS reports its factorization information on the host only, so this
-        backend synchronizes once per factorization and writes the batch-wide
-        outcome to every problem of the device status. It is therefore not
-        capturable into a CUDA graph.
-        """
         self._lin_sys_solver.factor(cuda_stream=wp.get_stream("cuda").cuda_stream)
 
     @nvtx.annotate("SparseKKTSolver::solve")

@@ -2,7 +2,7 @@ from importlib.metadata import version as _pkg_version, PackageNotFoundError
 
 from .data import Data
 from .settings import Settings
-from .results import Result, Status
+from .results import Result, Status, InfoSnapshot
 from .typedef import PIQP_INF
 
 from .dense.dense_data import DenseData
@@ -51,6 +51,7 @@ __all__ = [
     "Settings",
     "Result",
     "Status",
+    "InfoSnapshot",
     # Status aliases (PIQP-style)
     "CUPIQP_UNSOLVED",
     "CUPIQP_SOLVED",

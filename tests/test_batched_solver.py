@@ -45,7 +45,8 @@ def _solve_single(qp, settings=None):
     solver = DenseSolver()
     solver.settings = settings
     solver.setup(**{k: cp.array(v) for k, v in qp.items()})
-    status = solver.solve()[0]  # solve() always returns a list; B=1 -> one entry
+    solver.solve()
+    status = solver.result.info.to_host().status[0]  # status is always a list; B=1 -> one entry
     return status, cp.asnumpy(cp.asarray(solver.result.x)[0].copy())
 
 
@@ -55,7 +56,8 @@ def _solve_single_iter(qp, settings=None, solver_cls=DenseSolver):
     solver.settings = settings or _iter_settings()
     solver.setup(**{k: cp.array(v) for k, v in qp.items()})
     solver.solve()
-    return solver.result.info.status[0], int(solver.result.info.iter[0])
+    h = solver.result.info.to_host()
+    return h.status[0], int(h.iter[0])
 
 
 class TestBatchedSolverCorrectness:
@@ -93,7 +95,8 @@ class TestBatchedSolverCorrectness:
             x_u=cp.array(np.stack([q['x_u'] for q in qps])),
             x_l=cp.array(np.stack([q['x_l'] for q in qps])),
         )
-        batch_statuses = solver.solve()
+        solver.solve()
+        batch_statuses = solver.result.info.to_host().status
 
         for i in range(B):
             assert batch_statuses[i] == ref_statuses[i], (
@@ -113,7 +116,8 @@ class TestBatchedSolverCorrectness:
         solver = DenseSolver()
         solver.settings = settings
         _setup_batched(solver, **{k: cp.array(v[None, ...]) for k, v in qp.items()})
-        statuses = solver.solve()  # always a list, one Status per problem
+        solver.solve()
+        statuses = solver.result.info.to_host().status  # always a list, one Status per problem
 
         assert statuses[0] == ref_st
         if ref_st == Status.CUPIQP_SOLVED:
@@ -142,7 +146,8 @@ class TestBatchedSolverCorrectness:
             A=cp.array(np.stack(As)),
             b=cp.array(np.stack(bs)),
         )
-        statuses = solver.solve()
+        solver.solve()
+        statuses = solver.result.info.to_host().status
         for st in statuses:
             assert st == Status.CUPIQP_SOLVED, f"Expected SOLVED, got {st}"
 
@@ -166,7 +171,8 @@ class TestBatchedSolverBasic:
             P=cp.array(np.stack(Ps)),
             c=cp.array(rng.standard_normal((B, n))),
         )
-        statuses = solver.solve()
+        solver.solve()
+        statuses = solver.result.info.to_host().status
         assert all(st == Status.CUPIQP_SOLVED for st in statuses)
 
 
@@ -206,8 +212,9 @@ class TestPerProblemIterations:
         assert all(st == Status.CUPIQP_SOLVED for st, _ in ref)
 
         solver = self._make_dense_batch(qps, _iter_settings())
-        statuses = solver.solve()
-        iters = [int(v) for v in solver.result.info.iter]
+        solver.solve()
+        statuses = solver.result.info.to_host().status
+        iters = [int(v) for v in solver.result.info.to_host().iter]
 
         for i in range(B):
             assert statuses[i] == Status.CUPIQP_SOLVED
@@ -242,17 +249,18 @@ class TestPerProblemIterations:
         assert ref_st == Status.CUPIQP_SOLVED
 
         solver = self._make_dense_batch([feasible, infeasible], _iter_settings(max_iter=max_iter))
-        statuses = solver.solve()
-        iters = [int(v) for v in solver.result.info.iter]
+        solver.solve()
+        statuses = solver.result.info.to_host().status
+        iters = [int(v) for v in solver.result.info.to_host().iter]
 
         assert statuses[0] == Status.CUPIQP_SOLVED
         assert statuses[1] == Status.CUPIQP_MAX_ITER_REACHED
         # Solved member froze at its own (small) count, not the global max.
         assert iters[0] == ref_it
-        assert iters[0] < max_iter - 1
+        assert iters[0] < max_iter
         assert iters[0] < iters[1]
-        # Never-terminating member runs the full loop: iter == max_iter - 1 (0-based).
-        assert iters[1] == max_iter - 1
+        # Never-terminating member runs the full loop: iter == max_iter.
+        assert iters[1] == max_iter
 
     def test_three_problems_per_problem_iter(self):
         """Three different problems in one batch each freeze at their own
@@ -279,8 +287,9 @@ class TestPerProblemIterations:
             x_u=cp.array(np.stack([q['x_u'] for q in qps])),
             x_l=cp.array(np.stack([q['x_l'] for q in qps])),
         )
-        statuses = solver.solve()
-        iters = [int(v) for v in solver.result.info.iter]
+        solver.solve()
+        statuses = solver.result.info.to_host().status
+        iters = [int(v) for v in solver.result.info.to_host().iter]
 
         for i in range(len(seeds)):
             assert statuses[i] == Status.CUPIQP_SOLVED

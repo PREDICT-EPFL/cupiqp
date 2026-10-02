@@ -56,7 +56,8 @@ class TestSingleMode:
         n = 6
         A = cp.asarray(_make_spd(n, dtype=_np(dtype)))
         solver = CholeskyInplaceSolver(n, dtype=dtype)
-        assert solver.factorize(_w(A))
+        solver.factorize(_w(A))
+        assert not solver.factor_status.numpy().any()
 
     @pytest.mark.parametrize("dtype", DTYPES)
     @pytest.mark.parametrize("n", [1, 2, 4, 8, 16, 32, 64, 128, 256])
@@ -68,7 +69,8 @@ class TestSingleMode:
         x = cp.asarray(b.copy())
 
         solver = CholeskyInplaceSolver(n, dtype=dtype)
-        assert solver.factorize(_w(A_work))
+        solver.factorize(_w(A_work))
+        assert not solver.factor_status.numpy().any()
         solver.solve(_w(x))
         np.testing.assert_allclose(
             A_orig @ cp.asnumpy(x), b, atol=_atol(_np(dtype)), err_msg=f"n={n}",
@@ -101,7 +103,8 @@ class TestBatchedMode:
         B, n = 4, 6
         A = cp.asarray(_make_spd_batch(B, n, dtype=_np(dtype)))
         solver = BatchedCholeskyInplaceSolver(n, B, dtype=dtype)
-        assert solver.factorize(_w(A))
+        solver.factorize(_w(A))
+        assert not solver.factor_status.numpy().any()
 
     # (B, n) matrix exercises: batch=1 (smallest batched case), small
     # batches at various n, and a large-batch case. Fused from the former
@@ -123,7 +126,8 @@ class TestBatchedMode:
         x = cp.asarray(b.copy())
 
         solver = BatchedCholeskyInplaceSolver(n, B, dtype=dtype)
-        assert solver.factorize(_w(A_work))
+        solver.factorize(_w(A_work))
+        assert not solver.factor_status.numpy().any()
         solver.solve(_w(x))
 
         for i in range(B):

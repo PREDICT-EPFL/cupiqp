@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
-from typing import Optional, Any, List, Union
+from enum import Enum
+from typing import Optional, Any, Union
 
 import numpy as np
 import warp as wp
@@ -7,7 +8,7 @@ import nvtx
 
 from .settings import Settings, DeviceSettings
 from .data import Data
-from .results import Result, Status, Variables, InfoFloatIdx
+from .results import Result, Status, Variables
 from .kkt_systems import KKTSystem
 from .utils import cuda_graph_capture
 from .typedef import STATUS_MAX_ITER_REACHED, STATUS_NUMERICAL_ISSUES
@@ -54,6 +55,25 @@ wp.config.enable_backward = False  # disable backward mode, cut down kernel comp
 wp.init()
 
 
+class _CudaGraphMode(Enum):
+    """How one ``solve()`` uses CUDA graphs (chosen by ``SolverBase._cuda_graph_mode``)."""
+
+    NO_GRAPH = "no_graph"
+    """Plain kernel launches. Graphs are disabled, or something in the solve
+    needs the host every iteration (verbose printing, the host-driven
+    iterative refinement)."""
+
+    ITERATION_GRAPH_WITH_HOST_LOOP = "iteration_graph_with_host_loop"
+    """One IPM iteration is a CUDA graph; the host relaunches it while the
+    device's continue flag is set, reading that flag once per iteration. Used
+    when the backend's KKT solve cannot run inside a conditional graph node."""
+
+    SOLVE_GRAPH_WITH_DEVICE_LOOP = "solve_graph_with_device_loop"
+    """The whole device solve is one CUDA graph and the IPM loop is a
+    conditional node inside it, so the GPU alone decides when to stop and the
+    host waits only once, at the end."""
+
+
 class SolverBase(ABC):
     """Abstract base for the cuPIQP solver."""
 
@@ -66,6 +86,9 @@ class SolverBase(ABC):
         # it Warp's current stream, so all kernels, copies, library calls and
         # CUDA graphs of this solver are issued and captured on it. A stream
         # given to the constructor is borrowed (never destroyed here).
+        # Entering, the solver stream waits for the caller's current stream,
+        # except while it is being captured: that wait would depend on
+        # uncaptured work, and the caller already orders the captured stream.
         if stream is not None and not isinstance(stream, wp.Stream):
             raise TypeError(
                 "stream must be a warp.Stream or None; got "
@@ -229,7 +252,7 @@ class SolverBase(ABC):
         B = data.batch_size
 
         self._result = Result(B)
-        self._result.init(self._data)
+        self._result.init(self._data, self._stream)
         self._result.info.rho = self.settings.rho_init
         self._result.info.delta = self.settings.delta_init
 
@@ -320,6 +343,12 @@ class SolverBase(ABC):
             self._data, self._constraints_rhs_inf_norm_unscaled
         )
 
+        # Whole-solve CUDA graph (prelude, device-controlled loop, finalization),
+        # captured on the first eligible solve() after setup and replayed since.
+        self._solve_graph = None
+        # One-iteration CUDA graph, for backends that cannot run the loop as a
+        # conditional graph node (see _CudaGraphMode.ITERATION_GRAPH_WITH_HOST_LOOP).
+        self._iteration_graph = None
         self._setup_done = True
 
     def update(self,
@@ -362,7 +391,7 @@ class SolverBase(ABC):
             ``G`` unchanged; bound values (including which entries are
             ``+/-inf``) may change.
         """
-        with wp.ScopedStream(self._stream):
+        with wp.ScopedStream(self._stream, sync_enter=not self._stream.is_capturing):
             self._update_impl(P, c, A, b, G, h_u, h_l, x_u, x_l, check_validity)
 
     def _update_impl(self, P, c, A, b, G, h_u, h_l, x_u, x_l, check_validity):
@@ -433,38 +462,64 @@ class SolverBase(ABC):
             (G is not None) or preconditioner_did_fresh_ruiz or ineq_bound_pattern_may_change
         )
 
-    def solve(self) -> List[Status]:
-        """Solve the QP set up by ``setup()`` and return the solve status.
+    def solve(self) -> None:
+        """Solve the QP set up by ``setup()``.
 
-        Runs the proximal interior-point iterations on the GPU. The full
+        Runs the proximal interior-point iterations on the GPU and writes the
         solution (primal ``x``, dual, and slack variables) and per-problem
-        diagnostics are written to ``solver.result``; this method returns the
-        status for convenience.
+        diagnostics to ``solver.result``. The call is asynchronous: it queues
+        the work on ``solver.stream`` and returns without waiting for it.
 
-        Returns
-        -------
-        list of Status
-            One ``Status`` per problem in the batch (a list of length 1 for a
-            single problem). ``CUPIQP_SOLVED`` means the problem converged to
-            tolerance. The same list is available as
-            ``solver.result.info.status``.
+        Every result is a Warp array at a fixed address:
+        ``solver.result.x`` and the other variables, and the per-problem
+        diagnostics in ``solver.result.info`` (``status`` holds one ``Status``
+        code per problem; ``CUPIQP_SOLVED`` means converged to tolerance).
+        Work queued on ``solver.stream`` afterwards sees the finished solve
+        without any synchronization; ``.numpy()`` waits for the solve and
+        copies to the host::
 
-        Notes
-        -----
-        Read the solution from ``solver.result`` after solving - e.g.
-        ``solver.result.x`` (a ``(B, n)`` Warp array) and
-        ``solver.result.info.status``. Set ``solver.settings.verbose = True``
-        to print a per-iteration log. After ``setup()`` you may ``solve()``
-        repeatedly, optionally calling ``update()`` in between to change the
-        numerical data.
+            solver.solve()
+            x = solver.result.x.numpy()
+            status = solver.result.info.status.numpy()
+            print(Status(status[0]).name)       # CUPIQP_SOLVED
+
+        After ``setup()`` you may ``solve()`` repeatedly, optionally calling
+        ``update()`` in between to change the numerical data. Set
+        ``solver.settings.verbose = True`` to print a per-iteration log (this
+        makes the solve wait on the host every iteration).
+
+        CUDA graph capture: ``solve()`` and ``update()`` may be recorded into
+        your own CUDA graph together with your own work, also inside your own
+        ``wp.capture_while`` / ``wp.capture_if``; every launch of the graph
+        then runs a complete solve on the data the graph sets::
+
+            solver.solve()          # once before capturing: compiles every
+                                    # kernel and puts the settings on the GPU
+            with wp.ScopedStream(solver.stream), wp.ScopedCapture() as capture:
+                wp.launch(build_qp, ..., outputs=[c_buf])
+                solver.update(c=c_buf)
+                solver.solve()
+                wp.launch(use_solution, ..., inputs=[solver.result.x])
+            wp.capture_launch(capture.graph, stream=solver.stream)
+
+        Capture ``solver.stream`` and make it the current stream, as above,
+        so that your work and the solver's are recorded on one stream. Pass
+        the same input arrays to ``update()`` at every launch (the graph
+        reads them by address), and keep the settings of the last solve
+        before the capture. Verbose mode,
+        ``iterative_refinement_always_enabled`` and the sparse backend are not
+        supported inside a capture.
         """
-        with wp.ScopedStream(self._stream):
-            return self._solve_impl()
+        with wp.ScopedStream(self._stream, sync_enter=not self._stream.is_capturing):
+            self._solve_impl()
 
-    def _solve_impl(self) -> List[Status]:
+    def _solve_impl(self) -> None:
         """Body of :meth:`solve`; the caller holds the solver's stream scope."""
         if not self._setup_done:
             raise RuntimeError("Solver not setup yet. Call setup() first.")
+        capturing = self._stream.is_capturing
+        if capturing:
+            self._check_capturable()
 
         if self.settings.verbose:
             try:
@@ -486,17 +541,93 @@ class SolverBase(ABC):
             print(f"variable upper bounds n_x_u = {self._data.num_xu}")
             print("")
 
-        info = self._result.info
-        # Device prelude: upload the runtime settings, then reset the
-        # per-problem state from them with one kernel. Both are plain stream
-        # operations, so a captured prelude follows later Settings changes.
+        # The runtime settings go to the device first (two H2D copies from
+        # pinned staging, only when they changed); the device solve reads them.
         self._device_settings.upload(self.settings)
-        self._reset_solve_state()
-        self._loop_state.zero_()
-        info.iter_total = 0
 
         if self.settings.verbose:
             self._print_header()
+
+        stream = wp.get_stream("cuda")
+        mode = self._cuda_graph_mode()
+        if capturing:
+            # Recorded into the caller's graph; a graph launch is not allowed
+            # inside a capture, and the loops become nested conditional nodes.
+            self._run_device_solve()
+        elif mode is _CudaGraphMode.SOLVE_GRAPH_WITH_DEVICE_LOOP:
+            if self._solve_graph is None:
+                with wp.ScopedCapture(stream=stream) as capture:
+                    self._run_device_solve()
+                self._solve_graph = capture.graph
+            wp.capture_launch(self._solve_graph, stream=stream)
+        elif mode is _CudaGraphMode.ITERATION_GRAPH_WITH_HOST_LOOP:
+            self._run_device_solve(run_iteration=self._launch_iteration_graph)
+        else:
+            self._run_device_solve()
+
+        if self.settings.verbose:
+            self._print_summary()
+        # Capture the converged iterate in SCALED coordinates before it is
+        # unscaled below. Gradient smoothing warm-starts its relaxed Newton loop
+        # from this converged point, which must live in the same scaled frame as
+        # the data / KKT factor. (The frozen rho/delta are read straight from
+        # self._result.info at backward time, so they are not copied here.)
+        if self._grad_smoothing:
+            self._result_scaled.copy_from(self._result)
+        if self.settings.preconditioner_iter > 0:
+            self._preconditioner.unscale_solution(self._result, self._data)
+
+    def _check_capturable(self) -> None:
+        """Raise if this solve cannot be recorded into the caller's CUDA graph."""
+        settings = self.settings
+        reason = None
+        if settings.verbose:
+            reason = "verbose mode reads the solver state on the host every iteration"
+        elif settings.iterative_refinement_always_enabled:
+            reason = "iterative refinement decides its iterations on the host"
+        elif not self._kkt_system.supports_conditional_capture:
+            reason = ("this backend's KKT solve cannot run inside a CUDA "
+                      "conditional graph node, which the IPM loop needs")
+        if reason is not None:
+            raise RuntimeError(f"solve() cannot be captured into a CUDA graph: {reason}.")
+
+    def _cuda_graph_mode(self) -> "_CudaGraphMode":
+        """How this solve() uses CUDA graphs; see ``_CudaGraphMode``."""
+        settings = self.settings
+        if (not settings.enable_cuda_graph or settings.verbose
+                or settings.iterative_refinement_always_enabled):
+            return _CudaGraphMode.NO_GRAPH
+        if self._kkt_system.supports_conditional_capture:
+            return _CudaGraphMode.SOLVE_GRAPH_WITH_DEVICE_LOOP
+        return _CudaGraphMode.ITERATION_GRAPH_WITH_HOST_LOOP
+
+    def _launch_iteration_graph(self) -> None:
+        """Run one IPM iteration from its CUDA graph, capturing it on first use."""
+        stream = wp.get_stream("cuda")
+        if self._iteration_graph is None:
+            with wp.ScopedCapture(stream=stream) as capture:
+                self._run_one_iteration()
+            self._iteration_graph = capture.graph
+        wp.capture_launch(self._iteration_graph, stream=stream)
+
+    @nvtx.annotate("Solver::_run_device_solve")
+    def _run_device_solve(self, run_iteration=None) -> None:
+        """The device part of a solve: state reset, initial guess, the
+        device-controlled IPM loop and the final status update.
+
+        Everything here is stream work driven by device values, so the whole
+        method is captured once into ``_solve_graph`` and replayed; the loops
+        become conditional graph nodes. Without a capture the same code runs
+        as plain launches, with ``wp.capture_while`` reading its condition on
+        the host. Verbose mode runs the loop explicitly to print per iteration.
+        ``run_iteration`` replaces ``_run_one_iteration`` in the loop, e.g. a
+        launcher of the one-iteration graph.
+        """
+        if run_iteration is None:
+            run_iteration = self._run_one_iteration
+        info = self._result.info
+        self._reset_solve_state()
+        self._loop_state.zero_()
 
         # Initial guess, its residuals and the first termination check; from
         # here on the GPU alone decides which problems keep iterating.
@@ -512,28 +643,13 @@ class SolverBase(ABC):
             # only reason the loop ever synchronizes before it ends.
             while self._read_continue_flag():
                 self._print_iteration_info()
-                self._run_one_iteration()
+                run_iteration()
         else:
-            wp.capture_while(self._continue_flag, self._run_one_iteration)
+            wp.capture_while(self._continue_flag, run_iteration)
 
         # Everything still active ran out of iterations.
         self._terminate_active(STATUS_MAX_ITER_REACHED)
-        wp.copy(self._loop_state_host, self._loop_state)
-        info.to_host()  # one D2H of the info buffers, then one synchronization
-        info.iter_total = int(self._loop_state_host.numpy()[0])
-        if self.settings.verbose:
-            self._print_summary()
-        # Capture the converged iterate in SCALED coordinates before it is
-        # unscaled below. Gradient smoothing warm-starts its relaxed Newton loop
-        # from this converged point, which must live in the same scaled frame as
-        # the data / KKT factor. (The frozen rho/delta are read straight from
-        # self._result.info at backward time, so they are not copied here.)
-        if self._grad_smoothing:
-            self._result_scaled.copy_from(self._result)
-        if self.settings.preconditioner_iter > 0:
-            self._preconditioner.unscale_solution(self._result, self._data)
-
-        return info.status
+        wp.copy(info.iter_total, self._current_iter)
 
     @nvtx.annotate("Solver::_run_one_iteration")
     def _run_one_iteration(self) -> None:
@@ -601,7 +717,7 @@ class SolverBase(ABC):
     def _update_termination(self) -> None:
         """Device termination and finetune decisions of the current iteration.
 
-        Updates ``status_device`` / ``iter_device``, the device active and
+        Updates ``info.status`` / ``info.iter``, the device active and
         finetune masks, and the loop condition, from the residuals of
         ``_update_residuals_r``. Reads the iteration from ``_current_iter``.
         """
@@ -622,7 +738,7 @@ class SolverBase(ABC):
                 info.no_primal_update, info.no_dual_update,
                 self._current_iter,
                 self._device_settings.floats, self._device_settings.ints,
-                self._unsolved_mask, info.status_device, info.iter_device,
+                self._unsolved_mask, info.status, info.iter,
                 self._finetune_mask,
             ],
             device=self._device
@@ -648,7 +764,7 @@ class SolverBase(ABC):
                     info.rho, info.delta, info.reg_limit,
                     info.mu, info.primal_step, info.dual_step,
                     info.no_primal_update, info.no_dual_update,
-                    info.status_device, info.iter_device, info.factor_retries_device,
+                    info.status, info.iter, info.factor_retries,
                     self._unsolved_mask],
             device=self._device
         )
@@ -659,7 +775,7 @@ class SolverBase(ABC):
             kernel=terminate_active_kernel,
             dim=(self._data.batch_size,),
             inputs=[self._unsolved_mask, self._current_iter, wp.int32(status),
-                    self._result.info.status_device, self._result.info.iter_device],
+                    self._result.info.status, self._result.info.iter],
             device=self._device
         )
 
@@ -736,50 +852,48 @@ class SolverBase(ABC):
     @nvtx.annotate("Solver::_print_iteration_info")
     def _print_iteration_info(self):
         """Print the verbose line of the current iteration from a fresh host snapshot."""
-        info = self._result.info
-        info.to_host()
-        h = info.host
-        F = InfoFloatIdx
+        h = self._result.info.to_host()
         iteration = int(self._loop_state_host.numpy()[0])
         B = self._data.batch_size
 
         if B == 1:
             print(
                 f"{iteration:3d}   "
-                f"{h[0, F.primal_obj]: .5e}   "
-                f"{h[0, F.dual_obj]: .5e}  "
-                f"{h[0, F.duality_gap]: .5e}  "
-                f"{h[0, F.primal_res]: .5e}  "
-                f"{h[0, F.dual_res]: .5e}  "
-                f"{h[0, F.rho]: .3e}  "
-                f"{h[0, F.delta]: .3e}  "
-                f"{h[0, F.mu]: .3e}  "
-                f"{h[0, F.primal_step]: .4f}  "
-                f"{h[0, F.dual_step]: .4f}",
+                f"{h.primal_obj[0]: .5e}   "
+                f"{h.dual_obj[0]: .5e}  "
+                f"{h.duality_gap[0]: .5e}  "
+                f"{h.primal_res[0]: .5e}  "
+                f"{h.dual_res[0]: .5e}  "
+                f"{h.rho[0]: .3e}  "
+                f"{h.delta[0]: .3e}  "
+                f"{h.mu[0]: .3e}  "
+                f"{h.primal_step[0]: .4f}  "
+                f"{h.dual_step[0]: .4f}",
                 flush=True
             )
 
         else:
-            solved  = B - int((info.status_value == Status.CUPIQP_UNSOLVED.value).sum())
+            solved  = B - int((h.status_value == Status.CUPIQP_UNSOLVED.value).sum())
             counter = f"{solved}/{B}"
             counter_w = max(2 * len(str(B)) + 1, len("solved"))
             print(
                 f"{iteration:>4d}  "
                 f"{counter:>{counter_w}}  "
-                f"{h[:, F.duality_gap].max():>12.5e}  "
-                f"{h[:, F.primal_res].max():>12.5e}  "
-                f"{h[:, F.dual_res].max():>12.5e}  "
-                f"{h[:, F.rho].max():>10.3e}  "
-                f"{h[:, F.delta].max():>10.3e}  "
-                f"{h[:, F.mu].max():>10.3e}  "
-                f"{h[:, F.primal_step].min():>6.4f}  "
-                f"{h[:, F.dual_step].min():>6.4f}",
+                f"{h.duality_gap.max():>12.5e}  "
+                f"{h.primal_res.max():>12.5e}  "
+                f"{h.dual_res.max():>12.5e}  "
+                f"{h.rho.max():>10.3e}  "
+                f"{h.delta.max():>10.3e}  "
+                f"{h.mu.max():>10.3e}  "
+                f"{h.primal_step.min():>6.4f}  "
+                f"{h.dual_step.min():>6.4f}",
                 flush=True
             )
 
     @nvtx.annotate("Solver::_print_summary")
     def _print_summary(self):
-        statuses = self._result.info.status
+        h = self._result.info.to_host()
+        statuses = h.status
         labels = {
             "Solved":             Status.CUPIQP_SOLVED,
             "Max iter reached":   Status.CUPIQP_MAX_ITER_REACHED,
@@ -787,7 +901,7 @@ class SolverBase(ABC):
             "Dual infeasible":    Status.CUPIQP_DUAL_INFEASIBLE,
             "Numerical issues":   Status.CUPIQP_NUMERICAL_ISSUES,
         }
-        print(f"\nFinished in {self._result.info.iter_total} iterations", flush=True)
+        print(f"\nFinished in {h.iter_total} iterations", flush=True)
         for name, status in labels.items():
             count = statuses.count(status)
             if count > 0:
@@ -814,7 +928,7 @@ class SolverBase(ABC):
             kernel=mark_failed_kernel,
             dim=(self._data.batch_size,),
             inputs=[self._kkt_system.solve_status, self._current_iter,
-                    self._unsolved_mask, self._result.info.status_device, self._result.info.iter_device],
+                    self._unsolved_mask, self._result.info.status, self._result.info.iter],
             device=self._device
         )
 
@@ -828,7 +942,7 @@ class SolverBase(ABC):
             dim=(self._data.batch_size,),
             inputs=[self._kkt_system.factor_status, self._current_iter,
                     self._device_settings.floats, self._device_settings.ints,
-                    self._unsolved_mask, info.status_device, info.iter_device, info.factor_retries_device,
+                    self._unsolved_mask, info.status, info.iter, info.factor_retries,
                     info.rho, info.delta, info.reg_limit, self._needs_retry],
             device=self._device
         )
@@ -1615,7 +1729,7 @@ class SolverBase(ABC):
         RuntimeError
             If :meth:`solve` has not been called yet (no cached KKT factor).
         """
-        with wp.ScopedStream(self._stream):
+        with wp.ScopedStream(self._stream, sync_enter=not self._stream.is_capturing):
             return self._backward_impl(grad_x, grad_y, grad_z_u, grad_z_l, grad_z_bu, grad_z_bl,
                                        grad_s_u, grad_s_l, grad_s_bu, grad_s_bl)
 
@@ -1632,7 +1746,7 @@ class SolverBase(ABC):
                 f"call setup() and solve() before backward()."
             )
 
-        if not (self._result.info.status_value == Status.CUPIQP_SOLVED.value).all():
+        if not (self._result.info.to_host().status_value == Status.CUPIQP_SOLVED.value).all():
             raise RuntimeError(
                 "Gradient computation requires every problem in the batch to be "
                 "solved (status CUPIQP_SOLVED) since the last setup()/update(); "

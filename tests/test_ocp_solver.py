@@ -128,7 +128,7 @@ def _solve_dense(N, nx, nu, Qs, Rs, Ss, qs, rs, As, Bs, Es, bs, x0,
         kw.update(G=cp.asarray(G), h_l=cp.asarray(hl), h_u=cp.asarray(hu))
     s.setup(**kw)
     s.solve()
-    assert s.result.info.status[0] == Status.CUPIQP_SOLVED
+    assert s.result.info.to_host().status[0] == Status.CUPIQP_SOLVED
     z = cp.asnumpy(s.result.x[0]).reshape(N + 1, d)
     return z[:, :nx], z[:N, nx:]
 
@@ -173,7 +173,8 @@ def test_idxbx_state_box():
     for k in range(N + 1):
         s.set("lbx", k, cp.asarray([-vmax]))
         s.set("ubx", k, cp.asarray([vmax]))
-    assert _solved(s.solve())
+    s.solve()
+    assert _solved(s.result.info.to_host().status)
 
     x = cp.asnumpy(s.x_traj[0])
     np.testing.assert_allclose(x[0], x0, atol=1e-7)
@@ -215,7 +216,8 @@ def test_matches_dense_box_constrained():
     for k in range(N):
         s.set("lbu", k, cp.asarray([-umax]))
         s.set("ubu", k, cp.asarray([umax]))
-    status = s.solve()
+    s.solve()
+    status = s.result.info.to_host().status
     assert _solved(status)
 
     x = cp.asnumpy(s.x_traj[0])
@@ -243,7 +245,8 @@ def test_descriptor_E():
     s.setup(N=N, nx=nx, nu=nu)
     _fill_ocp(s, N, nx, nu, [Q] * N, [R] * N, [A] * N, [B] * N, x0,
               Es=[E] * N, Qf=Qf)
-    assert _solved(s.solve())
+    s.solve()
+    assert _solved(s.result.info.to_host().status)
     x = cp.asnumpy(s.x_traj[0])
     u = cp.asnumpy(s.u_traj[0])
 
@@ -259,7 +262,8 @@ def test_descriptor_E():
     s2.setup(N=N, nx=nx, nu=nu)
     _fill_ocp(s2, N, nx, nu, [Q] * N, [R] * N, [Einv @ A] * N, [Einv @ B] * N,
               x0, Qf=Qf)
-    assert _solved(s2.solve())
+    s2.solve()
+    assert _solved(s2.result.info.to_host().status)
     np.testing.assert_allclose(x, cp.asnumpy(s2.x_traj[0]), atol=1e-5)
     np.testing.assert_allclose(u, cp.asnumpy(s2.u_traj[0]), atol=1e-5)
 
@@ -301,7 +305,8 @@ def test_general_inequality():
     s.set("C", N, cp.asarray(C))
     s.set("lg", N, cp.asarray([-vmax]))
     s.set("ug", N, cp.asarray([vmax]))
-    assert _solved(s.solve())
+    s.solve()
+    assert _solved(s.result.info.to_host().status)
 
     x = cp.asnumpy(s.x_traj[0])
     u = cp.asnumpy(s.u_traj[0])
@@ -330,7 +335,8 @@ def test_batched_per_x0():
         s.set("ubu", k, cp.asarray([0.5]))
     s.set("Q", N, cp.asarray(Qf))
     s.set("x0", 0, cp.asarray(x0s))           # leading batch axis -> per-problem IC
-    statuses = s.solve()
+    s.solve()
+    statuses = s.result.info.to_host().status
 
     assert isinstance(statuses, list) and len(statuses) == Bsz
     assert all(st == Status.CUPIQP_SOLVED for st in statuses)
@@ -372,7 +378,8 @@ def test_mpc_loop_update_only():
     norms = [float(np.linalg.norm(x))]
     for _ in range(25):
         s.set("x0", 0, cp.asarray(x))            # only the initial condition changes
-        assert _solved(s.solve())
+        s.solve()
+        assert _solved(s.result.info.to_host().status)
         u0 = float(cp.asnumpy(s.get("u", 0))[0, 0])
         assert -umax - 1e-6 <= u0 <= umax + 1e-6
         x = A @ x + (B @ np.array([u0]))
@@ -406,12 +413,14 @@ def test_matrix_update_between_solves():
     s.settings.eps_abs = 1e-9
     s.setup(N=N, nx=nx, nu=nu)
     _fill_ocp(s, N, nx, nu, [Q] * N, [R_cheap] * N, [A] * N, [B] * N, x0, Qf=Qf)
-    assert _solved(s.solve())
+    s.solve()
+    assert _solved(s.result.info.to_host().status)
     u_cheap = cp.asnumpy(s.u_traj[0])
 
     for k in range(N):
         s.set("R", k, cp.asarray(R_pricey))        # heavier input penalty (flags the P block)
-    assert _solved(s.solve())
+    s.solve()
+    assert _solved(s.result.info.to_host().status)
     u_pricey = cp.asnumpy(s.u_traj[0])
 
     # a much larger input penalty shrinks the control effort
@@ -476,3 +485,32 @@ def test_solution_lifecycle_guards():
         _ = s.u_traj
     with pytest.raises(RuntimeError, match="only be called once"):
         s.setup(N=2, nx=2, nu=1)
+
+
+def test_set_invalidates_solution():
+    N, nx, nu = 4, 2, 1
+    A, B = _double_integrator()
+    Q, R = np.diag([1.0, 0.1]), np.array([[0.05]])
+
+    s = OcpSolver()
+    s.setup(N=N, nx=nx, nu=nu)
+    _fill_ocp(s, N, nx, nu, [Q] * N, [R] * N, [A] * N, [B] * N, np.array([1.0, 0.0]))
+    s.solve()
+    assert _solved(s.result.info.to_host().status)
+    x_old = s.x_traj.numpy().copy()
+
+    # a rejected write changes nothing: the solution stays readable
+    with pytest.raises(ValueError, match="has shape"):
+        s.set("Q", 0, cp.ones((3,)))
+    np.testing.assert_array_equal(s.x_traj.numpy(), x_old)
+
+    # a successful write makes the old solution unavailable until solve()
+    s.set("x0", 0, cp.asarray([0.5, 0.0]))
+    with pytest.raises(RuntimeError, match="call solve"):
+        _ = s.x_traj
+    with pytest.raises(RuntimeError, match="call solve"):
+        s.get("u", 0)
+
+    s.solve()
+    assert _solved(s.result.info.to_host().status)
+    assert not np.allclose(s.x_traj.numpy(), x_old)

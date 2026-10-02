@@ -26,8 +26,8 @@ solver = DenseSolver()
 solver.settings.enable_grad = True  # enable gradient computation
 solver.setup(P=P, c=c)
 
-status = solver.solve()              # always a list, one Status per problem
-assert status[0] == Status.CUPIQP_SOLVED
+solver.solve()
+assert solver.result.info.status.numpy()[0] == Status.CUPIQP_SOLVED
 
 x_star = solver.result.x
 

@@ -53,5 +53,6 @@ def test_maros_meszaros_problem(problem_file):
         x_u=cp.array(x_u) if x_u is not None else None,
         x_l=cp.array(x_l) if x_l is not None else None,
     )
-    status = solver.solve()
+    solver.solve()
+    status = solver.result.info.to_host().status
     assert status[0] == Status.CUPIQP_SOLVED, f"Solver failed with status {status}"

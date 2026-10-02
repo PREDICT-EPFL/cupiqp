@@ -1,11 +1,10 @@
-from typing import Sequence, Union, List
+from typing import Sequence, Union
 
 import warp as wp
 
 from ..utils import as_warp_array
 
 from ..typedef import CudaArray
-from ..results import Status
 from .multistage_solver import MultistageSolver
 from .ocp_data import OcpData
 
@@ -175,7 +174,7 @@ class OcpSolver(MultistageSolver):
 
         if isinstance(batch_size, bool) or batch_size < 1:
             raise ValueError(f"batch_size must be a positive integer; got {batch_size!r}.")
-        with wp.ScopedStream(self._stream):
+        with wp.ScopedStream(self._stream, sync_enter=not self._stream.is_capturing):
             ocp_data = OcpData(
                 N, nx, nu, ng=ng, idxbx=idxbx, idxbu=idxbu,
                 dtype=self.settings.dtype, device=self._device,
@@ -208,7 +207,7 @@ class OcpSolver(MultistageSolver):
             raise RuntimeError("Call setup() before set().")
 
         value = as_warp_array(value, f"field {field!r}", self._dtype)
-        with wp.ScopedStream(self._stream):
+        with wp.ScopedStream(self._stream, sync_enter=not self._stream.is_capturing):
             self._ocp_data.set_field(field, stage, value)
 
         # Mark dirty only after a successful write; the old solution is stale.
@@ -220,13 +219,13 @@ class OcpSolver(MultistageSolver):
             self._update_G = True
         self._solution_available = False
 
-    def solve(self) -> List[Status]:
+    def solve(self) -> None:
         """Flush any pending :meth:`set` updates into the solver, then solve.
 
-        Returns the solve status as a list with one ``Status`` per problem
-        (a list of length 1 for ``batch_size == 1``). The full solution is
+        Asynchronous, like ``MultistageSolver.solve()``. The solution is
         available through :meth:`get`, :attr:`x_traj`, :attr:`u_traj`, and
-        ``solver.result``.
+        ``solver.result``; ``solver.result.info.status`` holds the solve
+        status, one ``Status`` code per problem.
         """
         if not self._ocp_ready:
             raise RuntimeError("Call setup() before solve().")
@@ -244,7 +243,7 @@ class OcpSolver(MultistageSolver):
         if self._update_G and "G" in arrays:
             changed["G"] = arrays["G"]
 
-        with wp.ScopedStream(self._stream):
+        with wp.ScopedStream(self._stream, sync_enter=not self._stream.is_capturing):
             self._update_impl(
                 changed.get("P"), changed.get("c"), changed.get("A"), changed.get("b"),
                 changed.get("G"), changed.get("h_u"), changed.get("h_l"),
@@ -252,9 +251,8 @@ class OcpSolver(MultistageSolver):
             )
             # set back to false to prepare for next solver update
             self._update_P = self._update_A = self._update_G = False
-            status = self._solve_impl()
+            self._solve_impl()
         self._solution_available = True
-        return status
 
     def get(self, field: str, stage: int) -> wp.array:
         """Read part of the solution (a zero-copy Warp view of ``solver.result.x``).

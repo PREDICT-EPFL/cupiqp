@@ -269,7 +269,8 @@ class TestDenseKKTSolverSolve:
         rhs_z = cp.array(rng.standard_normal((B, m))) if m > 0 else cp.empty((B, 0))
 
         solver.update_kkt(data, delta, x_reg, z_reg, z_reg_inv)
-        assert solver.factor() is True
+        solver.factor()
+        assert not solver.factor_status.numpy().any()
 
         delta_x = cp.empty((B, n), dtype=cp.float64)
         delta_y = cp.empty((B, p), dtype=cp.float64) if p > 0 else cp.empty((B, 0))
@@ -341,9 +342,10 @@ class TestDenseKKTSystemCondensedSolve:
         rho_arr = cp.full(B, 1.0)
         delta_arr = cp.full(B, 1.0)
 
-        success = kkt.update_scalings_and_factor(
+        kkt.update_scalings_and_factor(
             data, preconditioner, settings, False, rho_arr, delta_arr, vars_)
-        assert success, "KKT factorization failed"
+
+        assert not kkt.factor_status.numpy().any(), "KKT factorization failed"
 
         cp.random.seed(123)
         rhs_x = cp.random.randn(B, n)
@@ -403,8 +405,10 @@ class TestDenseKKTSystemIR:
         vars_no_ir.init(data)
         vars_no_ir.set_random()
 
-        assert kkt_no_ir.update_scalings_and_factor(
+        kkt_no_ir.update_scalings_and_factor(
             data, preconditioner, settings_no_ir, False, rho_arr, delta_arr, vars_no_ir)
+
+        assert not kkt_no_ir.factor_status.numpy().any()
 
         cp.random.seed(111)
         rhs_x = cp.random.randn(B, n)
@@ -438,8 +442,10 @@ class TestDenseKKTSystemIR:
         vars_ir.init(data)
         vars_ir.set_random()
 
-        assert kkt_ir.update_scalings_and_factor(
+        kkt_ir.update_scalings_and_factor(
             data, preconditioner, settings_ir, True, rho_arr, delta_arr, vars_ir)
+
+        assert not kkt_ir.factor_status.numpy().any()
 
         lhs_x2 = cp.zeros((B, n))
         lhs_y2 = cp.zeros((B, p))

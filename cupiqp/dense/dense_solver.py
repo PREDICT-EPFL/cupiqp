@@ -98,7 +98,7 @@ class DenseSolver(SolverBase):
 
     ```python
     import cupy as cp
-    from cupiqp import DenseSolver
+    from cupiqp import DenseSolver, Status
 
     P = cp.eye(2)
     c = cp.array([-1.0, -4.0])
@@ -110,7 +110,7 @@ class DenseSolver(SolverBase):
     solver.setup(P=P, c=c, G=G, h_l=h_l, h_u=h_u)   # all shared: one problem
     solver.solve()
 
-    print(solver.result.info.status[0].name)    # CUPIQP_SOLVED
+    print(Status(solver.result.info.status.numpy()[0]).name)    # CUPIQP_SOLVED
     x = solver.result.x.numpy()[0]              # bring the solution to the host
     ```
 
@@ -248,7 +248,7 @@ class DenseSolver(SolverBase):
         )
         if (A is None) != (b is None):
             raise ValueError("A and b must either both be provided or both be None.")
-        with wp.ScopedStream(self._stream):
+        with wp.ScopedStream(self._stream, sync_enter=not self._stream.is_capturing):
             self._setup_impl(P, c, A, b, G, h_u, h_l, x_u, x_l)
             if self.settings.enable_grad:
                 self._init_grad_data()
@@ -309,7 +309,7 @@ class DenseSolver(SolverBase):
             for name, v in (("P", P), ("c", c), ("A", A), ("b", b), ("G", G),
                             ("h_u", h_u), ("h_l", h_l), ("x_u", x_u), ("x_l", x_l))
         )
-        with wp.ScopedStream(self._stream):
+        with wp.ScopedStream(self._stream, sync_enter=not self._stream.is_capturing):
             self._update_impl(P, c, A, b, G, h_u, h_l, x_u, x_l, check_validity)
 
     def _compute_data_gradients(self, adjoint_vector: Variables, linearization_point: Variables) -> DenseData:

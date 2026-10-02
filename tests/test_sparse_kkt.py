@@ -109,10 +109,10 @@ def _factor(data: SparseData, settings: Settings, use_static_reg: bool,
 
     rho_arr = cp.full(data.batch_size, rho)
     delta_arr = cp.full(data.batch_size, delta)
-    ok = kkt.update_scalings_and_factor(
+    kkt.update_scalings_and_factor(
         data, preconditioner, settings, use_static_reg, rho_arr, delta_arr, variables,
     )
-    assert ok, "KKT factorization failed"
+    assert not kkt.factor_status.numpy().any(), "KKT factorization failed"
     return kkt, preconditioner, variables
 
 
@@ -242,13 +242,15 @@ def test_update_data(n: int, p: int, m: int, B: int) -> None:
         data.set_G(_w(1.5 * arr['G'].data))
     kkt1.update_data(data, update_P=True, update_A=p > 0, update_G=m > 0)
     rho_arr, delta_arr = cp.full(B, 1.0), cp.full(B, 1.0)
-    assert kkt1.update_scalings_and_factor(data, precond, settings, False, rho_arr, delta_arr, variables)
+    kkt1.update_scalings_and_factor(data, precond, settings, False, rho_arr, delta_arr, variables)
+    assert not kkt1.factor_status.numpy().any()
 
     # Fresh KKT built from the updated data, factored at the same point.
     kkt2 = KKTSystem()
     kkt2.init(data, settings)
     precond2 = _make_preconditioner(data)
-    assert kkt2.update_scalings_and_factor(data, precond2, settings, False, rho_arr, delta_arr, variables)
+    kkt2.update_scalings_and_factor(data, precond2, settings, False, rho_arr, delta_arr, variables)
+    assert not kkt2.factor_status.numpy().any()
 
     # Same rhs through both -> identical solution.
     rhs = Variables()
