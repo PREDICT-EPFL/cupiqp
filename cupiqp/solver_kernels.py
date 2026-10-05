@@ -28,11 +28,12 @@ def create_calculate_step_kernel(dtype=wp.float64):
 
     For each batch ``b``, computes over finite-bound entries only::
 
-        alpha_s[b] = tau * min_i( ds[b,i] < 0 ? -s[b,i]/ds[b,i] : 1.0 )
-        alpha_z[b] = tau * min_i( dz[b,i] < 0 ? -z[b,i]/dz[b,i] : 1.0 )
+        alpha_s[b] = tau * min( 1.0, min_i( ds[b,i] < 0 ? -s[b,i]/ds[b,i] : 1.0 ) )
+        alpha_z[b] = tau * min( 1.0, min_i( dz[b,i] < 0 ? -z[b,i]/dz[b,i] : 1.0 ) )
 
-    Inactive entries have mask value 0.0 and contribute candidate step 1.0,
-    so they never restrict the line search.
+    so neither step exceeds ``tau`` times the full Newton step. Inactive
+    entries have mask value 0.0 and contribute candidate step 1.0, so they
+    never restrict the line search.
 
     ``tau`` is read from the device configuration. Dispatch with ``wp.launch_tiled(..., dim=[B], block_dim=REDUCTION_BLOCK_DIM)``:
     one CUDA block per batch entry; every thread reduces a strided subset of
@@ -61,8 +62,8 @@ def create_calculate_step_kernel(dtype=wp.float64):
     ):
         b, i = wp.tid()
         num_ineq = s_all.shape[1]
-        min_s = dtype(wp.inf)
-        min_z = dtype(wp.inf)
+        min_s = dtype(1.0)
+        min_z = dtype(1.0)
         for k in range(i, num_ineq, wp.block_dim()):
             mask = finite_mask_all[b, k]
             min_s = wp.min(min_s, step_candidate_masked(step_s_all[b, k], s_all[b, k], mask))
