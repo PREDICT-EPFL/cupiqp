@@ -29,6 +29,18 @@ CUPIQP_PRIMAL_INFEASIBLE = Status.CUPIQP_PRIMAL_INFEASIBLE
 CUPIQP_DUAL_INFEASIBLE   = Status.CUPIQP_DUAL_INFEASIBLE
 CUPIQP_NUMERICAL_ISSUES  = Status.CUPIQP_NUMERICAL_ISSUES
 
+# Framework interfaces are loaded on first access so that ``import cupiqp``
+# does not import torch; ``import cupiqp.torch`` works as well.
+_LAZY_SUBMODULES = ("torch",)
+
+
+def __getattr__(name: str):
+    if name in _LAZY_SUBMODULES:
+        import importlib
+        return importlib.import_module(f".{name}", __name__)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 try:
     __version__ = _pkg_version("cupiqp")
 except PackageNotFoundError:  # running from a source tree without an install
