@@ -31,13 +31,13 @@ class MultistageRuizEquilibration(RuizEquilibration):
         # specialized warp kernels here.
         N = data.num_blocks
         d = data.block_size
-        rows_A, rows_G = data.A_rows, data.G_rows
-        self._N, self._d, self._rows_A, self._rows_G = N, d, rows_A, rows_G
+        A_rows_per_block, G_rows_per_block = data.A_rows_per_block, data.G_rows_per_block
+        self._N, self._d, self._A_rows_per_block, self._G_rows_per_block = N, d, A_rows_per_block, G_rows_per_block
 
         self._multistage_scale_matrices_kernel = create_multistage_scale_matrices_kernel(
-            N, d, rows_A, rows_G, dtype=self._dtype)
+            N, d, A_rows_per_block, G_rows_per_block, dtype=self._dtype)
         self._multistage_compute_kkt_norms_kernel = create_multistage_compute_kkt_norms_kernel(
-            N, d, rows_A, rows_G, dtype=self._dtype)
+            N, d, A_rows_per_block, G_rows_per_block, dtype=self._dtype)
         self._multistage_P_col_norms_kernel = create_multistage_P_col_norms_kernel(N, d, dtype=self._dtype)
         self._gamma_from_norms_kernel = create_gamma_from_norms_kernel(
             self.min_scaling, self.max_scaling, dtype=self._dtype)
@@ -77,8 +77,8 @@ class MultistageRuizEquilibration(RuizEquilibration):
                        d_x: wp.array, d_y: wp.array, d_z: wp.array,
                        cost_scaling_factor: Optional[wp.array] = None):
         cf = cost_scaling_factor if cost_scaling_factor is not None else self._ones
-        N, d, rows_A, rows_G = self._N, self._d, self._rows_A, self._rows_G
-        max_rows = max(d, rows_A, rows_G)
+        N, d, A_rows_per_block, G_rows_per_block = self._N, self._d, self._A_rows_per_block, self._G_rows_per_block
+        max_rows = max(d, A_rows_per_block, G_rows_per_block)
         wp.launch(
             kernel=self._multistage_scale_matrices_kernel,
             dim=(self.B, N, max_rows, d),

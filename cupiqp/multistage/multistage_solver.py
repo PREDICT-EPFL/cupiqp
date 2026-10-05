@@ -112,8 +112,8 @@ class MultistageSolver(SolverBase):
         print("multistage backend:")
         print(f"batch size B = {d.batch_size}")
         print(f"variables n = {d.n}, num_blocks(P) = {d.num_blocks}, block_size(P) = ({d.block_size}, {d.block_size})")
-        for label, dim, rows in (("equality constraints p", d.p, d.A_rows),
-                                 ("inequality constraints m", d.m, d.G_rows)):
+        for label, dim, rows in (("equality constraints p", d.p, d.A_rows_per_block),
+                                 ("inequality constraints m", d.m, d.G_rows_per_block)):
             if rows == 0:
                 print(f"{label} = {dim}")
             else:
@@ -233,8 +233,8 @@ class MultistageSolver(SolverBase):
         d_sz = d.block_size
         dtype = d.dtype
 
-        r_a, N_a = (d.A_rows, N) if d.p > 0 else (0, 0)
-        r_g, N_g = (d.G_rows, N) if d.m > 0 else (0, 0)
+        r_a, N_a = (d.A_rows_per_block, N) if d.p > 0 else (0, 0)
+        r_g, N_g = (d.G_rows_per_block, N) if d.m > 0 else (0, 0)
 
         # Zero-initialized (B, ...) gradient storage with the forward
         # structure: blocks and bound sides exist exactly when they do in the
@@ -325,8 +325,8 @@ class MultistageSolver(SolverBase):
         d_sz = data.block_size
 
         N_off = max(N - 1, 0)
-        r_a, N_a = (data.A_rows, N) if data.p > 0 else (0, 0)
-        r_g, N_g = (data.G_rows, N) if data.m > 0 else (0, 0)
+        r_a, N_a = (data.A_rows_per_block, N) if data.p > 0 else (0, 0)
+        r_g, N_g = (data.G_rows_per_block, N) if data.m > 0 else (0, 0)
         total = (
             N * d_sz * d_sz
             + N_off * d_sz * d_sz

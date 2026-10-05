@@ -5,7 +5,7 @@ from ..utils import to_warp_dtype
 
 
 def create_update_kkt_kernel(num_blocks: int, block_size: int,
-                             p: int, m: int, rows_of_G: int, dtype=wp.float64):
+                             p: int, m: int, G_rows_per_block: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Fused warp kernel that builds the entire condensed KKT matrix
     and also writes ``delta_inv`` and a cached copy of ``z_reg_inv``.
@@ -42,7 +42,7 @@ def create_update_kkt_kernel(num_blocks: int, block_size: int,
         b, k, i, j = wp.tid()
         N_static = wp.static(num_blocks)
         d_static = wp.static(block_size)
-        rows_G_static = wp.static(rows_of_G)
+        G_rows_per_block_static = wp.static(G_rows_per_block)
 
         delta_inv_b = dtype(1.0) / delta[b]
 
@@ -54,8 +54,8 @@ def create_update_kkt_kernel(num_blocks: int, block_size: int,
         # Threads (b, k, i, 0) for k in [0, N+1), i in [0, rg) cover all
         # (N+1)*rg = m elements. Trailing j > 0 / i >= rg threads skip.
         if wp.static(m > 0):
-            if k <= N_static and i < rows_G_static and j == 0:
-                z_reg_inv_out[b, k * rows_G_static + i] = z_reg_inv[b, k * rows_G_static + i]
+            if k <= N_static and i < G_rows_per_block_static and j == 0:
+                z_reg_inv_out[b, k * G_rows_per_block_static + i] = z_reg_inv[b, k * G_rows_per_block_static + i]
 
         # ---- diagonal block element (k in [0, N)) ----
         if k < N_static:
@@ -66,9 +66,9 @@ def create_update_kkt_kernel(num_blocks: int, block_size: int,
                 v_D = v_D + delta_inv_b * AtA_D[b, k, i, j]
             if wp.static(m > 0):
                 acc_D = dtype(0.0)
-                for q in range(rows_G_static):
-                    w_dk = z_reg_inv[b, k * rows_G_static + q]
-                    w_ek = z_reg_inv[b, (k + 1) * rows_G_static + q]
+                for q in range(G_rows_per_block_static):
+                    w_dk = z_reg_inv[b, k * G_rows_per_block_static + q]
+                    w_ek = z_reg_inv[b, (k + 1) * G_rows_per_block_static + q]
                     acc_D = acc_D + w_dk * G_D[b, k, q, i] * G_D[b, k, q, j]
                     acc_D = acc_D + w_ek * G_E[b, k, q, i] * G_E[b, k, q, j]
                 v_D = v_D + acc_D
@@ -81,8 +81,8 @@ def create_update_kkt_kernel(num_blocks: int, block_size: int,
                 v_E = v_E + delta_inv_b * AtA_E[b, k, i, j]
             if wp.static(m > 0):
                 acc_E = dtype(0.0)
-                for q in range(rows_G_static):
-                    w_kp1 = z_reg_inv[b, (k + 1) * rows_G_static + q]
+                for q in range(G_rows_per_block_static):
+                    w_kp1 = z_reg_inv[b, (k + 1) * G_rows_per_block_static + q]
                     acc_E = acc_E + w_kp1 * G_D[b, k + 1, q, i] * G_E[b, k, q, j]
                 v_E = v_E + acc_E
             KKT_E[b, k, i, j] = v_E

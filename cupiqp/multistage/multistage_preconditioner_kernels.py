@@ -9,7 +9,7 @@ DLPack bridging is needed inside the kernels:
           E   (B, N, r, d)      sub-diagonal blocks
 
 For absent A or G, the call sites pass small dummy 4D buffers and rely on
-``wp.static(rows_A > 0)`` / ``wp.static(rows_G > 0)`` guards to dead-code-eliminate
+``wp.static(A_rows_per_block > 0)`` / ``wp.static(G_rows_per_block > 0)`` guards to dead-code-eliminate
 all access at codegen.
 """
 
@@ -17,21 +17,21 @@ import warp as wp
 from ..utils import to_warp_dtype
 
 
-def create_multistage_scale_matrices_kernel(N: int, d: int, rows_A: int, rows_G: int, dtype=wp.float64):
+def create_multistage_scale_matrices_kernel(N: int, d: int, A_rows_per_block: int, G_rows_per_block: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Single fused kernel for ``scale_matrices``.
 
-    Per ``(b, k, i, j)`` thread (grid (B, N, max(d, rows_A, rows_G), d)):
+    Per ``(b, k, i, j)`` thread (grid (B, N, max(d, A_rows_per_block, G_rows_per_block), d)):
         if i < d   : P_D[b,k,i,j] *= d_x[b, k*d+i] * d_x[b, k*d+j] * cf
                      if k < N-1 : P_E[b,k,i,j] *= d_x[b, (k+1)*d+i] * d_x[b, k*d+j] * cf
                      if i == 0  : c[b, k*d+j] *= d_x[b, k*d+j] * cf
-        if i < rows_A : A_D[b,k,i,j] *= d_y[b, k*rows_A+i]     * d_x[b, k*d+j]
-                     A_E[b,k,i,j] *= d_y[b, (k+1)*rows_A+i] * d_x[b, k*d+j]
-        if i < rows_G : G_D[b,k,i,j] *= d_z[b, k*rows_G+i]     * d_x[b, k*d+j]
-                     G_E[b,k,i,j] *= d_z[b, (k+1)*rows_G+i] * d_x[b, k*d+j]
+        if i < A_rows_per_block : A_D[b,k,i,j] *= d_y[b, k*A_rows_per_block+i]     * d_x[b, k*d+j]
+                     A_E[b,k,i,j] *= d_y[b, (k+1)*A_rows_per_block+i] * d_x[b, k*d+j]
+        if i < G_rows_per_block : G_D[b,k,i,j] *= d_z[b, k*G_rows_per_block+i]     * d_x[b, k*d+j]
+                     G_E[b,k,i,j] *= d_z[b, (k+1)*G_rows_per_block+i] * d_x[b, k*d+j]
 
-    All shape constants ``(N, d, rows_A, rows_G)`` are baked in via ``wp.static``;
-    when ``rows_A == 0`` or ``rows_G == 0`` the corresponding branches are
+    All shape constants ``(N, d, A_rows_per_block, G_rows_per_block)`` are baked in via ``wp.static``;
+    when ``A_rows_per_block == 0`` or ``G_rows_per_block == 0`` the corresponding branches are
     dead-code-eliminated and the dummy A/G arrays passed by the caller are
     never touched.
     """
@@ -39,10 +39,10 @@ def create_multistage_scale_matrices_kernel(N: int, d: int, rows_A: int, rows_G:
     def multistage_scale_matrices_kernel(
         P_D:         wp.array4d(dtype=dtype),  # type: ignore  (B, N, d, d) in-out
         P_E:         wp.array4d(dtype=dtype),  # type: ignore  (B, N-1, d, d) in-out
-        A_D:         wp.array4d(dtype=dtype),  # type: ignore  (B, N, rows_A, d) in-out
-        A_E:         wp.array4d(dtype=dtype),  # type: ignore  (B, N, rows_A, d) in-out
-        G_D:         wp.array4d(dtype=dtype),  # type: ignore  (B, N, rows_G, d) in-out
-        G_E:         wp.array4d(dtype=dtype),  # type: ignore  (B, N, rows_G, d) in-out
+        A_D:         wp.array4d(dtype=dtype),  # type: ignore  (B, N, A_rows_per_block, d) in-out
+        A_E:         wp.array4d(dtype=dtype),  # type: ignore  (B, N, A_rows_per_block, d) in-out
+        G_D:         wp.array4d(dtype=dtype),  # type: ignore  (B, N, G_rows_per_block, d) in-out
+        G_E:         wp.array4d(dtype=dtype),  # type: ignore  (B, N, G_rows_per_block, d) in-out
         c:           wp.array2d(dtype=dtype),  # type: ignore  (B, n) in-out
         d_x:         wp.array2d(dtype=dtype),  # type: ignore  (B, n)
         d_y:         wp.array2d(dtype=dtype),  # type: ignore  (B, p)
@@ -62,24 +62,24 @@ def create_multistage_scale_matrices_kernel(N: int, d: int, rows_A: int, rows_G:
             if i == 0:
                 c[b, k * wp.static(d) + j] = c[b, k * wp.static(d) + j] * d_x_kj * cf
 
-        if wp.static(rows_A > 0):
-            if i < wp.static(rows_A):
-                d_y_ki = d_y[b, k * wp.static(rows_A) + i]
-                d_y_kp1_i = d_y[b, (k + 1) * wp.static(rows_A) + i]
+        if wp.static(A_rows_per_block > 0):
+            if i < wp.static(A_rows_per_block):
+                d_y_ki = d_y[b, k * wp.static(A_rows_per_block) + i]
+                d_y_kp1_i = d_y[b, (k + 1) * wp.static(A_rows_per_block) + i]
                 A_D[b, k, i, j] = A_D[b, k, i, j] * d_y_ki * d_x_kj
                 A_E[b, k, i, j] = A_E[b, k, i, j] * d_y_kp1_i * d_x_kj
 
-        if wp.static(rows_G > 0):
-            if i < wp.static(rows_G):
-                d_z_ki = d_z[b, k * wp.static(rows_G) + i]
-                d_z_kp1_i = d_z[b, (k + 1) * wp.static(rows_G) + i]
+        if wp.static(G_rows_per_block > 0):
+            if i < wp.static(G_rows_per_block):
+                d_z_ki = d_z[b, k * wp.static(G_rows_per_block) + i]
+                d_z_kp1_i = d_z[b, (k + 1) * wp.static(G_rows_per_block) + i]
                 G_D[b, k, i, j] = G_D[b, k, i, j] * d_z_ki * d_x_kj
                 G_E[b, k, i, j] = G_E[b, k, i, j] * d_z_kp1_i * d_x_kj
 
     return multistage_scale_matrices_kernel
 
 
-def create_multistage_compute_kkt_norms_kernel(N: int, d: int, rows_A: int, rows_G: int, dtype=wp.float64):
+def create_multistage_compute_kkt_norms_kernel(N: int, d: int, A_rows_per_block: int, G_rows_per_block: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Single fused kernel for ``compute_kkt_norms``.
 
@@ -91,20 +91,20 @@ def create_multistage_compute_kkt_norms_kernel(N: int, d: int, rows_A: int, rows
         z-block  j ∈ [n+p, n+p+m)   row inf-norm of G
 
     Each output slot has a unique writer thread — no atomics. All shape
-    constants are static; the inner d / rows_A / rows_G loops unroll at codegen.
+    constants are static; the inner d / A_rows_per_block / G_rows_per_block loops unroll at codegen.
     """
     n = N * d
-    p = (N + 1) * rows_A
-    m = (N + 1) * rows_G
+    p = (N + 1) * A_rows_per_block
+    m = (N + 1) * G_rows_per_block
 
     @wp.kernel
     def multistage_compute_kkt_norms_kernel(
         P_D:         wp.array4d(dtype=dtype),  # type: ignore  (B, N, d, d)
         P_E:         wp.array4d(dtype=dtype),  # type: ignore  (B, N-1, d, d)
-        A_D:         wp.array4d(dtype=dtype),  # type: ignore  (B, N, rows_A, d)
-        A_E:         wp.array4d(dtype=dtype),  # type: ignore  (B, N, rows_A, d)
-        G_D:         wp.array4d(dtype=dtype),  # type: ignore  (B, N, rows_G, d)
-        G_E:         wp.array4d(dtype=dtype),  # type: ignore  (B, N, rows_G, d)
+        A_D:         wp.array4d(dtype=dtype),  # type: ignore  (B, N, A_rows_per_block, d)
+        A_E:         wp.array4d(dtype=dtype),  # type: ignore  (B, N, A_rows_per_block, d)
+        G_D:         wp.array4d(dtype=dtype),  # type: ignore  (B, N, G_rows_per_block, d)
+        G_E:         wp.array4d(dtype=dtype),  # type: ignore  (B, N, G_rows_per_block, d)
         x_b_scaling: wp.array2d(dtype=dtype),  # type: ignore  (B, n)
         d_iter:      wp.array2d(dtype=dtype),  # type: ignore  (B, n+p+m) out
         d_b_iter:    wp.array2d(dtype=dtype),  # type: ignore  (B, n)     out
@@ -135,14 +135,14 @@ def create_multistage_compute_kkt_norms_kernel(N: int, d: int, rows_A: int, rows
                     v = wp.max(v, wp.abs(P_E[b, k_blk, col, i]))
 
             # A col j: D[k_blk][:, i] and E[k_blk][:, i]
-            if wp.static(rows_A > 0):
-                for row in range(wp.static(rows_A)):
+            if wp.static(A_rows_per_block > 0):
+                for row in range(wp.static(A_rows_per_block)):
                     v = wp.max(v, wp.abs(A_D[b, k_blk, row, i]))
                     v = wp.max(v, wp.abs(A_E[b, k_blk, row, i]))
 
             # G col j: D[k_blk][:, i] and E[k_blk][:, i]
-            if wp.static(rows_G > 0):
-                for row in range(wp.static(rows_G)):
+            if wp.static(G_rows_per_block > 0):
+                for row in range(wp.static(G_rows_per_block)):
                     v = wp.max(v, wp.abs(G_D[b, k_blk, row, i]))
                     v = wp.max(v, wp.abs(G_E[b, k_blk, row, i]))
 
@@ -153,10 +153,10 @@ def create_multistage_compute_kkt_norms_kernel(N: int, d: int, rows_A: int, rows
 
         elif j < np_static:
             # y-block: row inf-norm of A
-            if wp.static(rows_A > 0):
+            if wp.static(A_rows_per_block > 0):
                 jp = j - n_static
-                k_blk = jp // wp.static(rows_A)
-                i = jp - k_blk * wp.static(rows_A)
+                k_blk = jp // wp.static(A_rows_per_block)
+                i = jp - k_blk * wp.static(A_rows_per_block)
 
                 v = dtype(0.0)
                 if k_blk < N_static:
@@ -169,10 +169,10 @@ def create_multistage_compute_kkt_norms_kernel(N: int, d: int, rows_A: int, rows
 
         elif j < npm_static:
             # z-block: row inf-norm of G
-            if wp.static(rows_G > 0):
+            if wp.static(G_rows_per_block > 0):
                 jm = j - np_static
-                k_blk = jm // wp.static(rows_G)
-                i = jm - k_blk * wp.static(rows_G)
+                k_blk = jm // wp.static(G_rows_per_block)
+                i = jm - k_blk * wp.static(G_rows_per_block)
 
                 v = dtype(0.0)
                 if k_blk < N_static:

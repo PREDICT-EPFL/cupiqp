@@ -84,12 +84,12 @@ class MultistageData(Data):
         self._c = self._flat(c)
 
         self._A_diag, self._A_offdiag = A_diag, A_offdiag
-        self._rows_A = int(A_diag.shape[2]) if A_diag is not None else 0
+        self._A_rows_per_block = int(A_diag.shape[2]) if A_diag is not None else 0
         self._b_wp = b
         self._b = self._flat(b) if b is not None else wp.zeros((B, 0), dtype=self._dtype, device=self._device)
 
         self._G_diag, self._G_offdiag = G_diag, G_offdiag
-        self._rows_G = int(G_diag.shape[2]) if G_diag is not None else 0
+        self._G_rows_per_block = int(G_diag.shape[2]) if G_diag is not None else 0
         self._has_h_l, self._has_h_u = h_l is not None, h_u is not None
         self._h_l_wp, self._h_u_wp = h_l, h_u
         self._h_l = self._flat(h_l) if h_l is not None else wp.zeros((B, 0), dtype=self._dtype, device=self._device)
@@ -121,11 +121,11 @@ class MultistageData(Data):
 
     @property
     def p(self) -> int:
-        return (self._N + 1) * self._rows_A
+        return (self._N + 1) * self._A_rows_per_block
 
     @property
     def m(self) -> int:
-        return (self._N + 1) * self._rows_G
+        return (self._N + 1) * self._G_rows_per_block
 
     @property
     def block_size(self) -> int:
@@ -138,14 +138,14 @@ class MultistageData(Data):
         return self._N
 
     @property
-    def A_rows(self) -> int:
+    def A_rows_per_block(self) -> int:
         """Rows per block row of A (``0`` if there are no equalities)."""
-        return self._rows_A
+        return self._A_rows_per_block
 
     @property
-    def G_rows(self) -> int:
+    def G_rows_per_block(self) -> int:
         """Rows per block row of G (``0`` if there are no inequalities)."""
-        return self._rows_G
+        return self._G_rows_per_block
 
     # ------------------------------------------------------------------
     # Construction from arrays
