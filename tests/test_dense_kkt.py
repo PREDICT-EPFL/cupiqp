@@ -8,6 +8,7 @@ Every test is parameterized over batch size so the single-problem path
 import pytest
 import numpy as np
 import cupy as cp
+import warp as wp
 
 from cupiqp.dense.dense_data import DenseData
 from cupiqp.dense.dense_kkt_solver import DenseKKTSolver
@@ -15,6 +16,11 @@ from cupiqp.dense.dense_preconditioner import DenseRuizEquilibration
 from cupiqp.kkt_systems import KKTSystem
 from cupiqp.results import Variables
 from cupiqp.settings import Settings
+
+
+def _w(a):
+    """Zero-copy Warp view: DenseKKTSolver takes Warp arrays only."""
+    return wp.array(a, copy=False)
 
 
 def make_preconditioner(data):
@@ -78,7 +84,7 @@ def random_dense_qp(B=1, n=20, p=8, m=9, seed=42) -> DenseData:
         kw["h_l"] = cp.array(np.stack(h_ls))
 
     data = DenseData()
-    data.init(**kw)
+    data.init(**{k: _w(v) for k, v in kw.items()})
     return data
 
 
@@ -145,7 +151,7 @@ class TestDenseKKTSolverMatvec:
 
         x = cp.array(np.random.default_rng(B * 100 + n).standard_normal((B, n)))
         z = cp.zeros((B, n), dtype=cp.float64)
-        solver.eval_P_x(data, 2.0, x, z)
+        solver.eval_P_x(data, 2.0, _w(x), _w(z))
 
         for i in range(B):
             expected = 2.0 * cp.asnumpy(data.P[i]) @ cp.asnumpy(x[i])
@@ -160,11 +166,11 @@ class TestDenseKKTSolverMatvec:
 
         x = cp.array(np.random.default_rng(B * 100 + n + 1).standard_normal((B, n)))
         y = cp.zeros((B, p), dtype=cp.float64)
-        solver.eval_A_xn(data, 1.0, x, y)
+        solver.eval_A_xn(data, 1.0, _w(x), _w(y))
 
         xt = cp.array(np.random.default_rng(B * 100 + p + 2).standard_normal((B, p)))
         zt = cp.zeros((B, n), dtype=cp.float64)
-        solver.eval_AT_xt(data, 1.0, xt, zt)
+        solver.eval_AT_xt(data, 1.0, _w(xt), _w(zt))
 
         for i in range(B):
             np.testing.assert_allclose(
@@ -183,11 +189,11 @@ class TestDenseKKTSolverMatvec:
 
         x = cp.array(np.random.default_rng(B * 100 + n + 3).standard_normal((B, n)))
         y = cp.zeros((B, m), dtype=cp.float64)
-        solver.eval_G_xn(data, 1.0, x, y)
+        solver.eval_G_xn(data, 1.0, _w(x), _w(y))
 
         xt = cp.array(np.random.default_rng(B * 100 + m + 4).standard_normal((B, m)))
         zt = cp.zeros((B, n), dtype=cp.float64)
-        solver.eval_GT_xt(data, 1.0, xt, zt)
+        solver.eval_GT_xt(data, 1.0, _w(xt), _w(zt))
 
         for i in range(B):
             np.testing.assert_allclose(
@@ -263,13 +269,14 @@ class TestDenseKKTSolverSolve:
         rhs_z = cp.array(rng.standard_normal((B, m))) if m > 0 else cp.empty((B, 0))
 
         solver.update_kkt(data, delta, x_reg, z_reg, z_reg_inv)
-        assert solver.factor() is True
+        solver.factor()
+        assert not solver.factor_status.numpy().any()
 
         delta_x = cp.empty((B, n), dtype=cp.float64)
         delta_y = cp.empty((B, p), dtype=cp.float64) if p > 0 else cp.empty((B, 0))
         delta_z = cp.empty((B, m), dtype=cp.float64) if m > 0 else cp.empty((B, 0))
 
-        solver.solve(data, rhs_x, rhs_y, rhs_z, delta_x, delta_y, delta_z)
+        solver.solve(data, _w(rhs_x), _w(rhs_y), _w(rhs_z), _w(delta_x), _w(delta_y), _w(delta_z))
 
         for i in range(B):
             ref_dx, ref_dy, ref_dz = _numpy_condensed_kkt_solve(
@@ -324,7 +331,6 @@ class TestDenseKKTSystemCondensedSolve:
         data = random_dense_qp(B=B, n=n, p=p, m=m)
 
         settings = Settings()
-        settings.kkt_solver = "dense_cholesky"
         kkt = KKTSystem()
         kkt.init(data, settings)
         preconditioner = make_preconditioner(data)
@@ -336,9 +342,10 @@ class TestDenseKKTSystemCondensedSolve:
         rho_arr = cp.full(B, 1.0)
         delta_arr = cp.full(B, 1.0)
 
-        success = kkt.update_scalings_and_factor(
+        kkt.update_scalings_and_factor(
             data, preconditioner, settings, False, rho_arr, delta_arr, vars_)
-        assert success, "KKT factorization failed"
+
+        assert not kkt.factor_status.numpy().any(), "KKT factorization failed"
 
         cp.random.seed(123)
         rhs_x = cp.random.randn(B, n)
@@ -350,14 +357,13 @@ class TestDenseKKTSystemCondensedSolve:
         lhs_x = cp.zeros((B, n))
         lhs_y = cp.zeros((B, p))
         lhs_z = cp.zeros((B, m))
-        kkt._kkt_solver.solve(data, rhs_x, rhs_y, rhs_z,
-                              lhs_x, lhs_y, lhs_z)
+        kkt._kkt_solver.solve(data, _w(rhs_x), _w(rhs_y), _w(rhs_z), _w(lhs_x), _w(lhs_y), _w(lhs_z))
 
         check_x = cp.zeros((B, n))
         check_y = cp.zeros((B, p))
         check_z = cp.zeros((B, m))
-        kkt.mul_condensed_kkt(data, lhs_x, lhs_y, lhs_z,
-                              check_x, check_y, check_z)
+        kkt.mul_condensed_kkt(data, _w(lhs_x), _w(lhs_y), _w(lhs_z),
+                              _w(check_x), _w(check_y), _w(check_z))
 
         atol = 1e-8
         assert cp.allclose(rhs_x, check_x, atol=atol), \
@@ -390,7 +396,6 @@ class TestDenseKKTSystemIR:
 
         # --- Without IR ---
         settings_no_ir = Settings()
-        settings_no_ir.kkt_solver = "dense_cholesky"
         settings_no_ir.iterative_refinement_max_iter = 0
         kkt_no_ir = KKTSystem()
         kkt_no_ir.init(data, settings_no_ir)
@@ -400,8 +405,10 @@ class TestDenseKKTSystemIR:
         vars_no_ir.init(data)
         vars_no_ir.set_random()
 
-        assert kkt_no_ir.update_scalings_and_factor(
+        kkt_no_ir.update_scalings_and_factor(
             data, preconditioner, settings_no_ir, False, rho_arr, delta_arr, vars_no_ir)
+
+        assert not kkt_no_ir.factor_status.numpy().any()
 
         cp.random.seed(111)
         rhs_x = cp.random.randn(B, n)
@@ -414,20 +421,18 @@ class TestDenseKKTSystemIR:
         lhs_y = cp.zeros((B, p))
         lhs_z = cp.zeros((B, m))
         kkt_no_ir._kkt_solver.solve(
-            data, rhs_x.copy(), rhs_y.copy(), rhs_z.copy(),
-            lhs_x, lhs_y, lhs_z)
+            data, _w(rhs_x.copy()), _w(rhs_y.copy()), _w(rhs_z.copy()), _w(lhs_x), _w(lhs_y), _w(lhs_z))
 
         err_x = cp.zeros((B, n))
         err_y = cp.zeros((B, p))
         err_z = cp.zeros((B, m))
         error_no_ir = kkt_no_ir.get_refinement_error(
-            data, lhs_x, lhs_y, lhs_z,
-            rhs_x, rhs_y, rhs_z,
-            err_x, err_y, err_z)
+            data, _w(lhs_x), _w(lhs_y), _w(lhs_z),
+            _w(rhs_x), _w(rhs_y), _w(rhs_z),
+            _w(err_x), _w(err_y), _w(err_z))
 
         # --- With IR (static reg + iterative refinement) ---
         settings_ir = Settings()
-        settings_ir.kkt_solver = "dense_cholesky"
         settings_ir.iterative_refinement_max_iter = 10
         kkt_ir = KKTSystem()
         kkt_ir.init(data, settings_ir)
@@ -437,28 +442,29 @@ class TestDenseKKTSystemIR:
         vars_ir.init(data)
         vars_ir.set_random()
 
-        assert kkt_ir.update_scalings_and_factor(
+        kkt_ir.update_scalings_and_factor(
             data, preconditioner, settings_ir, True, rho_arr, delta_arr, vars_ir)
+
+        assert not kkt_ir.factor_status.numpy().any()
 
         lhs_x2 = cp.zeros((B, n))
         lhs_y2 = cp.zeros((B, p))
         lhs_z2 = cp.zeros((B, m))
         kkt_ir._kkt_solver.solve(
-            data, rhs_x.copy(), rhs_y.copy(), rhs_z.copy(),
-            lhs_x2, lhs_y2, lhs_z2)
+            data, _w(rhs_x.copy()), _w(rhs_y.copy()), _w(rhs_z.copy()), _w(lhs_x2), _w(lhs_y2), _w(lhs_z2))
 
         kkt_ir.iterative_refinement(
             data, settings_ir,
-            rhs_x.copy(), rhs_y.copy(), rhs_z.copy(),
-            lhs_x2, lhs_y2, lhs_z2)
+            _w(rhs_x.copy()), _w(rhs_y.copy()), _w(rhs_z.copy()),
+            _w(lhs_x2), _w(lhs_y2), _w(lhs_z2))
 
         err_x2 = cp.zeros((B, n))
         err_y2 = cp.zeros((B, p))
         err_z2 = cp.zeros((B, m))
         error_ir = kkt_ir.get_refinement_error(
-            data, lhs_x2, lhs_y2, lhs_z2,
-            rhs_x, rhs_y, rhs_z,
-            err_x2, err_y2, err_z2)
+            data, _w(lhs_x2), _w(lhs_y2), _w(lhs_z2),
+            _w(rhs_x), _w(rhs_y), _w(rhs_z),
+            _w(err_x2), _w(err_y2), _w(err_z2))
 
         assert error_ir <= error_no_ir * 10 + 1e-14, \
             f"IR made things worse: {error_ir:.2e} > {error_no_ir:.2e}"

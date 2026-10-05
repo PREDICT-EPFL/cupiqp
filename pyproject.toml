@@ -37,25 +37,16 @@ classifiers = [
 
 # Runtime dependencies installed for every `pip install .`.
 #
-# numpy / scipy / warp-lang / nvmath-python / nvtx resolve cleanly from PyPI.
-# `socu` (block-structured Warp kernels backing `MultistageSolver`) is NOT on
-# PyPI yet, so it is pulled straight from GitHub via a PEP 508 direct reference.
-# It is listed here as a core dependency so the multistage backend works out of
-# the box after a plain `pip install .`.
-#
-# WARNING: the `socu @ git+...` direct reference makes this project
-# NON-uploadable to PyPI (PyPI rejects direct-URL dependencies). Before any
-# PyPI release, publish socu to PyPI and pin it as "socu>=x".
-#
-# CUDA-bound packages (cupy-cuda12x / cuda13x, torch+cuXY, jax-cudaXY) are still
-# NOT listed here — install them via the matching extra (see optional extras).
+# `socu` provides the block-structured Warp kernels behind `MultistageSolver`.
+# CUDA-bound packages (cupy-cuda12x / cuda13x, torch+cuXY, jax-cudaXY) are NOT
+# listed here; install them via the matching extra (see optional extras).
 dependencies = [
   "numpy>=2.0",
   "scipy>=1.13",
-  "warp-lang>=1.12",
-  "nvmath-python>=0.7.0",
+  "warp-lang>=1.17",
+  "nvmath-python>=1.0.0",
   "nvtx>=0.2",
-  "socu @ git+https://github.com/PREDICT-EPFL/socu.git",
+  "socu>=0.1.0",
 ]
 
 [project.optional-dependencies]
@@ -70,8 +61,8 @@ dependencies = [
 #
 # These are mutually exclusive — installing both will resolve, but only the
 # wheel matching the driver actually loads at runtime.
-cuda12 = ["cupy-cuda12x", "nvmath-python[cu12]>=0.7.0"]
-cuda13 = ["cupy-cuda13x", "nvmath-python[cu13]>=0.7.0"]
+cuda12 = ["cupy-cuda12x", "nvmath-python[cu12]>=1.0.0"]
+cuda13 = ["cupy-cuda13x", "nvmath-python[cu13]>=1.0.0"]
 
 # --- Differentiable layers ----------------------------------------------
 # The `cupiqp.torch` and `cupiqp.jax` packages are always shipped in the
@@ -87,11 +78,7 @@ cuda13 = ["cupy-cuda13x", "nvmath-python[cu13]>=0.7.0"]
 torch = ["torch>=2.4"]
 jax   = ["jax>=0.4", "jaxlib>=0.4"]
 
-# NOTE: the multistage backend (`MultistageSolver`) is a first-class backend
-# alongside dense and sparse. Its `socu` dependency ships by default via the
-# core [dependencies] above, so there is deliberately NO `multistage` extra.
-
-# Everything — both differentiable layers (multistage already ships by default):
+# Everything (both differentiable layers):
 #   pip install "cupiqp[cuda13,all]"
 all   = ["torch>=2.4", "jax>=0.4", "jaxlib>=0.4"]
 test  = ["pytest>=7"]

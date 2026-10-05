@@ -1,8 +1,13 @@
+import math
 import warnings
 from dataclasses import dataclass
-from typing import Literal
+from enum import IntEnum
+from typing import Optional, Union
 
 import numpy as np
+import warp as wp
+
+from .utils import to_warp_dtype
 
 
 _F32_DEFAULTS = {
@@ -38,8 +43,7 @@ assert _F32_DEFAULTS.keys() == _F64_DEFAULTS.keys(), (
 
 @dataclass
 class Settings:
-    dtype: Literal["float32", "float64"] = "float64"
-    device: str = "cuda"
+    dtype: Union[type[wp.float32], type[wp.float64]] = wp.float64
 
     rho_init: float = 1e-6
     delta_init: float = 1e-4
@@ -67,8 +71,6 @@ class Settings:
 
     tau: float = 0.99
 
-    kkt_solver: Literal["sparse_ldlt", "dense_cholesky", "multistage_block_cholesky"] = "sparse_ldlt"
-
     iterative_refinement_always_enabled: bool = False
     iterative_refinement_eps_abs: float = 1e-12
     iterative_refinement_eps_rel: float = 1e-12
@@ -91,14 +93,14 @@ class Settings:
 
 
     @classmethod
-    def for_dtype(cls, dtype) -> "Settings":
-        if dtype == "float32":
+    def for_dtype(cls, dtype: Union[type[wp.float32], type[wp.float64]]) -> "Settings":
+        if dtype is wp.float32:
             defaults = _F32_DEFAULTS
-        elif dtype == "float64":
+        elif dtype is wp.float64:
             defaults = _F64_DEFAULTS
         else:
             raise ValueError(
-                f"Unsupported dtype {dtype!r}; expected 'float32' or 'float64'."
+                f"Unsupported dtype {dtype!r}; expected wp.float32 or wp.float64."
             )
         return cls(dtype=dtype, **defaults)
 
@@ -110,14 +112,14 @@ class Settings:
                 "to the solver constructor."
             )
         if (name in _F32_DEFAULTS
-                and self.__dict__.get("dtype") == "float32"
+                and self.__dict__.get("dtype") is wp.float32
                 and isinstance(value, (int, float))
                 and not isinstance(value, bool)
                 and 0 < value < _F32_DEFAULTS[name]):
             warnings.warn(
                 f"Settings.{name} = {value:g} is tighter than the float32 "
                 f"recommended {_F32_DEFAULTS[name]:g}, convergence may fail.",
-                stacklevel=2,
+                stacklevel=2
             )
         super().__setattr__(name, value)
 
@@ -141,10 +143,112 @@ class Settings:
                self.iterative_refinement_max_iter >= 0 and
                self.iterative_refinement_min_improvement_rate >= 1.0 and
                self.iterative_refinement_static_regularization_eps > 0 and
-               self.iterative_refinement_static_regularization_rel >= 0 and
-               self.kkt_solver in ["dense_cholesky", "sparse_ldlt", "multistage_block_cholesky"]
-               and self.dtype in ("float32", "float64")
-               and self.gradient_smoothing_mu > 0
-               and self.gradient_smoothing_tol > 0
+               self.iterative_refinement_static_regularization_rel >= 0
+               and self.dtype in (wp.float32, wp.float64)
+               and self.gradient_smoothing_mu > 0 and math.isfinite(self.gradient_smoothing_mu)
+               and self.gradient_smoothing_tol > 0 and math.isfinite(self.gradient_smoothing_tol)
                and self.gradient_smoothing_max_iter > 0
                )
+
+
+class SettingsFloatIdx(IntEnum):
+    """Index of each floating-point setting in ``DeviceSettings.floats``."""
+    rho_init = 0
+    delta_init = 1
+    eps_abs = 2
+    eps_rel = 3
+    eps_duality_gap_abs = 4
+    eps_duality_gap_rel = 5
+    infeasibility_threshold = 6
+    reg_lower_limit = 7
+    reg_finetune_lower_limit = 8
+    tau = 9
+
+
+class SettingsIntIdx(IntEnum):
+    """Index of each integer setting in ``DeviceSettings.ints``."""
+    check_duality_gap = 0
+    reg_finetune_primal_update_threshold = 1
+    reg_finetune_dual_update_threshold = 2
+    max_iter = 3
+    max_factor_retires = 4
+
+
+class DeviceSettings:
+    """The runtime subset of ``Settings`` as two GPU arrays.
+
+    ``floats`` holds the ``SettingsFloatIdx`` values in the solver dtype and
+    ``ints`` the ``SettingsIntIdx`` values as ``int32``. Both keep the same
+    address for the lifetime of the solver, so kernels and captured graphs
+    can hold on to them. ``upload()`` refreshes them from a ``Settings``
+    object through pinned host staging buffers, which makes the transfer an
+    asynchronous, capturable stream operation.
+    """
+
+    def __init__(self, dtype, device):
+        dtype = to_warp_dtype(dtype)
+        self.floats = wp.zeros(len(SettingsFloatIdx), dtype=dtype, device=device)
+        self.ints = wp.zeros(len(SettingsIntIdx), dtype=wp.int32, device=device)
+        # Pinned staging: an H2D copy from pageable memory synchronizes the
+        # stream, a copy from pinned memory does not.
+        self._floats_host = wp.zeros(len(SettingsFloatIdx), dtype=dtype, device="cpu", pinned=True)
+        self._ints_host = wp.zeros(len(SettingsIntIdx), dtype=wp.int32, device="cpu", pinned=True)
+        self._floats_np = self._floats_host.numpy()
+        self._ints_np = self._ints_host.numpy()
+        # The values on the device (None before the first upload), and an
+        # event recorded after the copies that put them there.
+        self._uploaded = None
+        self._copied = wp.Event(device)
+
+    def upload(self, settings: Settings, max_iter: Optional[int] = None) -> None:
+        """Queue a copy of the runtime values of ``settings`` to the device.
+
+        ``max_iter`` overrides ``settings.max_iter`` when given. Nothing is
+        copied when the values equal the ones already on the device. Otherwise
+        the copy is issued on the current stream without waiting for it; the
+        host only waits for the previous upload's copy, which must have read
+        the staging buffers before they are rewritten.
+
+        Raises ``RuntimeError`` when the values changed while the current
+        stream is being captured: a captured copy would read the staging
+        buffers when the graph is launched, not now.
+        """
+        F, I = SettingsFloatIdx, SettingsIntIdx
+        floats = {
+            F.rho_init: settings.rho_init,
+            F.delta_init: settings.delta_init,
+            F.eps_abs: settings.eps_abs,
+            F.eps_rel: settings.eps_rel,
+            F.eps_duality_gap_abs: settings.eps_duality_gap_abs,
+            F.eps_duality_gap_rel: settings.eps_duality_gap_rel,
+            F.infeasibility_threshold: settings.infeasibility_threshold,
+            F.reg_lower_limit: settings.reg_lower_limit,
+            F.reg_finetune_lower_limit: settings.reg_finetune_lower_limit,
+            F.tau: settings.tau,
+        }
+        ints = {
+            I.check_duality_gap: 1 if settings.check_duality_gap else 0,
+            I.reg_finetune_primal_update_threshold: settings.reg_finetune_primal_update_threshold,
+            I.reg_finetune_dual_update_threshold: settings.reg_finetune_dual_update_threshold,
+            I.max_iter: settings.max_iter if max_iter is None else int(max_iter),
+            I.max_factor_retires: settings.max_factor_retires,
+        }
+        values = (tuple(floats.items()), tuple(ints.items()))
+        if values == self._uploaded:
+            return
+        if wp.get_stream(self.floats.device).is_capturing:
+            raise RuntimeError(
+                "The solver settings changed while the solver stream is being "
+                "captured into a CUDA graph. The settings of a captured solve "
+                "are the ones of the last solve() before the capture: set them, "
+                "call solve() once, then capture."
+            )
+        wp.synchronize_event(self._copied)
+        for idx, value in floats.items():
+            self._floats_np[idx] = value
+        for idx, value in ints.items():
+            self._ints_np[idx] = value
+        wp.copy(self.floats, self._floats_host)
+        wp.copy(self.ints, self._ints_host)
+        wp.record_event(self._copied)
+        self._uploaded = values

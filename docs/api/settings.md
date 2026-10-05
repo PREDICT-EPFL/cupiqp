@@ -6,7 +6,10 @@ Every solver owns a `Settings` dataclass at `solver.settings`. Mutate its fields
 `setup()` or between solves:
 
 ```python
-solver = DenseSolver(dtype="float64")
+import warp as wp
+from cupiqp import DenseSolver
+
+solver = DenseSolver(dtype=wp.float64)
 solver.settings.verbose = True
 solver.settings.max_iter = 100
 solver.settings.eps_abs = 1e-6
@@ -19,9 +22,10 @@ You can also build a `Settings` object directly. The factory
 defaults** (see [Precision](#precision-and-dtype)):
 
 ```python
+import warp as wp
 from cupiqp import Settings
 
-settings = Settings.for_dtype("float32")
+settings = Settings.for_dtype(wp.float32)
 settings.max_iter = 200
 ```
 
@@ -34,11 +38,10 @@ settings.max_iter = 200
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `dtype` | `"float32"` \| `"float64"` | `"float64"` | Solver arithmetic precision (fixed at construction). |
-| `device` | `str` | `"cuda"` | Compute device. |
+| `dtype` | `wp.float32` \| `wp.float64` | `wp.float64` | Solver arithmetic precision (fixed at construction). |
 
 `float32` and `float64` carry **different default tolerances**, since you cannot ask for
-`float64`-level accuracy in `float32` arithmetic. `Settings.for_dtype("float32")` loosens
+`float64`-level accuracy in `float32` arithmetic. `Settings.for_dtype(wp.float32)` loosens
 the tolerances accordingly. If you tighten a `float32` tolerance below its recommended
 floor, the solver emits a warning that convergence may fail.
 
@@ -113,11 +116,6 @@ cuPIQP equilibrates the problem with a Ruiz preconditioner before solving.
 |---|---|---|
 | `enable_cuda_graph` | `True` | Capture the repeated IPM iteration as a CUDA graph and replay it with near-zero launch overhead. |
 | `use_deterministic_mode_for_cudss` | `False` | Bit-wise reproducible cuDSS factorizations (slower); sparse backend only. |
-| `kkt_solver` | backend-specific | KKT factorization: `"dense_cholesky"`, `"sparse_ldlt"`, or `"multistage_block_cholesky"`. Set automatically by the chosen solver class. |
-
-!!! note "`kkt_solver` is set by the solver class"
-    Each solver subclass fixes `kkt_solver` to match its backend
-    (`DenseSolver → "dense_cholesky"`, etc.). You normally do not set it by hand.
 
 ### Differentiation, diagnostics, and logging
 
@@ -133,5 +131,5 @@ cuPIQP equilibrates the problem with a Ruiz preconditioner before solving.
 ### Validation
 
 `settings.verify_settings()` returns `True` when every field is within its valid range
-(positive tolerances, `0 < tau ≤ 1`, a recognized `kkt_solver` and `dtype`, etc.). Use
+(positive tolerances, `0 < tau ≤ 1`, a recognized `dtype`, etc.). Use
 it as a quick sanity check after programmatically constructing settings.

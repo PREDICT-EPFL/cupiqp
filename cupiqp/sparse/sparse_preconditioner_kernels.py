@@ -171,3 +171,86 @@ def create_sparse_compute_kkt_norms_kernel(n: int, p: int, m: int, dtype=wp.floa
                 wp.atomic_max(d_iter, b, cc, wp.abs(G_data[b, k]))
 
     return sparse_compute_row_inf_norm_kernel, sparse_compute_col_inf_norm_kernel
+
+
+def create_sparse_P_norms_kernel(dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
+    """Per-index inf-norms of P treating the stored triangle symmetrically:
+    ``norms[b, i] = max(max_j |P[b, i, j]|, max_j |P[b, j, i]|)`` over the
+    stored entries. ``norms`` must be zeroed first. Launch with
+    ``dim=(B, nnz_P)``."""
+
+    @wp.kernel
+    def sparse_P_norms_kernel(
+        P_data:    wp.array2d(dtype=dtype),   # type: ignore  (B, nnz_P)
+        P_rows:    wp.array(dtype=wp.int32),  # type: ignore  (nnz_P,)
+        P_indices: wp.array(dtype=wp.int32),  # type: ignore  (nnz_P,)
+        norms:     wp.array2d(dtype=dtype),   # type: ignore  (B, n) in-out
+    ):
+        b, k = wp.tid()
+        v = wp.abs(P_data[b, k])
+        wp.atomic_max(norms, b, P_rows[k], v)
+        wp.atomic_max(norms, b, P_indices[k], v)
+
+    return sparse_P_norms_kernel
+
+
+def create_sparse_compute_gamma_kernel(min_scaling: float, max_scaling: float, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
+    """Per-problem cost-scaling factor from the P column norms and c:
+
+        g = clip(mean_i(norms[b, i]), min, max)
+        g = clip(max(g, max_i |c[b, i]|), min, max)
+        gamma[b] = 1 / g
+
+    Dispatch with ``wp.launch_tiled(dim=[B], block_dim=REDUCTION_BLOCK_DIM)``."""
+    lo = float(min_scaling)
+    hi = float(max_scaling)
+
+    @wp.kernel
+    def sparse_compute_gamma_kernel(
+        norms: wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        c:     wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        gamma: wp.array(dtype=dtype),    # type: ignore  (B,) output
+    ):
+        b, i = wp.tid()
+        n = norms.shape[1]
+        acc_sum = dtype(0.0)
+        acc_max = dtype(0.0)
+        for k in range(i, n, wp.block_dim()):
+            acc_sum += norms[b, k]
+            acc_max = wp.max(acc_max, wp.abs(c[b, k]))
+        total = wp.tile_sum(wp.tile(acc_sum))
+        c_max = wp.tile_max(wp.tile(acc_max))
+        if i == 0:
+            g = total[0] / dtype(n)
+            g = wp.clamp(g, dtype(lo), dtype(hi))
+            g = wp.max(g, c_max[0])
+            g = wp.clamp(g, dtype(lo), dtype(hi))
+            gamma[b] = dtype(1.0) / g
+
+    return sparse_compute_gamma_kernel
+
+
+def create_sparse_apply_gamma_kernel(dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
+    """Scale P values and c by ``gamma[b]`` and accumulate it into the cost
+    scaling. Launch with ``dim=(B, max(nnz_P, n))``."""
+
+    @wp.kernel
+    def sparse_apply_gamma_kernel(
+        P_data:       wp.array2d(dtype=dtype),  # type: ignore  (B, nnz_P) in-out
+        c:            wp.array2d(dtype=dtype),  # type: ignore  (B, n) in-out
+        cost_scaling: wp.array(dtype=dtype),    # type: ignore  (B,) in-out
+        gamma:        wp.array(dtype=dtype),    # type: ignore  (B,)
+    ):
+        b, i = wp.tid()
+        g = gamma[b]
+        if i < P_data.shape[1]:
+            P_data[b, i] = P_data[b, i] * g
+        if i < c.shape[1]:
+            c[b, i] = c[b, i] * g
+        if i == 0:
+            cost_scaling[b] = cost_scaling[b] * g
+
+    return sparse_apply_gamma_kernel

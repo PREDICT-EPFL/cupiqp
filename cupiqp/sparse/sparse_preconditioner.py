@@ -1,28 +1,25 @@
-from typing import Optional
-
-import cupy as cp
 import warp as wp
 
 from .sparse_data import SparseData
 from ..preconditioner import RuizEquilibration
-from .batched_csr import UniformBatchedCsrMatrix
+from ..preconditioner_kernels import REDUCTION_BLOCK_DIM
 from .sparse_preconditioner_kernels import (
     create_sparse_scale_matrices_kernel,
     create_sparse_compute_kkt_norms_kernel,
+    create_sparse_P_norms_kernel,
+    create_sparse_compute_gamma_kernel,
+    create_sparse_apply_gamma_kernel
 )
 
 
 class SparseRuizEquilibration(RuizEquilibration):
     """Ruiz equilibration for the sparse CSR backend.
 
-    After the ``SparseData`` refactor, ``data.P`` / ``data.A`` / ``data.G``
-    are always :class:`UniformBatchedCsrMatrix` instances (B = 1 is just a 1-batch
-    batched matrix), so this class only has a single batched code path —
-    no ``isinstance(P, list)`` branching.
-
-    All in-place scaling and norm computations act on the shared
-    ``(B, nnz)`` values buffer via ``M.data`` (zero-copy), and on the
-    shared ``indptr`` / ``indices`` via ``M.indptr`` / ``M.indices``.
+    ``data.P`` / ``data.A`` / ``data.G`` are :class:`UniformBatchedCsrMatrix`
+    instances (B = 1 is a one-element batch), so there is a single batched
+    code path. All norm and scaling computations are Warp kernels over the
+    shared ``(B, nnz)`` values buffer ``M.data`` and the shared ``indptr`` /
+    ``indices``.
     """
 
     def __init__(self, *args, **kwargs):
@@ -30,19 +27,25 @@ class SparseRuizEquilibration(RuizEquilibration):
         self._sparse_scale_matrices_kernel = create_sparse_scale_matrices_kernel(self.n, self.p, self.m, dtype=self._dtype)
         self._sparse_compute_row_inf_norm_kernel, self._sparse_compute_col_inf_norm_kernel = \
             create_sparse_compute_kkt_norms_kernel(self.n, self.p, self.m, dtype=self._dtype)
+        self._sparse_P_norms_kernel = create_sparse_P_norms_kernel(dtype=self._dtype)
+        self._sparse_compute_gamma_kernel = create_sparse_compute_gamma_kernel(
+            self.min_scaling, self.max_scaling, dtype=self._dtype)
+        self._sparse_apply_gamma_kernel = create_sparse_apply_gamma_kernel(dtype=self._dtype)
 
-        self._ones = cp.ones(self.B, dtype=self._dtype)
+        self._ones = wp.full(self.B, 1.0, dtype=self._dtype, device=self._device)
+        # Per-column inf-norms of P (row and column max) and the resulting
+        # cost-scaling factor, reused by every apply_cost_scaling call.
+        self._P_norms = wp.zeros((self.B, self.n), dtype=self._dtype, device=self._device)
+        self._gamma_buf = wp.empty(self.B, dtype=self._dtype, device=self._device)
 
     # ------------------------------------------------------------------
     # 3-hook backend API
     # ------------------------------------------------------------------
 
-    def compute_kkt_norms(self, data: SparseData,
-                          d_iter: cp.ndarray, d_b_iter: cp.ndarray):
+    def compute_kkt_norms(self, data: SparseData, d_iter: wp.array, d_b_iter: wp.array):
         rows_max = max(self.n, self.p, self.m)
         if rows_max == 0:
             return
-        stream = wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr)
         wp.launch(
             kernel=self._sparse_compute_row_inf_norm_kernel,
             dim=(self.B, rows_max),
@@ -52,9 +55,9 @@ class SparseRuizEquilibration(RuizEquilibration):
                 data.G.data, data.G.indptr,
                 self._x_b_scaling, d_iter, d_b_iter,
             ],
-            device="cuda", stream=stream,
+            device=self._device
         )
-        
+
         nnz_max = max(int(data.A.nnz), int(data.G.nnz))
         if nnz_max > 0 and (self.p > 0 or self.m > 0):
             wp.launch(
@@ -65,12 +68,11 @@ class SparseRuizEquilibration(RuizEquilibration):
                     data.G.data, data.G.indices,
                     d_iter,
                 ],
-                device="cuda", stream=stream,
+                device=self._device
             )
 
-    def scale_matrices(self, data: SparseData,
-                       d_x: cp.ndarray, d_y: cp.ndarray, d_z: cp.ndarray,
-                       cost_scaling_factor: Optional[cp.ndarray] = None):
+    def scale_matrices(self, data: SparseData, d_x: wp.array, d_y: wp.array, d_z: wp.array,
+                       cost_scaling_factor: wp.array = None):
         cost_factor = cost_scaling_factor if cost_scaling_factor is not None else self._ones
         rows_max = max(self.n, self.p, self.m)
         if rows_max == 0:
@@ -84,58 +86,35 @@ class SparseRuizEquilibration(RuizEquilibration):
                 data.G.data, data.G.indptr, data.G.indices,
                 data.c, d_x, d_y, d_z, cost_factor,
             ],
-            device="cuda",
-            stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
+            device=self._device
         )
 
     def apply_cost_scaling(self, data: SparseData):
-        P_norms = self._batched_utri_symmetric_col_inf_norms(data.P)  # (B, n)
-        gamma = cp.mean(P_norms, axis=1)                                # (B,)
-        gamma = cp.clip(gamma, self.min_scaling, self.max_scaling)
-        c_norm = cp.max(cp.abs(data.c), axis=1)                        # (B,)
-        gamma = cp.maximum(gamma, c_norm)
-        gamma = cp.clip(gamma, self.min_scaling, self.max_scaling)
-        gamma = 1.0 / gamma                                             # (B,)
-        data.P.data[:] *= gamma[:, None]
-        data.c[:] *= gamma[:, None]
-        self._cost_scaling *= gamma
+        """Per-problem cost scaling gamma = 1 / clip(max(mean(||P_cols||), ||c||)).
 
-    # ------------------------------------------------------------------
-    # Batched CSR primitives — operate on a UniformBatchedCsrMatrix's shared
-    # sparsity + (B, nnz) values buffer
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _row_indices_from_indptr(indptr: cp.ndarray, nnz: int) -> cp.ndarray:
-        """nnz-length array mapping each CSR entry to its row index."""
-        if nnz == 0:
-            return cp.zeros(0, dtype=cp.int32)
-        nz = cp.arange(nnz, dtype=cp.int32)
-        return cp.searchsorted(indptr[1:], nz, side='right').astype(cp.int32)
-
-    def _batched_row_inf_norms(self, M: UniformBatchedCsrMatrix, out: cp.ndarray):
-        """Row inf-norms: out[b, r] = max_j |M[b, r, j]|. out shape: (B, rows)."""
-        out.fill(0.0)
-        if M.nnz == 0 or M.rows == 0:
-            return
-        row_idx = self._row_indices_from_indptr(M.indptr, M.nnz)
-        cp.maximum.at(out, (slice(None), row_idx), cp.abs(M.data))
-
-    def _batched_col_inf_norms(self, M: UniformBatchedCsrMatrix, out: cp.ndarray):
-        """Column inf-norms: out[b, c] = max_i |M[b, i, c]|. out shape: (B, cols)."""
-        out.fill(0.0)
-        if M.nnz == 0 or M.cols == 0:
-            return
-        cp.maximum.at(out, (slice(None), M.indices), cp.abs(M.data))
-
-    def _batched_utri_symmetric_col_inf_norms(self, P: UniformBatchedCsrMatrix) -> cp.ndarray:
-        """For a symmetric P stored as upper triangle only, per-batch column
-        inf-norms treat missing lower-triangle entries via row/col max."""
-        B, n = P.batch_size, P.rows
-        if P.nnz == 0:
-            return cp.zeros((B, n), dtype=self._dtype)
-        row = cp.empty((B, n), dtype=self._dtype)
-        col = cp.empty((B, n), dtype=self._dtype)
-        self._batched_row_inf_norms(P, row)
-        self._batched_col_inf_norms(P, col)
-        return cp.maximum(row, col)
+        Scales P and c by gamma and accumulates gamma into the cost scaling.
+        The column norms of P treat the stored triangle symmetrically (row and
+        column max per index).
+        """
+        P = data.P
+        self._P_norms.zero_()
+        if P.nnz > 0:
+            wp.launch(
+                kernel=self._sparse_P_norms_kernel,
+                dim=(self.B, P.nnz),
+                inputs=[P.data, P.row_indices, P.indices, self._P_norms],
+                device=self._device
+            )
+        wp.launch_tiled(
+            kernel=self._sparse_compute_gamma_kernel,
+            dim=[self.B],
+            inputs=[self._P_norms, data.c, self._gamma_buf],
+            block_dim=REDUCTION_BLOCK_DIM,
+            device=self._device
+        )
+        wp.launch(
+            kernel=self._sparse_apply_gamma_kernel,
+            dim=(self.B, max(P.nnz, self.n)),
+            inputs=[P.data, data.c, self._cost_scaling, self._gamma_buf],
+            device=self._device
+        )

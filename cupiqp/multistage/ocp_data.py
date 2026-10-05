@@ -1,13 +1,11 @@
 from types import MappingProxyType
-from typing import Sequence, Union, Literal
+from typing import Sequence, Union
 
 import numpy as np
-import cupy as cp
 import warp as wp
 
-from ..typedef import CudaArray
-from ..utils import to_warp_dtype, is_cuda_array
-from .multistage_utils import BlockTridiagMat, BlockBidiagMat, BlockVec
+from ..utils import to_warp_dtype, as_warp_array, batch_broadcast_view, strided_view
+from .ocp_data_kernels import create_ocp_data_kernels
 
 
 # Finite placeholder magnitude for a declared-but-not-yet-set bound. It must be
@@ -44,12 +42,12 @@ def _normalize_idx(spec, dim: int, name: str) -> np.ndarray:
 class OcpData:
     r"""Block-structured data of an optimal-control QP, with HPIPM-style access.
 
-    ``OcpData`` owns the multistage block containers for a single OCP structure
+    ``OcpData`` owns the multistage block storage for a single OCP structure
     (over stages ``k = 0, ..., N`` with stage variable ``y_k = [x_k; u_k]``) and
     lets you fill them field by field with :meth:`set_field`, using HPIPM field
     names.
     It is a *pure data holder*: it does not solve, scale, or clone -- the solver
-    (:class:`OcpSolver`) reads :attr:`blocks` and keeps its own scaled copy. This
+    (:class:`OcpSolver`) reads :attr:`arrays` and keeps its own scaled copy. This
     is what keeps the raw values you set separate from the Ruiz-scaled data the
     interior-point method factorizes.
 
@@ -67,6 +65,8 @@ class OcpData:
     * the box bounds act on the state components in ``idxbx`` and input components
       in ``idxbu``.
 
+    All storage is Warp arrays with a leading batch axis.
+
     Parameters
     ----------
     N : int
@@ -80,7 +80,7 @@ class OcpData:
         a single ``2``), in ``[0, nx)`` / ``[0, nu)``. ``None`` (default) means no
         box bounds for that category. State bounds apply at stages ``0..N``;
         input bounds apply at control stages ``0..N-1``.
-    dtype : {"float64", "float32"}, default: "float64"
+    dtype : {wp.float64, wp.float32}, default: wp.float64
     device : str, default: "cuda"
     batch_size : int, default: 1
         Number of OCPs stored together (leading batch axis).
@@ -89,7 +89,7 @@ class OcpData:
     def __init__(self, N: int, nx: int, nu: int, ng: int = 0,
                  idxbx: Union[int, Sequence[int], None] = None,
                  idxbu: Union[int, Sequence[int], None] = None,
-                 dtype: Literal["float32", "float64"] = "float64",
+                 dtype: Union[type[wp.float32], type[wp.float64]] = wp.float64,
                  device: str = "cuda",
                  batch_size: int = 1) -> None:
         assert isinstance(N, (int, np.integer)) and N >= 1, "N must be an integer >= 1."
@@ -102,7 +102,9 @@ class OcpData:
         self._d = self._nx + self._nu
         self._idxbx = _normalize_idx(idxbx, self._nx, "idxbx")
         self._idxbu = _normalize_idx(idxbu, self._nu, "idxbu")
-        self._cp_dtype = cp.dtype(dtype)
+        self._dtype = to_warp_dtype(dtype)
+        self._device = device
+        self._kernels = create_ocp_data_kernels(self._dtype)
 
         nx, nu, ng, N, B = self._nx, self._nu, self._ng, self._N, self._batch_size
         _base = {
@@ -129,70 +131,54 @@ class OcpData:
             f: ((B,) + shape, lo, hi) for f, (shape, lo, hi) in _base.items()
         }
 
-        blk_size, N_blk, B = self._d, self._N + 1, self._batch_size
-        wp_dtype = to_warp_dtype(dtype)
+        blk_size, N_blk = self._d, self._N + 1
 
-        # ---- allocate the block containers ----
-        self._P_raw = BlockTridiagMat(num_diag_blocks=N_blk, block_size=blk_size,
-                            batch_size=B, dtype=wp_dtype, device=device)
-        self._c_raw = BlockVec(num_blocks=N_blk, rows=blk_size, batch_size=B, dtype=wp_dtype, device=device)
-        self._A_raw = BlockBidiagMat(rows_of_blocks=self._nx, cols_of_blocks=blk_size, N=N_blk,
-                           batch_size=B, dtype=wp_dtype, device=device)
-        self._b_raw = BlockVec(num_blocks=N_blk + 1, rows=self._nx, batch_size=B, dtype=wp_dtype, device=device)
+        # ---- allocate the block storage (Warp arrays, batch axis first) ----
+        self._P_diag = wp.zeros((B, N_blk, blk_size, blk_size), dtype=self._dtype, device=device)
+        self._P_offdiag = wp.zeros((B, N_blk - 1, blk_size, blk_size), dtype=self._dtype, device=device)
+        self._c = wp.zeros((B, N_blk, blk_size), dtype=self._dtype, device=device)
+        self._A_diag = wp.zeros((B, N_blk, self._nx, blk_size), dtype=self._dtype, device=device)
+        self._A_offdiag = wp.zeros((B, N_blk, self._nx, blk_size), dtype=self._dtype, device=device)
+        self._b = wp.zeros((B, N_blk + 1, self._nx), dtype=self._dtype, device=device)
+        self._G_diag = wp.zeros((B, N_blk, self._ng, blk_size), dtype=self._dtype, device=device)
+        self._G_offdiag = wp.zeros((B, N_blk, self._ng, blk_size), dtype=self._dtype, device=device)
+        self._h_l = wp.zeros((B, N_blk + 1, self._ng), dtype=self._dtype, device=device)
+        self._h_u = wp.zeros((B, N_blk + 1, self._ng), dtype=self._dtype, device=device)
+        self._x_l = wp.zeros((B, N_blk, blk_size), dtype=self._dtype, device=device)
+        self._x_u = wp.zeros((B, N_blk, blk_size), dtype=self._dtype, device=device)
 
-        self._G_raw = BlockBidiagMat(rows_of_blocks=self._ng, cols_of_blocks=blk_size, N=N_blk,
-                            batch_size=B, dtype=wp_dtype, device=device)
-        self._h_l_raw = BlockVec(num_blocks=N_blk + 1, rows=self._ng, batch_size=B, dtype=wp_dtype, device=device)
-        self._h_u_raw = BlockVec(num_blocks=N_blk + 1, rows=self._ng, batch_size=B, dtype=wp_dtype, device=device)
-
-        self._x_l_raw = BlockVec(num_blocks=N_blk, rows=blk_size, batch_size=B, dtype=wp_dtype, device=device)
-        self._x_u_raw = BlockVec(num_blocks=N_blk, rows=blk_size, batch_size=B, dtype=wp_dtype, device=device)
-
-        self._blocks = {
-            "P": self._P_raw,
-            "c": self._c_raw,
-            "A": self._A_raw,
-            "b": self._b_raw,
-            "G": self._G_raw,
-            "h_l": self._h_l_raw,
-            "h_u": self._h_u_raw,
-            "x_l": self._x_l_raw,
-            "x_u": self._x_u_raw,
-        }
-        self._blocks_view = MappingProxyType(self._blocks)
+        # Box-bounded columns of the stage variable y_k = [x_k; u_k].
+        self._cols_bx = wp.array(self._idxbx.astype(np.int32), dtype=wp.int32, device=device)
+        self._cols_bu = wp.array((self._nx + self._idxbu).astype(np.int32), dtype=wp.int32, device=device)
 
         # ---- structural defaults ----
-        A_D = cp.from_dlpack(wp.to_dlpack(self._A_raw.D))
-        eye_nx = cp.eye(self._nx, dtype=self._cp_dtype)
         # initial-condition row 0:  [I, 0] y_0 = x0
-        A_D[:, 0, :, :self._nx] = eye_nx
         # stage-coupling rows 1..N: default descriptor E_k = I -> D[k+1] = [-I, 0]
-        A_D[:, 1:, :, :self._nx] = -eye_nx
+        wp.launch(self._kernels["init_coupling_diag"], dim=(B, N_blk, self._nx),
+                  inputs=[self._A_diag], device=device)
 
         # box bounds: everything free, declared components set to a finite sentinel
-        xl = cp.from_dlpack(wp.to_dlpack(self._x_l_raw.data))
-        xu = cp.from_dlpack(wp.to_dlpack(self._x_u_raw.data))
-        xl[:] = -cp.inf
-        xu[:] = cp.inf
+        self._x_l.fill_(-float("inf"))
+        self._x_u.fill_(float("inf"))
         if self._idxbx.size:
-            jx = cp.asarray(self._idxbx)
-            xl[:, :, jx] = -_BOUND_SENTINEL
-            xu[:, :, jx] = _BOUND_SENTINEL
+            wp.launch(self._kernels["fill_cols"], dim=(B, N_blk, self._idxbx.size),
+                      inputs=[self._x_l, self._cols_bx, self._dtype(-_BOUND_SENTINEL)], device=device)
+            wp.launch(self._kernels["fill_cols"], dim=(B, N_blk, self._idxbx.size),
+                      inputs=[self._x_u, self._cols_bx, self._dtype(_BOUND_SENTINEL)], device=device)
         if self._idxbu.size:
-            ju = cp.asarray(self._nx + self._idxbu)
             # u_N is padding used only to keep a uniform stage block size.
-            xl[:, :self._N, ju] = -_BOUND_SENTINEL
-            xu[:, :self._N, ju] = _BOUND_SENTINEL
+            wp.launch(self._kernels["fill_cols"], dim=(B, self._N, self._idxbu.size),
+                      inputs=[self._x_l, self._cols_bu, self._dtype(-_BOUND_SENTINEL)], device=device)
+            wp.launch(self._kernels["fill_cols"], dim=(B, self._N, self._idxbu.size),
+                      inputs=[self._x_u, self._cols_bu, self._dtype(_BOUND_SENTINEL)], device=device)
 
         if self._ng > 0:
             # all ng rows present at stages 0..N (finite sentinel); the trailing
             # padding row stays infinite so the backend drops it.
-            hl = cp.from_dlpack(wp.to_dlpack(self._h_l_raw.data))
-            hu = cp.from_dlpack(wp.to_dlpack(self._h_u_raw.data))
-            hl[:] = -cp.inf
-            hu[:] = cp.inf
-            hl[:, :N_blk, :] = -_BOUND_SENTINEL
-            hu[:, :N_blk, :] = _BOUND_SENTINEL
+            self._h_l.fill_(-float("inf"))
+            self._h_u.fill_(float("inf"))
+            self._h_l[:, :N_blk, :].fill_(-_BOUND_SENTINEL)
+            self._h_u[:, :N_blk, :].fill_(_BOUND_SENTINEL)
 
 
     @property
@@ -236,21 +222,33 @@ class OcpData:
         return self._idxbu
 
     @property
-    def blocks(self):
-        """Read-only mapping from solver block-group names to containers.
+    def arrays(self):
+        """Read-only mapping of the problem data as MultistageSolver inputs.
 
-        The mapping structure is immutable. The contained GPU buffers are owned
-        by this object and should be modified only through :meth:`set_field`.
+        Keys ``P, c, A, b, G, h_l, h_u, x_l, x_u``; matrices are
+        ``(diag, offdiag)`` pairs and vectors ``(B, num_blocks, rows)`` arrays,
+        all the Warp buffers owned by this object. Modify them only through
+        :meth:`set_field`.
         """
-        return self._blocks_view
+        return MappingProxyType({
+            "P": (self._P_diag, self._P_offdiag),
+            "c": self._c,
+            "A": (self._A_diag, self._A_offdiag),
+            "b": self._b,
+            "G": (self._G_diag, self._G_offdiag),
+            "h_l": self._h_l,
+            "h_u": self._h_u,
+            "x_l": self._x_l,
+            "x_u": self._x_u,
+        })
 
-    def set_field(self, field: str, stage: int, value: CudaArray) -> None:
+    def set_field(self, field: str, stage: int, value: wp.array) -> None:
         """Set one block of OCP data at a given stage.
 
         ``field`` is an HPIPM field name (``A``, ``B``, ``E``, ``b``, ``x0``,
         ``Q``, ``R``, ``S``, ``q``, ``r``, ``C``, ``D``, ``lg``, ``ug``,
-        ``lbx``, ``ubx``, ``lbu``, ``ubu``). ``value`` must be a CUDA array;
-        cuPIQP is GPU-only and never silently copies host data to the device.
+        ``lbx``, ``ubx``, ``lbu``, ``ubu``). ``value`` is a Warp array of this
+        object's dtype (``OcpSolver.set`` converts user arrays).
 
         ``value`` must match exactly one of two shapes:
 
@@ -277,86 +275,103 @@ class OcpData:
 
         expected_shape, lo, hi = self._field_specific_info[field]
         k = self._check_stage(stage, lo, hi, field)
-        if not is_cuda_array(value):
-            raise TypeError(
-                f"field {field!r}: value must be a CUDA array; got {type(value)}."
-            )
-        val = cp.asarray(value)
-        self._check_value_shape(field, val, expected_shape)
+        val = self._batched_value(field, value, expected_shape)
+        kernels = self._kernels
+        one = self._dtype(1.0)
+        minus_one = self._dtype(-1.0)
+        B = self._batch_size
+
+        def block(dst, k, row0, col0, src, scale=one, transpose=0):
+            rows = int(src.shape[2]) if transpose else int(src.shape[1])
+            cols = int(src.shape[1]) if transpose else int(src.shape[2])
+            if rows == 0 or cols == 0:
+                return
+            wp.launch(kernels["set_block"], dim=(B, rows, cols),
+                      inputs=[dst, wp.int32(k), wp.int32(row0), wp.int32(col0), src, scale, wp.int32(transpose)],
+                      device=self._device)
+
+        def vec(dst, k, col0, src, scale=one):
+            if int(src.shape[1]) == 0:
+                return
+            wp.launch(kernels["set_vec"], dim=(B, int(src.shape[1])),
+                      inputs=[dst, wp.int32(k), wp.int32(col0), src, scale],
+                      device=self._device)
 
         if field == "x0":
-            cp.from_dlpack(wp.to_dlpack(self._b_raw.data))[:, 0, :] = val
-        elif field in ("A", "B", "E", "b"):
-            if field == "A":
-                cp.from_dlpack(wp.to_dlpack(self._A_raw.E))[:, k, :, :nx] = val
-            elif field == "B":
-                cp.from_dlpack(wp.to_dlpack(self._A_raw.E))[:, k, :, nx:] = val
-            elif field == "E":
-                cp.from_dlpack(wp.to_dlpack(self._A_raw.D))[:, k + 1, :, :nx] = -val
-            else:
-                cp.from_dlpack(wp.to_dlpack(self._b_raw.data))[:, k + 1, :] = -val
-        elif field in ("Q", "R", "S"):
-            P = cp.from_dlpack(wp.to_dlpack(self._P_raw.D))
-            if field == "Q":
-                P[:, k, :nx, :nx] = val
-            elif field == "R":
-                P[:, k, nx:, nx:] = val
-            else:
-                P[:, k, nx:, :nx] = val
-                P[:, k, :nx, nx:] = cp.swapaxes(val, -1, -2)
-        elif field in ("q", "r"):
-            c = cp.from_dlpack(wp.to_dlpack(self._c_raw.data))
-            if field == "q":
-                c[:, k, :nx] = val
-            else:
-                c[:, k, nx:] = val
-        elif field in ("C", "D", "lg", "ug"):
-            if field == "C":
-                cp.from_dlpack(wp.to_dlpack(self._G_raw.D))[:, k, :, :nx] = val
-            elif field == "D":
-                cp.from_dlpack(wp.to_dlpack(self._G_raw.D))[:, k, :, nx:] = val
-            elif field == "lg":
-                cp.from_dlpack(wp.to_dlpack(self._h_l_raw.data))[:, k, :] = val
-            else:
-                cp.from_dlpack(wp.to_dlpack(self._h_u_raw.data))[:, k, :] = val
+            vec(self._b, 0, 0, val)
+        elif field == "A":
+            block(self._A_offdiag, k, 0, 0, val)
+        elif field == "B":
+            block(self._A_offdiag, k, 0, nx, val)
+        elif field == "E":
+            block(self._A_diag, k + 1, 0, 0, val, scale=minus_one)
+        elif field == "b":
+            vec(self._b, k + 1, 0, val, scale=minus_one)
+        elif field == "Q":
+            block(self._P_diag, k, 0, 0, val)
+        elif field == "R":
+            block(self._P_diag, k, nx, nx, val)
+        elif field == "S":
+            block(self._P_diag, k, nx, 0, val)
+            block(self._P_diag, k, 0, nx, val, transpose=1)
+        elif field == "q":
+            vec(self._c, k, 0, val)
+        elif field == "r":
+            vec(self._c, k, nx, val)
+        elif field == "C":
+            block(self._G_diag, k, 0, 0, val)
+        elif field == "D":
+            block(self._G_diag, k, 0, nx, val)
+        elif field == "lg":
+            vec(self._h_l, k, 0, val)
+        elif field == "ug":
+            vec(self._h_u, k, 0, val)
         else:
-            if field in ("lbx", "ubx"):
-                cols = cp.asarray(self._idxbx)
-            else:
-                cols = cp.asarray(nx + self._idxbu)
-            if field in ("lbx", "lbu"):
-                cp.from_dlpack(wp.to_dlpack(self._x_l_raw.data))[:, k, cols] = val
-            else:
-                cp.from_dlpack(wp.to_dlpack(self._x_u_raw.data))[:, k, cols] = val
+            cols = self._cols_bx if field in ("lbx", "ubx") else self._cols_bu
+            dst = self._x_l if field in ("lbx", "lbu") else self._x_u
+            wp.launch(kernels["set_vec_cols"], dim=(B, int(cols.shape[0])),
+                      inputs=[dst, wp.int32(k), cols, val],
+                      device=self._device)
 
-    def _staged(self, x_flat: cp.ndarray) -> cp.ndarray:
-        return x_flat.reshape(self._batch_size, self._N + 1, self._d)
+    def _batched_value(self, field: str, value: wp.array, expected_shape: tuple) -> wp.array:
+        """``(B, ...)`` view of a field value: the value itself when batched,
+        or a zero-stride batch view of an unbatched value."""
+        shape = tuple(value.shape)
+        if shape == expected_shape:
+            return value
+        if shape == expected_shape[1:]:
+            return batch_broadcast_view(value, self._batch_size)
+        raise ValueError(
+            f"field {field!r} has shape {shape}; expected {expected_shape} "
+            f"or {expected_shape[1:]} (unbatched, broadcast across the batch)."
+        )
 
-    def state_traj(self, x_flat: cp.ndarray) -> cp.ndarray:
+    def _staged(self, x_flat: wp.array) -> wp.array:
+        """``(B, N+1, d)`` view of a flat ``(B, n)`` primal solution (zero-copy)."""
+        x_flat = as_warp_array(x_flat, "x")
+        itemsize = wp.types.type_size_in_bytes(x_flat.dtype)
+        return strided_view(
+            x_flat, (self._batch_size, self._N + 1, self._d),
+            (x_flat.strides[0], self._d * itemsize, itemsize)
+        )
+
+    def state_traj(self, x_flat) -> wp.array:
         """State trajectory ``(B, N+1, nx)`` from a flat primal solution."""
         return self._staged(x_flat)[:, :, :self._nx]
 
-    def input_traj(self, x_flat: cp.ndarray) -> cp.ndarray:
+    def input_traj(self, x_flat) -> wp.array:
         """Input trajectory ``(B, N, nu)`` (the dummy ``u_N`` is dropped)."""
         return self._staged(x_flat)[:, :self._N, self._nx:]
 
-    def state(self, x_flat: cp.ndarray, stage: int) -> cp.ndarray:
+    def state(self, x_flat, stage: int) -> wp.array:
         """Stage state ``(B, nx)`` for ``stage = 0..N``."""
         k = self._check_stage(stage, 0, self._N, "x")
         return self._staged(x_flat)[:, k, :self._nx]
 
-    def input(self, x_flat: cp.ndarray, stage: int) -> cp.ndarray:
+    def input(self, x_flat, stage: int) -> wp.array:
         """Stage input ``(B, nu)`` for ``stage = 0..N-1`` (``u_N`` is a dummy)."""
         k = self._check_stage(stage, 0, self._N - 1, "u")
         return self._staged(x_flat)[:, k, self._nx:]
-
-    def _check_value_shape(self, field: str, value: cp.ndarray, expected_shape: tuple) -> None:
-        shape = value.shape
-        if shape != expected_shape and shape != expected_shape[1:]:
-            raise ValueError(
-                f"field {field!r} has shape {shape}; expected {expected_shape} "
-                f"or {expected_shape[1:]} (unbatched, broadcast across the batch)."
-            )
 
     @staticmethod
     def _check_stage(stage: int, lb: int, ub: int, field: str) -> int:

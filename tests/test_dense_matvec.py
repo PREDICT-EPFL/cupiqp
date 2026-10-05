@@ -8,6 +8,7 @@ and graph-capture coverage. Tolerances are dtype-specific (see ``_atol``).
 import cupy as cp
 import numpy as np
 import pytest
+import warp as wp
 
 from cupiqp.dense.cublas_wrappers import (
     dgemv,
@@ -25,16 +26,24 @@ from cupiqp.dense.cublas_wrappers import (
 DTYPES = [cp.float64, cp.float32]
 
 
+def _w(a):
+    """Zero-copy Warp view: the wrappers take Warp arrays only."""
+    return wp.array(a, copy=False)
+
+
 def _gemv(dtype):
-    return dgemv if dtype == cp.float64 else sgemv
+    f = dgemv if dtype == cp.float64 else sgemv
+    return lambda handle, A, x, y, **kw: f(handle, _w(A), _w(x), _w(y), **kw)
 
 
 def _gemv_batched(dtype):
-    return dgemv_strided_batched if dtype == cp.float64 else sgemv_strided_batched
+    f = dgemv_strided_batched if dtype == cp.float64 else sgemv_strided_batched
+    return lambda handle, A, x, y, **kw: f(handle, _w(A), _w(x), _w(y), **kw)
 
 
 def _gemm_batched(dtype):
-    return dgemm_strided_batched if dtype == cp.float64 else sgemm_strided_batched
+    f = dgemm_strided_batched if dtype == cp.float64 else sgemm_strided_batched
+    return lambda handle, A, B, C, **kw: f(handle, _w(A), _w(B), _w(C), **kw)
 
 
 def _atol(dtype):
@@ -52,7 +61,7 @@ def handle():
 
 def _random_dense(m, n, order="C", dtype=cp.float64, seed=42):
     rng = np.random.default_rng(seed)
-    return cp.array(rng.standard_normal((m, n)), dtype=dtype, order=order)
+    return cp.array(rng.standard_normal((m, n)), dtype=dtype)
 
 
 # Mixed shape coverage: tiny / square / tall / wide / asymmetric / large.
@@ -75,13 +84,12 @@ SHAPES = [
 
 
 # ---------------------------------------------------------------------------
-# Shape × order × dtype matrix
+# Shape x dtype matrix (row-major only: the wrappers assume C-contiguous arrays)
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("order", ["C", "F"])
 @pytest.mark.parametrize("m,n", SHAPES)
-def test_basic_gemv(handle, m, n, order, dtype):
-    A = _random_dense(m, n, order=order, dtype=dtype, seed=m * 1000 + n)
+def test_basic_gemv(handle, m, n, dtype):
+    A = _random_dense(m, n, dtype=dtype, seed=m * 1000 + n)
     rng = np.random.default_rng(m * 7 + n)
     x = cp.asarray(rng.standard_normal(n), dtype=dtype)
     y = cp.zeros(m, dtype=dtype)
@@ -92,10 +100,9 @@ def test_basic_gemv(handle, m, n, order, dtype):
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("order", ["C", "F"])
 @pytest.mark.parametrize("m,n", SHAPES)
-def test_transpose(handle, m, n, order, dtype):
-    A = _random_dense(m, n, order=order, dtype=dtype, seed=m * 31 + n)
+def test_transpose(handle, m, n, dtype):
+    A = _random_dense(m, n, dtype=dtype, seed=m * 31 + n)
     rng = np.random.default_rng(m * 13 + n + 1)
     x = cp.asarray(rng.standard_normal(m), dtype=dtype)
     y = cp.zeros(n, dtype=dtype)
@@ -106,10 +113,9 @@ def test_transpose(handle, m, n, order, dtype):
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("order", ["C", "F"])
 @pytest.mark.parametrize("m,n", SHAPES)
-def test_alpha_beta(handle, m, n, order, dtype):
-    A = _random_dense(m, n, order=order, dtype=dtype, seed=m * 17 + n + 2)
+def test_alpha_beta(handle, m, n, dtype):
+    A = _random_dense(m, n, dtype=dtype, seed=m * 17 + n + 2)
     rng = np.random.default_rng(m * 19 + n + 3)
     x = cp.asarray(rng.standard_normal(n), dtype=dtype)
     y = cp.asarray(rng.standard_normal(m), dtype=dtype)
@@ -123,10 +129,9 @@ def test_alpha_beta(handle, m, n, order, dtype):
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("order", ["C", "F"])
 @pytest.mark.parametrize("m,n", SHAPES)
-def test_alpha_beta_transpose(handle, m, n, order, dtype):
-    A = _random_dense(m, n, order=order, dtype=dtype, seed=m * 23 + n + 4)
+def test_alpha_beta_transpose(handle, m, n, dtype):
+    A = _random_dense(m, n, dtype=dtype, seed=m * 23 + n + 4)
     rng = np.random.default_rng(m * 29 + n + 5)
     x = cp.asarray(rng.standard_normal(m), dtype=dtype)
     y = cp.asarray(rng.standard_normal(n), dtype=dtype)
@@ -240,9 +245,8 @@ def test_scalar_matrix(handle, dtype):
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("transa", [False, True])
-@pytest.mark.parametrize("order", ["C", "F"])
-def test_cuda_graph_capture(handle, transa, order, dtype):
-    A = _random_dense(4, 5, order=order, dtype=dtype)
+def test_cuda_graph_capture(handle, transa, dtype):
+    A = _random_dense(4, 5, dtype=dtype)
     x = cp.ones(4 if transa else 5, dtype=dtype)
     y = cp.zeros(5 if transa else 4, dtype=dtype)
 

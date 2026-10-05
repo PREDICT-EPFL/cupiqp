@@ -8,8 +8,8 @@ KKT factorization and the storage category of your `P` / `A` / `G` inputs.
 | Solver | Matrices `P, A, G` | KKT backend | Use when |
 |---|---|---|---|
 | [`DenseSolver`](#densesolver) | dense `cupy` arrays | dense Cholesky | small-to-medium, dense problems |
-| [`SparseSolver`](#sparsesolver) | [`UniformBatchedCsrMatrix`](../api/solvers.md#cupiqp.UniformBatchedCsrMatrix) (or CSR) | sparse LDLᵀ (cuDSS) | large, structurally sparse problems |
-| [`MultistageSolver`](#multistagesolver) | block-structured objects | block Cholesky | block-tridiagonal/-arrow KKT (e.g. OCPs) |
+| [`SparseSolver`](#sparsesolver) | one GPU CSR template + `(B, nnz)` values | sparse LDLᵀ (cuDSS) | large, structurally sparse problems |
+| [`MultistageSolver`](#multistagesolver) | `(diag, offdiag)` block arrays | block Cholesky | block-tridiagonal/-arrow KKT (e.g. OCPs) |
 
 All three accept GPU-resident inputs only and share the same `setup` / `solve` /
 `update` workflow and [`Settings`](../api/settings.md). See
@@ -46,13 +46,14 @@ P = cp.eye(4)
 c = cp.zeros(4)
 
 s = DenseSolver()
-s.setup(P=P, c=c)
+s.setup(P=P, c=c)      # one problem
 s.solve()
 ```
 
-- `P`, `A`, `G` must be **dense** GPU arrays (2D for a single problem, 3D `(B, …)` for a
-  batch).
-- The vector inputs (`c`, `b`, `h_l`, `h_u`, `x_l`, `x_u`) are dense GPU vectors.
+- `P`, `A`, `G` must be **dense** GPU arrays: 2D shared by every problem, or 3D `(B, …)`
+  with one matrix per problem.
+- The vector inputs (`c`, `b`, `h_l`, `h_u`, `x_l`, `x_u`) are dense GPU arrays: 1D shared,
+  or 2D `(B, k)` per problem. The batch size `B` is read from the batched inputs.
 
 ---
 
@@ -62,43 +63,31 @@ The sparse backend uses a sparse LDLᵀ direct factorization (cuDSS) and is far 
 efficient than the dense backend for large, structurally sparse problems.
 
 ```python
-from cupyx.scipy.sparse import csr_matrix
 from cupiqp import SparseSolver
 
 s = SparseSolver()
 s.setup(
-    P=csr_matrix(P), c=c,
-    A=csr_matrix(A), b=b,
-    G=csr_matrix(G), h_l=h_l, h_u=h_u,
+    P=(P_indptr, P_indices, P_values),   # values (nnz,) shared, or (B, nnz) per problem
+    c=c,                                 # (n,) or (B, n)
+    A=(A_indptr, A_indices, A_values), b=b,
+    G=(G_indptr, G_indices, G_values), h_l=h_l, h_u=h_u,
 )
+s.solve()
+s.update(P=P_values_new, c=c_new)        # values only: (B, nnz) and (B, n)
 s.solve()
 ```
 
-- `P`, `A`, `G` are **GPU CSR** matrices (`cupyx.scipy.sparse.csr_matrix`); a single CSR
-  is treated as the `B = 1` case.
-- For a **batch**, the preferred input is a
-  [`UniformBatchedCsrMatrix`](../api/solvers.md#cupiqp.UniformBatchedCsrMatrix) —
-  cuPIQP's own container holding `B` matrices that share **one** sparsity pattern, with
-  the values stacked as a `(B, nnz)` array. The vectors are stacked `(B, …)`.
-
-```python
-from cupiqp import UniformBatchedCsrMatrix
-
-# Pack each shared-pattern matrix into a (B, nnz) batched container.
-# from_cupy_csr_matrix replicates one CSR across the batch; for differing
-# per-problem values, build with the UniformBatchedCsrMatrix(B, indices, indptr,
-# values, shape=...) constructor instead (see Getting Started).
-P_b = UniformBatchedCsrMatrix.from_cupy_csr_matrix(csr_matrix(P), batch_size=B)
-A_b = UniformBatchedCsrMatrix.from_cupy_csr_matrix(csr_matrix(A), batch_size=B)
-G_b = UniformBatchedCsrMatrix.from_cupy_csr_matrix(csr_matrix(G), batch_size=B)
-s.setup(P=P_b, c=c_b, A=A_b, b=b_b, G=G_b, h_l=h_l_b, h_u=h_u_b)
-```
-
-!!! warning "Avoid passing a raw `list` of `csr_matrix`"
-    `setup` also accepts a plain `list` of `B` CSR matrices that share one pattern, but
-    separate matrix objects lack the uniform stride batched routines need, so cuPIQP must
-    copy them into a `UniformBatchedCsrMatrix` at `setup`. Build and pass one yourself to
-    skip that copy. See [Getting Started](../getting-started.md) for the full example.
+- `P`, `A`, `G` are **CSR triples** `(indptr, indices, values)`. The pattern `indptr`,
+  `indices` is 1-D `int32` or `int64`, with column indices sorted within each row, and may
+  be on the host (e.g. straight from scipy) or the device; the values must be on the device. For
+  a scipy `csr_matrix` `M` pass `(M.indptr, M.indices, values)` with `values` on the device, for a
+  cupyx `csr_matrix` `M` pass `(M.indptr, M.indices, M.data)`, for a CUDA torch CSR
+  tensor `T` pass `(T.crow_indices(), T.col_indices(), T.values())`. `setup` checks the
+  pattern once.
+- The pattern is shared by every problem and fixed by `setup`: store every entry that may
+  be nonzero in *any* problem (explicit zeros are fine). Values and vectors are shared
+  (`(nnz,)`, `(k,)`) or batched (`(B, nnz)`, `(B, k)`), at `setup` and at `update`;
+  `update` takes a matrix's values only.
 
 !!! tip "Bit-reproducible cuDSS"
     Set `settings.use_deterministic_mode_for_cudss = True` for bit-wise reproducible
@@ -110,69 +99,86 @@ s.setup(P=P_b, c=c_b, A=A_b, b=b_b, G=G_b, h_l=h_l_b, h_u=h_u_b)
 
 The multistage backend exploits **block-tridiagonal / block-tridiagonal-arrow** KKT
 structure — the structure that arises in optimal control problems (OCPs) and other
-multistage programs — with a block Cholesky factorization. It requires the
-[`socu`](https://github.com/PREDICT-EPFL/socu) extra (install with
-`pip install ".[cuda13,multistage]"`).
+multistage programs — with a block Cholesky factorization from
+[`socu`](https://github.com/PREDICT-EPFL/socu), which is installed with cuPIQP.
 
-It accepts **block-structured storage end-to-end**: generic CSR is *not* auto-promoted
-to block form, because if you have not built the block matrices the multistage solver
-cannot exploit the structure anyway.
+It takes **plain GPU arrays, block by block**: each block-structured matrix is a
+`(diag, offdiag)` tuple of arrays and each vector an array. Generic dense or CSR
+matrices are *not* converted to block form, because the structure can only be
+exploited if you provide it. With `N` stages of size `d` and `r` constraint rows per
+block row:
 
 ```python
 from cupiqp import MultistageSolver
-from cupiqp.multistage.multistage_utils import (
-    BlockTridiagMat, BlockBidiagMat, BlockVec,
-)
-
-P = BlockTridiagMat(num_diag_blocks=N, block_size=d)
-A = BlockBidiagMat(rows_of_blocks=d, cols_of_blocks=d, N=N)
-c = BlockVec(num_blocks=N, rows=d)
-b = BlockVec(num_blocks=N, rows=d)
-# ... fill block data ...
 
 s = MultistageSolver()
-s.setup(P=P, c=c, A=A, b=b)
+s.setup(
+    P=(P_diag, P_offdiag),              # (N, d, d), (N-1, d, d): shared by every problem
+    c=c_batch,                          # (B, N, d): batched, so this is a batch of B
+    A=(A_diag, A_offdiag), b=b,         # (N, r, d) each; b: (N+1, r) or flat
+)
+s.solve()
+s.update(P=(None, P_offdiag_batch))     # per-problem data (B, ...); None = unchanged
 s.solve()
 ```
 
-| Input | Type |
+| Input | Layout (one problem) |
 |---|---|
-| `P` | `BlockTridiagMat` |
-| `A`, `G` | `BlockBidiagMat` (or `None`) |
-| `c`, `b`, `h_u`, `h_l`, `x_u`, `x_l` | `BlockVec` (or `None`) |
+| `P` | `(P_diag, P_offdiag)`: symmetric block-tridiagonal, lower off-diagonal blocks |
+| `A`, `G` | `(diag, offdiag)`, both `(N, r, d)`: block lower-bidiagonal with `N + 1` block rows |
+| `c`, `x_l`, `x_u` | `(N, d)` or flat `(N*d,)` |
+| `b`, `h_l`, `h_u` | `(N + 1, r)` or flat `((N + 1) * r,)` |
+
+Block row `k` of `A` is `[A_offdiag[k-1], A_diag[k]]` acting on stages `k-1, k`; the last
+block row holds only `A_offdiag[N-1]`. Every array passed to `update` is copied once,
+in place, into the solver's buffers.
 
 ---
 
-## Kernel strategy
+## Streams
 
-cuPIQP runs the same interior-point algorithm at every problem size; only the
-inner-loop kernel implementation changes, and the solver picks it automatically at
-`setup()` — there is no setting to tune and nothing to change in your code. The inner
-loop (step length, barrier parameter `mu`, centering `sigma`, residual and merit
-evaluation) is evaluated one of two ways:
+Each solver instance runs on **one CUDA stream** of its own: `setup`, `update`,
+`solve`, `backward` (and `OcpSolver.set`) make it Warp's current stream for their
+duration, so every kernel, copy, library call and CUDA graph of the solver is
+issued there. The stream is exposed as `solver.stream` (a `warp.Stream`).
 
-- **Fused Warp tile kernels** — JIT-compiled and specialized to the problem dimensions,
-  very fast per launch, and they amortize across a batch and across IPM iterations.
-  The catch is the compile step: because the kernels are specialized to the problem
-  width, the **first-solve compile time grows with the problem** and eventually
-  dominates — you can spend more time compiling kernels than actually solving.
-- **CuPy axis-reduction kernels** (`cp.min`, `cp.sum`, `cp.max` over the data axis) —
-  generic, so they need no shape-specialized compilation and the compile cliff
-  disappears. They carry more per-launch overhead, but over a long reduction axis — i.e.
-  a wide problem — that overhead is amortized and the trade is worth it. This path also
-  builds the Ruiz preconditioner with the tile kernels switched off, for the same reason.
+By default the solver creates the stream. It is created blocking with respect to
+the legacy default stream, so plain cupy / torch / numba code on the default stream
+is ordered with the solver automatically. To run the solver on a stream of your own,
+pass a `warp.Stream` to the constructor:
 
-The choice is made from the problem width at `setup()`: with
-`tile_width = max(n + p + m, p + num_ineq)`, the solver uses the CuPy axis-reduction
-kernels when `tile_width >= 1024` and the fused Warp tile kernels otherwise, where
-`num_ineq` is the total number of finite inequality + box-bound rows. It depends
-on width only — independent of batch size and dtype, because the thing it avoids
-(tile-kernel compile time) depends on shape, not on how many problems you batch. The
-threshold is an internal heuristic, not a precisely calibrated constant, and both paths
-run the same algorithm and agree to solver tolerance.
+```python
+stream = wp.Stream("cuda:0")
+solver = DenseSolver(stream=stream)      # borrowed: the solver never destroys it
+```
 
-!!! note "Batched workloads use the tile kernels"
-    The selection is by problem width, not batch size: a large batch of moderately-wide
-    problems still uses the fused tile kernels (they amortize across the batch), which is
-    the intended behavior. The CuPy path targets a single (or small-batch) wide
-    problem where compile time of warp tile-based kernels would dominate the run time.
+Only `warp.Stream` objects are accepted by the core solvers. Producers or consumers
+on other non-default streams must order themselves with `solver.stream` (for
+example with `wp.ScopedStream(solver.stream)` around the work, or Warp events).
+The framework adapters do this for you: `cupiqp.torch` orders every call with
+the `torch.cuda.Stream` given to its constructor (or torch's current stream).
+The sparse backend enters a non-owning cupy view of the same stream during
+`setup()`, where it builds the KKT sparsity pattern with `cupyx`; it is an
+implementation detail of that backend.
+
+## Inner-loop kernels
+
+cuPIQP runs the same interior-point algorithm at every problem size, with one set
+of Warp kernels. The per-element steps of the iteration (variable updates, the
+Newton right-hand sides, the regularization terms) are Warp kernels specialized to
+the block widths fixed at `setup()`, and every reduction of the iteration (step
+lengths, the barrier parameter `mu`, the centering parameter `sigma`, residual norms
+and objectives) is a fixed-size block reduction: one CUDA block per problem of the
+batch, each thread striding over the row. These reduction kernels read the problem
+width from the array shapes, so they are compiled once per dtype and serve a
+3-variable QP and a QP whose KKT width is in the thousands alike - there is no
+compile time that grows with the problem width, no width-dependent code path, and
+nothing to select.
+
+Every backend stores its data as Warp arrays: problem data, iterates and
+workspaces, and for the sparse backend also the CSR pattern (`int32` row pointers
+and column indices) and the `(B, nnz)` value buffers. The dense linear algebra
+calls cuBLAS / cuSOLVER and the sparse backend calls cuSPARSE / cuDSS on those
+buffers directly, and CUDA graphs are captured with Warp. CuPy appears only in
+the sparse backend at `setup()`, where `cupyx.scipy.sparse` assembles the KKT
+pattern and the index maps that the Warp kernels use afterwards.

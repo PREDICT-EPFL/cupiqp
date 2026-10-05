@@ -1,4 +1,11 @@
-import cupy as cp
+"""In-place dense Cholesky factorization and solves through cuSOLVER.
+
+Both classes work on C-contiguous Warp arrays of the solver dtype: the
+condensed KKT matrices ``(n, n)`` / ``(B, n, n)`` and right-hand sides
+``(n,)`` / ``(B, n)`` (rows contiguous, batch stride free). Nothing here
+checks layout or dtype; the caller guarantees both. The cuSOLVER handle is
+bound once, to the Warp stream that is current when the object is created.
+"""
 import warp as wp
 from nvmath.bindings import cublas, cusolverDn
 
@@ -32,41 +39,37 @@ def cusolver_set_stream(handle, stream_ptr):
 
 class CholeskyInplaceSolver:
     """Perform in-place dense Cholesky factorization and solves using cuSOLVER.
-    
-    Code insipred by cupy.linalg.cholesky implementation, but adapted for repeated use
-    on the same size matrix without repeated allocations.
+
+    Code inspired by cupy.linalg.cholesky implementation, but adapted for repeated use
+    on the same size matrix without repeated allocations. The matrix is C-contiguous,
+    which cuSOLVER (column-major) sees as the upper triangle of its transpose.
     """
-    def __init__(self, n: int, dtype = cp.float64):
+    def __init__(self, n: int, dtype=wp.float64):
         self.n = n
-        self._dtype = cp.dtype(dtype).char
+        self._dtype = dtype
+        self._stream = wp.get_stream("cuda")
         self._cusolver_handle = cusolver_create_handle()
-        
-        if self._dtype == 'f':
+        cusolver_set_stream(self._cusolver_handle, self._stream.cuda_stream)
+        self._uplo = cublas.FillMode.UPPER
+
+        if dtype is wp.float32:
             self._potrf = cusolverDn.spotrf
             self._potrs = cusolverDn.spotrs
             buffer_func = cusolverDn.spotrf_buffer_size
-        elif self._dtype == 'd':
+        elif dtype is wp.float64:
             self._potrf = cusolverDn.dpotrf
             self._potrs = cusolverDn.dpotrs
             buffer_func = cusolverDn.dpotrf_buffer_size
-        elif self._dtype == 'F':
-            self._potrf = cusolverDn.cpotrf
-            self._potrs = cusolverDn.cpotrs
-            buffer_func = cusolverDn.cpotrf_buffer_size
-        elif self._dtype == 'D':
-            self._potrf = cusolverDn.zpotrf
-            self._potrs = cusolverDn.zpotrs
-            buffer_func = cusolverDn.zpotrf_buffer_size
         else:
             raise ValueError(f"Unsupported dtype: {dtype}")
 
-        self._dev_info = cp.empty(1, dtype=cp.int32)
-        self._buffersize = buffer_func(self._cusolver_handle, cublas.FillMode.UPPER, n, 0, n)
-        self._workspace = cp.empty(self._buffersize, dtype=self._dtype)
+        self._factor_status = wp.zeros(1, dtype=wp.int32, device="cuda")
+        self._buffersize = buffer_func(self._cusolver_handle, self._uplo, n, 0, n)
+        self._workspace = wp.empty(max(self._buffersize, 1), dtype=dtype, device="cuda")
 
+        self._solve_info = wp.zeros(1, dtype=wp.int32, device="cuda")  # potrs argument check, unused
         self._factor_ptr = None
-        self._uplo = None
-        self._ctx_A = None # holds reference to A
+        self._ctx_A = None  # holds reference to A
 
     def __del__(self):
         handle = getattr(self, "_cusolver_handle", None)
@@ -76,86 +79,49 @@ class CholeskyInplaceSolver:
             except Exception:
                 pass
 
-    def factorize(self, A: cp.ndarray) -> bool:
-        # point the cusolver handle at CuPy's current stream
-        cusolver_set_stream(self._cusolver_handle, cp.cuda.get_current_stream().ptr)
-        if not cp.dtype(A.dtype).char == self._dtype:
-            raise TypeError(f"Input matrix dtype {A.dtype} does not match solver dtype {self._dtype}.")
-        if A.ndim != 2 or A.shape != (self.n, self.n):
-            raise ValueError(f"Shape mismatch. Expected ({self.n}, {self.n}), got {A.shape}")
-        
-        # Layout Detection
-        if A.flags.f_contiguous:
-            self._uplo = cublas.FillMode.LOWER
-        elif A.flags.c_contiguous:
-            self._uplo = cublas.FillMode.UPPER
-        else:
-            raise ValueError("Matrix A must be contiguous (C or F order).")
+    @property
+    def factor_status(self) -> wp.array:
+        """``(1,)`` int32 device array: cuSOLVER's ``info`` of the last
+        ``factorize()``; zero means the factorization succeeded. Written on
+        the device, never read on the host by this class."""
+        return self._factor_status
 
+    def factorize(self, A: wp.array) -> None:
+        """In-place Cholesky factorization of the C-contiguous ``(n, n)``
+        matrix ``A``, launched on the current stream without waiting for it;
+        the outcome is left in ``factor_status``."""
         # Keep A alive!
         self._ctx_A = A
-        self._factor_ptr = A.data.ptr
-        
+        self._factor_ptr = A.ptr
+
         self._potrf(
             self._cusolver_handle,
             self._uplo,
             self.n,
             self._factor_ptr,
             self.n,
-            self._workspace.data.ptr,
+            self._workspace.ptr,
             self._buffersize,
-            self._dev_info.data.ptr
+            self._factor_status.ptr
         )
 
-        factorization_success = cp.all(self._dev_info == 0)  # dev_info == 0 indicates success
-        return factorization_success
-
-    def solve(self, B: cp.ndarray):
-        """Combined forward and backward substitution to solve Ax = B."""
-        cusolver_set_stream(self._cusolver_handle, cp.cuda.get_current_stream().ptr)
+    def solve(self, B: wp.array):
+        """Combined forward and backward substitution to solve Ax = B in place, B of shape ``(n,)``."""
         if self._factor_ptr is None:
             raise RuntimeError("You must call factorize() before solve().")
-
-        if cp.dtype(B.dtype).char != self._dtype:
-            raise TypeError(
-                f"RHS dtype {B.dtype} does not match solver dtype {self._dtype}."
-            )
-
-        # Handle dimensions
-        if B.ndim == 1:
-            if B.shape[0] != self.n:
-                raise ValueError(
-                    f"1-D RHS length mismatch. Expected {self.n}, got {B.shape[0]}"
-                )
-            nrhs = 1
-            ldb = self.n
-        elif B.ndim == 2:
-            if B.shape[0] != self.n:
-                raise ValueError(f"RHS dimension mismatch. Expected rows {self.n}, got {B.shape[0]}")
-            nrhs = B.shape[1]
-            ldb = self.n
-            if nrhs > 1 and not B.flags.f_contiguous:
-                raise ValueError(
-                    "A 2-D RHS with multiple columns must be Fortran-contiguous "
-                    "because cuSOLVER reads it in column-major order."
-                )
-        else:
-            raise ValueError(f"RHS B must be 1-D or 2-D, got shape {B.shape}.")
-
-        if not (B.flags.c_contiguous or B.flags.f_contiguous):
-            raise ValueError("RHS B must be contiguous.")
 
         self._potrs(
             self._cusolver_handle,
             self._uplo,
             self.n,
-            nrhs,
+            1,  # nrhs
             self._factor_ptr,
             self.n,
-            B.data.ptr,
-            ldb,
-            self._dev_info.data.ptr
+            B.ptr,
+            self.n,
+            self._solve_info.ptr
         )
+
 
 class BatchedCholeskyInplaceSolver:
     """Batched in-place dense Cholesky factorization and solve using cuSOLVER.
@@ -163,72 +129,65 @@ class BatchedCholeskyInplaceSolver:
     Uses ``cusolverDnDpotrfBatched`` / ``cusolverDnDpotrsBatched`` to
     process all B matrices in a single kernel launch.
 
-    The batched API takes a device array of pointers (one per matrix).
-    Pointer arrays are cached and rebuilt when the base address changes
-    or when the outer batch stride changes.
+    The batched API takes a device array of pointers (one per matrix),
+    rebuilt by a small kernel on every call so the class keeps no host-side
+    state that a CUDA graph replay could invalidate.
 
     Parameters
     ----------
     n : int
-        Matrix dimension (each matrix is *n × n*).
+        Matrix dimension (each matrix is *n x n*).
     batch_size : int
         Number of matrices in the batch.
-    dtype : dtype
-        Element type (default ``float64``).
+    dtype : wp.float32 or wp.float64
+        Element type (default ``wp.float64``).
     """
 
-    def __init__(self, n: int, batch_size: int, dtype=cp.float64):
+    def __init__(self, n: int, batch_size: int, dtype=wp.float64):
         self._n = n
         self._batch_size = batch_size
-        self._dtype = cp.dtype(dtype).char
+        self._dtype = dtype
+        self._stream = wp.get_stream("cuda")
         self._cusolver_handle = cusolver_create_handle()
-        self._uplo = cublas.FillMode.UPPER  # C-contiguous → upper in col-major
+        cusolver_set_stream(self._cusolver_handle, self._stream.cuda_stream)
+        self._uplo = cublas.FillMode.UPPER  # C-contiguous -> upper in col-major
 
-        if self._dtype == 'f':
+        if dtype is wp.float32:
             self._potrf_batched = cusolverDn.spotrf_batched
             self._potrs_batched = cusolverDn.spotrs_batched
-        elif self._dtype == 'd':
+        elif dtype is wp.float64:
             self._potrf_batched = cusolverDn.dpotrf_batched
             self._potrs_batched = cusolverDn.dpotrs_batched
-        elif self._dtype == 'F':
-            self._potrf_batched = cusolverDn.cpotrf_batched
-            self._potrs_batched = cusolverDn.cpotrs_batched
-        elif self._dtype == 'D':
-            self._potrf_batched = cusolverDn.zpotrf_batched
-            self._potrs_batched = cusolverDn.zpotrs_batched
         else:
             raise ValueError(f"Unsupported dtype: {dtype}")
 
-        self._dev_info = cp.empty(batch_size, dtype=cp.int32)
-        self._dev_info_potrs = cp.empty(1, dtype=cp.int32)
+        self._factor_status = wp.zeros(batch_size, dtype=wp.int32, device="cuda")
+        self._solve_info = wp.zeros(1, dtype=wp.int32, device="cuda")  # potrsBatched argument check, unused
 
-        # Preallocated device pointer arrays and their source-layout keys.
-        self._A_ptrs = cp.empty(batch_size, dtype=cp.int64)  # store the pointer to each batch
-        self._A_ptr_key = None
-        self._B_ptrs = cp.empty(batch_size, dtype=cp.int64)
-        self._B_ptr_key = None
+        # Preallocated device pointer arrays (one pointer per matrix / rhs row).
+        # They are refilled on every factorize() / solve() rather than cached
+        # against a host-side record of the last buffer: a CUDA graph replay
+        # rewrites them on the device without the host knowing, so any such
+        # record goes stale and a later uncaptured call would skip a needed
+        # refill (the initial guess solved into the step buffer that way).
+        self._A_ptrs = wp.zeros(batch_size, dtype=wp.int64, device="cuda")
+        self._B_ptrs = wp.zeros(batch_size, dtype=wp.int64, device="cuda")
 
         self._ctx_A = None
         self._ctx_B = None
         self._factorized = False
 
-    def _ensure_ptrs(self, arr: cp.ndarray, ptrs: cp.ndarray,
-                     cached_key: tuple) -> tuple:
-        """Rebuild pointers if the base address or batch stride changed.
-
-        Returns the current source-layout key for caching.
-        """
-        key = (arr.data.ptr, arr.strides[0])
-        if key != cached_key:
-            wp.launch(
-                _fill_ptrs_kernel,
-            dim=ptrs.shape[0],
-                inputs=[wp.int64(arr.data.ptr), wp.int64(arr.strides[0])],
-                outputs=[ptrs],
-                device="cuda",
-                stream=wp.Stream(cuda_stream=cp.cuda.get_current_stream().ptr),
-            )
-        return key
+    def _fill_ptrs(self, arr: wp.array, ptrs: wp.array) -> None:
+        """Write the device address of every matrix / row of ``arr`` into ``ptrs``
+        (one tiny kernel, from the base address and the outer batch stride)."""
+        wp.launch(
+            _fill_ptrs_kernel,
+            dim=self._batch_size,
+            inputs=[wp.int64(arr.ptr), wp.int64(arr.strides[0])],
+            outputs=[ptrs],
+            device="cuda",
+            stream=self._stream,
+        )
 
     def __del__(self):
         handle = getattr(self, "_cusolver_handle", None)
@@ -246,90 +205,55 @@ class BatchedCholeskyInplaceSolver:
     def batch_size(self) -> int:
         return self._batch_size
 
-    def factorize(self, A: cp.ndarray) -> bool:
-        """In-place Cholesky factorization of all B matrices.
+    @property
+    def factor_status(self) -> wp.array:
+        """``(batch_size,)`` int32 device array: cuSOLVER's per-matrix
+        ``info`` of the last ``factorize()``; zero where the factorization
+        of that matrix succeeded. Written on the device, never read on the
+        host by this class."""
+        return self._factor_status
+
+    def factorize(self, A: wp.array) -> None:
+        """In-place Cholesky factorization of all B matrices, launched on the
+        current stream without waiting for it.
 
         Parameters
         ----------
-        A : cp.ndarray, shape ``(batch_size, n, n)``
-            Overwritten with Cholesky factors. Each ``(n, n)`` matrix
-            must be C-contiguous internally (i.e. ``A[i]`` is
-            C-contiguous); the outer batch stride may be arbitrary —
-            the per-matrix pointer kernel uses ``strides[0]`` directly,
-            which supports views like ``big[:, :n, :n]`` where rows of
-            matrices skip past trailing padding.
+        A : wp.array, shape ``(batch_size, n, n)``
+            Overwritten with Cholesky factors. Each ``(n, n)`` matrix is
+            C-contiguous; the outer batch stride may be arbitrary (the
+            per-matrix pointer kernel uses ``strides[0]`` directly).
+
+        The per-matrix outcome is left in ``factor_status``; nothing is read
+        on the host.
         """
-        cusolver_set_stream(self._cusolver_handle,
-                            cp.cuda.get_current_stream().ptr)
-
-        if cp.dtype(A.dtype).char != self._dtype:
-            raise TypeError(
-                f"Input matrix dtype {A.dtype} does not match solver dtype {self._dtype}."
-            )
-        if A.shape != (self._batch_size, self._n, self._n):
-            raise ValueError(
-                f"A shape mismatch. Expected ({self._batch_size}, {self._n}, "
-                f"{self._n}), got {tuple(A.shape)}."
-            )
-        # Each (n, n) block must be C-contiguous so cuSOLVER reads it with
-        # ``lda = n``. The outer batch stride is free; ``_ensure_ptrs``
-        # uses ``A.strides[0]`` directly.
-        if self._batch_size > 0 and not A[0].flags.c_contiguous:
-            raise ValueError(
-                "Each (n, n) matrix in A must be C-contiguous; "
-                f"got strides {A.strides} with itemsize {A.dtype.itemsize}."
-            )
-
-        self._A_ptr_key = self._ensure_ptrs(A, self._A_ptrs, self._A_ptr_key)
+        self._fill_ptrs(A, self._A_ptrs)
         self._ctx_A = A
 
         self._potrf_batched(
             self._cusolver_handle,
             self._uplo,
             self.n,
-            self._A_ptrs.data.ptr,
+            self._A_ptrs.ptr,
             self.n,
-            self._dev_info.data.ptr,
+            self._factor_status.ptr,
             self.batch_size,
         )
         self._factorized = True
-        return bool(cp.all(self._dev_info == 0))
 
-    def solve(self, B: cp.ndarray):
+    def solve(self, B: wp.array):
         """In-place Cholesky solve.
 
         Parameters
         ----------
-        B : cp.ndarray, shape ``(batch_size, n)``, row-contiguous with arbitrary outer batch stride
-            Overwritten with the solution. Single-RHS-per-batch only —
-            the underlying ``potrsBatched`` call is invoked with
-            ``nrhs = 1``; pass each column separately if you need
-            multi-RHS.
+        B : wp.array, shape ``(batch_size, n)``, row-contiguous with arbitrary outer batch stride
+            Overwritten with the solution. Single RHS per batch only
+            (``potrsBatched`` is invoked with ``nrhs = 1``).
         """
-        cusolver_set_stream(self._cusolver_handle,
-                            cp.cuda.get_current_stream().ptr)
         if not self._factorized:
             raise RuntimeError("You must call factorize() before solve().")
 
-        if cp.dtype(B.dtype).char != self._dtype:
-            raise TypeError(
-                f"RHS dtype {B.dtype} does not match solver dtype {self._dtype}."
-            )
-        if B.shape != (self._batch_size, self._n):
-            raise ValueError(
-                f"B shape mismatch. Expected ({self._batch_size}, {self._n}), "
-                f"got {tuple(B.shape)}."
-            )
-        # Each row (length n) must be contiguous; the outer batch stride
-        # is free (``_ensure_ptrs`` uses ``B.strides[0]`` directly, which
-        # supports views like ``buf[:, :n]``).
-        if self._batch_size > 0 and not B[0].flags.c_contiguous:
-            raise ValueError(
-                "Each row of B must be contiguous; "
-                f"got strides {B.strides} with itemsize {B.dtype.itemsize}."
-            )
-
-        self._B_ptr_key = self._ensure_ptrs(B, self._B_ptrs, self._B_ptr_key)
+        self._fill_ptrs(B, self._B_ptrs)
         self._ctx_B = B
 
         self._potrs_batched(
@@ -337,10 +261,10 @@ class BatchedCholeskyInplaceSolver:
             self._uplo,
             self.n,
             1,  # nrhs
-            self._A_ptrs.data.ptr,
+            self._A_ptrs.ptr,
             self.n,
-            self._B_ptrs.data.ptr,
+            self._B_ptrs.ptr,
             self.n,
-            self._dev_info_potrs.data.ptr,
+            self._solve_info.ptr,
             self.batch_size,
         )

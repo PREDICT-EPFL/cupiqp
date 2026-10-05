@@ -1,9 +1,10 @@
-from typing import Literal, Sequence, Union, List
+from typing import Sequence, Union
 
-import cupy as cp
+import warp as wp
+
+from ..utils import as_warp_array
 
 from ..typedef import CudaArray
-from ..results import Status
 from .multistage_solver import MultistageSolver
 from .ocp_data import OcpData
 
@@ -70,11 +71,12 @@ class OcpSolver(MultistageSolver):
     with a leading batch axis ``(B, ...)`` for per-problem data (for example a
     different ``'x0'`` per batch element). Read the solution back with
     :meth:`get` (``'x'`` / ``'u'``) or the :attr:`x_traj` / :attr:`u_traj`
-    properties; the solve status is in ``solver.result.info.status``.
+    properties, which are Warp views of ``solver.result.x``; the solve status
+    is in ``solver.result.info.status``.
 
     Parameters
     ----------
-    dtype : {"float64", "float32"}, default: "float64"
+    dtype : {wp.float64, wp.float32}, default: wp.float64
         Floating-point precision used throughout the solve.
 
     Examples
@@ -108,8 +110,8 @@ class OcpSolver(MultistageSolver):
     For differentiable QPs use ``DenseSolver``, ``SparseSolver`` or ``MultistageSolver``.
     """
 
-    def __init__(self, dtype: Literal["float32", "float64"] = "float64") -> None:
-        super().__init__(dtype=dtype)
+    def __init__(self, dtype: Union[type[wp.float32], type[wp.float64]] = wp.float64, stream=None) -> None:
+        super().__init__(dtype=dtype, stream=stream)
         self._ocp_data = None
         self._ocp_ready = False
 
@@ -131,7 +133,7 @@ class OcpSolver(MultistageSolver):
         ng: int = 0,
         idxbx: Union[int, Sequence[int], None] = None,
         idxbu: Union[int, Sequence[int], None] = None,
-        batch_size: int = 1,
+        batch_size: int = 1
     ) -> None:
         """Declare the OCP dimensions and allocate all GPU memory.
 
@@ -170,12 +172,17 @@ class OcpSolver(MultistageSolver):
                 "To differentiate a QP, use DenseSolver, SparseSolver or MultistageSolver."
             )
 
-        ocp_data = OcpData(
-            N, nx, nu, ng=ng, idxbx=idxbx, idxbu=idxbu,
-            dtype=self.settings.dtype, device=self.settings.device,
-            batch_size=batch_size,
-        )
-        MultistageSolver.setup(self, **ocp_data.blocks)
+        if isinstance(batch_size, bool) or batch_size < 1:
+            raise ValueError(f"batch_size must be a positive integer; got {batch_size!r}.")
+        with wp.ScopedStream(self._stream, sync_enter=not self._stream.is_capturing):
+            ocp_data = OcpData(
+                N, nx, nu, ng=ng, idxbx=idxbx, idxbu=idxbu,
+                dtype=self.settings.dtype, device=self._device,
+                batch_size=batch_size,
+            )
+            # The OcpData arrays carry the batch axis, from which the core
+            # setup reads the batch size.
+            self._setup_impl(**self._solver_arrays(ocp_data))
 
         self._ocp_data = ocp_data
         self._solution_available = False
@@ -199,50 +206,56 @@ class OcpSolver(MultistageSolver):
         if not self._ocp_ready:
             raise RuntimeError("Call setup() before set().")
 
+        value = as_warp_array(value, f"field {field!r}", self._dtype)
+        with wp.ScopedStream(self._stream, sync_enter=not self._stream.is_capturing):
+            self._ocp_data.set_field(field, stage, value)
+
+        # Mark dirty only after a successful write; the old solution is stale.
         if field in ("Q", "R", "S"):
             self._update_P = True
         elif field in ("A", "B", "E"):
             self._update_A = True
         elif field in ("C", "D"):
             self._update_G = True
+        self._solution_available = False
 
-        self._ocp_data.set_field(field, stage, value)
-
-    def solve(self) -> List[Status]:
+    def solve(self) -> None:
         """Flush any pending :meth:`set` updates into the solver, then solve.
 
-        Returns the solve status (a single ``Status`` for ``batch_size == 1``,
-        otherwise a list of one ``Status`` per problem). The full solution is
+        Asynchronous, like ``MultistageSolver.solve()``. The solution is
         available through :meth:`get`, :attr:`x_traj`, :attr:`u_traj`, and
-        ``solver.result``.
+        ``solver.result``; ``solver.result.info.status`` holds the solve
+        status, one ``Status`` code per problem.
         """
         if not self._ocp_ready:
             raise RuntimeError("Call setup() before solve().")
 
-        blocks = self._ocp_data.blocks
+        arrays = self._solver_arrays(self._ocp_data)
         changed = {
-            group: block
-            for group, block in blocks.items()
-            if block is not None and group not in ("P", "A", "G")
+            group: value
+            for group, value in arrays.items()
+            if group not in ("P", "A", "G")
         }
         if self._update_P:
-            changed["P"] = blocks["P"]
+            changed["P"] = arrays["P"]
         if self._update_A:
-            changed["A"] = blocks["A"]
-        if self._update_G:
-            changed["G"] = blocks["G"]
+            changed["A"] = arrays["A"]
+        if self._update_G and "G" in arrays:
+            changed["G"] = arrays["G"]
 
-        MultistageSolver.update(self, **changed)
-
-        # set back to false to prepare for next solver update
-        self._update_P = self._update_A = self._update_G = False
-
-        status = MultistageSolver.solve(self)
+        with wp.ScopedStream(self._stream, sync_enter=not self._stream.is_capturing):
+            self._update_impl(
+                changed.get("P"), changed.get("c"), changed.get("A"), changed.get("b"),
+                changed.get("G"), changed.get("h_u"), changed.get("h_l"),
+                changed.get("x_u"), changed.get("x_l"), False,
+            )
+            # set back to false to prepare for next solver update
+            self._update_P = self._update_A = self._update_G = False
+            self._solve_impl()
         self._solution_available = True
-        return status
 
-    def get(self, field: str, stage: int) -> cp.ndarray:
-        """Read part of the solution.
+    def get(self, field: str, stage: int) -> wp.array:
+        """Read part of the solution (a zero-copy Warp view of ``solver.result.x``).
 
         ``field='x'`` returns the stage state ``(B, nx)`` for ``stage = 0..N``;
         ``field='u'`` returns the stage input ``(B, nu)`` for ``stage = 0..N-1``
@@ -256,16 +269,26 @@ class OcpSolver(MultistageSolver):
         raise ValueError(f"Unknown solution field {field!r}; use 'x' or 'u'.")
 
     @property
-    def x_traj(self) -> cp.ndarray:
-        """State trajectory, shape ``(B, N+1, nx)``."""
+    def x_traj(self) -> wp.array:
+        """State trajectory, a ``(B, N+1, nx)`` Warp view of ``solver.result.x``."""
         self._require_solution()
         return self._ocp_data.state_traj(self._result.x)
 
     @property
-    def u_traj(self) -> cp.ndarray:
-        """Input trajectory, shape ``(B, N, nu)`` (the dummy ``u_N`` is dropped)."""
+    def u_traj(self) -> wp.array:
+        """Input trajectory, a ``(B, N, nu)`` Warp view (the dummy ``u_N`` is dropped)."""
         self._require_solution()
         return self._ocp_data.input_traj(self._result.x)
+
+    @staticmethod
+    def _solver_arrays(ocp_data: OcpData) -> dict:
+        """The OCP data as MultistageSolver inputs; without general inequalities
+        (``ng == 0``) the G / h blocks are omitted rather than passed empty."""
+        arrays = dict(ocp_data.arrays)
+        if ocp_data.ng == 0:
+            for name in ("G", "h_l", "h_u"):
+                del arrays[name]
+        return arrays
 
     def _require_solution(self) -> None:
         if not self._solution_available:

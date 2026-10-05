@@ -1,11 +1,14 @@
-from typing import Optional
-import cupy as cp
+from typing import Optional, Tuple
 import warp as wp
 
 from ..data import Data
-from ..typedef import PIQP_INF
-from ..utils import to_warp_dtype
-from .multistage_utils import BlockTridiagMat, BlockBidiagMat, BlockVec
+from ..typedef import CudaArray
+
+
+# A block-structured matrix: a (diag, offdiag) pair of GPU arrays, either of
+# which may be None (zero at setup, unchanged in update). MultistageSolver
+# takes any GPU arrays; MultistageData.init receives Warp arrays.
+BlockPair = Tuple[Optional[CudaArray], Optional[CudaArray]]
 
 
 class MultistageData(Data):
@@ -48,340 +51,374 @@ class MultistageData(Data):
 
     A batch of such QPs is stored together: every matrix and vector carries
     a leading batch axis, and the same formulation is solved independently
-    for each batch entry. ``batch_size`` defaults to 1 so the single-QP API
-    is unchanged at the user level.
+    for each batch entry.
 
-    All flat CuPy views (``_c``, ``_b``, ``_h_l``, ...) are zero-copy DLPack
-    views of the underlying Warp buffers and have shape ``(B, k)``. Updating
-    the Warp buffer (e.g. via ``set_c``) automatically makes the flat view
-    reflect the new values.
+    All storage is Warp arrays owned by this object. Block vectors are
+    ``(B, num_blocks, rows)`` buffers; the flat ``(B, k)`` views (``c``,
+    ``b``, ``h_l``, ...) used by the interior-point iteration alias them.
     """
 
-    def __init__(self, dtype=cp.float64, device: str = "cuda"):
+    def __init__(self, dtype=wp.float64, device: str = "cuda"):
         super().__init__(dtype=dtype, device=device)
 
-    def init(
-        self,
-        P: BlockTridiagMat,
-        c: BlockVec,
-        A: Optional[BlockBidiagMat] = None,
-        b: Optional[BlockVec] = None,
-        G: Optional[BlockBidiagMat] = None,
-        h_u: Optional[BlockVec] = None,
-        h_l: Optional[BlockVec] = None,
-        x_u: Optional[BlockVec] = None,
-        x_l: Optional[BlockVec] = None,
-    ):
-        """Allocate and populate buffers from user inputs. Returns self for chaining."""
+    def _adopt_storage(self, P_diag: wp.array, P_offdiag: wp.array, c: wp.array,
+                       A_diag: Optional[wp.array], A_offdiag: Optional[wp.array], b: Optional[wp.array],
+                       G_diag: Optional[wp.array], G_offdiag: Optional[wp.array],
+                       h_u: Optional[wp.array], h_l: Optional[wp.array],
+                       x_u: Optional[wp.array], x_l: Optional[wp.array]):
+        """Adopt freshly allocated Warp buffers as this object's storage.
 
-        self._require_dtype(P.D)
-        self._require_dtype(P.E)
-        self._require_dtype(c.data)
-        if A is not None:
-            self._require_dtype(A.D)
-            self._require_dtype(A.E)
-        if b is not None:
-            self._require_dtype(b.data)
-        if G is not None:
-            self._require_dtype(G.D)
-            self._require_dtype(G.E)
-        for bound in (h_u, h_l, x_u, x_l):
-            if bound is not None:
-                self._require_dtype(bound.data)
-
-        B = P.batch_size
-        block_size = P.block_size
-        num_blocks = P.num_diag_blocks
-        n = num_blocks * block_size
-
+        Only :meth:`init` calls this, with buffers it allocated itself; the
+        solver later modifies them in place (e.g. the preconditioner scales
+        them). Matrix blocks are ``(B, N, rows, cols)``; vectors are
+        ``(B, num_blocks, rows)`` and also get flat ``(B, k)`` views
+        (zero-copy) for the shared IPM code.
+        """
+        B, N, d = (int(v) for v in P_diag.shape[:3])
         self._batch_size = B
-        self._n = n
+        self._n = N * d
+        self._N, self._d = N, d
 
-        # We clone every caller-provided block container so the solver owns
-        # its buffers — the preconditioner (Ruiz scaling) mutates them in
-        # place, and we don't want that to bleed back into the caller's
-        # arrays. Flat dlpack views are then built into the owned clones.
+        self._P_diag, self._P_offdiag = P_diag, P_offdiag
+        self._c_wp = c
+        self._c = self._flat(c)
 
-        # ---- P (block-tridiagonal) ----
-        self._P = P.clone()
+        self._A_diag, self._A_offdiag = A_diag, A_offdiag
+        self._A_rows_per_block = int(A_diag.shape[2]) if A_diag is not None else 0
+        self._b_wp = b
+        self._b = self._flat(b) if b is not None else wp.zeros((B, 0), dtype=self._dtype, device=self._device)
 
-        # ---- c (linear cost) ----
-        self._c_blk = c.clone()
-        self._c = self._block_vec_to_flat(self._c_blk, B)
-        if self._c.shape != (B, n):
-            raise ValueError(
-                f"c flat shape {self._c.shape} != expected ({B}, {n})"
-            )
+        self._G_diag, self._G_offdiag = G_diag, G_offdiag
+        self._G_rows_per_block = int(G_diag.shape[2]) if G_diag is not None else 0
+        self._has_h_l, self._has_h_u = h_l is not None, h_u is not None
+        self._h_l_wp, self._h_u_wp = h_l, h_u
+        self._h_l = self._flat(h_l) if h_l is not None else wp.zeros((B, 0), dtype=self._dtype, device=self._device)
+        self._h_u = self._flat(h_u) if h_u is not None else wp.zeros((B, 0), dtype=self._dtype, device=self._device)
 
-        # ---- A, b (equality constraints) ----
-        if A is not None and b is not None:
-            self._validate_bidiag(A, block_size, num_blocks, B)
-            self._A = A.clone()
-            p = (self._A.N + 1) * self._A.rows_of_blocks
-            self._b_blk, self._b = self._init_block_vec(b.clone(), B, p)
-        elif A is None and b is None:
-            self._A = None
-            self._b_blk = None
-            self._b = cp.zeros((B, 0), dtype=self._dtype)
-        else:
-            raise ValueError("A and b must both be provided or both be None")
-
-        # ---- G, h_u, h_l (inequality constraints) ----
-        self._has_h_l = h_l is not None
-        self._has_h_u = h_u is not None
-        if G is not None:
-            self._validate_bidiag(G, block_size, num_blocks, B)
-            if h_u is None and h_l is None:
-                raise ValueError(
-                    "Either h_l or h_u must be provided when G is given"
-                )
-            self._G = G.clone()
-            m = (self._G.N + 1) * self._G.rows_of_blocks
-            self._h_u_blk, self._h_u = self._init_block_vec(
-                h_u.clone() if h_u is not None else None, B, m
-            )
-            self._h_l_blk, self._h_l = self._init_block_vec(
-                h_l.clone() if h_l is not None else None, B, m
-            )
-        else:
-            if h_u is not None or h_l is not None:
-                raise ValueError("h_u and h_l must be None when G is None")
-            self._G = None
-            self._h_u_blk = self._h_l_blk = None
-            self._h_u = self._h_l = cp.zeros((B, 0), dtype=self._dtype)
-
-        # ---- x_u, x_l (box constraints) ----
         # Box-block presence is structural and fixed here: an omitted bound
         # gets no storage (empty (B, 0)); a provided one is a full (B, n) block.
-        self._has_x_l = x_l is not None
-        self._has_x_u = x_u is not None
-        if x_u is not None:
-            self._x_u_block = x_u.clone()
-            self._x_u = self._block_vec_to_flat(self._x_u_block, B)
-            if self._x_u.shape != (B, n):
-                raise ValueError(
-                    f"x_u flat shape {self._x_u.shape} != expected ({B}, {n})"
-                )
-        else:
-            self._x_u_block = None
-            self._x_u = cp.zeros((B, 0), dtype=self._dtype)
+        self._has_x_l, self._has_x_u = x_l is not None, x_u is not None
+        self._x_l_wp, self._x_u_wp = x_l, x_u
+        self._x_l = self._flat(x_l) if x_l is not None else wp.zeros((B, 0), dtype=self._dtype, device=self._device)
+        self._x_u = self._flat(x_u) if x_u is not None else wp.zeros((B, 0), dtype=self._dtype, device=self._device)
 
-        if x_l is not None:
-            self._x_l_block = x_l.clone()
-            self._x_l = self._block_vec_to_flat(self._x_l_block, B)
-            if self._x_l.shape != (B, n):
-                raise ValueError(
-                    f"x_l flat shape {self._x_l.shape} != expected ({B}, {n})"
-                )
-        else:
-            self._x_l_block = None
-            self._x_l = cp.zeros((B, 0), dtype=self._dtype)
-
-        # Hand off to the shared post-init: builds bound index sets,
-        # constraints-RHS inf-norm, etc., all assuming (B, k) shapes — which
-        # we now match.
+        # Shared post-init: bound masks etc., all on the flat (B, k) views.
         self._finalize()
-        self._x_b_scaling = cp.ones((B, n), dtype=self._dtype)
 
-        # Cache flat dlpack views for allocation-free in-place update paths
-        # — these point directly into the Warp block-data buffers.
-        self._c_flat_view = self._block_vec_to_flat(self._c_blk, B)
-        if self._b_blk is not None:
-            self._b_flat_view = self._block_vec_to_flat(self._b_blk, B)
-        if self._h_l_blk is not None:
-            self._h_l_flat_view = self._block_vec_to_flat(self._h_l_blk, B)
-        if self._h_u_blk is not None:
-            self._h_u_flat_view = self._block_vec_to_flat(self._h_u_blk, B)
-        if self._x_l_block is not None:
-            self._x_l_flat_view = self._block_vec_to_flat(self._x_l_block, B)
-        if self._x_u_block is not None:
-            self._x_u_flat_view = self._block_vec_to_flat(self._x_u_block, B)
+    @staticmethod
+    def _flat(vec: wp.array) -> wp.array:
+        """``(B, num_blocks, rows)`` -> ``(B, num_blocks*rows)`` view (zero-copy)."""
+        B = int(vec.shape[0])
+        return vec.reshape((B, int(vec.shape[1]) * int(vec.shape[2])))
+
+    # ------------------------------------------------------------------
+    # Dimensions
+    # ------------------------------------------------------------------
 
     @property
-    def n(self):
+    def n(self) -> int:
         return self._n
 
     @property
-    def p(self):
-        if self._A is None:
-            return 0
-        return (self._A.N + 1) * self._A.rows_of_blocks
+    def p(self) -> int:
+        return (self._N + 1) * self._A_rows_per_block
 
     @property
-    def m(self):
-        if self._G is None:
-            return 0
-        return (self._G.N + 1) * self._G.rows_of_blocks
+    def m(self) -> int:
+        return (self._N + 1) * self._G_rows_per_block
 
     @property
-    def block_size(self):
-        return self._P.block_size
+    def block_size(self) -> int:
+        """Stage variable size ``d``."""
+        return self._d
 
     @property
-    def num_blocks(self):
-        return self._P.num_diag_blocks
+    def num_blocks(self) -> int:
+        """Number of stages ``N`` (diagonal blocks of P)."""
+        return self._N
 
-    def extract_P_diag(self, diag_P: cp.ndarray):
-        """Extract the diagonal of every batch's P into ``diag_P`` of shape ``(B, n)``."""
-        B = self._batch_size
-        d = self.block_size
-        N = self.num_blocks
-        # (B, N, d, d) — Warp buffer.
-        P_D = cp.from_dlpack(wp.to_dlpack(self._P.D))
-        # cp.diagonal over axes 2, 3 gives (B, N, d) → reshape to (B, N*d).
-        diag_P[:] = cp.diagonal(P_D, axis1=2, axis2=3).reshape(B, N * d)
+    @property
+    def A_rows_per_block(self) -> int:
+        """Rows per block row of A (``0`` if there are no equalities)."""
+        return self._A_rows_per_block
 
-    def set_P(self, value: BlockTridiagMat, check: bool = True):
-        if check:
-            if value.batch_size != self._batch_size:
+    @property
+    def G_rows_per_block(self) -> int:
+        """Rows per block row of G (``0`` if there are no inequalities)."""
+        return self._G_rows_per_block
+
+    # ------------------------------------------------------------------
+    # Construction from arrays
+    # ------------------------------------------------------------------
+
+    def init(
+        self,
+        P: BlockPair,
+        c: wp.array,
+        A: Optional[BlockPair] = None,
+        b: Optional[wp.array] = None,
+        G: Optional[BlockPair] = None,
+        h_u: Optional[wp.array] = None,
+        h_l: Optional[wp.array] = None,
+        x_u: Optional[wp.array] = None,
+        x_l: Optional[wp.array] = None
+    ):
+        """Allocate the batched block storage and fill it.
+
+        Matrices are ``(diag, offdiag)`` tuples of GPU arrays and vectors are
+        GPU arrays. For one problem the shapes are:
+
+        * ``P``: ``(N, d, d)`` diagonal blocks and ``(N-1, d, d)`` lower
+          off-diagonal blocks (``offdiag`` may be ``None`` for zero).
+        * ``A`` / ``G``: ``(N, r, d)`` diagonal and ``(N, r, d)`` lower
+          off-diagonal blocks, i.e. ``N+1`` block rows (``offdiag`` may be
+          ``None`` for zero).
+        * ``c``, ``x_l``, ``x_u``: ``(N, d)`` or flat ``(N*d,)``;
+          ``b``, ``h_l``, ``h_u``: ``(N+1, r)`` or flat ``((N+1)*r,)``.
+
+        Every array is either **shared** (the shape above, copied into every
+        problem) or **batched** (the same with a leading batch axis). ``B`` is
+        read from the batched arrays, which must agree. Inputs are Warp arrays of
+        this object's dtype (``MultistageSolver`` converts user arrays at its
+        public boundary); they are only read, never adopted.
+        """
+        P_diag, P_off = self._split_pair(P, "P")
+        if P_diag.ndim not in (3, 4) or P_diag.shape[-1] != P_diag.shape[-2]:
+            raise ValueError(f"P diag must have shape (N, d, d) or (B, N, d, d); got {tuple(P_diag.shape)}.")
+        N, d = int(P_diag.shape[-3]), int(P_diag.shape[-1])
+        if N < 1:
+            raise ValueError("P diag must contain at least one block.")
+
+        pairs = {"P": (P_diag, P_off)}
+        rows = {}
+        for name, M in (("A", A), ("G", G)):
+            if M is None:
+                rows[name] = 0
+                continue
+            M_diag, M_off = self._split_pair(M, name)
+            if M_diag.ndim not in (3, 4) or M_diag.shape[-3] != N or M_diag.shape[-1] != d:
                 raise ValueError(
-                    f"P batch_size mismatch: got {value.batch_size}, expected {self._batch_size}"
+                    f"{name} diag must have shape ({N}, r, {d}) or (B, {N}, r, {d}); got {tuple(M_diag.shape)}."
                 )
-            if value.num_diag_blocks != self._P.num_diag_blocks:
-                raise ValueError(
-                    f"P num_diag_blocks mismatch: got {value.num_diag_blocks}, expected {self._P.num_diag_blocks}"
-                )
-            if value.block_size != self._P.block_size:
-                raise ValueError(
-                    f"P block_size mismatch: got {value.block_size}, expected {self._P.block_size}"
-                )
-        wp.copy(self._P.D, value.D)
-        wp.copy(self._P.E, value.E)
+            pairs[name] = (M_diag, M_off)
+            rows[name] = int(M_diag.shape[-2])
 
-    def set_c(self, value: BlockVec, check: bool = True):
-        if check:
-            self._check_same_block_vec(self._c_blk, value)
-        wp.copy(self._c_blk.data, value.data)
-        self._c[:] = self._c_flat_view
+        # Batch axis of each input: blocks are batched when 4-D; a vector
+        # when 3-D, or 2-D other than its block shape (flat and batched).
+        vectors = {"c": (c, N, d), "x_u": (x_u, N, d), "x_l": (x_l, N, d),
+                   "b": (b, N + 1, rows["A"]), "h_u": (h_u, N + 1, rows["G"]), "h_l": (h_l, N + 1, rows["G"])}
+        batch_dims = {}
+        for name, (M_diag, M_off) in pairs.items():
+            for part, arr in (("diag", M_diag), ("offdiag", M_off)):
+                if arr is not None:
+                    batch_dims[f"{name} {part}"] = int(arr.shape[0]) if arr.ndim == 4 else None
+        for name, (v, nb, r) in vectors.items():
+            if v is not None:
+                batched = v.ndim == 3 or (v.ndim == 2 and tuple(v.shape) != (nb, r))
+                batch_dims[name] = int(v.shape[0]) if batched else None
+        B = self._resolve_batch_size(batch_dims)
 
-    def set_A(self, value: BlockBidiagMat, check: bool = True):
-        if check:
-            self._check_same_bidiag(self._A, value)
-        wp.copy(self._A.D, value.D)
-        wp.copy(self._A.E, value.E)
+        def blocks(M_diag, M_off, name, num_off):
+            """(diag, offdiag) of a block matrix -> two (B, N, rows, cols) buffers."""
+            r, cols = int(M_diag.shape[-2]), int(M_diag.shape[-1])
+            diag_wp = wp.zeros((B, N, r, cols), dtype=self._dtype, device=self._device)
+            off_wp = wp.zeros((B, num_off, r, cols), dtype=self._dtype, device=self._device)
+            self._write_blocks(diag_wp, M_diag, f"{name} diag")
+            if M_off is not None:
+                self._write_blocks(off_wp, M_off, f"{name} offdiag")
+            return diag_wp, off_wp
 
-    def set_b(self, value: BlockVec, check: bool = True):
-        if check:
-            self._check_same_block_vec(self._b_blk, value)
-        wp.copy(self._b_blk.data, value.data)
-        self._b[:] = self._b_flat_view
+        def vec(v: Optional[wp.array], name: str, num_blocks: int, r: int) -> Optional[wp.array]:
+            if v is None:
+                return None
+            out = wp.zeros((B, num_blocks, r), dtype=self._dtype, device=self._device)
+            self._write_vec(out, v, name)
+            return out
 
-    def set_G(self, value: BlockBidiagMat, check: bool = True):
-        if check:
-            self._check_same_bidiag(self._G, value)
-        wp.copy(self._G.D, value.D)
-        wp.copy(self._G.E, value.E)
+        if (A is None) != (b is None):
+            raise ValueError("A and b must both be provided or both be None")
+        if G is None and (h_u is not None or h_l is not None):
+            raise ValueError("h_u and h_l must be None when G is None")
+        if G is not None and h_u is None and h_l is None:
+            raise ValueError("Either h_l or h_u must be provided when G is given")
 
-    def set_h_l(self, value: BlockVec, check: bool = True):
+        P_diag_wp, P_off_wp = blocks(P_diag, P_off, "P", N - 1)
+        A_diag_wp, A_off_wp = blocks(*pairs["A"], "A", N) if A is not None else (None, None)
+        G_diag_wp, G_off_wp = blocks(*pairs["G"], "G", N) if G is not None else (None, None)
+        self._adopt_storage(
+            P_diag_wp, P_off_wp, vec(c, "c", N, d),
+            A_diag_wp, A_off_wp, vec(b, "b", N + 1, rows["A"]),
+            G_diag_wp, G_off_wp, vec(h_u, "h_u", N + 1, rows["G"]), vec(h_l, "h_l", N + 1, rows["G"]),
+            vec(x_u, "x_u", N, d), vec(x_l, "x_l", N, d)
+        )
+
+    # ------------------------------------------------------------------
+    # Public block storage (Warp arrays, owned by this object)
+    # ------------------------------------------------------------------
+
+    @property
+    def P_diag(self) -> wp.array:
+        """Diagonal blocks of P, a ``(B, N, d, d)`` Warp array."""
+        return self._P_diag
+
+    @property
+    def P_offdiag(self) -> wp.array:
+        """Lower off-diagonal blocks of P, a ``(B, N-1, d, d)`` Warp array."""
+        return self._P_offdiag
+
+    @property
+    def A_diag(self) -> Optional[wp.array]:
+        """Diagonal blocks of A, a ``(B, N, r, d)`` Warp array (``None`` if absent)."""
+        return self._A_diag
+
+    @property
+    def A_offdiag(self) -> Optional[wp.array]:
+        """Lower off-diagonal blocks of A, a ``(B, N, r, d)`` Warp array (``None`` if absent)."""
+        return self._A_offdiag
+
+    @property
+    def G_diag(self) -> Optional[wp.array]:
+        """Diagonal blocks of G, a ``(B, N, r, d)`` Warp array (``None`` if absent)."""
+        return self._G_diag
+
+    @property
+    def G_offdiag(self) -> Optional[wp.array]:
+        """Lower off-diagonal blocks of G, a ``(B, N, r, d)`` Warp array (``None`` if absent)."""
+        return self._G_offdiag
+
+    @property
+    def P(self) -> Tuple[wp.array, wp.array]:
+        """``(P_diag, P_offdiag)``, the same layout as the solver inputs."""
+        return (self._P_diag, self._P_offdiag)
+
+    @property
+    def A(self) -> Optional[Tuple[wp.array, wp.array]]:
+        """``(A_diag, A_offdiag)``, or ``None`` if there are no equalities."""
+        return (self._A_diag, self._A_offdiag) if self._A_diag is not None else None
+
+    @property
+    def G(self) -> Optional[Tuple[wp.array, wp.array]]:
+        """``(G_diag, G_offdiag)``, or ``None`` if there are no inequalities."""
+        return (self._G_diag, self._G_offdiag) if self._G_diag is not None else None
+
+    # ------------------------------------------------------------------
+    # In-place setters: (diag, offdiag) tuples for matrices, arrays for
+    # vectors. One device-to-device copy per given array, no allocation.
+    # ------------------------------------------------------------------
+
+    def set_P(self, value: BlockPair, check: bool = True):
+        diag, off = self._split_pair(value, "P")
+        if diag is not None:
+            self._write_blocks(self._P_diag, diag, "P diag")
+        if off is not None:
+            self._write_blocks(self._P_offdiag, off, "P offdiag")
+
+    def set_c(self, value: wp.array, check: bool = True):
+        self._write_vec(self._c_wp, value, "c")
+
+    def set_A(self, value: BlockPair, check: bool = True):
+        if self._A_diag is None:
+            raise ValueError("Cannot set A: no equality block was provided at setup().")
+        diag, off = self._split_pair(value, "A")
+        if diag is not None:
+            self._write_blocks(self._A_diag, diag, "A diag")
+        if off is not None:
+            self._write_blocks(self._A_offdiag, off, "A offdiag")
+
+    def set_b(self, value: wp.array, check: bool = True):
+        if self._b_wp is None:
+            raise ValueError("Cannot set b: no equality block was provided at setup().")
+        self._write_vec(self._b_wp, value, "b")
+
+    def set_G(self, value: BlockPair, check: bool = True):
+        if self._G_diag is None:
+            raise ValueError("Cannot set G: no inequality block was provided at setup().")
+        diag, off = self._split_pair(value, "G")
+        if diag is not None:
+            self._write_blocks(self._G_diag, diag, "G diag")
+        if off is not None:
+            self._write_blocks(self._G_offdiag, off, "G offdiag")
+
+    def set_h_l(self, value: wp.array, check: bool = True):
         if not self._has_h_l:
             raise ValueError(
                 "Cannot set h_l: no lower-inequality block was provided at setup(). "
                 "Adding an inequality block requires a new setup()."
             )
-        if check:
-            self._check_same_block_vec(self._h_l_blk, value)
-        wp.copy(self._h_l_blk.data, value.data)
-        self._h_l[:] = self._h_l_flat_view
+        self._write_vec(self._h_l_wp, value, "h_l")
         self._update_finite_bound_masks()
 
-    def set_h_u(self, value: BlockVec, check: bool = True):
+    def set_h_u(self, value: wp.array, check: bool = True):
         if not self._has_h_u:
             raise ValueError(
                 "Cannot set h_u: no upper-inequality block was provided at setup(). "
                 "Adding an inequality block requires a new setup()."
             )
-        if check:
-            self._check_same_block_vec(self._h_u_blk, value)
-        wp.copy(self._h_u_blk.data, value.data)
-        self._h_u[:] = self._h_u_flat_view
+        self._write_vec(self._h_u_wp, value, "h_u")
         self._update_finite_bound_masks()
 
-    def set_x_l(self, value: BlockVec, check: bool = True):
+    def set_x_l(self, value: wp.array, check: bool = True):
         if not self._has_x_l:
             raise ValueError(
                 "Cannot set x_l: no lower box-bound block was provided at setup(). "
                 "Adding a box-bound block requires a new setup()."
             )
-        if check:
-            self._check_same_block_vec(self._x_l_block, value)
-        wp.copy(self._x_l_block.data, value.data)
-        self._x_l[:] = self._x_l_flat_view
+        self._write_vec(self._x_l_wp, value, "x_l")
         self._update_finite_bound_masks()
 
-    def set_x_u(self, value: BlockVec, check: bool = True):
+    def set_x_u(self, value: wp.array, check: bool = True):
         if not self._has_x_u:
             raise ValueError(
                 "Cannot set x_u: no upper box-bound block was provided at setup(). "
                 "Adding a box-bound block requires a new setup()."
             )
-        if check:
-            self._check_same_block_vec(self._x_u_block, value)
-        wp.copy(self._x_u_block.data, value.data)
-        self._x_u[:] = self._x_u_flat_view
+        self._write_vec(self._x_u_wp, value, "x_u")
         self._update_finite_bound_masks()
 
-    @staticmethod
-    def _block_vec_to_flat(bv: BlockVec, B: int) -> cp.ndarray:
-        """``(B, num_blocks, rows)`` Warp → ``(B, num_blocks*rows)`` cupy (zero-copy)."""
-        return cp.from_dlpack(wp.to_dlpack(bv.data)).reshape(B, -1)
+    # ------------------------------------------------------------------
+    # Write helpers
+    # ------------------------------------------------------------------
 
-    def _require_dtype(self, array) -> None:
-        expected = to_warp_dtype(self._dtype)
-        if array.dtype != expected:
+    @staticmethod
+    def _split_pair(value: BlockPair, name: str) -> BlockPair:
+        """Unpack a ``(diag, offdiag)`` matrix tuple."""
+        if not (isinstance(value, (tuple, list)) and len(value) == 2):
             raise TypeError(
-                f"Multistage input must have dtype {expected} for this solver; "
-                f"got {array.dtype}. Construct inputs with dtype={expected}."
+                f"{name} must be a (diag, offdiag) tuple of GPU arrays; either "
+                f"entry may be None (zero at setup(), unchanged in update()). "
+                f"Got {type(value).__name__}."
             )
+        return value[0], value[1]
 
-    @staticmethod
-    def _validate_bidiag(mat, block_size, num_blocks, batch_size):
-        if mat.batch_size != batch_size:
-            raise ValueError(
-                f"BlockBidiagMat batch_size ({mat.batch_size}) != P batch_size ({batch_size})"
-            )
-        if mat.cols_of_blocks != block_size:
-            raise ValueError(
-                f"BlockBidiagMat column block size ({mat.cols_of_blocks}) != P block size ({block_size})"
-            )
-        if mat.N != num_blocks:
-            raise ValueError(
-                f"BlockBidiagMat column block count ({mat.N}) != P block count ({num_blocks})"
-            )
+    def _write_blocks(self, dst: wp.array, value: wp.array, name: str, allow_batched: bool = True):
+        """Copy ``value`` into the ``(B, N, rows, cols)`` block buffer in place.
 
-    @staticmethod
-    def _check_same_bidiag(old, new):
-        if new.batch_size != old.batch_size:
-            raise ValueError(
-                f"BlockBidiagMat batch_size mismatch: got {new.batch_size}, expected {old.batch_size}"
-            )
-        if new.N != old.N:
-            raise ValueError(f"BlockBidiagMat N mismatch: got {new.N}, expected {old.N}")
-        if new.rows_of_blocks != old.rows_of_blocks:
-            raise ValueError(
-                f"BlockBidiagMat rows_of_blocks mismatch: got {new.rows_of_blocks}, expected {old.rows_of_blocks}"
-            )
-        if new.cols_of_blocks != old.cols_of_blocks:
-            raise ValueError(
-                f"BlockBidiagMat cols_of_blocks mismatch: got {new.cols_of_blocks}, expected {old.cols_of_blocks}"
-            )
+        ``value`` is ``(N, rows, cols)`` (shared by every problem) or, when
+        ``allow_batched``, ``(B, N, rows, cols)``.
+        """
+        self._write(dst, value, name, allow_batched=allow_batched)
 
-    @staticmethod
-    def _check_same_block_vec(old, new):
-        if new.data.shape != old.data.shape:
-            raise ValueError(
-                f"BlockVec shape mismatch: got {tuple(new.data.shape)}, expected {tuple(old.data.shape)}"
-            )
+    def _write_vec(self, dst: wp.array, value: wp.array, name: str, allow_batched: bool = True):
+        """Copy ``value`` into the ``(B, num_blocks, rows)`` vector buffer in place.
 
-    def _init_block_vec(self, bv, batch_size, expected_size):
-        if bv is None:
-            return None, None
-        if bv.batch_size != batch_size:
+        ``value`` is block ``(num_blocks, rows)`` or flat ``(num_blocks*rows,)``
+        (shared by every problem) or, when ``allow_batched``, the same with a
+        leading batch axis.
+        """
+        src = value
+        B, nb, rows = (int(s) for s in dst.shape)
+        K = nb * rows
+        shape = tuple(src.shape)
+        if shape == (K,):
+            src = src.contiguous().reshape((nb, rows))
+        elif allow_batched and shape == (B, K):
+            src = src.contiguous().reshape((B, nb, rows))
+        elif shape not in ((nb, rows), (B, nb, rows)):
+            allowed = [(nb, rows), (K,)]
+            if allow_batched:
+                allowed += [(B, nb, rows), (B, K)]
             raise ValueError(
-                f"BlockVec batch_size ({bv.batch_size}) != P batch_size ({batch_size})"
+                f"{name} must have shape {' or '.join(str(s) for s in allowed)}; "
+                f"got {shape}."
             )
-        flat = self._block_vec_to_flat(bv, batch_size)
-        if flat.shape != (batch_size, expected_size):
-            raise ValueError(
-                f"BlockVec flat shape {flat.shape} != expected ({batch_size}, {expected_size})"
-            )
-        return bv, flat
+        self._write(dst, src, name, allow_batched=allow_batched)

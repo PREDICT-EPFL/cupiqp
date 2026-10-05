@@ -24,7 +24,7 @@ def create_multistage_data_gradients_kernel(
       ``A`` at the diagonal and sub-diagonal block positions.
     * ``dG_D, dG_E`` (``B, N_g, r_g, d``) — same for ``G``.
     * ``dc, db, dh_u, dh_l, dx_u, dx_l`` — vector grads, written as
-      flat ``(B, k)`` arrays that alias the underlying ``BlockVec.data``
+      flat ``(B, k)`` arrays that alias the underlying block vector buffers
       buffers via DLPack reshape.
 
     Mapping conventions (all in flat user-space layout):
@@ -85,7 +85,7 @@ def create_multistage_data_gradients_kernel(
         dA_E:              wp.array4d(dtype=dtype),  # type: ignore (B, N_a, r_a, d)
         dG_D:              wp.array4d(dtype=dtype),  # type: ignore (B, N_g, r_g, d)
         dG_E:              wp.array4d(dtype=dtype),  # type: ignore (B, N_g, r_g, d)
-        # Outputs — flat (B, k) vector grads (aliased to BlockVec.data).
+        # Outputs -- flat (B, k) vector grads (aliased to the block vector buffers).
         dc:   wp.array2d(dtype=dtype),  # type: ignore (B, n)
         db:   wp.array2d(dtype=dtype),  # type: ignore (B, p)
         dh_u: wp.array2d(dtype=dtype),  # type: ignore (B, m)

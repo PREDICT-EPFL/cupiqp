@@ -5,7 +5,7 @@ from .typedef import PIQP_INF
 
 
 def create_finite_bound_masks_kernel(
-    has_h_l: bool, has_h_u: bool, has_x_l: bool, has_x_u: bool, dtype=wp.float64,
+    has_h_l: bool, has_h_u: bool, has_x_l: bool, has_x_u: bool, dtype=wp.float64
     ):
     """Build all per-batch finite-bound masks in a single GPU pass.
 

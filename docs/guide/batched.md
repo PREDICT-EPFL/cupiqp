@@ -5,17 +5,20 @@ one solver call.
 
 ## Batch as the leading dimension
 
-CuPIQP is natively designed to solve batched problems. Therefore, the problem data should be passed as batchl, and every array in the results has **the batch size as its leading dimension**.
+All `B` problems in a batch share one structure: the dimensions, and which constraint
+blocks and bound sides exist. Every argument of `setup` and `update` is either
+**batched**, with the batch size as its leading dimension (one value per problem), or
+**shared**, in the shape of a single problem (one value for every problem). `setup`
+reads `B` from the batched arguments, which must agree; if every argument is shared, it
+sets up a single problem. Every array in the results has the batch size as its leading
+dimension.
 
-| field |  shape |
-|---|---|
-| `P`, `c` |  `(B, n, n)`, `(B, n)` |
-| `A`, `b` | `(B, p, n)` , `(B, p)` |
-| `G`, `h_l`, `h_u` | `(B, m, n)` , `(B, m)`, `(B, m)` |
-| `x_l`, `x_u` | `(B, n)`, `(B, n)` |
-
-
-The solver detects the batch size at `setup()` time from the input shape.
+| field | shared | batched |
+|---|---|---|
+| `P`, `c` | `(n, n)`, `(n,)` | `(B, n, n)`, `(B, n)` |
+| `A`, `b` | `(p, n)`, `(p,)` | `(B, p, n)`, `(B, p)` |
+| `G`, `h_l`, `h_u` | `(m, n)`, `(m,)`, `(m,)` | `(B, m, n)`, `(B, m)`, `(B, m)` |
+| `x_l`, `x_u` | `(n,)`, `(n,)` | `(B, n)`, `(B, n)` |
 
 Each problem in the batch carries its own information and converges independently. Read per-problem diagnostics from `solver.result.info` — every field
 is a `(B,)` array. See [Results & Status](../api/results.md).
@@ -24,29 +27,28 @@ is a `(B,)` array. See [Results & Status](../api/results.md).
 ```python
 solver = DenseSolver()
 solver.setup(
-  P=P_batch,       # 3-dim array, with batch size as leading dim
-  c=c_batch,       # 2-dim array, with batch size as leading dim
-  A=A_batch,       # 3-dim array, with batch size as leading dim
-  b=b_batch,       # 2-dim array, with batch size as leading dim
-  G=G_batch,       # 3-dim array, with batch size as leading dim
-  h_l=h_l_batch,   # 2-dim array, with batch size as leading dim
-  h_u=h_u_batch,   # 2-dim array, with batch size as leading dim
-  x_l=x_l_batch,   # 2-dim array, with batch size as leading dim
-  x_u=x_u_batch,   # 2-dim array, with batch size as leading dim
+  P=P_batch, c=c_batch,       # batched: (B, n, n), (B, n)
+  A=A_single, b=b_batch,      # A shared by every problem, b batched
+  x_l=x_l_single, x_u=x_u_single,
   )
 solver.solve()
 
-x_sol = solver.result.x                  # cupy array of shape (B, n)
-status = solver.result.info.status       # list of length B
+x_sol = solver.result.x.numpy()                # (B, n); result.x is a warp.array on the GPU
+status = solver.result.info.status.numpy()     # (B,) Status codes
 for i, st in enumerate(status):
-    print(f"problem {i}: status = {status.name}, x = {x_sol[i]}")
+    print(f"problem {i}: status = {Status(st).name}, x = {x_sol[i]}")
 ```
+
+To change values later, pass new arrays in the same shared or batched form to
+`update`, then `solve` again; the structure stays fixed. To set up `B` problems that
+are all equal for now, give at least one argument its batch axis, for example
+`cupy.broadcast_to(c, (B, n))`, and fill in per-problem values with `update`.
 
 ### Single problem case:
 
-A single problem is simply the `B=1` case. CuPIQP accepts problem data as single problem, i.e., without the batch size dimension.
-
-However, cuPIQP internally treat this case as `B=1` and **the returned result still carries the batch size 1 as the leading dimension**.
+A single problem is simply the case where every argument is shared. cuPIQP internally
+treats it as a batch of one, so **the returned result still carries the batch size 1 as
+the leading dimension**.
 
 ```python
 P_single = cp.eye(2)                 # 2-dim array, no batch dim
@@ -55,10 +57,7 @@ A_single = cp.array([[1.0, -2.0]])   # 2-dim array, no batch dim
 b_single = cp.array([1.0])           # 1-dim array, no batch dim
 
 solver = DenseSolver()
-solver.setup(
-  P=P_single, c=c_single,
-  A=A_single, b=b_single
-  )
+solver.setup(P=P_single, c=c_single, A=A_single, b=b_single)
 solver.solve()
 
 # result.x still carries a leading batch dimension (B, n); here B = 1
@@ -66,13 +65,27 @@ x_sol = solver.result.x[0]
 ```
 
 ### Sparse problems
-For the **sparse** problems, pass `P`, `A`, `G` as one of the following types:
-- [`cupyx.scipy.sparse.csr_matrix`](https://docs.cupy.dev/en/stable/reference/generated/cupyx.scipy.sparse.csr_matrix.html#cupyx.scipy.sparse.csr_matrix). It only works for batch size 1.
-- List or tuple of `cupyx.scipy.sparse.csr_matrix` objects. However, it is **discouraged** when the batch size is big because this can cause long setup time and low performance.
-- `UniformBatchedCsrMatrix`. This is a class introduced and used internally by cuPIQP itself to represent a batch of sparse CSR matrices with uniform sparsity. It has `indices` and `indptr` attributes which are two `cupy.ndarray` of shape (nnz,) to represent the sparsity pattern. Its `data` attribute is a `cupy.ndarray` of shape (batch_size, nnz) that stores the non-zeros values of all matrices in the batch. We **encourage** users to import it from cuPIQP to store their batched CSR matrices and pass to the `SparseSolver`.
-- [`torch.sparse_csr_tensor`](https://docs.pytorch.org/docs/2.12/generated/torch.sparse_csr_tensor.html), which is the CSR matrix representation in Torch and can express batched CSR matrices. CuPIQP requires that  `crow_indices` and `col_indices` must be identical for all matrices to enforce uniform sparsity.
+For **sparse** problems, `P`, `A`, `G` are CSR triples `(indptr, indices, values)` of GPU
+arrays. The pattern, `indptr` and `indices`, is shared by all `B` problems; the values
+follow the same rule as the vectors: `(nnz,)` shared, or `(B, nnz)` per problem, in the
+order of `indices`. `update` takes the values alone. For a
+[`cupyx.scipy.sparse.csr_matrix`](https://docs.cupy.dev/en/stable/reference/generated/cupyx.scipy.sparse.csr_matrix.html#cupyx.scipy.sparse.csr_matrix)
+`M` pass `(M.indptr, M.indices, M.data)`; for a CUDA
+[`torch.sparse_csr_tensor`](https://docs.pytorch.org/docs/2.12/generated/torch.sparse_csr_tensor.html)
+`T`, `(T.crow_indices(), T.col_indices(), T.values())`.
 
-The vectors $c, b, h_l, h_u, x_l, x_u$ stay stacked `(B, ...)` dense arrays just like the dense case.
+```python
+solver = SparseSolver()
+solver.setup(
+  P=(P_csr.indptr, P_csr.indices, P_values),   # P_values: (B, P_csr.nnz)
+  c=c_batch,                                   # (B, n)
+  G=(G_csr.indptr, G_csr.indices, G_csr.data), # values shared by every problem
+  h_l=h_l_single, h_u=h_u_single,
+  )
+solver.solve()
+solver.update(P=P_values_new, h_u=h_u_batch)   # (B, P_csr.nnz), (B, m)
+solver.solve()
+```
 
 See [this example](https://github.com/PREDICT-EPFL/cupiqp/blob/main/examples/getting_started.ipynb) for more details.
 

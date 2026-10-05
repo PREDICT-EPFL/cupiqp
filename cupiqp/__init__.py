@@ -2,17 +2,15 @@ from importlib.metadata import version as _pkg_version, PackageNotFoundError
 
 from .data import Data
 from .settings import Settings
-from .results import Result, Status
+from .results import Result, Status, InfoSnapshot
 from .typedef import PIQP_INF
 
 from .dense.dense_data import DenseData
 
 from .sparse.sparse_data import SparseData
-from .sparse.batched_csr import UniformBatchedCsrMatrix
 
 from .multistage.multistage_data import MultistageData
 from .multistage.ocp_data import OcpData
-from .multistage.multistage_utils import BlockTridiagMat, BlockBidiagMat, BlockVec
 
 
 # Type-strict, backend-specific Solver subclasses.
@@ -49,14 +47,11 @@ __all__ = [
     "SparseData",
     "MultistageData",
     "OcpData",
-    "BlockTridiagMat",
-    "BlockBidiagMat",
-    "BlockVec",
-    "UniformBatchedCsrMatrix",
     # Configuration / results
     "Settings",
     "Result",
     "Status",
+    "InfoSnapshot",
     # Status aliases (PIQP-style)
     "CUPIQP_UNSOLVED",
     "CUPIQP_SOLVED",
