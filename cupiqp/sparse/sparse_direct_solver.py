@@ -1,19 +1,11 @@
 import os, importlib.util
+from typing import Optional, Union
 from abc import ABC, abstractmethod
 import numpy as np
-import cupy as cp
 import warp as wp
 import nvtx
-from nvmath.sparse.advanced import (
-    DirectSolver,
-    DirectSolverOptions,
-    DirectSolverMatrixType,
-    DirectSolverMatrixViewType,
-    DirectSolverReorderingAlg,
-    ExecutionHybrid,
-    ExecutionCUDA
-)
-from nvmath.bindings import cudss as cudss_bindings
+from cuda.bindings import runtime as cudart
+from nvmath.bindings import cudss
 
 from .batched_csr import UniformBatchedCsrMatrix
 
@@ -93,91 +85,115 @@ class SparseDirectSolver(ABC):
 
 
 class CudssSparseDirectSolver(SparseDirectSolver):
-    def __init__(self, matrix: UniformBatchedCsrMatrix, use_deterministic_mode: bool = False, **cudss_kwargs):
+    """cuDSS through its raw bindings, on the Warp buffers directly.
+
+    The matrix descriptor points at the packed ``(B, nnz)`` values of
+    ``matrix`` and the dense descriptors at the ``(B, dim)`` ``rhs`` / ``sol``
+    buffers; cuDSS uniform batching (``UBATCH_SIZE``) walks the B problems
+    behind them. Nothing is copied or allocated per call.
+    """
+
+    def __init__(self, matrix: UniformBatchedCsrMatrix, use_deterministic_mode: bool = False) -> None:
         super().__init__(matrix)
-        batch_size = self._batch_size
+        _CUDSS_VALUE_TYPE = {wp.float32: cudss.DataType.R_32F, wp.float64: cudss.DataType.R_64F}
+        value_type = _CUDSS_VALUE_TYPE[matrix.dtype]
+        index_type = cudss.DataType.R_32I
 
-        # setup cuDSS solver
-        opts = DirectSolverOptions(
-            sparse_system_type=DirectSolverMatrixType.SYMMETRIC,
-            sparse_system_view=DirectSolverMatrixViewType.LOWER,  # NOTE: only take the lower triangular part of the matrix
-            multithreading_lib=self._find_cudss_mt_lib()
-        )
-        exe = ExecutionCUDA()  # Optional: ExecutionCUDA(). NOTE: hybrid mode seems more numerically stable
+        self._cudss_handle = cudss.create()
+        self._cudss_config = cudss.config_create()
+        self._cudss_data = cudss.data_create(self._cudss_handle)
 
-        # nvmath builds its descriptors from cupy objects: a csr_matrix view of
-        # the first matrix and the first rhs row, both zero-copy views of the
-        # Warp buffers. cuDSS uniform batching then walks the packed
-        # (B, nnz) / (B, dim) storage behind them.
-        self._cudss_solver = DirectSolver(
-            a=matrix[0],
-            b=cp.asarray(self._rhs)[0],
-            options=opts,
-            execution=exe,
-            stream=wp.get_stream("cuda").cuda_stream
+        # Symmetric matrix, only the lower triangle is read. row_end = 0 means
+        # standard CSR (row r ends where row r + 1 starts).
+        self._cudss_a = cudss.matrix_create_csr(
+            self._dim, self._dim, matrix.nnz,
+            matrix.indptr.ptr, 0, matrix.indices.ptr, matrix.data.ptr,
+            index_type, index_type, value_type,
+            cudss.MatrixType.SYMMETRIC, cudss.MatrixViewType.LOWER, cudss.IndexBase.ZERO
         )
-        if batch_size > 1:
-            ubatch_size = np.array([batch_size], dtype=np.int32)
-            cudss_bindings.config_set(
-                self._cudss_solver.config_ptr,
-                cudss_bindings.ConfigParam.UBATCH_SIZE,
-                ubatch_size.ctypes.data,
-                ubatch_size.dtype.itemsize
-            )
-        self._cudss_solver.plan_config.reordering_algorithm = DirectSolverReorderingAlg.DEFAULT
-        self._cudss_solver.plan_config.use_superpanels = 0
-        self._cudss_solver.solution_config.ir_num_steps = 0  # NOTE: iterative refinement steps, to be tuned
+        # One column-major right-hand side / solution per problem.
+        self._cudss_b = cudss.matrix_create_dn(
+            self._dim, 1, self._dim, self._rhs.ptr, value_type, cudss.Layout.COL_MAJOR)
+        self._cudss_x = cudss.matrix_create_dn(
+            self._dim, 1, self._dim, self._sol.ptr, value_type, cudss.Layout.COL_MAJOR)
+
+        # The multithreading layer speeds up the host part of the analysis.
+        mt_lib = self._find_cudss_mt_lib() or os.getenv("CUDSS_THREADING_LIB")
+        if mt_lib is not None and os.path.isfile(mt_lib):
+            cudss.set_threading_layer(self._cudss_handle, mt_lib)
+
+        # Workspace from the device's default memory pool (stream-ordered
+        # cudaMallocAsync) instead of cuDSS's default synchronous cudaMalloc.
+        err, pool = cudart.cudaDeviceGetDefaultMemPool(wp.get_device(matrix.device).ordinal)
+        if err != cudart.cudaError_t.cudaSuccess:
+            raise RuntimeError(f"cudaDeviceGetDefaultMemPool failed: {err}")
+        cudss.set_async_workspace_allocator(self._cudss_handle, int(pool))
+
+        if self._batch_size > 1:
+            self._config_set(cudss.ConfigParam.UBATCH_SIZE, self._batch_size)
+        self._config_set(cudss.ConfigParam.HYBRID_MEMORY_MODE, 0)  # equivalent to ExecutionCUDA in nvmath's DirectSolver wrapper
+        self._config_set(cudss.ConfigParam.USE_CUDA_REGISTER_MEMORY, 1)
+        self._config_set(cudss.ConfigParam.REORDERING_ALG, cudss.ReorderingAlg.DEFAULT)
+        self._config_set(cudss.ConfigParam.USE_SUPERPANELS, 0)
+        self._config_set(cudss.ConfigParam.IR_N_STEPS, 0)  # NOTE: iterative refinement steps, to be tuned
         # cudss has IR_TOL, but not implemented yet according to https://docs.nvidia.com/cuda/cudss/types.html#c.cudssConfigParam_t.CUDSS_CONFIG_IR_TOL
-        # self._cudss_solver.plan_config.pivot_type = cudss_bindings.PivotType.PIVOT_COL
-        # self._cudss_solver.plan_config.pivot_threshold = 1.0
-        # self._cudss_solver.factorization_config.pivot_eps = 1e-12
-
-        # Enable deterministic mode for bit-wise reproducible results across runs.
-        # Uses slower kernels but guarantees identical factorization every time.
-        # Not exposed by nvmath's high-level API, so we call config_set directly.
+        # NOTE: pivoting settings left at the cuDSS defaults; possible tuning knobs:
+        # self._config_set(cudss.ConfigParam.PIVOT_TYPE, cudss.PivotType.PIVOT_GLOBAL_COL)
+        # self._config_set(cudss.ConfigParam.PIVOT_THRESHOLD, 1.0)
+        # self._config_set(cudss.ConfigParam.PIVOT_EPSILON, 1e-12)
+        # Bit-wise reproducible results across runs; slower kernels.
         if use_deterministic_mode:
-            _det_flag = np.ones(1, dtype=np.int32)
-            cudss_bindings.config_set(
-                self._cudss_solver.config_ptr,
-                cudss_bindings.ConfigParam.DETERMINISTIC_MODE,
-                _det_flag.ctypes.data,
-                _det_flag.dtype.itemsize
-            )
+            self._config_set(cudss.ConfigParam.DETERMINISTIC_MODE, 1)
 
-        # Use raw cuDSS handles for direct execute() calls in solve(),
-        # bypassing nvmath's _allocate_batched_result overhead.
-        self._cudss_handle = self._cudss_solver.handle
-        self._cudss_config = self._cudss_solver.config_ptr
-        self._cudss_data   = self._cudss_solver.data_ptr
-        self._cudss_a      = self._cudss_solver.a_ptr
-        self._cudss_x      = self._cudss_solver.x_ptr
-        self._cudss_b      = self._cudss_solver.b_ptr
+    def _config_set(self, param: cudss.ConfigParam, value: Union[int, float]) -> None:
+        buf = np.array([value], dtype=cudss.get_config_param_dtype(param))
+        cudss.config_set(self._cudss_config, param, buf.ctypes.data, buf.itemsize)
 
-        # Uniform batching advances within these packed parent buffers; bind
-        # them explicitly rather than relying on first-row view pointers.
-        cudss_bindings.matrix_set_csr_pointers(
-            self._cudss_a,
-            self._mat.indptr.ptr,
-            0,
-            self._mat.indices.ptr,
-            self._mat.data.ptr
-        )
-        cudss_bindings.matrix_set_values(self._cudss_b, self._rhs.ptr)
-        cudss_bindings.matrix_set_values(self._cudss_x, self._sol.ptr)
-
-    def __del__(self):
-        cudss_solver = getattr(self, "_cudss_solver", None)
-        if cudss_solver is not None:
+    def __del__(self) -> None:
+        # Matrices and data before the handle that created them.
+        for name, destroy in (("_cudss_a", cudss.matrix_destroy),
+                              ("_cudss_b", cudss.matrix_destroy),
+                              ("_cudss_x", cudss.matrix_destroy)):
+            ptr = getattr(self, name, None)
+            if ptr:
+                try:
+                    destroy(ptr)
+                except Exception:
+                    pass
+                setattr(self, name, None)
+        handle = getattr(self, "_cudss_handle", None)
+        if getattr(self, "_cudss_data", None) and handle:
             try:
-                cudss_solver.free()
+                cudss.data_destroy(handle, self._cudss_data)
             except Exception:
                 pass
-            self._cudss_solver = None
+            self._cudss_data = None
+        if getattr(self, "_cudss_config", None):
+            try:
+                cudss.config_destroy(self._cudss_config)
+            except Exception:
+                pass
+            self._cudss_config = None
+        if handle:
+            try:
+                cudss.destroy(handle)
+            except Exception:
+                pass
+            self._cudss_handle = None
+
+    def _execute(self, phase: cudss.Phase, cuda_stream: int) -> None:
+        cudss.set_stream(self._cudss_handle, cuda_stream)
+        cudss.execute(
+            self._cudss_handle, phase,
+            self._cudss_config, self._cudss_data,
+            self._cudss_a, self._cudss_x, self._cudss_b
+        )
 
     @nvtx.annotate("CudssSparseDirectSolver::plan")
     def plan(self, cuda_stream: int) -> bool:
+        """Reordering and symbolic factorization (cuDSS ``ANALYSIS`` phase)."""
         try:
-            plan_info = self._cudss_solver.plan(stream=cuda_stream)
+            self._execute(cudss.Phase.ANALYSIS, cuda_stream)
         except Exception as e:
             print(f"Planning failed: {e}")
             return False
@@ -232,12 +248,7 @@ class CudssSparseDirectSolver(SparseDirectSolver):
         #   -delta * I block has pivots of size delta by design (down to
         #   reg_finetune_lower_limit = 1e-13), so 1e-12 would reject healthy,
         #   quasi-definite factorizations after regularization finetuning.
-        cudss_bindings.set_stream(self._cudss_handle, cuda_stream)
-        cudss_bindings.execute(
-            self._cudss_handle, cudss_bindings.Phase.FACTORIZATION,
-            self._cudss_config, self._cudss_data,
-            self._cudss_a, self._cudss_x, self._cudss_b
-        )
+        self._execute(cudss.Phase.FACTORIZATION, cuda_stream)
 
     @nvtx.annotate("CudssSparseDirectSolver::solve")
     def solve(self, cuda_stream: int) -> None:
@@ -247,18 +258,12 @@ class CudssSparseDirectSolver(SparseDirectSolver):
         node bodies reject (verified with cuDSS 0.8 for single, uniform-batch
         and explicit-batch matrices). The factorization phase has no such
         copies."""
-        # Bypass nvmath's solve() which allocates B fresh arrays every call.
-        # x_ptr already points at self._sol (set once in __init__), so cuDSS
-        # writes directly into our buffer - zero allocation, zero copy.
-        cudss_bindings.set_stream(self._cudss_handle, cuda_stream)
-        cudss_bindings.execute(
-            self._cudss_handle, cudss_bindings.Phase.SOLVE,
-            self._cudss_config, self._cudss_data,
-            self._cudss_a, self._cudss_x, self._cudss_b
-        )
+        # The solution descriptor points at self._sol: cuDSS writes directly
+        # into it, with no allocation and no copy.
+        self._execute(cudss.Phase.SOLVE, cuda_stream)
 
     @staticmethod
-    def _find_cudss_mt_lib():
+    def _find_cudss_mt_lib() -> Optional[str]:
         """Auto-discover the cuDSS multithreading layer library.
 
         Searches across CUDA version packages (nvidia.cu11, nvidia.cu12, nvidia.cu13, ...)
