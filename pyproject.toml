@@ -19,7 +19,6 @@ keywords = [
   "interior-point method",
   "gpu",
   "cuda",
-  "cupy",
   "warp",
   "differentiable",
 ]
@@ -38,8 +37,8 @@ classifiers = [
 # Runtime dependencies installed for every `pip install .`.
 #
 # `socu` provides the block-structured Warp kernels behind `MultistageSolver`.
-# CUDA-bound packages (cupy-cuda12x / cuda13x, torch+cuXY, jax-cudaXY) are NOT
-# listed here; install them via the matching extra (see optional extras).
+# The CUDA runtime libraries are NOT listed here; install them via the
+# matching CUDA extra (see optional extras).
 dependencies = [
   "numpy>=2.0",
   "scipy>=1.13",
@@ -50,19 +49,18 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# --- CUDA / CuPy ---------------------------------------------------------
-# CuPy ships as separate wheels per CUDA major version (cupy-cuda12x for
-# CUDA 12.x, cupy-cuda13x for CUDA 13.x). Pick the one matching the CUDA
-# version reported by ``nvidia-smi``. nvmath-python's CUDA extras provide
-# the matching NVIDIA runtime libraries, including cuDSS for the sparse backend:
+# --- CUDA ---------------------------------------------------------------
+# Pick the extra matching the CUDA version reported by ``nvidia-smi``.
+# nvmath-python's CUDA extras provide the matching NVIDIA runtime libraries
+# (cuBLAS, cuSOLVER, cuSPARSE, and cuDSS for the sparse backend):
 #
 #   pip install "cupiqp[cuda12]"   -> CUDA 12.x driver/runtime
 #   pip install "cupiqp[cuda13]"   -> CUDA 13.x driver/runtime
 #
 # These are mutually exclusive — installing both will resolve, but only the
 # wheel matching the driver actually loads at runtime.
-cuda12 = ["cupy-cuda12x", "nvmath-python[cu12]>=1.0.0"]
-cuda13 = ["cupy-cuda13x", "nvmath-python[cu13]>=1.0.0"]
+cuda12 = ["nvmath-python[cu12]>=1.0.0"]
+cuda13 = ["nvmath-python[cu13]>=1.0.0"]
 
 test  = ["pytest>=7"]
 dev   = [

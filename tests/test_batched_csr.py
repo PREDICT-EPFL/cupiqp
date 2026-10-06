@@ -106,34 +106,21 @@ def test_row_indices(B: int, m: int, n: int) -> None:
 
 
 # ===========================================================================
-# __getitem__: cupy CSR views for setup-time algebra
+# pattern(): host scipy pattern for setup-time algebra
 # ===========================================================================
 
-@pytest.mark.parametrize("B,m,n", [(1, 3, 4), (3, 5, 7), (8, 6, 6)])
-def test_getitem_returns_correct_csr(B: int, m: int, n: int) -> None:
-    tpl = random_csr_template(m, n, seed=4)
-    mat, values = build_from_template(tpl, B, seed=5)
+def test_pattern_keeps_explicit_zeros() -> None:
+    """``pattern()`` has a one on every stored entry, also where the values are zero."""
+    tpl = random_csr_template(4, 5, seed=8)
+    values = cp.zeros((2, tpl.nnz))
+    mat = UniformBatchedCsrMatrix(2, tpl.indptr, tpl.indices, values, shape=tpl.shape)
 
-    tpl_cpu = tpl.get()
-    for i in range(B):
-        got = mat[i]
-        assert isinstance(got, csr_matrix)
-        assert got.shape == (m, n)
-        np.testing.assert_allclose(cp.asnumpy(got.data), cp.asnumpy(values[i]))
-
-        ref = tpl_cpu.copy()
-        ref.data[:] = cp.asnumpy(values[i])
-        np.testing.assert_allclose(got.toarray().get(), ref.toarray())
-
-
-def test_getitem_returns_view() -> None:
-    """Mutating the returned csr_matrix's data writes through to ``mat.data``."""
-    tpl = random_csr_template(3, 4, seed=6)
-    mat, _ = build_from_template(tpl, B=2, seed=7)
-
-    got = mat[0]
-    got.data[0] = 999.0
-    assert float(mat.data.numpy()[0, 0]) == 999.0
+    pat = mat.pattern()
+    assert isinstance(pat, sp_cpu.csr_matrix)
+    assert pat.nnz == tpl.nnz
+    np.testing.assert_array_equal(pat.data, np.ones(tpl.nnz))
+    np.testing.assert_array_equal(pat.indptr, cp.asnumpy(tpl.indptr))
+    np.testing.assert_array_equal(pat.indices, cp.asnumpy(tpl.indices))
 
 
 # ===========================================================================

@@ -1,4 +1,3 @@
-import cupy as cp
 import numpy as np
 import warp as wp
 
@@ -18,11 +17,12 @@ def _to_host(arr) -> np.ndarray:
     return as_warp_array(arr).numpy() if is_cuda_array(arr) else np.ascontiguousarray(arr)
 
 
-def _check_csr(name: str, value, dtype, device, cols: Optional[int] = None) -> Optional[Tuple[wp.array, wp.array, wp.array]]:
-    """Device Warp arrays of a CSR triple ``(indptr, indices, values)`` (``None`` passes through).
+def _check_csr(name: str, value, dtype, cols: Optional[int] = None) -> Optional[Tuple[np.ndarray, np.ndarray, wp.array]]:
+    """Checked CSR triple ``(indptr, indices, values)`` (``None`` passes through).
 
     ``indptr`` and ``indices`` are 1-D integer arrays on the host or the device;
-    they are checked on the host and copied to ``device`` once. ``values`` is a
+    they are checked on the host and returned as NumPy arrays (the solver
+    data uploads them once). ``values`` is a
     device array of the stored entries in the solver ``dtype``, ``(nnz,)``
     shared by every problem or ``(B, nnz)`` per problem. The matrix has
     ``len(indptr) - 1`` rows and ``cols`` columns (as many as rows when ``cols``
@@ -82,7 +82,7 @@ def _check_csr(name: str, value, dtype, device, cols: Optional[int] = None) -> O
             f"before passing its pattern."
         )
 
-    return wp.array(indptr_host, device=device), wp.array(indices_host, device=device), values
+    return indptr_host, indices_host, values
 
 
 def _check_dense_vector(name: str, m, dtype) -> Optional[wp.array]:
@@ -159,18 +159,19 @@ class SparseSolver(SolverBase):
     Examples
     --------
     ```python
+    import numpy as np
     import scipy.sparse as sp
-    import cupy as cp
-    from cupyx.scipy.sparse import csr_matrix
+    import warp as wp
     from cupiqp import SparseSolver, Status
 
     B, n = 8, 4
-    P = csr_matrix(sp.eye(n, format="csr"))     # lift scipy -> GPU CSR
+    P = sp.eye(n, format="csr")                 # pattern on the host
+    values = np.random.uniform(1.0, 2.0, (B, P.nnz))
 
     solver = SparseSolver()
     solver.setup(
-        P=(P.indptr, P.indices, cp.random.uniform(1.0, 2.0, (B, P.nnz))),  # per-problem values
-        c=cp.zeros(n),                          # shared by all B problems
+        P=(P.indptr, P.indices, wp.array(values, dtype=wp.float64)),  # per-problem values on the GPU
+        c=wp.zeros(n, dtype=wp.float64),        # shared by all B problems
     )
     solver.solve()
 
@@ -192,14 +193,6 @@ class SparseSolver(SolverBase):
     (tolerances, verbosity, iteration cap, ...) is configured through
     ``solver.settings``.
     """
-
-    def __init__(self, dtype: Union[type[wp.float32], type[wp.float64]] = wp.float64, stream=None):
-        super().__init__(dtype=dtype, stream=stream)
-        # Non-owning cupy view of the solver stream. cupy is used only at
-        # setup, to build CSR patterns and index maps; running those ops on
-        # the solver stream orders them with the Warp copies that consume
-        # their results. The Warp stream owns the handle.
-        self._cupy_stream = cp.cuda.ExternalStream(self._stream.cuda_stream)
 
     def _print_problem_size(self):
         d = self._data
@@ -312,16 +305,16 @@ class SparseSolver(SolverBase):
         """
         if P is None:
             raise TypeError("SparseSolver.setup requires P.")
-        P = _check_csr("P", P, self._dtype, self._device)
+        P = _check_csr("P", P, self._dtype)
         n = int(P[0].shape[0]) - 1
-        A = _check_csr("A", A, self._dtype, self._device, cols=n)
-        G = _check_csr("G", G, self._dtype, self._device, cols=n)
+        A = _check_csr("A", A, self._dtype, cols=n)
+        G = _check_csr("G", G, self._dtype, cols=n)
         c, b, h_u, h_l, x_u, x_l = (
             _check_dense_vector(name, v, self._dtype)
             for name, v in (("c", c), ("b", b), ("h_u", h_u), ("h_l", h_l),
                             ("x_u", x_u), ("x_l", x_l))
         )
-        with wp.ScopedStream(self._stream, sync_enter=not self._stream.is_capturing), self._cupy_stream:
+        with wp.ScopedStream(self._stream, sync_enter=not self._stream.is_capturing):
             self._setup_impl(P, c, A, b, G, h_u, h_l, x_u, x_l)
             if self.settings.enable_grad:
                 self._init_grad_data()

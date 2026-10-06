@@ -40,8 +40,8 @@ where $P \succeq 0$ is positive semidefinite, $x \in \mathbb{R}^n$ is the decisi
 - Python 3.10 or later.
 - Linux with an NVIDIA GPU and a working CUDA driver/runtime stack.
 - CUDA Python packages compatible with the installed CUDA stack. This repository
-  defines extras for CUDA 12.x and CUDA 13.x, which pull in the matching nvmath runtime
-  libraries and the CuPy build used by the sparse backend.
+  defines extras for CUDA 12.x and CUDA 13.x, which pull in the matching NVIDIA
+  runtime libraries (cuBLAS, cuSOLVER, cuSPARSE, cuDSS) through nvmath-python.
 
 cuPIQP is not currently published on PyPI. From a local clone, install it
 with one CUDA extra:
@@ -54,8 +54,8 @@ python -m pip install ".[cuda12]"  # for a CUDA 12.x driver/runtime
 python -m pip install ".[cuda13]"  # for a CUDA 13.x driver/runtime
 ```
 
-If a CuPy build matching your CUDA version is already installed, the base local
-install is:
+If the NVIDIA runtime libraries matching your CUDA version are already installed,
+the base local install is:
 
 ```bash
 python -m pip install .
@@ -84,11 +84,11 @@ print(x.numpy())                                 # [[-1. -1. -1.]]
 
 ### Runtime dependencies (for reference)
 
-Pulled automatically by the relevant extras above:
+Installed automatically by `pip install .`; the CUDA extras add the matching NVIDIA runtime libraries:
 
 - [Warp](https://github.com/NVIDIA/warp) — the solver's arrays and JIT-compiled CUDA kernels.
 - [nvmath-python](https://developer.nvidia.com/nvmath-python) — cuBLAS / cuSOLVER / cuSPARSE / cuDSS bindings and CUDA runtime packages via the selected CUDA extra.
-- [CuPy](https://cupy.dev/) (`cupy-cuda12x` or `cupy-cuda13x`) — used internally by the sparse backend only, for the CSR matrices passed to cuSPARSE / cuDSS.
+- [SciPy](https://scipy.org/) — sparse backend only, to build the KKT sparsity pattern once at `setup()`.
 - [NVTX](https://github.com/NVIDIA/NVTX) — profiling annotations.
 - [socu](https://github.com/PREDICT-EPFL/socu) — required by the `MultistageSolver` as the linear system solver.
 

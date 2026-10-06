@@ -4,12 +4,12 @@ The operator takes a :class:`UniformBatchedCsrMatrix` and keeps every
 cuSPARSE resource (handle, descriptors, workspace) from construction on, so a
 call only rebinds the dense-vector pointers and dispatches ``cusparseSpMV``
 through ``nvmath.bindings.cusparse``: no allocation, no host sync, safe to
-record in a CUDA graph. Calls run on Warp's current stream. cupy is used
-only while building the block-diagonal pattern for a batch of several.
+record in a CUDA graph. Calls run on Warp's current stream. The
+block-diagonal pattern for a batch of several is built once, on the host.
 """
 import ctypes
 
-import cupy as cp
+import numpy as np
 import warp as wp
 from nvmath.bindings import cusparse
 
@@ -77,14 +77,20 @@ class SparseMatVecProduct:
         if B == 1:
             indptr, indices = mats.indptr, mats.indices
         else:
-            # Block-diagonal pattern (cupy at setup): big_indptr[b*rows + r] = b*nnz + indptr[r],
+            # Block-diagonal pattern (host, at setup): big_indptr[b*rows + r] = b*nnz + indptr[r],
             # big_indices[b*nnz + k] = indices[k] + b*cols.
-            indptr_cp = cp.asarray(mats.indptr)
-            indices_cp = cp.asarray(mats.indices)
-            big_indptr = cp.empty(B * rows + 1, dtype=cp.int32)
-            big_indptr[:B * rows] = (indptr_cp[:-1][None, :] + (cp.arange(B, dtype=cp.int32) * nnz)[:, None]).reshape(-1)
+            pattern = mats.pattern()
+            indptr_np = pattern.indptr.astype(np.int64)
+            indices_np = pattern.indices.astype(np.int64)
+            big_indptr = np.empty(B * rows + 1, dtype=np.int64)
+            big_indptr[:B * rows] = (indptr_np[:-1][None, :] + (np.arange(B, dtype=np.int64) * nnz)[:, None]).reshape(-1)
             big_indptr[-1] = B * nnz
-            big_indices = (indices_cp[None, :] + (cp.arange(B, dtype=cp.int32) * cols)[:, None]).reshape(-1)
+            big_indices = (indices_np[None, :] + (np.arange(B, dtype=np.int64) * cols)[:, None]).reshape(-1)
+            if big_indptr[-1] >= 2 ** 31 or B * cols >= 2 ** 31:
+                raise ValueError(
+                    f"The batched sparse matrix-vector product needs B * nnz = {B * nnz} and "
+                    f"B * cols = {B * cols} below 2**31 (int32 indices)."
+                )
             indptr = to_wp_int32(big_indptr, mats.device)
             indices = to_wp_int32(big_indices, mats.device)
         self._indptr, self._indices = indptr, indices   # kept alive for the descriptor

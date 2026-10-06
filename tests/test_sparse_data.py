@@ -184,13 +184,13 @@ class TestSetters:
         np.testing.assert_allclose(data.A.data.numpy(), [[3.0, 4.0]])
         np.testing.assert_allclose(data.G.data.numpy(), 2.0 * np.ones((1, n)))
 
-    def test_inplace_mutation_visible_via_getitem(self):
-        """``data.P[b]`` is a view of the stored values."""
+    def test_inplace_mutation_visible_in_data(self):
+        """``data.P.data`` is the stored values buffer: in-place changes are seen."""
         B, n = 2, 4
         P = _make_spd_csr(n, seed=90)
         data = _sparse_data(P=P, c=cp.zeros((B, n)))
         cp.asarray(data.P.data)[:] *= 3.0
-        np.testing.assert_allclose(data.P[0].data.get(), 3.0 * P.data.get())
+        np.testing.assert_allclose(data.P.data.numpy()[0], 3.0 * P.data.get())
 
 
 # ===========================================================================

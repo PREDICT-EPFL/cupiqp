@@ -1,17 +1,17 @@
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
-import cupy as cp
 import numpy as np
 import warp as wp
-from cupyx.scipy.sparse import csr_matrix
+from scipy.sparse import csr_matrix
 
-from ..utils import to_warp_dtype
+from ..utils import to_warp_dtype, is_cuda_array, as_warp_array, batch_broadcast_view
+from .csr_helpers import csr_row_indices
 
 
 class UniformBatchedCsrMatrix:
     """A batch of CSR matrices that share one sparsity pattern.
 
-    A batched extension of ``cupyx.scipy.sparse.csr_matrix``: where a single
+    A batched extension of ``scipy.sparse.csr_matrix``: where a single
     CSR matrix stores ``indptr``, ``indices`` and a 1-D ``data`` array of
     length ``nnz``, this type stores **one shared** ``indptr`` / ``indices``
     pair plus a **2-D** ``data`` buffer of shape ``(batch_size, nnz)`` - the
@@ -22,22 +22,23 @@ class UniformBatchedCsrMatrix:
     The storage is Warp arrays owned by this object: ``indptr`` and
     ``indices`` are ``int32`` and ``data`` has the value dtype. cuSPARSE and
     cuDSS read them through their device pointers and the solver's Warp
-    kernels index them directly. cupy is used only while constructing the
-    pattern; ``mat[b]`` returns a zero-copy ``csr_matrix`` view of one matrix
-    for pattern algebra at setup time.
+    kernels index them directly. The setup-time pattern algebra (KKT
+    assembly, index maps) is done on the host with numpy / scipy:
+    ``pattern()`` downloads the pattern when called.
 
     Parameters
     ----------
     batch_size : int
         Number of matrices in the batch, ``B`` (must be positive).
-    indptr, indices : int array
+    indptr, indices : numpy.ndarray or GPU array (warp, cupy, ...) of integers
         The shared CSR row-pointer and column-index arrays - the single
-        sparsity pattern used by every matrix in the batch. Any host or GPU
-        integer array; copied into ``int32`` Warp arrays.
-    data : GPU array
+        sparsity pattern used by every matrix in the batch. Any 1-D host or
+        GPU integer array; copied once into ``int32`` Warp arrays.
+    data : numpy.ndarray or GPU array (warp, cupy, ...)
         Values of shape ``(batch_size, nnz)``, row ``i`` holding the nonzeros
         of the ``i``-th matrix in the order of ``indices``, or ``(nnz,)`` for
-        the same values in every matrix. Copied into the owned buffer.
+        the same values in every matrix. A GPU array must already have the
+        value dtype; a host array is converted. Copied into the owned buffer.
     shape : tuple of (int, int)
         Dense ``(rows, cols)`` shape of each matrix.
     dtype : Warp scalar type, default: ``wp.float64``
@@ -50,40 +51,42 @@ class UniformBatchedCsrMatrix:
     batch_size, nnz, rows, cols, shape :
         Batch size ``B``, nonzeros per matrix, and the shared dense shape.
     indptr, indices : warp.array of int32
-        The shared CSR sparsity pattern.
+        The shared CSR sparsity pattern, on the device.
     data : warp.array2d
-        The ``(batch_size, nnz)`` values buffer.
+        The ``(batch_size, nnz)`` values buffer, on the device.
     """
     def __init__(
         self,
         batch_size: int,
-        indptr,
-        indices,
-        data,
+        indptr: Union[np.ndarray, wp.array],
+        indices: Union[np.ndarray, wp.array],
+        data: wp.array,
         shape: Tuple[int, int],
-        dtype=wp.float64,
+        dtype: Union[type[wp.float32], type[wp.float64]] = wp.float64,
         device: str = "cuda"
-    ):
+    ) -> None:
         if isinstance(batch_size, bool) or not isinstance(batch_size, (int, np.integer)) or batch_size < 1:
             raise ValueError("batch_size must be a positive integer.")
         batch_size = int(batch_size)
         rows, cols = int(shape[0]), int(shape[1])
         dtype = to_warp_dtype(dtype)
 
-        # The pattern is validated and normalized with cupy (setup time only).
-        indptr_cp = cp.asarray(indptr, dtype=cp.int32).ravel()
-        indices_cp = cp.asarray(indices, dtype=cp.int32).ravel()
-        nnz = int(indices_cp.size)
-        if int(indptr_cp.size) != rows + 1:
+        indptr_wp = to_wp_int32(indptr, device)
+        indices_wp = to_wp_int32(indices, device)
+        nnz = int(indices_wp.shape[0])
+        if int(indptr_wp.shape[0]) != rows + 1:
             raise ValueError(
-                f"indptr must have length rows + 1 = {rows + 1}; got {int(indptr_cp.size)}."
+                f"indptr must have length rows + 1 = {rows + 1}; got {int(indptr_wp.shape[0])}."
             )
-        data_cp = cp.asarray(data, dtype=wp.dtype_to_numpy(dtype))
-        if data_cp.shape == (nnz,):
-            data_cp = cp.broadcast_to(data_cp, (batch_size, nnz))
-        if data_cp.shape != (batch_size, nnz):
+        if is_cuda_array(data) or isinstance(data, wp.array):
+            data_wp = as_warp_array(data, "data", dtype)
+        else:
+            data_wp = wp.array(np.ascontiguousarray(data, dtype=wp.dtype_to_numpy(dtype)), dtype=dtype, device=device)
+        if tuple(data_wp.shape) == (nnz,):
+            data_wp = batch_broadcast_view(data_wp, batch_size)
+        if tuple(data_wp.shape) != (batch_size, nnz):
             raise ValueError(
-                f"data must have shape ({batch_size}, {nnz}) or ({nnz},), got {data_cp.shape}."
+                f"data must have shape ({batch_size}, {nnz}) or ({nnz},), got {tuple(data_wp.shape)}."
             )
 
         self._batch_size = batch_size
@@ -92,11 +95,11 @@ class UniformBatchedCsrMatrix:
         self._cols = cols
         self._dtype = dtype
         self._device = device
-        self._indptr = to_wp_int32(indptr_cp, device)
-        self._indices = to_wp_int32(indices_cp, device)
+        self._indptr = indptr_wp
+        self._indices = indices_wp
         self._data = wp.empty((batch_size, nnz), dtype=dtype, device=device)
         if nnz > 0:
-            wp.copy(self._data, wp.array(data_cp, dtype=dtype, copy=False))
+            wp.copy(self._data, data_wp)
         self._row_indices: Optional[wp.array] = None
 
     # ------------------------------------------------------------------
@@ -129,68 +132,83 @@ class UniformBatchedCsrMatrix:
         return self._dtype
 
     @property
-    def device(self) -> str:
+    def device(self):
         return self._device
 
     @property
     def indptr(self) -> wp.array:
-        """Shared CSR row pointers, ``(rows + 1,)`` int32."""
+        """Shared CSR row pointers, ``(rows + 1,)`` int32, on the device."""
         return self._indptr
 
     @property
     def indices(self) -> wp.array:
-        """Shared CSR column indices, ``(nnz,)`` int32."""
+        """Shared CSR column indices, ``(nnz,)`` int32, on the device."""
         return self._indices
 
     @property
     def data(self) -> wp.array:
-        """Values, ``(batch_size, nnz)``."""
+        """Values, ``(batch_size, nnz)`` in ``dtype``, on the device."""
         return self._data
 
     @property
     def row_indices(self) -> wp.array:
-        """Row index of every stored entry, ``(nnz,)`` int32 (the COO row array).
+        """Row index of every stored entry, ``(nnz,)`` int32 on the device (the COO row array).
 
-        Depends only on the pattern, so it is computed once, with cupy, on
+        Depends only on the pattern, so it is computed once, on the host, on
         first use.
         """
         if self._row_indices is None:
-            if self._nnz == 0:
-                self._row_indices = wp.zeros(0, dtype=wp.int32, device=self._device)
-            else:
-                indptr_cp = cp.asarray(self._indptr)
-                rows = cp.searchsorted(indptr_cp[1:], cp.arange(self._nnz, dtype=cp.int32), side="right")
-                self._row_indices = to_wp_int32(rows, self._device)
+            self._row_indices = to_wp_int32(csr_row_indices(self._indptr.numpy()), self._device)
         return self._row_indices
 
-    def __getitem__(self, key: int) -> csr_matrix:
-        """Zero-copy ``csr_matrix`` view of the ``key``-th matrix (cupy views of
-        the Warp buffers), for pattern algebra and library setup calls."""
+    def pattern(self) -> csr_matrix:
+        """Host ``scipy.sparse.csr_matrix`` of the shared sparsity pattern,
+        with every stored entry set to one (explicit zeros of the values
+        stay stored entries here). Downloads the pattern: for setup-time
+        use only."""
         return csr_matrix(
-            (cp.asarray(self._data)[key], cp.asarray(self._indices), cp.asarray(self._indptr)),
+            (np.ones(self._nnz), self._host_indices(), self._indptr.numpy()),
             shape=(self._rows, self._cols)
         )
 
+    def _host_indices(self) -> np.ndarray:
+        """Host copy of ``indices`` (a zero-length Warp array has no data to download)."""
+        return self._indices.numpy() if self._nnz > 0 else np.zeros(0, dtype=np.int32)
+
     @classmethod
     def empty(
-        cls, batch_size: int, rows: int, cols: int, dtype=wp.float64, device: str = "cuda"
+        cls, batch_size: int, rows: int, cols: int, dtype: Union[type[wp.float32], type[wp.float64]] = wp.float64,
+        device: str = "cuda"
     ) -> "UniformBatchedCsrMatrix":
         """Build a batch of ``(rows, cols)`` matrices with no stored entries."""
         return cls(
             batch_size=batch_size,
             indptr=np.zeros(rows + 1, dtype=np.int32),
             indices=np.zeros(0, dtype=np.int32),
-            data=cp.empty((batch_size, 0), dtype=wp.dtype_to_numpy(to_warp_dtype(dtype))),
+            data=np.empty((batch_size, 0), dtype=wp.dtype_to_numpy(to_warp_dtype(dtype))),
             shape=(rows, cols),
             dtype=dtype,
             device=device
         )
 
 
-def to_wp_int32(values, device: str = "cuda") -> wp.array:
-    """Owned ``int32`` Warp copy of an integer array (host or GPU); a
-    zero-length input gives an empty array instead of a null-pointer view."""
-    values_cp = cp.asarray(values, dtype=cp.int32).ravel()
-    if values_cp.size == 0:
+def to_wp_int32(values: Union[np.ndarray, wp.array], device: str = "cuda") -> wp.array:
+    """Owned 1-D ``int32`` Warp copy of an integer array (host or GPU); a
+    zero-length input gives an empty array instead of a null-pointer view.
+
+    A 1-D ``int32`` GPU array is copied on the device; anything else goes
+    through the host once.
+    """
+    if isinstance(values, wp.array) or is_cuda_array(values):
+        arr = as_warp_array(values)
+        if arr.ndim == 1 and arr.dtype == wp.int32:
+            if arr.shape[0] == 0:
+                return wp.zeros(0, dtype=wp.int32, device=device)
+            out = wp.empty(arr.shape[0], dtype=wp.int32, device=device)
+            wp.copy(out, arr)
+            return out
+        values = arr.numpy()
+    values_np = np.ascontiguousarray(values, dtype=np.int32).ravel()
+    if values_np.size == 0:
         return wp.zeros(0, dtype=wp.int32, device=device)
-    return wp.array(cp.ascontiguousarray(values_cp), dtype=wp.int32, device=device)
+    return wp.array(values_np, dtype=wp.int32, device=device)

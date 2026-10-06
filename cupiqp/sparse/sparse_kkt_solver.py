@@ -1,8 +1,8 @@
 from typing import Optional
-import cupy as cp
+import numpy as np
 import warp as wp
 
-from cupyx.scipy.sparse import csr_matrix, diags, bmat
+from scipy.sparse import csr_matrix, eye_array, bmat
 import nvtx
 
 from ..kkt_solver import KKTSolverBase
@@ -26,7 +26,8 @@ class SparseKKTSolver(KKTSolverBase):
     Manages B independent KKT systems sharing the same sparsity pattern.
     All B KKT matrices' data are packed into a contiguous ``(B, kkt_nnz)``
     Warp buffer so that diagonal / block updates are single kernel launches.
-    The KKT pattern and the index maps are built once at setup with cupy;
+    The KKT pattern and the index maps are built once at setup, on the host
+    with NumPy / SciPy;
     everything that runs afterwards is Warp kernels, cuSPARSE and cuDSS on
     Warp storage.
     """
@@ -39,23 +40,23 @@ class SparseKKTSolver(KKTSolverBase):
         self._dtype = data.dtype
         self._device = device = data.device
 
-        # -- Build KKT structure from the first problem's sparsity (cupy views) --
-        P0, A0, G0 = data.P[0], data.A[0], data.G[0]
-        kkt_template = self._initialize_kkt_csr(P0, A0, G0, dtype=wp.dtype_to_numpy(data.dtype))
+        # -- Build the KKT structure from the shared sparsity patterns (host) --
+        P0, A0, G0 = data.P.pattern(), data.A.pattern(), data.G.pattern()
+        kkt0 = self._initialize_kkt_csr(P0, A0, G0)
 
         # -- Pack all KKT matrices in the batch into one UniformBatchedCsrMatrix
         # (contiguous (B, kkt_nnz) values, shared indices/indptr), initialized
-        # from the template values.
+        # from the template values: one on every stored entry, then P, A, G
+        # are scattered in below.
         self._kkt_mats = UniformBatchedCsrMatrix(
             batch_size=B,
-            indptr=kkt_template.indptr,
-            indices=kkt_template.indices,
-            data=kkt_template.data,
-            shape=kkt_template.shape,
+            indptr=kkt0.indptr,
+            indices=kkt0.indices,
+            data=kkt0.data,
+            shape=kkt0.shape,
             dtype=data.dtype,
             device=device
         )
-        kkt0 = self._kkt_mats[0]
 
         # -- Diagonal indices (shared - same structure) -----------------
         single_kkt_diag_idx = csr_diag_indices(kkt0)
@@ -86,8 +87,8 @@ class SparseKKTSolver(KKTSolverBase):
         # (row_indices == col_indices) is [True False False False True],
         # so the 0th and 4th entries of P.data are diagonal elements, and they
         # belong to rows/cols P.indices[[0, 4]] = [0, 2].
-        P0_rows, P0_cols = csr_row_indices(P0), P0.indices
-        diag_positions = cp.where(P0_rows == P0_cols)[0]
+        P0_rows, P0_cols = csr_row_indices(P0.indptr), P0.indices
+        diag_positions = np.flatnonzero(P0_rows == P0_cols)
         self._P_diag_src_cols = to_wp_int32(diag_positions, device)           # positions in P.data
         self._P_diag_dst_cols = to_wp_int32(P0_cols[diag_positions], device)  # variable index
         self._P_diag = wp.zeros((B, n), dtype=self._dtype, device=device)
@@ -143,44 +144,39 @@ class SparseKKTSolver(KKTSolverBase):
     def _initialize_kkt_csr(
         P: csr_matrix,
         A: Optional[csr_matrix] = None,
-        G: Optional[csr_matrix] = None,
-        dtype=cp.float64
+        G: Optional[csr_matrix] = None
     ) -> csr_matrix:
         """
         Initialize the KKT matrix based on the sparsity of P, A, G.
 
-        This builds a CSR matrix with a fixed sparsity pattern suitable for repeated
-        numeric refactorizations. We intentionally insert identity diagonals into each
-        diagonal block so later updates can use setdiag() without changing structure.
+        This builds a host CSR matrix with a fixed sparsity pattern suitable for
+        repeated numeric refactorizations. We intentionally insert identity
+        diagonals into each diagonal block so later updates can write the
+        diagonals without changing structure.
+
+        ``P``, ``A``, ``G`` are patterns with every stored entry equal to one
+        (``UniformBatchedCsrMatrix.pattern()``), so no sum below is zero and
+        every stored entry, including the explicit zeros of the values, stays
+        in the KKT pattern. Every entry of the result is positive.
         """
-        P = P.tocsr()
         n = P.shape[0]
 
         p = 0 if A is None else int(A.shape[0])
         m = 0 if G is None else int(G.shape[0])
 
-        # Sparse diagonal placeholders (avoid cp.diag / cp.eye which create dense matrices)
-        # Do P+In make sure the diagonal entries are non-zero
-        # P is p.s.d so P's diagonal are all non-negative, adding I will not change non-zeros entries to zero
-        #
-        # NOTE: cupyx's CSR addition sorts the operand's indices/data buffers
-        # *in place* as a side effect (csrgeam pre-condition). The inputs are
-        # views of the solver's Warp buffers, so we operate on copies here to
-        # avoid corrupting the shared structure.
-        P = P.copy()
-        A = A.copy() if p else A
-        G = G.copy() if m else G
-        In = diags(cp.ones(n, dtype=dtype), 0, shape=(n, n), format="csr")
-        Ip = diags(cp.ones(p, dtype=dtype), 0, shape=(p, p), format="csr") if p else None
-        Im = diags(cp.ones(m, dtype=dtype), 0, shape=(m, m), format="csr") if m else None
+        # Sparse diagonal placeholders. P + In keeps every diagonal entry
+        # stored (all entries are positive, so the sum never cancels).
+        In = eye_array(n, format="csr")
+        Ip = eye_array(p, format="csr") if p else None
+        Im = eye_array(m, format="csr") if m else None
         # only store lower triangular part (but the full P is still stored)
         # TODO: store the lower triangular part of P only
-        kkt = bmat([
-                [P+In, None, None],
-                [A,    Ip,   None],
-                [G,    None, Im],
-            ], format="csr", dtype=dtype
-            )
+        kkt = csr_matrix(bmat([
+                [P + In, None, None],
+                [A,      Ip,   None],
+                [G,      None, Im],
+            ], format="csr"))
+        kkt.sum_duplicates()  # canonical: sorted column indices, no duplicates
         return kkt
 
     def _scatter_P_A_G(self, data: SparseData, update_P: bool, update_A: bool, update_G: bool) -> None:
