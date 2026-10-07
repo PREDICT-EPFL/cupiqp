@@ -150,7 +150,10 @@ class BatchedCholeskyInplaceSolver:
         self._stream = wp.get_stream("cuda")
         self._cusolver_handle = cusolver_create_handle()
         cusolver_set_stream(self._cusolver_handle, self._stream.cuda_stream)
-        self._uplo = cublas.FillMode.UPPER  # C-contiguous -> upper in col-major
+        # cuSOLVER's potrfBatched uses lower internally. If we choose UPPER,
+        # it makes a copy, which introduces some overhead
+        # Internally: potrfBatch_upper2lower -> potrf_cta_lower_batch -> potrfBatch_lower2upper
+        self._uplo = cublas.FillMode.LOWER
 
         if dtype is wp.float32:
             self._potrf_batched = cusolverDn.spotrf_batched
