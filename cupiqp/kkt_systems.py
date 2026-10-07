@@ -6,7 +6,7 @@ import nvtx
 from .results import Variables
 from .data import Data
 from .settings import Settings
-from .utils import cuda_graph_capture, device_ptr, column_slice
+from .utils import column_slice
 from .preconditioner import PreconditionerBase
 from .kkt_systems_kernels import (
     create_inf_norm_2d_kernel,
@@ -206,7 +206,6 @@ class KKTSystem:
         return self._kkt_solver.solve_status
 
     @nvtx.annotate("KKTSystem::_update_reg_and_kkt")
-    @cuda_graph_capture(key=lambda self, data, preconditioner, delta, rho, vars: (vars.buffer_ptr, device_ptr(delta), device_ptr(rho)), enable=lambda self: self._settings.enable_cuda_graph)
     def _update_reg_and_kkt(self, data: Data, preconditioner: PreconditionerBase, delta: wp.array, rho: wp.array, vars: Variables):
         """Update the regularization terms x_reg and z_reg for the condensed KKT system after eliminating slacks and duals of inequalities and box constraints.
         Also update the condensed KKT matrix with the new regularization terms."""
@@ -283,7 +282,6 @@ class KKTSystem:
         self._recover_lhs(data, preconditioner, rhs, lhs, transpose=transpose)
 
     @nvtx.annotate("KKTSystem::_prepare_rhs")
-    @cuda_graph_capture(key=lambda self, data, preconditioner, rhs, transpose=False: (rhs.buffer_ptr, bool(transpose)), enable=lambda self: self._settings.enable_cuda_graph)
     def _prepare_rhs(self, data: Data, preconditioner: PreconditionerBase, rhs: Variables, transpose: bool = False):
         """Build the condensed KKT rhs by eliminating slacks and duals.
 
@@ -331,7 +329,6 @@ class KKTSystem:
 
 
     @nvtx.annotate("KKTSystem::_recover_lhs")
-    @cuda_graph_capture(key=lambda self, data, preconditioner, rhs, lhs, transpose=False: (rhs.buffer_ptr, lhs.buffer_ptr, bool(transpose)), enable=lambda self: self._settings.enable_cuda_graph)
     def _recover_lhs(self, data: Data, preconditioner: PreconditionerBase, rhs: Variables, lhs: Variables, transpose: bool = False):
         """Back-substitute lhs.z_* and lhs.s_* from the condensed (lhs.x, lhs.y).
 

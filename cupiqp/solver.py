@@ -10,7 +10,6 @@ from .settings import Settings, DeviceSettings
 from .data import Data
 from .results import Result, Status, Variables
 from .kkt_systems import KKTSystem
-from .utils import cuda_graph_capture
 from .typedef import STATUS_MAX_ITER_REACHED, STATUS_NUMERICAL_ISSUES
 from .solver_kernels import (
     REDUCTION_BLOCK_DIM,
@@ -1112,7 +1111,6 @@ class SolverBase(ABC):
         self._update_vars_after_corrector_step()
         self._calculate_mu()
 
-    @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
     def _update_vars_after_corrector_step(self):
         # result.primals_all += primal_step * step.primals_all
         # result.duals_all += dual_step * step.duals_all
@@ -1135,7 +1133,6 @@ class SolverBase(ABC):
         )
 
     @nvtx.annotate("Solver::_calculate_step")
-    @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
     def _calculate_step(self) -> None:
         wp.launch_tiled(
             kernel=self._calculate_step_kernel,
@@ -1152,7 +1149,6 @@ class SolverBase(ABC):
         )
 
     @nvtx.annotate("Solver::_calculate_mu")
-    @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
     def _calculate_mu(self) -> None:
         """Calculate mu (the duality measure)."""
         wp.launch_tiled(
@@ -1168,7 +1164,6 @@ class SolverBase(ABC):
         )
 
     @nvtx.annotate("Solver::_calculate_sigma")
-    @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
     def _calculate_sigma(self) -> None:
         """Calculate sigma (the centering parameter)."""
         wp.launch_tiled(
@@ -1187,7 +1182,6 @@ class SolverBase(ABC):
         )
 
     @nvtx.annotate("Solver::_update_residuals_nr")
-    @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
     def _update_residuals_nr(self):
         r"""Compute non-regularized KKT residuals + objective values +
         relative norms (used for convergence checks).
@@ -1332,7 +1326,6 @@ class SolverBase(ABC):
         )
 
     @nvtx.annotate("Solver::_update_residuals_r")
-    @cuda_graph_capture(enable=lambda self: self.settings.enable_cuda_graph)
     def _update_residuals_r(self):
         """
         Compute the regularized primal and dual residuals. The computation is based on the non-regularized residuals computed in _update_residuals_nr.

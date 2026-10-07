@@ -1,5 +1,4 @@
-from typing import Any, Callable, Optional
-import functools
+from typing import Any, Optional
 import numpy as np
 import warp as wp
 
@@ -135,67 +134,6 @@ def batch_broadcast_view(src: wp.array, batch_size: int) -> wp.array:
     plain element-wise copy kernel replicates ``src`` into a batched buffer.
     """
     return strided_view(src, (batch_size,) + tuple(src.shape), (0,) + tuple(src.strides))
-
-
-def cuda_graph_capture(key: Optional[Callable] = None, enable: Optional[Callable] = None):
-    """Decorator that caches a method's GPU operations as a CUDA graph.
-
-    On first call (per unique key), captures all GPU operations inside the
-    decorated method into a CUDA graph. On subsequent calls with the same key,
-    replays the cached graph instead of re-executing the operations.
-
-    The capture runs on Warp's current stream, which every public solver
-    entry point sets to the solver's own stream with ``wp.ScopedStream``, so
-    it records Warp launches, Warp array fills and copies, and library calls
-    bound to that stream. Nothing inside the captured method may allocate
-    device memory or synchronize.
-
-    Args:
-        key: A callable ``(self, *args, **kwargs) -> hashable`` that computes
-             the cache key from the method's arguments. Different key values
-             produce separate cached graphs.
-        enable: A callable ``(self) -> bool`` that determines whether CUDA
-             graph capture is enabled at runtime. When it returns False, the
-             decorated method is called directly without graph capture/replay.
-             Defaults to None (always enabled).
-
-    Example::
-
-        @cuda_graph_capture(key=lambda self: (self._result.buffer_ptr,))
-        def _calculate_sigma(self):
-            wp.launch(...)
-    """
-    def decorator(fn):
-        cache_attr = f'_cuda_graphs_{fn.__name__}'
-
-        @functools.wraps(fn)
-        def wrapper(self, *args, **kwargs):
-            if enable is not None and not enable(self):
-                return fn(self, *args, **kwargs)
-
-            if not hasattr(self, cache_attr):
-                setattr(self, cache_attr, {})
-
-            cache = getattr(self, cache_attr)
-            k = key(self, *args, **kwargs) if key is not None else None
-
-            stream = wp.get_stream("cuda")
-            if stream.is_capturing:
-                # Inside an outer capture (a whole iteration or solve): a
-                # graph cannot be launched into a capture, so the kernels
-                # are recorded directly into the outer graph.
-                return fn(self, *args, **kwargs)
-
-            if k not in cache:
-                with wp.ScopedCapture(stream=stream) as capture:
-                    fn(self, *args, **kwargs)
-                cache[k] = capture.graph
-
-            wp.capture_launch(cache[k], stream=stream)
-
-        return wrapper
-
-    return decorator
 
 
 def print_matlab_format(arr, name=None):

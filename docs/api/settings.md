@@ -114,7 +114,7 @@ cuPIQP equilibrates the problem with a Ruiz preconditioner before solving.
 
 | Field | Default | Description |
 |---|---|---|
-| `enable_cuda_graph` | `True` | Capture the repeated IPM iteration as a CUDA graph and replay it with near-zero launch overhead. |
+| `enable_cuda_graph` | `True` | Record the solve as a CUDA graph on the first `solve()` and replay it afterwards: the whole solve, with the IPM loop running on the GPU, for the dense and multistage backends; one IPM iteration for the sparse backend. Recording does not slow the first solve, and later solves are typically several times faster for small problems. Set it to `False` only for debugging: every kernel is then launched from Python, so an error is reported at the kernel that caused it. |
 | `use_deterministic_mode_for_cudss` | `False` | Bit-wise reproducible cuDSS factorizations (slower); sparse backend only. |
 
 ### Differentiation, diagnostics, and logging

@@ -174,7 +174,6 @@ class DenseSolver(SolverBase):
             has_h_l=self._data.has_h_l, has_h_u=self._data.has_h_u,
             has_x_l=self._data.has_x_l, has_x_u=self._data.has_x_u,
             active_x_bound=self._data.active_x_bound,
-            enable_cuda_graph=self.settings.enable_cuda_graph,
             dtype=self._data.dtype,
             device=self._data.device
         )
