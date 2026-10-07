@@ -7,7 +7,7 @@ import nvtx
 from cuda.bindings import runtime as cudart
 from nvmath.bindings import cudss
 
-from .batched_csr import UniformBatchedCsrMatrix
+from .batched_csr import UniformBatchedCsrMatrix, to_wp_int32
 
 
 
@@ -84,13 +84,14 @@ class SparseDirectSolver(ABC):
         return self._sol
 
 
-class CudssSparseDirectSolver(SparseDirectSolver):
-    """cuDSS through its raw bindings, on the Warp buffers directly.
+class _CudssSolver(SparseDirectSolver):
+    """Shared cuDSS plumbing for the batched solvers, on the Warp buffers directly.
 
     The matrix descriptor points at the packed ``(B, nnz)`` values of
     ``matrix`` and the dense descriptors at the ``(B, dim)`` ``rhs`` / ``sol``
-    buffers; cuDSS uniform batching (``UBATCH_SIZE``) walks the B problems
-    behind them. Nothing is copied or allocated per call.
+    buffers. Subclasses decide how cuDSS sees the batch (see
+    ``_system_layout``): one uniform batch, or one big block-diagonal system.
+    Nothing is copied or allocated per call.
     """
 
     def __init__(self, matrix: UniformBatchedCsrMatrix, use_deterministic_mode: bool = False) -> None:
@@ -103,19 +104,24 @@ class CudssSparseDirectSolver(SparseDirectSolver):
         self._cudss_config = cudss.config_create()
         self._cudss_data = cudss.data_create(self._cudss_handle)
 
+        # Dimension and entry count of the system cuDSS sees, its CSR pattern,
+        # and the uniform batch size (1 = no uniform batching).
+        dim, nnz, indptr, indices, ubatch_size = self._system_layout(matrix)
+        self._indptr, self._indices = indptr, indices  # kept alive for the descriptor
+
         # Symmetric matrix, only the lower triangle is read. row_end = 0 means
         # standard CSR (row r ends where row r + 1 starts).
         self._cudss_a = cudss.matrix_create_csr(
-            self._dim, self._dim, matrix.nnz,
-            matrix.indptr.ptr, 0, matrix.indices.ptr, matrix.data.ptr,
+            dim, dim, nnz,
+            indptr.ptr, 0, indices.ptr, matrix.data.ptr,
             index_type, index_type, value_type,
             cudss.MatrixType.SYMMETRIC, cudss.MatrixViewType.LOWER, cudss.IndexBase.ZERO
         )
-        # One column-major right-hand side / solution per problem.
+        # One column-major right-hand side / solution (per problem under uniform batching).
         self._cudss_b = cudss.matrix_create_dn(
-            self._dim, 1, self._dim, self._rhs.ptr, value_type, cudss.Layout.COL_MAJOR)
+            dim, 1, dim, self._rhs.ptr, value_type, cudss.Layout.COL_MAJOR)
         self._cudss_x = cudss.matrix_create_dn(
-            self._dim, 1, self._dim, self._sol.ptr, value_type, cudss.Layout.COL_MAJOR)
+            dim, 1, dim, self._sol.ptr, value_type, cudss.Layout.COL_MAJOR)
 
         # The multithreading layer speeds up the host part of the analysis.
         mt_lib = self._find_cudss_mt_lib() or os.getenv("CUDSS_THREADING_LIB")
@@ -129,8 +135,8 @@ class CudssSparseDirectSolver(SparseDirectSolver):
             raise RuntimeError(f"cudaDeviceGetDefaultMemPool failed: {err}")
         cudss.set_async_workspace_allocator(self._cudss_handle, int(pool))
 
-        if self._batch_size > 1:
-            self._config_set(cudss.ConfigParam.UBATCH_SIZE, self._batch_size)
+        if ubatch_size > 1:
+            self._config_set(cudss.ConfigParam.UBATCH_SIZE, ubatch_size)
         self._config_set(cudss.ConfigParam.HYBRID_MEMORY_MODE, 0)  # equivalent to ExecutionCUDA in nvmath's DirectSolver wrapper
         self._config_set(cudss.ConfigParam.USE_CUDA_REGISTER_MEMORY, 1)
         self._config_set(cudss.ConfigParam.REORDERING_ALG, cudss.ReorderingAlg.DEFAULT)
@@ -144,6 +150,12 @@ class CudssSparseDirectSolver(SparseDirectSolver):
         # Bit-wise reproducible results across runs; slower kernels.
         if use_deterministic_mode:
             self._config_set(cudss.ConfigParam.DETERMINISTIC_MODE, 1)
+
+    @abstractmethod
+    def _system_layout(self, matrix: UniformBatchedCsrMatrix):
+        """``(dim, nnz, indptr, indices, ubatch_size)`` of the system handed to cuDSS:
+        its dimension and stored entries, the CSR pattern as int32 Warp arrays
+        over the packed values of ``matrix``, and the uniform batch size."""
 
     def _config_set(self, param: cudss.ConfigParam, value: Union[int, float]) -> None:
         buf = np.array([value], dtype=cudss.get_config_param_dtype(param))
@@ -189,7 +201,7 @@ class CudssSparseDirectSolver(SparseDirectSolver):
             self._cudss_a, self._cudss_x, self._cudss_b
         )
 
-    @nvtx.annotate("CudssSparseDirectSolver::plan")
+    @nvtx.annotate("_CudssSolver::plan")
     def plan(self, cuda_stream: int) -> bool:
         """Reordering and symbolic factorization (cuDSS ``ANALYSIS`` phase)."""
         try:
@@ -200,7 +212,7 @@ class CudssSparseDirectSolver(SparseDirectSolver):
 
         return True
 
-    @nvtx.annotate("CudssSparseDirectSolver::factor")
+    @nvtx.annotate("_CudssSolver::factor")
     def factor(self, cuda_stream: int) -> None:
         """Numerical factorization (cuDSS ``FACTORIZATION`` phase), launched on
         the given stream without waiting for it.
@@ -250,7 +262,7 @@ class CudssSparseDirectSolver(SparseDirectSolver):
         #   quasi-definite factorizations after regularization finetuning.
         self._execute(cudss.Phase.FACTORIZATION, cuda_stream)
 
-    @nvtx.annotate("CudssSparseDirectSolver::solve")
+    @nvtx.annotate("_CudssSolver::solve")
     def solve(self, cuda_stream: int) -> None:
         """Solve phase, launched on the given stream. It captures into a CUDA graph, but not
         into a conditional graph node: cuDSS issues small host-to-device
@@ -282,3 +294,49 @@ class CudssSparseDirectSolver(SparseDirectSolver):
                     if os.path.isfile(lib):
                         return lib
         return None
+
+
+class CudssUbatchSolver(_CudssSolver):
+    """cuDSS uniform batching: the shared ``dim x dim`` pattern with ``B``
+    value / right-hand-side buffers, handed over with ``UBATCH_SIZE = B``.
+    cuDSS walks the B problems behind one set of descriptors."""
+
+    def _system_layout(self, matrix: UniformBatchedCsrMatrix):
+        return self._dim, matrix.nnz, matrix.indptr, matrix.indices, self._batch_size
+
+
+class CudssStackedSolver(_CudssSolver):
+    """cuDSS on one big block-diagonal system, without uniform batching.
+
+    The ``B`` matrices are stacked along the diagonal into a single
+    ``(B * dim) x (B * dim)`` sparse matrix whose values are the packed
+    ``(B, nnz)`` buffer of ``matrix`` seen flat (block ``b`` owns entries
+    ``b * nnz`` to ``(b + 1) * nnz``), and the right-hand sides and solutions
+    are the ``(B, dim)`` buffers seen flat::
+
+        [ K_0                  ]   [ x_0   ]   [ rhs_0   ]
+        [     K_1              ] @ [ x_1   ] = [ rhs_1   ]
+        [           ...        ]   [  ...  ]   [  ...    ]
+        [               K_B-1  ]   [ x_B-1 ]   [ rhs_B-1 ]
+
+    The block-diagonal pattern is built once on the host at construction.
+    In-place updates of ``matrix.data`` are seen by the next ``factor()``.
+    """
+
+    def _system_layout(self, matrix: UniformBatchedCsrMatrix):
+        B, dim, nnz = self._batch_size, self._dim, matrix.nnz
+        if B * nnz >= 2 ** 31 or B * dim >= 2 ** 31:
+            raise ValueError(
+                f"The stacked sparse solver needs B * nnz = {B * nnz} and B * dim = {B * dim} "
+                f"below 2**31 (int32 indices)."
+            )
+        indptr_np = matrix.indptr.numpy().astype(np.int64)
+        indices_np = matrix.indices.numpy().astype(np.int64)
+        offsets = np.arange(B, dtype=np.int64)
+        # big_indptr[b * dim + r] = b * nnz + indptr[r]; big_indices[b * nnz + k] = indices[k] + b * dim
+        big_indptr = np.empty(B * dim + 1, dtype=np.int64)
+        big_indptr[:B * dim] = (indptr_np[:-1][None, :] + (offsets * nnz)[:, None]).reshape(-1)
+        big_indptr[-1] = B * nnz
+        big_indices = (indices_np[None, :] + (offsets * dim)[:, None]).reshape(-1)
+        device = matrix.device
+        return B * dim, B * nnz, to_wp_int32(big_indptr, device), to_wp_int32(big_indices, device), 1

@@ -10,7 +10,7 @@ from ..utils import column_slice
 from .batched_csr import UniformBatchedCsrMatrix, to_wp_int32
 from .sparse_data import SparseData
 from .sparse_matvec import SparseMatVecProduct
-from .sparse_direct_solver import CudssSparseDirectSolver
+from .sparse_direct_solver import CudssStackedSolver
 from .csr_helpers import csr_diag_indices, csr_row_indices, csr_subblock_indices
 from .sparse_kkt_solver_kernels import (
     create_update_kkt_diag_kernel,
@@ -116,7 +116,7 @@ class SparseKKTSolver(KKTSolverBase):
             self._spmv_GT = SparseMatVecProduct(data.G, transa=True)
 
         # Direct solver (cuDSS uniform batching handles B == 1 and B > 1)
-        self._lin_sys_solver = CudssSparseDirectSolver(
+        self._lin_sys_solver = CudssStackedSolver(
             self._kkt_mats, use_deterministic_mode=use_deterministic_mode
         )
         if not self._lin_sys_solver.plan(cuda_stream=wp.get_stream("cuda").cuda_stream):
@@ -238,7 +238,7 @@ class SparseKKTSolver(KKTSolverBase):
     @property
     def supports_conditional_capture(self) -> bool:
         # The cuDSS solve phase copies from pageable host memory, which a
-        # conditional graph node rejects (see CudssSparseDirectSolver.solve).
+        # conditional graph node rejects.
         return False
 
     @nvtx.annotate("SparseKKTSolver::factor")
