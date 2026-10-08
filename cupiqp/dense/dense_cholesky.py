@@ -1,4 +1,5 @@
-"""In-place dense Cholesky factorization and solves through cuSOLVER.
+"""In-place dense Cholesky factorization and solves, through Warp tile
+kernels (small batched matrices) or cuSOLVER.
 
 Both classes work on C-contiguous Warp arrays of the solver dtype: the
 condensed KKT matrices ``(n, n)`` / ``(B, n, n)`` and right-hand sides
@@ -8,6 +9,11 @@ bound once, to the Warp stream that is current when the object is created.
 """
 import warp as wp
 from nvmath.bindings import cublas, cusolverDn
+
+from .dense_cholesky_kernels import (
+    create_tile_cholesky_factor_kernel,
+    create_tile_cholesky_solve_kernel,
+)
 
 
 wp.set_module_options({"enable_backward": False})
@@ -128,15 +134,30 @@ class CholeskyInplaceSolver:
         )
 
 
+# Largest matrix size n factorized and solved by the Warp tile kernels, per
+# dtype; larger matrices use cuSOLVER. Measured on an RTX 5090 with
+# helpers/benchmark_dense_cholesky.py (one factorization and two solves,
+# B = 1024 to 16384): up to these sizes the tile kernels are 1.5-7x faster than
+# potrfBatched + potrsBatched; float64 at n = 64 is slower for B >= 4096, and
+# from n = 80 the tile factorization is 3-10x slower in both dtypes.
+TILE_CHOLESKY_MAX_N = {wp.float64: 48, wp.float32: 64}
+# Threads per block of the tile kernels (one block per matrix). One warp is the
+# fastest or within a few percent of it for B >= 1024, n = 4 to 48, both dtypes
+# (up to 1.4x faster than 64 threads in float64 and 2.7x in float32).
+TILE_CHOLESKY_BLOCK_DIM = 32
+
+
 class BatchedCholeskyInplaceSolver:
-    """Batched in-place dense Cholesky factorization and solve using cuSOLVER.
+    """Batched in-place dense Cholesky factorization and solve.
 
-    Uses ``cusolverDnDpotrfBatched`` / ``cusolverDnDpotrsBatched`` to
-    process all B matrices in a single kernel launch.
+    Small matrices (``n <= TILE_CHOLESKY_MAX_N[dtype]``) use Warp tile kernels, one
+    CUDA block per matrix; larger ones use cuSOLVER's
+    ``potrfBatched`` / ``potrsBatched``. Both read only the row-major upper
+    triangle of every matrix.
 
-    The batched API takes a device array of pointers (one per matrix),
-    rebuilt by a small kernel on every call so the class keeps no host-side
-    state that a CUDA graph replay could invalidate.
+    The cuSOLVER batched API takes a device array of pointers (one per
+    matrix), rebuilt by a small kernel on every call so the class keeps no
+    host-side state that a CUDA graph replay could invalidate.
 
     Parameters
     ----------
@@ -146,13 +167,29 @@ class BatchedCholeskyInplaceSolver:
         Number of matrices in the batch.
     dtype : wp.float32 or wp.float64
         Element type (default ``wp.float64``).
+    backend : {"auto", "warp", "cusolver"}
+        ``"auto"`` chooses by ``n``; the others force one implementation.
     """
 
-    def __init__(self, n: int, batch_size: int, dtype=wp.float64):
+    def __init__(self, n: int, batch_size: int, dtype=wp.float64, backend: str = "auto"):
+        if backend not in ("auto", "warp", "cusolver"):
+            raise ValueError(f"backend must be 'auto', 'warp' or 'cusolver'; got {backend!r}.")
         self._n = n
         self._batch_size = batch_size
         self._dtype = dtype
         self._stream = wp.get_stream("cuda")
+        self._factor_status = wp.zeros(batch_size, dtype=wp.int32, device="cuda")
+        self._ctx_A = None
+        self._ctx_B = None
+        self._factorized = False
+
+        self._use_warp = backend == "warp" or (backend == "auto" and n <= TILE_CHOLESKY_MAX_N[dtype])
+        if self._use_warp:
+            self._cusolver_handle = None
+            self._factor_kernel = create_tile_cholesky_factor_kernel(n, dtype)
+            self._solve_kernel = create_tile_cholesky_solve_kernel(n, dtype)
+            return
+
         self._cusolver_handle = cusolver_create_handle()
         cusolver_set_stream(self._cusolver_handle, self._stream.cuda_stream)
         # cuSOLVER's potrfBatched uses lower internally. If we choose UPPER,
@@ -169,7 +206,6 @@ class BatchedCholeskyInplaceSolver:
         else:
             raise ValueError(f"Unsupported dtype: {dtype}")
 
-        self._factor_status = wp.zeros(batch_size, dtype=wp.int32, device="cuda")
         self._solve_info = wp.zeros(1, dtype=wp.int32, device="cuda")  # potrsBatched argument check, unused
 
         # Preallocated device pointer arrays (one pointer per matrix / rhs row).
@@ -180,10 +216,6 @@ class BatchedCholeskyInplaceSolver:
         # refill (the initial guess solved into the step buffer that way).
         self._A_ptrs = wp.zeros(batch_size, dtype=wp.int64, device="cuda")
         self._B_ptrs = wp.zeros(batch_size, dtype=wp.int64, device="cuda")
-
-        self._ctx_A = None
-        self._ctx_B = None
-        self._factorized = False
 
     def _fill_ptrs(self, arr: wp.array, ptrs: wp.array) -> None:
         """Write the device address of every matrix / row of ``arr`` into ``ptrs``
@@ -215,10 +247,10 @@ class BatchedCholeskyInplaceSolver:
 
     @property
     def factor_status(self) -> wp.array:
-        """``(batch_size,)`` int32 device array: cuSOLVER's per-matrix
-        ``info`` of the last ``factorize()``; zero where the factorization
-        of that matrix succeeded. Written on the device, never read on the
-        host by this class."""
+        """``(batch_size,)`` int32 device array: per-matrix outcome of the
+        last ``factorize()``; zero where the factorization of that matrix
+        succeeded, nonzero where it is not numerically positive definite.
+        Written on the device, never read on the host by this class."""
         return self._factor_status
 
     def factorize(self, A: wp.array) -> None:
@@ -235,8 +267,15 @@ class BatchedCholeskyInplaceSolver:
         The per-matrix outcome is left in ``factor_status``; nothing is read
         on the host.
         """
-        self._fill_ptrs(A, self._A_ptrs)
         self._ctx_A = A
+        if self._use_warp:
+            wp.launch_tiled(self._factor_kernel, dim=[self._batch_size],
+                            inputs=[A, self._factor_status],
+                            block_dim=TILE_CHOLESKY_BLOCK_DIM, device="cuda")
+            self._factorized = True
+            return
+
+        self._fill_ptrs(A, self._A_ptrs)
 
         self._potrf_batched(
             self._cusolver_handle,
@@ -261,8 +300,14 @@ class BatchedCholeskyInplaceSolver:
         if not self._factorized:
             raise RuntimeError("You must call factorize() before solve().")
 
-        self._fill_ptrs(B, self._B_ptrs)
         self._ctx_B = B
+        if self._use_warp:
+            wp.launch_tiled(self._solve_kernel, dim=[self._batch_size],
+                            inputs=[self._ctx_A, B],
+                            block_dim=TILE_CHOLESKY_BLOCK_DIM, device="cuda")
+            return
+
+        self._fill_ptrs(B, self._B_ptrs)
 
         self._potrs_batched(
             self._cusolver_handle,

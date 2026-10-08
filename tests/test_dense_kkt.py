@@ -237,12 +237,12 @@ class TestDenseKKTSolverAssembly:
 
             actual_kkt = cp.asnumpy(solver._kkt_mat[i])
 
-            # cuSOLVER reads FILL_MODE_UPPER (col-major) = row-major LOWER
-            # triangle. For B=1 the syrk path only populates that triangle;
-            # for B>1 the gemm path fills both. Compare the triangle the
-            # solver actually uses — sufficient and consistent across B.
+            # The Cholesky solvers read the row-major upper triangle
+            # (cuSOLVER FILL_MODE_LOWER in its column-major view); the syrk
+            # paths populate only that triangle. Compare the triangle the
+            # solver actually uses.
             for r in range(n):
-                for c in range(r + 1):
+                for c in range(r, n):
                     np.testing.assert_allclose(
                         actual_kkt[r, c], ref_kkt[r, c], atol=1e-10,
                         err_msg=f"batch={i}, ({r},{c})")
