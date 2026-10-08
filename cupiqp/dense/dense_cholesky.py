@@ -44,8 +44,10 @@ class CholeskyInplaceSolver:
     """Perform in-place dense Cholesky factorization and solves using cuSOLVER.
 
     Code inspired by cupy.linalg.cholesky implementation, but adapted for repeated use
-    on the same size matrix without repeated allocations. The matrix is C-contiguous,
-    which cuSOLVER (column-major) sees as the upper triangle of its transpose.
+    on the same size matrix without repeated allocations. The matrix is C-contiguous
+    (row-major); only its upper triangle (i <= j) is read, which column-major
+    cuSOLVER sees as the lower triangle (FILL_MODE_LOWER), as in the batched
+    solver.
     """
     def __init__(self, n: int, dtype=wp.float64):
         self.n = n
@@ -53,7 +55,7 @@ class CholeskyInplaceSolver:
         self._stream = wp.get_stream("cuda")
         self._cusolver_handle = cusolver_create_handle()
         cusolver_set_stream(self._cusolver_handle, self._stream.cuda_stream)
-        self._uplo = cublas.FillMode.UPPER
+        self._uplo = cublas.FillMode.LOWER
 
         if dtype is wp.float32:
             self._potrf = cusolverDn.spotrf

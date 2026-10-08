@@ -26,6 +26,7 @@ from nvmath.bindings import cublas
 # ---------------------------------------------------------------------------
 OP_N = 0            # CUBLAS_OP_N  (non-transpose)
 OP_T = 1            # CUBLAS_OP_T  (transpose)
+FILL_LOWER = 0      # CUBLAS_FILL_MODE_LOWER
 FILL_UPPER = 1      # CUBLAS_FILL_MODE_UPPER
 SIDE_RIGHT = 1      # CUBLAS_SIDE_RIGHT
 POINTER_HOST = 0    # CUBLAS_POINTER_MODE_HOST
