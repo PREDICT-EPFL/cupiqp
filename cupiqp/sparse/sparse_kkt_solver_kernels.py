@@ -1,7 +1,13 @@
+import functools
+
 import warp as wp
 from ..utils import to_warp_dtype
 
 
+wp.set_module_options({"enable_backward": False})
+
+
+@functools.lru_cache(maxsize=None)
 def create_update_kkt_diag_kernel(n: int, p: int, m: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Fused scatter into the diagonal of the sparse KKT matrix:
@@ -45,6 +51,7 @@ def create_update_kkt_diag_kernel(n: int, p: int, m: int, dtype=wp.float64):
     return update_kkt_diag_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_scatter_masked_G_kernel(dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Scatter G values into the KKT data buffer, zeroing the
@@ -79,6 +86,7 @@ def create_scatter_masked_G_kernel(dtype=wp.float64):
     return scatter_masked_G_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_scatter_values_kernel(dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """``dst[b, dst_cols[k]] = src[b, k]`` for every batch ``b`` and entry
@@ -97,6 +105,7 @@ def create_scatter_values_kernel(dtype=wp.float64):
     return scatter_values_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_gather_scatter_values_kernel(dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """``dst[b, dst_cols[k]] = src[b, src_cols[k]]``: copies selected entries

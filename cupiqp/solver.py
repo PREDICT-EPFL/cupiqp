@@ -49,10 +49,6 @@ from .solver_kernels import (
 )
 
 
-wp.config.quiet = True  # disable warp module initialization messages.
-wp.config.enable_backward = False  # disable backward mode, cut down kernel compile time
-wp.init()
-
 
 class _CudaGraphMode(Enum):
     """How one ``solve()`` uses CUDA graphs (chosen by ``SolverBase._cuda_graph_mode``)."""
@@ -77,6 +73,7 @@ class SolverBase(ABC):
     """Abstract base for the cuPIQP solver."""
 
     def __init__(self, dtype: Union[type[wp.float32], type[wp.float64]] = wp.float64, stream=None):
+        wp.init()
         if dtype is not wp.float32 and dtype is not wp.float64:
             raise TypeError(
                 f"Solver dtype must be wp.float32 or wp.float64; got {dtype!r}."

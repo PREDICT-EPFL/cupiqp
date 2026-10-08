@@ -11,6 +11,9 @@ import warp as wp
 from ..utils import to_warp_dtype
 
 
+wp.set_module_options({"enable_backward": False})
+
+
 @functools.lru_cache(maxsize=None)
 def create_ocp_data_kernels(dtype=wp.float64):
     """Kernels writing OCP fields into ``(B, num_blocks, ...)`` Warp buffers.

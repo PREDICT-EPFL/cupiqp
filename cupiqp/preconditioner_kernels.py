@@ -1,7 +1,13 @@
+import functools
+
 import warp as wp
 from .utils import to_warp_dtype
 
 
+wp.set_module_options({"enable_backward": False})
+
+
+@functools.lru_cache(maxsize=None)
 def create_clamp_and_rsqrt_kernel(n: int, p: int, m: int,
                               min_scaling: float, max_scaling: float, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
@@ -44,6 +50,7 @@ def create_clamp_and_rsqrt_kernel(n: int, p: int, m: int,
     return clamp_rsqrt_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_calc_scaling_inv_and_scale_bounds_kernel(
     n: int, p: int, m: int,
     num_hl: int, num_hu: int, num_xl: int, num_xu: int,
@@ -155,6 +162,7 @@ dtype=wp.float64):
     return finalize_and_scale_bounds_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_scale_bounds_kernel(n: int, p: int, m: int, has_h_l: bool, has_h_u: bool, has_x_l: bool, has_x_u: bool, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Sentinel-safe in-place forward bound scaling, single launch (B, n+p+m).
@@ -202,6 +210,7 @@ def create_scale_bounds_kernel(n: int, p: int, m: int, has_h_l: bool, has_h_u: b
     return scale_bounds_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_unscale_bounds_kernel(n: int, p: int, m: int, has_h_l: bool, has_h_u: bool, has_x_l: bool, has_x_u: bool, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Sentinel-safe in-place inverse bound scaling, single launch (B, n+p+m).
@@ -255,6 +264,7 @@ def create_unscale_bounds_kernel(n: int, p: int, m: int, has_h_l: bool, has_h_u:
     return unscale_bounds_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_accumulate_deltas_kernel(n: int, p: int, m: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Fused per-iteration state update.
@@ -292,6 +302,7 @@ def create_accumulate_deltas_kernel(n: int, p: int, m: int, dtype=wp.float64):
 REDUCTION_BLOCK_DIM = 256
 
 
+@functools.lru_cache(maxsize=None)
 def create_ruiz_conv_check_kernel(dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Per-batch Ruiz convergence measure, reduced over the whole batch.
@@ -322,6 +333,7 @@ def create_ruiz_conv_check_kernel(dtype=wp.float64):
     return conv_check_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_compute_constraints_rhs_inf_norm_unscaled_kernel(dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Per-batch inf-norm of the user-space (unscaled) constraint right-hand sides.
@@ -376,6 +388,7 @@ def create_compute_constraints_rhs_inf_norm_unscaled_kernel(dtype=wp.float64):
     return kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_unscale_solution_kernel(dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Map a scaled IPM iterate back to original coordinates, in place.

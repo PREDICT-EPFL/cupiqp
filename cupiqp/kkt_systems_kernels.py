@@ -1,7 +1,13 @@
+import functools
+
 import warp as wp
 from .utils import to_warp_dtype
 
 
+wp.set_module_options({"enable_backward": False})
+
+
+@functools.lru_cache(maxsize=None)
 def create_update_regularizations_step_1_kernel(num_ineq: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Create kernel operating on contiguous s_all/z_all buffers. Performs:
@@ -66,6 +72,7 @@ def create_update_regularizations_step_1_kernel(num_ineq: int, dtype=wp.float64)
     return update_regularizations_step_1_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_update_regularizations_step_2_kernel(nx: int, nz: int,
                                                 has_h_l: bool, has_h_u: bool,
                                                 has_x_l: bool, has_x_u: bool,
@@ -134,6 +141,7 @@ def create_update_regularizations_step_2_kernel(nx: int, nz: int,
 
     return update_regularizations_step_2_kernel
 
+@functools.lru_cache(maxsize=None)
 def create_eliminate_duals_kernel(nx: int, nz: int,
                                   has_h_l: bool, has_h_u: bool,
                                   has_x_l: bool, has_x_u: bool,
@@ -212,6 +220,7 @@ def create_eliminate_duals_kernel(nx: int, nz: int,
 
     return eliminate_duals_kernel
 
+@functools.lru_cache(maxsize=None)
 def create_eliminate_slacks_kernel(dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Batched element-wise kernel for eliminating slacks for inequalities.
@@ -231,6 +240,7 @@ def create_eliminate_slacks_kernel(dtype=wp.float64):
     return eliminate_slacks_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_eliminate_slacks_transposed_kernel(dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Transposed (K^T) variant of eliminate_slacks. Scales rhs_s by W = S/Z instead
@@ -253,6 +263,7 @@ def create_eliminate_slacks_transposed_kernel(dtype=wp.float64):
     return eliminate_slacks_transposed_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_recover_duals_kernel(num_hu: int, num_hl: int, num_xu: int, num_xl: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Create kernel specialized for recovering duals.
@@ -317,6 +328,7 @@ def create_recover_duals_kernel(num_hu: int, num_hl: int, num_xu: int, num_xl: i
     return recover_duals_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_recover_slacks_kernel(dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Create kernel specialized for eliminating slacks. Performs the operation:
@@ -345,6 +357,7 @@ def create_recover_slacks_kernel(dtype=wp.float64):
     return recover_slacks_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_recover_slacks_transposed_kernel(dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Transposed (K^T) variant of recover_slacks. The slack rows in K^T read
@@ -364,6 +377,7 @@ def create_recover_slacks_transposed_kernel(dtype=wp.float64):
 
     return recover_slacks_transposed_kernel
 
+@functools.lru_cache(maxsize=None)
 def create_condensed_kkt_combine_kernel(dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Assemble the condensed KKT matrix-vector product from its pieces.
@@ -442,6 +456,7 @@ def create_condensed_kkt_combine_kernel(dtype=wp.float64):
     return condensed_kkt_combine_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_inf_norm_2d_kernel(dtype=wp.float64):
     """``out[0] = max(out[0], max |a|)`` over a ``(B, k)`` array (atomic; zero ``out`` first).
     Launch with ``dim=a.shape``. Used by the iterative-refinement error norm."""

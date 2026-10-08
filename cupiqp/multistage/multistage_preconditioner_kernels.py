@@ -13,10 +13,16 @@ For absent A or G, the call sites pass small dummy 4D buffers and rely on
 all access at codegen.
 """
 
+import functools
+
 import warp as wp
 from ..utils import to_warp_dtype
 
 
+wp.set_module_options({"enable_backward": False})
+
+
+@functools.lru_cache(maxsize=None)
 def create_multistage_scale_matrices_kernel(N: int, d: int, A_rows_per_block: int, G_rows_per_block: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Single fused kernel for ``scale_matrices``.
@@ -79,6 +85,7 @@ def create_multistage_scale_matrices_kernel(N: int, d: int, A_rows_per_block: in
     return multistage_scale_matrices_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_multistage_compute_kkt_norms_kernel(N: int, d: int, A_rows_per_block: int, G_rows_per_block: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Single fused kernel for ``compute_kkt_norms``.
@@ -186,6 +193,7 @@ def create_multistage_compute_kkt_norms_kernel(N: int, d: int, A_rows_per_block:
     return multistage_compute_kkt_norms_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_multistage_P_col_norms_kernel(N: int, d: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Column inf-norms of the symmetric block-tridiagonal P, per variable.
@@ -223,6 +231,7 @@ def create_multistage_P_col_norms_kernel(N: int, d: int, dtype=wp.float64):
     return multistage_P_col_norms_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_gamma_from_norms_kernel(min_scaling: float, max_scaling: float, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Per-batch Ruiz cost-scaling factor from column norms and the linear cost.

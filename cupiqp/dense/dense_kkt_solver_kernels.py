@@ -1,7 +1,13 @@
+import functools
+
 import warp as wp
 from ..utils import to_warp_dtype
 
 
+wp.set_module_options({"enable_backward": False})
+
+
+@functools.lru_cache(maxsize=None)
 def create_update_kkt_kernel(n: int, p: int, m: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Fused warp kernel replacing the cupy ops in ``DenseKKTSolver.update_kkt``
@@ -84,6 +90,7 @@ def create_update_kkt_kernel(n: int, p: int, m: int, dtype=wp.float64):
     return update_kkt_kernel, total_dim
 
 
+@functools.lru_cache(maxsize=None)
 def create_solve_pre_cholesky_kernel(p: int, m: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Fused post-matvec / pre-Cholesky assembly of the right-hand side
@@ -112,6 +119,7 @@ def create_solve_pre_cholesky_kernel(p: int, m: int, dtype=wp.float64):
     return solve_pre_cholesky_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_solve_post_cholesky_kernel(p: int, m: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Fused finalization after the Cholesky solve and the A / G matvecs::

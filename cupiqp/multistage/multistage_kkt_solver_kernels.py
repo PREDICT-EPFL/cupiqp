@@ -1,9 +1,15 @@
 from typing import Any
 
+import functools
+
 import warp as wp
 from ..utils import to_warp_dtype
 
 
+wp.set_module_options({"enable_backward": False})
+
+
+@functools.lru_cache(maxsize=None)
 def create_update_kkt_kernel(num_blocks: int, block_size: int,
                              p: int, m: int, G_rows_per_block: int, dtype=wp.float64):
     """Build the fused kernel that assembles the condensed multistage KKT matrix.
@@ -116,6 +122,7 @@ def create_update_kkt_kernel(num_blocks: int, block_size: int,
     return update_kkt_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_add_scaled_rows_kernel(dtype=wp.float64):
     """``out[b, :] += scale[b] * x[b, :]`` on ``(B, n)`` buffers with a per-problem scale."""
     dtype = to_warp_dtype(dtype)
@@ -128,6 +135,7 @@ def create_add_scaled_rows_kernel(dtype=wp.float64):
     return add_scaled_rows
 
 
+@functools.lru_cache(maxsize=None)
 def create_sub_scale_rows_kernel(dtype=wp.float64):
     """``out[b, :] = (out[b, :] - x[b, :]) * scale[b]`` on ``(B, n)`` buffers with a per-problem scale."""
     dtype = to_warp_dtype(dtype)
@@ -148,6 +156,7 @@ def sub_mul(o: Any, x: Any, w: Any):
     return (o - x) * w
 
 
+@functools.lru_cache(maxsize=None)
 def create_has_nan_rows_kernel(dtype=wp.float64):
     """Sets ``flag[b] = 1`` for every row ``b`` of ``a`` that contains a NaN;
     rows without NaN are left untouched, so clear ``flag`` first. Launch

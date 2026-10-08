@@ -1,7 +1,13 @@
+import functools
+
 import warp as wp
 from ..utils import to_warp_dtype
 
 
+wp.set_module_options({"enable_backward": False})
+
+
+@functools.lru_cache(maxsize=None)
 def create_block_tridiag_diaad_kernel(block_size: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """``diag(A[b]) += x[b]`` for each batch b. A is block-tridiagonal.
@@ -22,6 +28,7 @@ def create_block_tridiag_diaad_kernel(block_size: int, dtype=wp.float64):
     return _block_tridiag_diaad_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_block_tridiag_gead_kernel(num_blocks: int, block_size: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """``B[b] += alpha[b] * A[b]`` for each batch b. Both A and B are block-tridiag.
@@ -47,6 +54,7 @@ def create_block_tridiag_gead_kernel(num_blocks: int, block_size: int, dtype=wp.
     return _block_tridiag_gead_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_block_bidiag_gemv_n_kernel(num_blocks: int, rows_of_blocks: int, cols_of_blocks: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """``y[b] = alpha * A[b] * x[b] + beta * y[b]``, A block lower bidiagonal.
@@ -92,6 +100,7 @@ def create_block_bidiag_gemv_n_kernel(num_blocks: int, rows_of_blocks: int, cols
     return _block_bidiag_gemv_n_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_block_bidiag_gemv_t_kernel(num_blocks: int, rows_of_blocks: int, cols_of_blocks: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """``z[b] = alpha * A[b]^T * y[b] + beta * z[b]``, A block lower bidiagonal.
@@ -137,6 +146,7 @@ def create_block_bidiag_gemv_t_kernel(num_blocks: int, rows_of_blocks: int, cols
     return _block_bidiag_gemv_t_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_block_tridiag_gemv_kernel(num_blocks: int, block_size: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """``z[b] = alpha * P[b] * x[b] + beta * z[b]``, P symmetric block-tridiagonal.
@@ -186,6 +196,7 @@ def create_block_tridiag_gemv_kernel(num_blocks: int, block_size: int, dtype=wp.
     return _block_tridiag_gemv_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_block_syrk_kernel(num_blocks: int, rows_of_blocks: int, cols_of_blocks: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Batched block-tridiagonal SYRK: ``C[b] = alpha * A[b]^T A[b] + beta * C[b]``.
@@ -245,6 +256,7 @@ def create_block_syrk_kernel(num_blocks: int, rows_of_blocks: int, cols_of_block
     return block_syrk_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_weighted_block_syrk_kernel(num_blocks: int, rows_of_blocks: int, cols_of_blocks: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Batched weighted block SYRK: ``C[b] = alpha * A[b]^T diag(w[b]) A[b] + beta * C[b]``.

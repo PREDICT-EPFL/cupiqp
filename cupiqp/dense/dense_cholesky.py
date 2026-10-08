@@ -10,6 +10,9 @@ import warp as wp
 from nvmath.bindings import cublas, cusolverDn
 
 
+wp.set_module_options({"enable_backward": False})
+
+
 @wp.kernel
 def _fill_ptrs_kernel(base: wp.int64, stride: wp.int64,
                       out: wp.array(dtype=wp.int64)):  # type: ignore

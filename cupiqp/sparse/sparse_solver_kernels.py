@@ -1,7 +1,13 @@
+import functools
+
 import warp as wp
 from ..utils import to_warp_dtype
 
 
+wp.set_module_options({"enable_backward": False})
+
+
+@functools.lru_cache(maxsize=None)
 def create_sparse_data_gradients_kernel(
     nnz_P: int, nnz_A: int, nnz_G: int,
     p: int, m: int, n: int, num_hu: int, num_xu: int,

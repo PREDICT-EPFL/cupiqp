@@ -1,9 +1,15 @@
+import functools
+
 import warp as wp
 
 from .utils import to_warp_dtype
 from .typedef import PIQP_INF
 
 
+wp.set_module_options({"enable_backward": False})
+
+
+@functools.lru_cache(maxsize=None)
 def create_finite_bound_masks_kernel(
     has_h_l: bool, has_h_u: bool, has_x_l: bool, has_x_u: bool, dtype=wp.float64
     ):

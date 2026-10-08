@@ -6,10 +6,16 @@ no per-nz row-index buffer is materialized; each row-scanning thread is a
 the nz range owned by that row.
 """
 
+import functools
+
 import warp as wp
 from ..utils import to_warp_dtype
 
 
+wp.set_module_options({"enable_backward": False})
+
+
+@functools.lru_cache(maxsize=None)
 def create_sparse_scale_matrices_kernel(n: int, p: int, m: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Single fused kernel for ``scale_matrices``: applies row+col Ruiz scaling
@@ -79,6 +85,7 @@ def create_sparse_scale_matrices_kernel(n: int, p: int, m: int, dtype=wp.float64
     return sparse_scale_matrices_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_sparse_compute_kkt_norms_kernel(n: int, p: int, m: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Two fused kernels backing ``compute_kkt_norms``: row scans for
@@ -173,6 +180,7 @@ def create_sparse_compute_kkt_norms_kernel(n: int, p: int, m: int, dtype=wp.floa
     return sparse_compute_row_inf_norm_kernel, sparse_compute_col_inf_norm_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_sparse_P_norms_kernel(dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Per-index inf-norms of P treating the stored triangle symmetrically:
@@ -195,6 +203,7 @@ def create_sparse_P_norms_kernel(dtype=wp.float64):
     return sparse_P_norms_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_sparse_compute_gamma_kernel(min_scaling: float, max_scaling: float, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Per-problem cost-scaling factor from the P column norms and c:
@@ -232,6 +241,7 @@ def create_sparse_compute_gamma_kernel(min_scaling: float, max_scaling: float, d
     return sparse_compute_gamma_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_sparse_apply_gamma_kernel(dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Scale P values and c by ``gamma[b]`` and accumulate it into the cost

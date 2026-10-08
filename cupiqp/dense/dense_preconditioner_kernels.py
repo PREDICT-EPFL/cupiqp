@@ -12,10 +12,16 @@ Kernels defined here:
     - create_dense_apply_gamma_kernel         (apply gamma to P, c, cost_scaling)
 """
 
+import functools
+
 import warp as wp
 from ..utils import to_warp_dtype
 
 
+wp.set_module_options({"enable_backward": False})
+
+
+@functools.lru_cache(maxsize=None)
 def create_dense_compute_kkt_norms_kernel(n: int, p: int, m: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Fused KKT row/col inf-norm computation for the dense backend.
@@ -66,6 +72,7 @@ def create_dense_compute_kkt_norms_kernel(n: int, p: int, m: int, dtype=wp.float
     return dense_compute_kkt_norms_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_dense_scale_P_and_c_kernel(n: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Fused row+col scaling for P (symmetric) and c, plus optional cost factor.
@@ -92,6 +99,7 @@ def create_dense_scale_P_and_c_kernel(n: int, dtype=wp.float64):
     return dense_scale_P_and_c_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_dense_scale_A_or_G_kernel(rows: int, cols: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Fused row+col scaling for a dense rectangular (B, rows, cols) matrix.
@@ -112,6 +120,7 @@ def create_dense_scale_A_or_G_kernel(rows: int, cols: int, dtype=wp.float64):
     return dense_scale_A_or_G_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_dense_compute_gamma_kernel(n: int,
                                       min_scaling: float, max_scaling: float, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
@@ -169,6 +178,7 @@ def create_dense_compute_gamma_kernel(n: int,
     return dense_compute_gamma_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_dense_apply_gamma_kernel(n: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Apply computed gamma to P, c, and accumulate into cost_scaling.

@@ -16,6 +16,9 @@ from .typedef import (
 from .settings import SettingsFloatIdx, SettingsIntIdx
 
 
+wp.set_module_options({"enable_backward": False})
+
+
 # Threads per batch entry in the block-reduction kernels below. Each thread
 # strides over the row it reduces, so the kernels work for any problem width
 # and are compiled once per dtype rather than once per shape.
@@ -1292,6 +1295,7 @@ def advance_iteration_kernel(current_iter: wp.array(dtype=wp.int32)):  # type: i
     current_iter[0] = current_iter[0] + wp.int32(1)
 
 
+@functools.lru_cache(maxsize=None)
 def create_init_guess_rhs_kernel(n: int, p: int,
                                  num_hl: int, num_hu: int,
                                  num_xl: int, num_xu: int,
@@ -1363,6 +1367,7 @@ def create_init_guess_rhs_kernel(n: int, p: int,
     return init_guess_rhs_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_prepare_predictor_step_kernel(dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Fused kernel for the predictor-step RHS assembly:
@@ -1386,6 +1391,7 @@ def create_prepare_predictor_step_kernel(dtype=wp.float64):
     return prepare_predictor_step_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_prepare_corrector_step_kernel(dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Fused kernel for the corrector-step RHS update:
@@ -1412,6 +1418,7 @@ def create_prepare_corrector_step_kernel(dtype=wp.float64):
     return prepare_corrector_step_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_update_vars_after_corrector_step_kernel(n: int, p: int, num_ineq: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Fused scaled-add for ``_update_vars_after_corrector_step``.
@@ -1482,6 +1489,7 @@ def create_update_vars_after_corrector_step_kernel(n: int, p: int, num_ineq: int
     return update_vars_after_corrector_step_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_run_full_newton_step_kernel(n: int, p: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Fused post-solve variable update for the equality-only (no-inequality)
@@ -1531,6 +1539,7 @@ def create_run_full_newton_step_kernel(n: int, p: int, dtype=wp.float64):
     return run_full_newton_step_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_prepare_zu_minus_zl_and_zbu_minus_zbl_kernel(m: int, n: int,
                                                         has_h_l: bool, has_h_u: bool,
                                                         has_x_l: bool, has_x_u: bool,
@@ -1687,6 +1696,7 @@ def create_update_rho_delta_with_ineq_kernel(dtype=wp.float64):
     return update_rho_delta_with_ineq_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_update_prox_vars_kernel(n: int, num_duals: int, dtype=wp.float64):
     """Proximal-center update from the flags of ``update_rho_delta_with_ineq_kernel``::
 
@@ -1721,6 +1731,7 @@ def create_update_prox_vars_kernel(n: int, num_duals: int, dtype=wp.float64):
     return update_prox_vars_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_update_rho_delta_without_ineq_kernel(n: int, p: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Fused adaptive-regularization update for the equality-only path.
@@ -1817,6 +1828,7 @@ def create_update_rho_delta_without_ineq_kernel(n: int, p: int, dtype=wp.float64
     return update_rho_delta_without_ineq_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_boundary_shift_kernel(num_hl: int, num_hu: int, num_xl: int, num_xu: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Per-element ``z`` boundary shift to avoid division-by-zero in the IPM.
@@ -1888,6 +1900,7 @@ def create_boundary_shift_kernel(num_hl: int, num_hu: int, num_xl: int, num_xu: 
     return boundary_shift_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_backward_assemble_rhs_kernel(
     n: int, p: int,
     num_hu: int, num_hl: int, num_xu: int, num_xl: int,
@@ -2022,6 +2035,7 @@ dtype=wp.float64):
     return backward_assemble_rhs_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_backward_unscale_lhs_kernel(
     n: int, p: int,
     num_hu: int, num_hl: int, num_xu: int, num_xl: int,
@@ -2108,6 +2122,7 @@ def create_backward_unscale_lhs_kernel(
     return backward_unscale_lhs_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_backward_compute_vector_grad_kernel(
     n: int, p: int,
     num_hu: int, num_hl: int, num_xu: int, num_xl: int,
@@ -2187,6 +2202,7 @@ dtype=wp.float64):
     return backward_compute_vector_grad_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_backward_copy_kernel(
     n: int, p: int,
     num_hu: int, num_hl: int, num_xu: int, num_xl: int,
@@ -2270,6 +2286,7 @@ dtype=wp.float64):
     return backward_copy_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_backward_pack_full_layout_kernel(m: int, n: int,
                                             num_hl: int, num_hu: int,
                                             num_xl: int, num_xu: int,

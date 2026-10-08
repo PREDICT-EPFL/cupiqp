@@ -1,7 +1,13 @@
+import functools
+
 import warp as wp
 from ..utils import to_warp_dtype
 
 
+wp.set_module_options({"enable_backward": False})
+
+
+@functools.lru_cache(maxsize=None)
 def create_dense_data_gradients_kernel(n: int, p: int, m: int, num_hu: int, num_xu: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
 

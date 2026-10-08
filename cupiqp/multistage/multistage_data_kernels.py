@@ -1,8 +1,14 @@
+import functools
+
 import warp as wp
 
 from ..utils import to_warp_dtype
 
 
+wp.set_module_options({"enable_backward": False})
+
+
+@functools.lru_cache(maxsize=None)
 def create_broadcast_copy_kernels(dtype=wp.float64):
     """Build the kernels that copy one problem's data into every batch entry.
 
