@@ -216,7 +216,7 @@ def create_sparse_compute_gamma_kernel(min_scaling: float, max_scaling: float, d
     lo = float(min_scaling)
     hi = float(max_scaling)
 
-    @wp.kernel
+    @wp.kernel(module="unique", enable_backward=False)
     def sparse_compute_gamma_kernel(
         norms: wp.array2d(dtype=dtype),  # type: ignore  (B, n)
         c:     wp.array2d(dtype=dtype),  # type: ignore  (B, n)

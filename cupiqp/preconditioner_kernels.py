@@ -313,7 +313,7 @@ def create_ruiz_conv_check_kernel(dtype=wp.float64):
     launch and read it back once. Dispatch with
     ``wp.launch_tiled(dim=[B], block_dim=REDUCTION_BLOCK_DIM)``.
     """
-    @wp.kernel
+    @wp.kernel(module="unique", enable_backward=False)
     def conv_check_kernel(
         delta_iter:   wp.array2d(dtype=dtype),   # type: ignore  (B, n+p+m)
         delta_b_iter: wp.array2d(dtype=dtype),   # type: ignore  (B, n)
@@ -351,7 +351,7 @@ def create_compute_constraints_rhs_inf_norm_unscaled_kernel(dtype=wp.float64):
     def finite_value(v: dtype, mask: dtype) -> dtype:    # type: ignore
         return wp.where(mask > dtype(0.5), v, dtype(0.0))
 
-    @wp.kernel
+    @wp.kernel(module="unique", enable_backward=False)
     def kernel(
         delta_inv:   wp.array2d(dtype=dtype),  # type: ignore  (B, n+p+m)
         delta_b_inv: wp.array2d(dtype=dtype),  # type: ignore  (B, n)

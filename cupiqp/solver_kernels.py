@@ -52,7 +52,7 @@ def create_calculate_step_kernel(dtype=wp.float64):
     def step_candidate_masked(a: dtype, b: dtype, mask: dtype) -> dtype:    # type: ignore
         return wp.where(mask > dtype(0.5), step_candidate(a, b), dtype(1.0))
 
-    @wp.kernel
+    @wp.kernel(module="unique", enable_backward=False)
     def calculate_step_kernel(
         s_all: wp.array2d(dtype=dtype),        # (B, num_ineq)  # type: ignore
         z_all: wp.array2d(dtype=dtype),        # (B, num_ineq)  # type: ignore
@@ -94,7 +94,7 @@ def create_calculate_mu_kernel(dtype=wp.float64):
     """
     dtype = to_warp_dtype(dtype)
 
-    @wp.kernel
+    @wp.kernel(module="unique", enable_backward=False)
     def calculate_mu_kernel(
         s_all: wp.array2d(dtype=dtype),  # (B, num_ineq)  # type: ignore
         z_all: wp.array2d(dtype=dtype),  # (B, num_ineq)  # type: ignore
@@ -134,7 +134,7 @@ def create_calculate_sigma_kernel(dtype=wp.float64):
     """
     dtype = to_warp_dtype(dtype)
 
-    @wp.kernel
+    @wp.kernel(module="unique", enable_backward=False)
     def calculate_sigma_kernel(
         s_all: wp.array2d(dtype=dtype),        # (B, num_ineq)  # type: ignore
         z_all: wp.array2d(dtype=dtype),        # (B, num_ineq)  # type: ignore
@@ -187,7 +187,7 @@ def create_init_guess_center_kernel(dtype=wp.float64):
     """
     dtype = to_warp_dtype(dtype)
 
-    @wp.kernel
+    @wp.kernel(module="unique", enable_backward=False)
     def init_guess_center_kernel(
         finite_mask_all: wp.array2d(dtype=dtype),  # type: ignore  (B, num_ineq)
         num_finite_bounds: wp.array(dtype=dtype),  # type: ignore  (B,)
@@ -273,7 +273,7 @@ def create_update_residuals_r_kernel(dtype=wp.float64):
     """
     dtype = to_warp_dtype(dtype)
 
-    @wp.kernel
+    @wp.kernel(module="unique", enable_backward=False)
     def update_residuals_r_kernel(
         # Stage 1 inputs
         rho:           wp.array(dtype=dtype),    # type: ignore  (B,)
@@ -399,7 +399,7 @@ def create_update_residual_nr_kernel(dtype=wp.float64):
     def finite_value(v: dtype, mask: dtype) -> dtype:    # type: ignore
         return wp.where(mask > dtype(0.5), v, dtype(0.0))
 
-    @wp.kernel
+    @wp.kernel(module="unique", enable_backward=False)
     def update_residual_nr_kernel(
         minus_Px:                   wp.array2d(dtype=dtype),  # type: ignore  (B, n)
         A_x:                        wp.array2d(dtype=dtype),  # type: ignore  (B, p)
@@ -698,7 +698,7 @@ def create_update_smoothing_residual_nr_kernel(dtype=wp.float64):
     def finite_value(v: dtype, mask: dtype) -> dtype:    # type: ignore
         return wp.where(mask > dtype(0.5), v, dtype(0.0))
 
-    @wp.kernel
+    @wp.kernel(module="unique", enable_backward=False)
     def update_smoothing_residual_nr_kernel(
         # Precomputed matrix-vector products
         minus_Px:        wp.array2d(dtype=dtype),  # type: ignore  (B, n)
@@ -1113,7 +1113,7 @@ def create_update_termination_kernel(dtype=wp.float64):
     return update_termination_kernel
 
 
-@wp.kernel
+@wp.kernel(module="unique", enable_backward=False)
 def update_continue_flag_kernel(
     active:        wp.array(dtype=wp.bool),   # type: ignore  (B,)
     current_iter:  wp.array(dtype=wp.int32),  # type: ignore  (1,)
@@ -1224,7 +1224,7 @@ def create_solution_finite_kernel(dtype=wp.float64):
     """
     dtype = to_warp_dtype(dtype)
 
-    @wp.kernel
+    @wp.kernel(module="unique", enable_backward=False)
     def solution_finite_kernel(
         x:      wp.array2d(dtype=dtype),     # type: ignore  (B, n)
         y:      wp.array2d(dtype=dtype),     # type: ignore  (B, p)
@@ -1252,7 +1252,7 @@ def create_solution_finite_kernel(dtype=wp.float64):
     return solution_finite_kernel
 
 
-@wp.kernel
+@wp.kernel(module="unique", enable_backward=False)
 def any_flag_kernel(
     flags: wp.array(dtype=wp.int32),  # type: ignore  (B,)
     out:   wp.array(dtype=wp.int32),  # type: ignore  (1,) output

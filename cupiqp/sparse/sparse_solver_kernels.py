@@ -10,8 +10,7 @@ wp.set_module_options({"enable_backward": False})
 @functools.lru_cache(maxsize=None)
 def create_sparse_data_gradients_kernel(
     nnz_P: int, nnz_A: int, nnz_G: int,
-    p: int, m: int, n: int, num_hu: int, num_xu: int,
-dtype=wp.float64):
+    p: int, m: int, n: int, num_hu: int, num_xu: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     
     @wp.kernel
