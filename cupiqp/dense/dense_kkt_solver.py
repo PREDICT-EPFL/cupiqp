@@ -1,8 +1,6 @@
 import nvtx
 import warp as wp
 
-from ..utils import device_ptr
-
 from ..kkt_solver import KKTSolverBase
 from .dense_data import DenseData
 from .dense_cholesky import CholeskyInplaceSolver, BatchedCholeskyInplaceSolver
@@ -11,9 +9,12 @@ from .dense_kkt_solver_kernels import (
     create_solve_pre_cholesky_kernel,
     create_solve_post_cholesky_kernel
 )
-from .cublas_wrappers import (
-    cublas_set_stream, cublas_create_handle, cublas_destroy_handle
-)
+from .dense_matmul import CublasHandle, DenseGemv, DenseSyrk
+
+
+def use_cusolver_potrf(rows):
+    return True if rows > 32 else False
+
 
 
 class DenseKKTSolver(KKTSolverBase):
@@ -37,7 +38,7 @@ class DenseKKTSolver(KKTSolverBase):
         self._z_reg_inv = wp.empty((B, m), dtype=self._dtype, device=self._device)
         self._z_reg_inv_sqrt = wp.empty((B, m), dtype=self._dtype, device=self._device)
         self._kkt_mat = wp.empty((B, n, n), dtype=self._dtype, device=self._device)
-        self._AtA = wp.empty((B, n, n), dtype=self._dtype, device=self._device) if p > 0 else wp.zeros((B, 0, 0), dtype=self._dtype, device=self._device)
+        self._AtA = wp.zeros((B, n, n), dtype=self._dtype, device=self._device) if p > 0 else wp.zeros((B, 0, 0), dtype=self._dtype, device=self._device)
         self._G_scaled = wp.empty((B, m, n), dtype=self._dtype, device=self._device) if m > 0 else wp.zeros((B, 0, 0), dtype=self._dtype, device=self._device)
         self._work_n_AT = wp.empty((B, n), dtype=self._dtype, device=self._device) if p > 0 else wp.empty((B, 0), dtype=self._dtype, device=self._device)
         self._work_n_GT = wp.empty((B, n), dtype=self._dtype, device=self._device) if m > 0 else wp.empty((B, 0), dtype=self._dtype, device=self._device)
@@ -46,40 +47,20 @@ class DenseKKTSolver(KKTSolverBase):
         self._solve_pre_cholesky_kernel = create_solve_pre_cholesky_kernel(p, m, dtype=self._dtype)
         self._solve_post_cholesky_kernel = create_solve_post_cholesky_kernel(p, m, dtype=self._dtype)
 
-        # Bound once: the KKT solver is created inside the solver's stream
-        # scope and a solver never changes its stream.
-        self._cublas_handle = cublas_create_handle()
-        cublas_set_stream(self._cublas_handle, wp.get_stream("cuda").cuda_stream)
-
-        if self._dtype is wp.float32:
-            from .cublas_wrappers import (
-                sgemv as _gemv_fn,
-                ssyrk as _syrk_fn,
-                sgemm_strided_batched as _gemm_strided_fn,
-                sgemv_strided_batched as _gemv_strided_fn
-            )
-        else:
-            from .cublas_wrappers import (
-                dgemv as _gemv_fn,
-                dsyrk as _syrk_fn,
-                dgemm_strided_batched as _gemm_strided_fn,
-                dgemv_strided_batched as _gemv_strided_fn
-            )
+        # Matrix products, each with its own Warp / cuBLAS choice for its shape
+        # (see dense_matmul.py). They share one cuBLAS handle, created only if
+        # one of them uses cuBLAS.
+        cublas = CublasHandle()
+        self._P_gemv = DenseGemv(B, n, n, self._dtype, cublas)
+        self._A_gemv = DenseGemv(B, p, n, self._dtype, cublas)
+        self._G_gemv = DenseGemv(B, m, n, self._dtype, cublas)
+        self._AtA_syrk = DenseSyrk(B, p, n, self._dtype, cublas)
+        self._GtG_syrk = DenseSyrk(B, m, n, self._dtype, cublas)
 
         if B > 1:
             self._cholesky_solver = BatchedCholeskyInplaceSolver(n, B, dtype=self._dtype)
-            self._gemv = lambda handle, mat, x, y, transa, alpha, beta: \
-                _gemv_strided_fn(handle, mat, x, y, transa=transa, alpha=alpha, beta=beta)
-            self._syrk = lambda handle, A, C, alpha, beta: _gemm_strided_fn(
-                handle, A, A, C, transa=True, transb=False, alpha=alpha, beta=beta)
         else:
             self._cholesky_solver = CholeskyInplaceSolver(n, dtype=self._dtype)
-            self._gemv = lambda handle, mat, x, y, transa=False, alpha=1.0, beta=0.0: \
-                _gemv_fn(handle, mat[0], x[0], y[0], transa=transa, alpha=alpha, beta=beta)
-            # syrk exploits symmetry; A is (1, k, n), C is (1, n, n)
-            self._syrk = lambda handle, A, C, alpha, beta: _syrk_fn(
-                handle, 1, 0, A.shape[-1], A.shape[-2],  # FILL_UPPER, OP_N, n, k
-                alpha, device_ptr(A), A.shape[-1], beta, device_ptr(C), C.shape[-1])
 
         # cuSOLVER writes one info entry per matrix ((1,) for the single
         # solver) straight into the status buffer.
@@ -88,17 +69,9 @@ class DenseKKTSolver(KKTSolverBase):
         if p > 0:
             self._compute_AtA(data)
 
-    def __del__(self):
-        handle = getattr(self, "_cublas_handle", None)
-        if handle is not None:
-            try:
-                cublas_destroy_handle(handle)
-            except Exception:
-                pass
-
     def _compute_AtA(self, data: DenseData):
         """Compute AtA = A^T * A."""
-        self._syrk(self._cublas_handle, data.A, self._AtA, 1.0, 0.0)
+        self._AtA_syrk(data.A, self._AtA)
 
     def update_data(self, data: DenseData, update_P: bool, update_A: bool, update_G: bool):
         if update_A and data.p > 0:
@@ -106,7 +79,7 @@ class DenseKKTSolver(KKTSolverBase):
 
     @nvtx.annotate("DenseKKTSolver::update_kkt")
     def update_kkt(self, data: DenseData, delta: wp.array, x_reg: wp.array, z_reg: wp.array, z_reg_inv: wp.array) -> None:
-        """Assemble KKT matrix using batched cuBLAS calls (CUDA graph safe)."""
+        """Assemble the condensed KKT matrix (CUDA graph safe)."""
 
         # For inactive rows G[i], z_reg_inv[i] is already zero.
         # Therefore the contribution of G[i] to the condensed KKT is zero.
@@ -121,7 +94,7 @@ class DenseKKTSolver(KKTSolverBase):
             device=self._device
         )
         if data.m > 0:
-            self._syrk(self._cublas_handle, self._G_scaled, self._kkt_mat, 1.0, 1.0)
+            self._GtG_syrk(self._G_scaled, self._kkt_mat, accumulate=True)
 
     @nvtx.annotate("DenseKKTSolver::factor")
     def factor(self) -> None:
@@ -174,20 +147,20 @@ class DenseKKTSolver(KKTSolverBase):
 
     @nvtx.annotate("DenseKKTSolver::eval_P_x")
     def eval_P_x(self, data: DenseData, alpha: float, x: wp.array, z: wp.array):
-        self._gemv(self._cublas_handle, data.P, x, z, transa=False, alpha=alpha, beta=0.0)
+        self._P_gemv(data.P, x, z, alpha=alpha)
 
     @nvtx.annotate("DenseKKTSolver::eval_A_xn")
     def eval_A_xn(self, data: DenseData, alpha_n: float, xn: wp.array, zn: wp.array):
-        self._gemv(self._cublas_handle, data.A, xn, zn, transa=False, alpha=alpha_n, beta=0.0)
+        self._A_gemv(data.A, xn, zn, alpha=alpha_n)
 
     @nvtx.annotate("DenseKKTSolver::eval_AT_xt")
     def eval_AT_xt(self, data: DenseData, alpha_t: float, xt: wp.array, zt: wp.array):
-        self._gemv(self._cublas_handle, data.A, xt, zt, transa=True, alpha=alpha_t, beta=0.0)
+        self._A_gemv(data.A, xt, zt, transpose=True, alpha=alpha_t)
 
     @nvtx.annotate("DenseKKTSolver::eval_G_xn")
     def eval_G_xn(self, data: DenseData, alpha_n: float, xn: wp.array, zn: wp.array):
-        self._gemv(self._cublas_handle, data.G, xn, zn, transa=False, alpha=alpha_n, beta=0.0)
+        self._G_gemv(data.G, xn, zn, alpha=alpha_n)
 
     @nvtx.annotate("DenseKKTSolver::eval_GT_xt")
     def eval_GT_xt(self, data: DenseData, alpha_t: float, xt: wp.array, zt: wp.array):
-        self._gemv(self._cublas_handle, data.G, xt, zt, transa=True, alpha=alpha_t, beta=0.0)
+        self._G_gemv(data.G, xt, zt, transpose=True, alpha=alpha_t)
