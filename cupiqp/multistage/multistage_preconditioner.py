@@ -34,11 +34,13 @@ class MultistageRuizEquilibration(RuizEquilibration):
         A_rows_per_block, G_rows_per_block = data.A_rows_per_block, data.G_rows_per_block
         self._N, self._d, self._A_rows_per_block, self._G_rows_per_block = N, d, A_rows_per_block, G_rows_per_block
 
+        has_E = dict(has_P_E=data.has_P_offdiag, has_A_E=data.has_A_offdiag, has_G_E=data.has_G_offdiag)
         self._multistage_scale_matrices_kernel = create_multistage_scale_matrices_kernel(
-            N, d, A_rows_per_block, G_rows_per_block, dtype=self._dtype)
+            N, d, A_rows_per_block, G_rows_per_block, **has_E, dtype=self._dtype)
         self._multistage_compute_kkt_norms_kernel = create_multistage_compute_kkt_norms_kernel(
-            N, d, A_rows_per_block, G_rows_per_block, dtype=self._dtype)
-        self._multistage_P_col_norms_kernel = create_multistage_P_col_norms_kernel(N, d, dtype=self._dtype)
+            N, d, A_rows_per_block, G_rows_per_block, **has_E, dtype=self._dtype)
+        self._multistage_P_col_norms_kernel = create_multistage_P_col_norms_kernel(
+            N, d, has_P_E=data.has_P_offdiag, dtype=self._dtype)
         self._gamma_from_norms_kernel = create_gamma_from_norms_kernel(
             self.min_scaling, self.max_scaling, dtype=self._dtype)
 

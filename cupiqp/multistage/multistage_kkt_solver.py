@@ -82,11 +82,13 @@ class MultistageKKTSolver(KKTSolverBase):
         self._sub_scale_rows_kernel = create_sub_scale_rows_kernel(dtype)
         self._has_nan_rows_kernel = create_has_nan_rows_kernel(dtype)
 
-        # Precompute A^T A as block-tridiagonal (A is fixed across iterations).
+        # Precompute A^T A as block-tridiagonal (A is fixed across iterations);
+        # it is block diagonal when A has no off-diagonal blocks.
         if data.p > 0:
             self._AtA_diag = wp.zeros((B, N, d, d), dtype=self._dtype, device=self._device)
-            self._AtA_offdiag = wp.zeros((B, N - 1, d, d), dtype=self._dtype, device=self._device)
-            self._eval_AT_A_kernel = create_block_syrk_kernel(N, data.A_rows_per_block, d, dtype=dtype)
+            self._AtA_offdiag = wp.zeros((B, N - 1 if data.has_A_offdiag else 0, d, d), dtype=self._dtype, device=self._device)
+            self._eval_AT_A_kernel = create_block_syrk_kernel(
+                N, data.A_rows_per_block, d, has_E=data.has_A_offdiag, dtype=dtype)
             wp.launch(
                 kernel=self._eval_AT_A_kernel,
                 dim=(B, N, d, d),
@@ -112,18 +114,23 @@ class MultistageKKTSolver(KKTSolverBase):
         self._update_kkt_kernel = create_update_kkt_kernel(
             num_blocks=N, block_size=d,
             p=data.p, m=data.m, G_rows_per_block=G_rows_per_block,
+            has_P_E=data.has_P_offdiag, has_A_E=data.has_A_offdiag, has_G_E=data.has_G_offdiag,
             dtype=dtype)
 
-        # ---- matvec kernels ----
-        self._eval_P_x_kernel = create_block_tridiag_gemv_kernel(N, d, dtype=dtype)
+        # ---- matvec kernels (absent off-diagonal blocks are compiled out) ----
+        self._eval_P_x_kernel = create_block_tridiag_gemv_kernel(N, d, has_E=data.has_P_offdiag, dtype=dtype)
 
         if data.p > 0:
-            self._eval_A_xn_kernel = create_block_bidiag_gemv_n_kernel(N, data.A_rows_per_block, d, dtype=dtype)
-            self._eval_AT_xt_kernel = create_block_bidiag_gemv_t_kernel(N, data.A_rows_per_block, d, dtype=dtype)
+            self._eval_A_xn_kernel = create_block_bidiag_gemv_n_kernel(
+                N, data.A_rows_per_block, d, has_E=data.has_A_offdiag, dtype=dtype)
+            self._eval_AT_xt_kernel = create_block_bidiag_gemv_t_kernel(
+                N, data.A_rows_per_block, d, has_E=data.has_A_offdiag, dtype=dtype)
 
         if data.m > 0:
-            self._eval_G_xn_kernel = create_block_bidiag_gemv_n_kernel(N, data.G_rows_per_block, d, dtype=dtype)
-            self._eval_GT_xt_kernel = create_block_bidiag_gemv_t_kernel(N, data.G_rows_per_block, d, dtype=dtype)
+            self._eval_G_xn_kernel = create_block_bidiag_gemv_n_kernel(
+                N, data.G_rows_per_block, d, has_E=data.has_G_offdiag, dtype=dtype)
+            self._eval_GT_xt_kernel = create_block_bidiag_gemv_t_kernel(
+                N, data.G_rows_per_block, d, has_E=data.has_G_offdiag, dtype=dtype)
 
     def update_data(self, data: MultistageData, update_P: bool, update_A: bool, update_G: bool):
         if update_A and data.p > 0:
@@ -238,7 +245,7 @@ class MultistageKKTSolver(KKTSolverBase):
         if data.p > 0:
             wp.launch(
                 kernel=self._eval_A_xn_kernel,
-                dim=(B, N + 1, data.A_rows_per_block),
+                dim=(B, data.A_num_block_rows, data.A_rows_per_block),
                 inputs=[
                     self._dtype(1.0),
                     data.A_diag, data.A_offdiag,
@@ -254,7 +261,7 @@ class MultistageKKTSolver(KKTSolverBase):
         if data.m > 0:
             wp.launch(
                 kernel=self._eval_G_xn_kernel,
-                dim=(B, N + 1, data.G_rows_per_block),
+                dim=(B, data.G_num_block_rows, data.G_rows_per_block),
                 inputs=[
                     self._dtype(1.0),
                     data.G_diag, data.G_offdiag,
@@ -285,7 +292,7 @@ class MultistageKKTSolver(KKTSolverBase):
     def eval_A_xn(self, data: MultistageData, alpha_n: float, xn: wp.array, zn: wp.array):
         wp.launch(
             self._eval_A_xn_kernel,
-            dim=(self._batch_size, self.num_stages + 1, data.A_rows_per_block),
+            dim=(self._batch_size, data.A_num_block_rows, data.A_rows_per_block),
             inputs=[
                 self._dtype(alpha_n),
                 data.A_diag, data.A_offdiag,
@@ -313,7 +320,7 @@ class MultistageKKTSolver(KKTSolverBase):
     def eval_G_xn(self, data: MultistageData, alpha_n: float, xn: wp.array, zn: wp.array):
         wp.launch(
             self._eval_G_xn_kernel,
-            dim=(self._batch_size, self.num_stages + 1, data.G_rows_per_block),
+            dim=(self._batch_size, data.G_num_block_rows, data.G_rows_per_block),
             inputs=[
                 self._dtype(alpha_n),
                 data.G_diag, data.G_offdiag,

@@ -10,7 +10,9 @@ DLPack bridging is needed inside the kernels:
 
 For absent A or G, the call sites pass small dummy 4D buffers and rely on
 ``wp.static(A_rows_per_block > 0)`` / ``wp.static(G_rows_per_block > 0)`` guards to dead-code-eliminate
-all access at codegen.
+all access at codegen. Likewise, an absent off-diagonal (``has_P_E`` /
+``has_A_E`` / ``has_G_E`` False) is an empty array that is never read; A or G
+without one has ``N`` block rows instead of ``N + 1``.
 """
 
 import functools
@@ -23,7 +25,9 @@ wp.set_module_options({"enable_backward": False})
 
 
 @functools.lru_cache(maxsize=None)
-def create_multistage_scale_matrices_kernel(N: int, d: int, A_rows_per_block: int, G_rows_per_block: int, dtype=wp.float64):
+def create_multistage_scale_matrices_kernel(N: int, d: int, A_rows_per_block: int, G_rows_per_block: int,
+                                            has_P_E: bool = True, has_A_E: bool = True, has_G_E: bool = True,
+                                            dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Single fused kernel for ``scale_matrices``.
 
@@ -62,31 +66,36 @@ def create_multistage_scale_matrices_kernel(N: int, d: int, A_rows_per_block: in
         if i < wp.static(d):
             d_x_ki = d_x[b, k * wp.static(d) + i]
             P_D[b, k, i, j] = P_D[b, k, i, j] * d_x_ki * d_x_kj * cf
-            if k < wp.static(N - 1):
-                d_x_kp1_i = d_x[b, (k + 1) * wp.static(d) + i]
-                P_E[b, k, i, j] = P_E[b, k, i, j] * d_x_kp1_i * d_x_kj * cf
+            if wp.static(has_P_E):
+                if k < wp.static(N - 1):
+                    d_x_kp1_i = d_x[b, (k + 1) * wp.static(d) + i]
+                    P_E[b, k, i, j] = P_E[b, k, i, j] * d_x_kp1_i * d_x_kj * cf
             if i == 0:
                 c[b, k * wp.static(d) + j] = c[b, k * wp.static(d) + j] * d_x_kj * cf
 
         if wp.static(A_rows_per_block > 0):
             if i < wp.static(A_rows_per_block):
                 d_y_ki = d_y[b, k * wp.static(A_rows_per_block) + i]
-                d_y_kp1_i = d_y[b, (k + 1) * wp.static(A_rows_per_block) + i]
                 A_D[b, k, i, j] = A_D[b, k, i, j] * d_y_ki * d_x_kj
-                A_E[b, k, i, j] = A_E[b, k, i, j] * d_y_kp1_i * d_x_kj
+                if wp.static(has_A_E):
+                    d_y_kp1_i = d_y[b, (k + 1) * wp.static(A_rows_per_block) + i]
+                    A_E[b, k, i, j] = A_E[b, k, i, j] * d_y_kp1_i * d_x_kj
 
         if wp.static(G_rows_per_block > 0):
             if i < wp.static(G_rows_per_block):
                 d_z_ki = d_z[b, k * wp.static(G_rows_per_block) + i]
-                d_z_kp1_i = d_z[b, (k + 1) * wp.static(G_rows_per_block) + i]
                 G_D[b, k, i, j] = G_D[b, k, i, j] * d_z_ki * d_x_kj
-                G_E[b, k, i, j] = G_E[b, k, i, j] * d_z_kp1_i * d_x_kj
+                if wp.static(has_G_E):
+                    d_z_kp1_i = d_z[b, (k + 1) * wp.static(G_rows_per_block) + i]
+                    G_E[b, k, i, j] = G_E[b, k, i, j] * d_z_kp1_i * d_x_kj
 
     return multistage_scale_matrices_kernel
 
 
 @functools.lru_cache(maxsize=None)
-def create_multistage_compute_kkt_norms_kernel(N: int, d: int, A_rows_per_block: int, G_rows_per_block: int, dtype=wp.float64):
+def create_multistage_compute_kkt_norms_kernel(N: int, d: int, A_rows_per_block: int, G_rows_per_block: int,
+                                               has_P_E: bool = True, has_A_E: bool = True, has_G_E: bool = True,
+                                               dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Single fused kernel for ``compute_kkt_norms``.
 
@@ -101,8 +110,8 @@ def create_multistage_compute_kkt_norms_kernel(N: int, d: int, A_rows_per_block:
     constants are static; the inner d / A_rows_per_block / G_rows_per_block loops unroll at codegen.
     """
     n = N * d
-    p = (N + 1) * A_rows_per_block
-    m = (N + 1) * G_rows_per_block
+    p = (N + int(has_A_E)) * A_rows_per_block
+    m = (N + int(has_G_E)) * G_rows_per_block
 
     @wp.kernel
     def multistage_compute_kkt_norms_kernel(
@@ -132,26 +141,29 @@ def create_multistage_compute_kkt_norms_kernel(N: int, d: int, A_rows_per_block:
             # P diag block: row i of P_D[k_blk]
             for col in range(d_static):
                 v = wp.max(v, wp.abs(P_D[b, k_blk, i, col]))
-            # Lower off-diag (block (k_blk, k_blk-1)): P_E[k_blk-1] row i
-            if k_blk > 0:
-                for col in range(d_static):
-                    v = wp.max(v, wp.abs(P_E[b, k_blk - 1, i, col]))
-            # Upper off-diag (= P_E[k_blk] transposed): |P_E[k_blk, col, i]|
-            if k_blk < N_static - 1:
-                for col in range(d_static):
-                    v = wp.max(v, wp.abs(P_E[b, k_blk, col, i]))
+            if wp.static(has_P_E):
+                # Lower off-diag (block (k_blk, k_blk-1)): P_E[k_blk-1] row i
+                if k_blk > 0:
+                    for col in range(d_static):
+                        v = wp.max(v, wp.abs(P_E[b, k_blk - 1, i, col]))
+                # Upper off-diag (= P_E[k_blk] transposed): |P_E[k_blk, col, i]|
+                if k_blk < N_static - 1:
+                    for col in range(d_static):
+                        v = wp.max(v, wp.abs(P_E[b, k_blk, col, i]))
 
             # A col j: D[k_blk][:, i] and E[k_blk][:, i]
             if wp.static(A_rows_per_block > 0):
                 for row in range(wp.static(A_rows_per_block)):
                     v = wp.max(v, wp.abs(A_D[b, k_blk, row, i]))
-                    v = wp.max(v, wp.abs(A_E[b, k_blk, row, i]))
+                    if wp.static(has_A_E):
+                        v = wp.max(v, wp.abs(A_E[b, k_blk, row, i]))
 
             # G col j: D[k_blk][:, i] and E[k_blk][:, i]
             if wp.static(G_rows_per_block > 0):
                 for row in range(wp.static(G_rows_per_block)):
                     v = wp.max(v, wp.abs(G_D[b, k_blk, row, i]))
-                    v = wp.max(v, wp.abs(G_E[b, k_blk, row, i]))
+                    if wp.static(has_G_E):
+                        v = wp.max(v, wp.abs(G_E[b, k_blk, row, i]))
 
             xbs = x_b_scaling[b, j]
             v = wp.max(v, xbs)
@@ -169,9 +181,10 @@ def create_multistage_compute_kkt_norms_kernel(N: int, d: int, A_rows_per_block:
                 if k_blk < N_static:
                     for col in range(d_static):
                         v = wp.max(v, wp.abs(A_D[b, k_blk, i, col]))
-                if k_blk > 0:
-                    for col in range(d_static):
-                        v = wp.max(v, wp.abs(A_E[b, k_blk - 1, i, col]))
+                if wp.static(has_A_E):
+                    if k_blk > 0:
+                        for col in range(d_static):
+                            v = wp.max(v, wp.abs(A_E[b, k_blk - 1, i, col]))
                 d_iter[b, j] = v
 
         elif j < npm_static:
@@ -185,16 +198,17 @@ def create_multistage_compute_kkt_norms_kernel(N: int, d: int, A_rows_per_block:
                 if k_blk < N_static:
                     for col in range(d_static):
                         v = wp.max(v, wp.abs(G_D[b, k_blk, i, col]))
-                if k_blk > 0:
-                    for col in range(d_static):
-                        v = wp.max(v, wp.abs(G_E[b, k_blk - 1, i, col]))
+                if wp.static(has_G_E):
+                    if k_blk > 0:
+                        for col in range(d_static):
+                            v = wp.max(v, wp.abs(G_E[b, k_blk - 1, i, col]))
                 d_iter[b, j] = v
 
     return multistage_compute_kkt_norms_kernel
 
 
 @functools.lru_cache(maxsize=None)
-def create_multistage_P_col_norms_kernel(N: int, d: int, dtype=wp.float64):
+def create_multistage_P_col_norms_kernel(N: int, d: int, has_P_E: bool = True, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Column inf-norms of the symmetric block-tridiagonal P, per variable.
 
@@ -220,12 +234,13 @@ def create_multistage_P_col_norms_kernel(N: int, d: int, dtype=wp.float64):
         v = dtype(0.0)
         for col in range(d_static):
             v = wp.max(v, wp.abs(P_D[b, k_blk, i, col]))
-        if k_blk > 0:
-            for col in range(d_static):
-                v = wp.max(v, wp.abs(P_E[b, k_blk - 1, i, col]))
-        if k_blk < N_static - 1:
-            for col in range(d_static):
-                v = wp.max(v, wp.abs(P_E[b, k_blk, col, i]))
+        if wp.static(has_P_E):
+            if k_blk > 0:
+                for col in range(d_static):
+                    v = wp.max(v, wp.abs(P_E[b, k_blk - 1, i, col]))
+            if k_blk < N_static - 1:
+                for col in range(d_static):
+                    v = wp.max(v, wp.abs(P_E[b, k_blk, col, i]))
         out[b, j] = v
 
     return multistage_P_col_norms_kernel

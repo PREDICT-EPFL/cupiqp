@@ -5,9 +5,10 @@ from ..data import Data
 from ..typedef import CudaArray
 
 
-# A block-structured matrix: a (diag, offdiag) pair of GPU arrays, either of
-# which may be None (zero at setup, unchanged in update). MultistageSolver
-# takes any GPU arrays; MultistageData.init receives Warp arrays.
+# A block-structured matrix: a (diag, offdiag) pair of GPU arrays. At setup
+# an offdiag of None means the matrix has no off-diagonal blocks for the
+# lifetime of the solver; in update a None entry leaves that part unchanged.
+# MultistageSolver takes any GPU arrays; MultistageData.init receives Warp arrays.
 BlockPair = Tuple[Optional[CudaArray], Optional[CudaArray]]
 
 
@@ -49,6 +50,12 @@ class MultistageData(Data):
     inequality bounds ``h_l <= G x <= h_u`` and box bounds
     ``x_l <= x <= x_u`` on top of the one-sided form above.
 
+    Off-diagonal blocks are optional. Without ``P``'s, P is block diagonal
+    (per-stage costs). Without ``A``'s (or ``G``'s), A (or G) is block
+    diagonal with only ``N`` block rows: per-stage constraints, and ``b``
+    (or ``h_l`` / ``h_u``) has ``N`` blocks instead of ``N + 1``. The kernels
+    then skip all work on the absent blocks.
+
     A batch of such QPs is stored together: every matrix and vector carries
     a leading batch axis, and the same formulation is solved independently
     for each batch entry.
@@ -65,14 +72,16 @@ class MultistageData(Data):
                        A_diag: Optional[wp.array], A_offdiag: Optional[wp.array], b: Optional[wp.array],
                        G_diag: Optional[wp.array], G_offdiag: Optional[wp.array],
                        h_u: Optional[wp.array], h_l: Optional[wp.array],
-                       x_u: Optional[wp.array], x_l: Optional[wp.array]):
+                       x_u: Optional[wp.array], x_l: Optional[wp.array],
+                       has_P_offdiag: bool, has_A_offdiag: bool, has_G_offdiag: bool):
         """Adopt freshly allocated Warp buffers as this object's storage.
 
         Only :meth:`init` calls this, with buffers it allocated itself; the
         solver later modifies them in place (e.g. the preconditioner scales
         them). Matrix blocks are ``(B, N, rows, cols)``; vectors are
         ``(B, num_blocks, rows)`` and also get flat ``(B, k)`` views
-        (zero-copy) for the shared IPM code.
+        (zero-copy) for the shared IPM code. An absent off-diagonal is a
+        ``(B, 0, rows, cols)`` array and its ``has_*_offdiag`` flag is False.
         """
         B, N, d = (int(v) for v in P_diag.shape[:3])
         self._batch_size = B
@@ -80,6 +89,7 @@ class MultistageData(Data):
         self._N, self._d = N, d
 
         self._P_diag, self._P_offdiag = P_diag, P_offdiag
+        self._has_P_offdiag, self._has_A_offdiag, self._has_G_offdiag = has_P_offdiag, has_A_offdiag, has_G_offdiag
         self._c_wp = c
         self._c = self._flat(c)
 
@@ -121,11 +131,36 @@ class MultistageData(Data):
 
     @property
     def p(self) -> int:
-        return (self._N + 1) * self._A_rows_per_block
+        return self.A_num_block_rows * self._A_rows_per_block
 
     @property
     def m(self) -> int:
-        return (self._N + 1) * self._G_rows_per_block
+        return self.G_num_block_rows * self._G_rows_per_block
+
+    @property
+    def A_num_block_rows(self) -> int:
+        """Block rows of A: ``N + 1`` with off-diagonal blocks, ``N`` without."""
+        return self._N + int(self._has_A_offdiag)
+
+    @property
+    def G_num_block_rows(self) -> int:
+        """Block rows of G: ``N + 1`` with off-diagonal blocks, ``N`` without."""
+        return self._N + int(self._has_G_offdiag)
+
+    @property
+    def has_P_offdiag(self) -> bool:
+        """Whether P has off-diagonal blocks (given at setup)."""
+        return self._has_P_offdiag
+
+    @property
+    def has_A_offdiag(self) -> bool:
+        """Whether A has off-diagonal blocks (given at setup)."""
+        return self._has_A_offdiag
+
+    @property
+    def has_G_offdiag(self) -> bool:
+        """Whether G has off-diagonal blocks (given at setup)."""
+        return self._has_G_offdiag
 
     @property
     def block_size(self) -> int:
@@ -169,12 +204,13 @@ class MultistageData(Data):
         GPU arrays. For one problem the shapes are:
 
         * ``P``: ``(N, d, d)`` diagonal blocks and ``(N-1, d, d)`` lower
-          off-diagonal blocks (``offdiag`` may be ``None`` for zero).
+          off-diagonal blocks (``offdiag`` ``None``: P is block diagonal).
         * ``A`` / ``G``: ``(N, r, d)`` diagonal and ``(N, r, d)`` lower
-          off-diagonal blocks, i.e. ``N+1`` block rows (``offdiag`` may be
-          ``None`` for zero).
+          off-diagonal blocks, i.e. ``N+1`` block rows (``offdiag`` ``None``:
+          block diagonal with ``N`` block rows).
         * ``c``, ``x_l``, ``x_u``: ``(N, d)`` or flat ``(N*d,)``;
-          ``b``, ``h_l``, ``h_u``: ``(N+1, r)`` or flat ``((N+1)*r,)``.
+          ``b``, ``h_l``, ``h_u``: ``(R, r)`` or flat ``(R*r,)`` with ``R``
+          the number of block rows of A / G.
 
         Every array is either **shared** (the shape above, copied into every
         problem) or **batched** (the same with a leading batch axis). ``B`` is
@@ -205,8 +241,12 @@ class MultistageData(Data):
 
         # Batch axis of each input: blocks are batched when 4-D; a vector
         # when 3-D, or 2-D other than its block shape (flat and batched).
+        # Block rows of A / G: N + 1 with off-diagonal blocks, N without.
+        A_block_rows = N + int(A is not None and pairs["A"][1] is not None)
+        G_block_rows = N + int(G is not None and pairs["G"][1] is not None)
         vectors = {"c": (c, N, d), "x_u": (x_u, N, d), "x_l": (x_l, N, d),
-                   "b": (b, N + 1, rows["A"]), "h_u": (h_u, N + 1, rows["G"]), "h_l": (h_l, N + 1, rows["G"])}
+                   "b": (b, A_block_rows, rows["A"]), "h_u": (h_u, G_block_rows, rows["G"]),
+                   "h_l": (h_l, G_block_rows, rows["G"])}
         batch_dims = {}
         for name, (M_diag, M_off) in pairs.items():
             for part, arr in (("diag", M_diag), ("offdiag", M_off)):
@@ -219,10 +259,11 @@ class MultistageData(Data):
         B = self._resolve_batch_size(batch_dims)
 
         def blocks(M_diag, M_off, name, num_off):
-            """(diag, offdiag) of a block matrix -> two (B, N, rows, cols) buffers."""
+            """(diag, offdiag) of a block matrix -> two (B, N, rows, cols) buffers;
+            an absent offdiag gets an empty (B, 0, rows, cols) buffer."""
             r, cols = int(M_diag.shape[-2]), int(M_diag.shape[-1])
             diag_wp = wp.zeros((B, N, r, cols), dtype=self._dtype, device=self._device)
-            off_wp = wp.zeros((B, num_off, r, cols), dtype=self._dtype, device=self._device)
+            off_wp = wp.zeros((B, num_off if M_off is not None else 0, r, cols), dtype=self._dtype, device=self._device)
             self._write_blocks(diag_wp, M_diag, f"{name} diag")
             if M_off is not None:
                 self._write_blocks(off_wp, M_off, f"{name} offdiag")
@@ -247,9 +288,12 @@ class MultistageData(Data):
         G_diag_wp, G_off_wp = blocks(*pairs["G"], "G", N) if G is not None else (None, None)
         self._adopt_storage(
             P_diag_wp, P_off_wp, vec(c, "c", N, d),
-            A_diag_wp, A_off_wp, vec(b, "b", N + 1, rows["A"]),
-            G_diag_wp, G_off_wp, vec(h_u, "h_u", N + 1, rows["G"]), vec(h_l, "h_l", N + 1, rows["G"]),
-            vec(x_u, "x_u", N, d), vec(x_l, "x_l", N, d)
+            A_diag_wp, A_off_wp, vec(b, "b", A_block_rows, rows["A"]),
+            G_diag_wp, G_off_wp, vec(h_u, "h_u", G_block_rows, rows["G"]), vec(h_l, "h_l", G_block_rows, rows["G"]),
+            vec(x_u, "x_u", N, d), vec(x_l, "x_l", N, d),
+            has_P_offdiag=P_off is not None,
+            has_A_offdiag=A is not None and pairs["A"][1] is not None,
+            has_G_offdiag=G is not None and pairs["G"][1] is not None,
         )
 
     # ------------------------------------------------------------------
@@ -263,7 +307,8 @@ class MultistageData(Data):
 
     @property
     def P_offdiag(self) -> wp.array:
-        """Lower off-diagonal blocks of P, a ``(B, N-1, d, d)`` Warp array."""
+        """Lower off-diagonal blocks of P, a ``(B, N-1, d, d)`` Warp array
+        (``(B, 0, d, d)`` if P has none)."""
         return self._P_offdiag
 
     @property
@@ -273,7 +318,8 @@ class MultistageData(Data):
 
     @property
     def A_offdiag(self) -> Optional[wp.array]:
-        """Lower off-diagonal blocks of A, a ``(B, N, r, d)`` Warp array (``None`` if absent)."""
+        """Lower off-diagonal blocks of A, a ``(B, N, r, d)`` Warp array
+        (``(B, 0, r, d)`` if A has none, ``None`` if there is no A)."""
         return self._A_offdiag
 
     @property
@@ -283,7 +329,8 @@ class MultistageData(Data):
 
     @property
     def G_offdiag(self) -> Optional[wp.array]:
-        """Lower off-diagonal blocks of G, a ``(B, N, r, d)`` Warp array (``None`` if absent)."""
+        """Lower off-diagonal blocks of G, a ``(B, N, r, d)`` Warp array
+        (``(B, 0, r, d)`` if G has none, ``None`` if there is no G)."""
         return self._G_offdiag
 
     @property
@@ -311,6 +358,7 @@ class MultistageData(Data):
         if diag is not None:
             self._write_blocks(self._P_diag, diag, "P diag")
         if off is not None:
+            self._check_offdiag_present(self._has_P_offdiag, "P")
             self._write_blocks(self._P_offdiag, off, "P offdiag")
 
     def set_c(self, value: wp.array, check: bool = True):
@@ -323,6 +371,7 @@ class MultistageData(Data):
         if diag is not None:
             self._write_blocks(self._A_diag, diag, "A diag")
         if off is not None:
+            self._check_offdiag_present(self._has_A_offdiag, "A")
             self._write_blocks(self._A_offdiag, off, "A offdiag")
 
     def set_b(self, value: wp.array, check: bool = True):
@@ -337,6 +386,7 @@ class MultistageData(Data):
         if diag is not None:
             self._write_blocks(self._G_diag, diag, "G diag")
         if off is not None:
+            self._check_offdiag_present(self._has_G_offdiag, "G")
             self._write_blocks(self._G_offdiag, off, "G offdiag")
 
     def set_h_l(self, value: wp.array, check: bool = True):
@@ -384,11 +434,19 @@ class MultistageData(Data):
         """Unpack a ``(diag, offdiag)`` matrix tuple."""
         if not (isinstance(value, (tuple, list)) and len(value) == 2):
             raise TypeError(
-                f"{name} must be a (diag, offdiag) tuple of GPU arrays; either "
-                f"entry may be None (zero at setup(), unchanged in update()). "
-                f"Got {type(value).__name__}."
+                f"{name} must be a (diag, offdiag) tuple of GPU arrays; offdiag "
+                f"may be None (no off-diagonal blocks at setup(), unchanged in "
+                f"update()). Got {type(value).__name__}."
             )
         return value[0], value[1]
+
+    @staticmethod
+    def _check_offdiag_present(present: bool, name: str) -> None:
+        if not present:
+            raise ValueError(
+                f"Cannot set {name} offdiag: {name} was set up without off-diagonal "
+                f"blocks. Adding them requires a new setup()."
+            )
 
     def _write_blocks(self, dst: wp.array, value: wp.array, name: str, allow_batched: bool = True):
         """Copy ``value`` into the ``(B, N, rows, cols)`` block buffer in place.

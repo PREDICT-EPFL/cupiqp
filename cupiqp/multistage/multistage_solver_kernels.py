@@ -14,6 +14,7 @@ def create_multistage_data_gradients_kernel(
     N_g: int, r_g: int,
     p: int, m: int, n: int,
     num_hu: int, num_hl: int, num_xu: int, num_xl: int,
+    has_P_E: bool = True, has_A_E: bool = True, has_G_E: bool = True,
     dtype=wp.float64
     ):
     dtype = to_warp_dtype(dtype)
@@ -43,16 +44,17 @@ def create_multistage_data_gradients_kernel(
     Absent constraint groups (``p == 0`` ⇒ ``N_a = r_a = 0``;
     ``m == 0`` ⇒ ``N_g = r_g = 0``) collapse their sub-ranges to size
     0 — callers must still pass valid (possibly empty) wp.array
-    arguments for those inputs/outputs.
+    arguments for those inputs/outputs. So do absent off-diagonal blocks
+    (``has_P_E`` / ``has_A_E`` / ``has_G_E`` False).
     """
     # Pre-compute compile-time region sizes / cumulative offsets.
     N_off = max(N - 1, 0)
     sz_dP_diag    = N * d * d
-    sz_dP_offdiag = N_off * d * d
+    sz_dP_offdiag = N_off * d * d if has_P_E else 0
     sz_dA_D       = N_a * r_a * d
-    sz_dA_E       = N_a * r_a * d
+    sz_dA_E       = N_a * r_a * d if has_A_E else 0
     sz_dG_D       = N_g * r_g * d
-    sz_dG_E       = N_g * r_g * d
+    sz_dG_E       = N_g * r_g * d if has_G_E else 0
 
     end_dP_diag    = sz_dP_diag
     end_dP_offdiag = end_dP_diag    + sz_dP_offdiag

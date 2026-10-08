@@ -135,15 +135,15 @@ class OcpData:
 
         # ---- allocate the block storage (Warp arrays, batch axis first) ----
         self._P_diag = wp.zeros((B, N_blk, blk_size, blk_size), dtype=self._dtype, device=device)
-        self._P_offdiag = wp.zeros((B, N_blk - 1, blk_size, blk_size), dtype=self._dtype, device=device)
         self._c = wp.zeros((B, N_blk, blk_size), dtype=self._dtype, device=device)
         self._A_diag = wp.zeros((B, N_blk, self._nx, blk_size), dtype=self._dtype, device=device)
         self._A_offdiag = wp.zeros((B, N_blk, self._nx, blk_size), dtype=self._dtype, device=device)
         self._b = wp.zeros((B, N_blk + 1, self._nx), dtype=self._dtype, device=device)
         self._G_diag = wp.zeros((B, N_blk, self._ng, blk_size), dtype=self._dtype, device=device)
-        self._G_offdiag = wp.zeros((B, N_blk, self._ng, blk_size), dtype=self._dtype, device=device)
-        self._h_l = wp.zeros((B, N_blk + 1, self._ng), dtype=self._dtype, device=device)
-        self._h_u = wp.zeros((B, N_blk + 1, self._ng), dtype=self._dtype, device=device)
+        # P and G have no off-diagonal blocks: costs (Q, R, S) and general
+        # inequalities (C, D) act on one stage each, so G has N_blk block rows.
+        self._h_l = wp.zeros((B, N_blk, self._ng), dtype=self._dtype, device=device)
+        self._h_u = wp.zeros((B, N_blk, self._ng), dtype=self._dtype, device=device)
         self._x_l = wp.zeros((B, N_blk, blk_size), dtype=self._dtype, device=device)
         self._x_u = wp.zeros((B, N_blk, blk_size), dtype=self._dtype, device=device)
 
@@ -173,12 +173,9 @@ class OcpData:
                       inputs=[self._x_u, self._cols_bu, self._dtype(_BOUND_SENTINEL)], device=device)
 
         if self._ng > 0:
-            # all ng rows present at stages 0..N (finite sentinel); the trailing
-            # padding row stays infinite so the backend drops it.
-            self._h_l.fill_(-float("inf"))
-            self._h_u.fill_(float("inf"))
-            self._h_l[:, :N_blk, :].fill_(-_BOUND_SENTINEL)
-            self._h_u[:, :N_blk, :].fill_(_BOUND_SENTINEL)
+            # all ng rows present at stages 0..N (finite sentinel)
+            self._h_l.fill_(-_BOUND_SENTINEL)
+            self._h_u.fill_(_BOUND_SENTINEL)
 
 
     @property
@@ -231,11 +228,11 @@ class OcpData:
         :meth:`set_field`.
         """
         return MappingProxyType({
-            "P": (self._P_diag, self._P_offdiag),
+            "P": (self._P_diag, None),
             "c": self._c,
             "A": (self._A_diag, self._A_offdiag),
             "b": self._b,
-            "G": (self._G_diag, self._G_offdiag),
+            "G": (self._G_diag, None),
             "h_l": self._h_l,
             "h_u": self._h_u,
             "x_l": self._x_l,

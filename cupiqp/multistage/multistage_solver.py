@@ -49,6 +49,15 @@ class MultistageSolver(SolverBase):
     * ``c``, ``x_l``, ``x_u``: ``(N, d)`` or flat ``(n,)``; ``b``, ``h_l``,
       ``h_u``: ``(N + 1, r)`` or flat ``((N + 1) * r,)``.
 
+    **Per-stage problems.** Any ``offdiag`` may be ``None`` at ``setup``: the
+    matrix then has no off-diagonal blocks for the lifetime of the solver,
+    and the solver skips all work on them. ``P_offdiag = None`` gives a block
+    diagonal P (per-stage costs). ``A_offdiag = None`` (or ``G_offdiag``)
+    gives per-stage constraints: A is block diagonal with only ``N`` block
+    rows, and ``b`` (or ``h_l`` / ``h_u``) is ``(N, r)`` or flat
+    ``(N * r,)``. In MPC, typically only the dynamics (in ``A``) couple
+    consecutive stages, so ``P_offdiag`` and ``G_offdiag`` can be ``None``.
+
     Only ``P`` and ``c`` are required. As with the other backends, ``+/-inf``
     entries in the bounds mark one-sided or free bounds.
 
@@ -177,19 +186,22 @@ class MultistageSolver(SolverBase):
         P : tuple of GPU arrays
             ``(P_diag, P_offdiag)``: diagonal blocks ``(N, d, d)`` and lower
             off-diagonal blocks ``(N-1, d, d)`` of the symmetric
-            block-tridiagonal cost matrix. ``P_offdiag`` may be ``None``
-            (zero). Required.
+            block-tridiagonal cost matrix. ``P_offdiag`` may be ``None``:
+            P is then block diagonal. Required.
         c : GPU array
             Linear cost, ``(N, d)`` or flat ``(N*d,)``. Required.
         A, b : optional
             Equality constraints ``A x = b``: ``A = (A_diag, A_offdiag)``,
-            both ``(N, r, d)`` (``A_offdiag`` may be ``None``), and ``b`` of
-            shape ``(N+1, r)`` or flat. Provide both or neither.
+            both ``(N, r, d)``, and ``b`` of shape ``(N+1, r)`` or flat.
+            ``A_offdiag`` may be ``None`` (per-stage equalities): ``b`` is
+            then ``(N, r)`` or flat. Provide both or neither.
         G, h_l, h_u : optional
             Inequalities ``h_l <= G x <= h_u``: ``G = (G_diag, G_offdiag)``,
-            both ``(N, r, d)``, and bounds ``(N+1, r)`` or flat. At least one
-            bound is required when ``G`` is given; an omitted side is absent
-            for the lifetime of the solver.
+            both ``(N, r, d)``, and bounds ``(N+1, r)`` or flat.
+            ``G_offdiag`` may be ``None`` (per-stage inequalities): the bounds
+            are then ``(N, r)`` or flat. At least one bound is required when
+            ``G`` is given; an omitted side is absent for the lifetime of the
+            solver.
         x_l, x_u : GPU array, optional
             Box bounds, ``(N, d)`` or flat ``(N*d,)``. An omitted side is
             absent for the lifetime of the solver.
@@ -213,7 +225,8 @@ class MultistageSolver(SolverBase):
 
     def _inputs_to_warp(self, P, c, A, b, G, h_u, h_l, x_u, x_l) -> tuple:
         """Warp views of the user inputs, checked against the solver dtype.
-        Matrices are ``(diag, offdiag)`` tuples whose entries may be ``None``;
+        Matrices are ``(diag, offdiag)`` tuples whose entries may be ``None``
+        (setup: no off-diagonal blocks; update: unchanged);
         anything that is not such a tuple is passed through for
         ``MultistageData`` to reject."""
         def pair(value, name):
@@ -236,18 +249,22 @@ class MultistageSolver(SolverBase):
         r_g, N_g = (d.G_rows_per_block, N) if d.m > 0 else (0, 0)
 
         # Zero-initialized (B, ...) gradient storage with the forward
-        # structure: blocks and bound sides exist exactly when they do in the
-        # forward problem.
+        # structure: blocks, off-diagonal blocks and bound sides exist exactly
+        # when they do in the forward problem.
         has_A, has_G = d.p > 0, d.m > 0
+
+        def zeros(*shape):
+            return wp.zeros(shape, dtype=dtype, device=d.device)
+
         self._grad_data = MultistageData(dtype=dtype, device=self._device)
         self._grad_data.init(
-            P=(wp.zeros((B, N, d_sz, d_sz), dtype=dtype, device=d.device), None),
-            c=wp.zeros((B, N, d_sz), dtype=dtype, device=d.device),
-            A=(wp.zeros((B, N_a, r_a, d_sz), dtype=dtype, device=d.device), None) if has_A else None,
-            b=wp.zeros((B, N_a + 1, r_a), dtype=dtype, device=d.device) if has_A else None,
-            G=(wp.zeros((B, N_g, r_g, d_sz), dtype=dtype, device=d.device), None) if has_G else None,
-            h_u=wp.zeros((B, N_g + 1, r_g), dtype=dtype, device=d.device) if has_G and d.has_h_u else None,
-            h_l=wp.zeros((B, N_g + 1, r_g), dtype=dtype, device=d.device) if has_G and d.has_h_l else None,
+            P=(zeros(B, N, d_sz, d_sz), zeros(B, max(N - 1, 0), d_sz, d_sz) if d.has_P_offdiag else None),
+            c=zeros(B, N, d_sz),
+            A=(zeros(B, N_a, r_a, d_sz), zeros(B, N_a, r_a, d_sz) if d.has_A_offdiag else None) if has_A else None,
+            b=zeros(B, d.A_num_block_rows, r_a) if has_A else None,
+            G=(zeros(B, N_g, r_g, d_sz), zeros(B, N_g, r_g, d_sz) if d.has_G_offdiag else None) if has_G else None,
+            h_u=zeros(B, d.G_num_block_rows, r_g) if has_G and d.has_h_u else None,
+            h_l=zeros(B, d.G_num_block_rows, r_g) if has_G and d.has_h_l else None,
             x_u=wp.zeros((B, N, d_sz), dtype=dtype, device=d.device) if d.has_x_u else None,
             x_l=wp.zeros((B, N, d_sz), dtype=dtype, device=d.device) if d.has_x_l else None
         )
@@ -264,7 +281,8 @@ class MultistageSolver(SolverBase):
 
         # Eager-compile the fused multistage data-gradients kernel.
         self._multistage_data_gradients_kernel = create_multistage_data_gradients_kernel(
-            N, d_sz, N_a, r_a, N_g, r_g, d.p, d.m, d.n, d.num_hu, d.num_hl, d.num_xu, d.num_xl, dtype=dtype)
+            N, d_sz, N_a, r_a, N_g, r_g, d.p, d.m, d.n, d.num_hu, d.num_hl, d.num_xu, d.num_xl,
+            has_P_E=d.has_P_offdiag, has_A_E=d.has_A_offdiag, has_G_E=d.has_G_offdiag, dtype=dtype)
 
     def update(
         self,
@@ -294,6 +312,7 @@ class MultistageSolver(SolverBase):
         ----------
         P, A, G : tuple of GPU arrays, optional
             New ``(diag, offdiag)`` blocks; see :meth:`setup` for the layout.
+            Off-diagonal blocks absent at ``setup()`` cannot be added.
         c, b, h_u, h_l, x_u, x_l : GPU array, optional
             New vectors, block or flat layout. Bound values may switch between
             finite and ``+/-inf``, but only bound sides given at ``setup()``
@@ -326,11 +345,12 @@ class MultistageSolver(SolverBase):
         N_off = max(N - 1, 0)
         r_a, N_a = (data.A_rows_per_block, N) if data.p > 0 else (0, 0)
         r_g, N_g = (data.G_rows_per_block, N) if data.m > 0 else (0, 0)
+        # Must match the region sizes of create_multistage_data_gradients_kernel.
         total = (
             N * d_sz * d_sz
-            + N_off * d_sz * d_sz
-            + 2 * N_a * r_a * d_sz
-            + 2 * N_g * r_g * d_sz
+            + (N_off * d_sz * d_sz if data.has_P_offdiag else 0)
+            + (1 + int(data.has_A_offdiag)) * N_a * r_a * d_sz
+            + (1 + int(data.has_G_offdiag)) * N_g * r_g * d_sz
             + data.n + data.p + data.num_hu + data.num_hl + data.num_xu + data.num_xl
         )
         if total > 0:

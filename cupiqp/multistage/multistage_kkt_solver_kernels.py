@@ -11,7 +11,9 @@ wp.set_module_options({"enable_backward": False})
 
 @functools.lru_cache(maxsize=None)
 def create_update_kkt_kernel(num_blocks: int, block_size: int,
-                             p: int, m: int, G_rows_per_block: int, dtype=wp.float64):
+                             p: int, m: int, G_rows_per_block: int,
+                             has_P_E: bool = True, has_A_E: bool = True, has_G_E: bool = True,
+                             dtype=wp.float64):
     """Build the fused kernel that assembles the condensed multistage KKT matrix.
 
     For each problem ``b`` of the batch the kernel computes the
@@ -31,6 +33,11 @@ def create_update_kkt_kernel(num_blocks: int, block_size: int,
         KKT_E[k] += G_D[k+1]^T W_{k+1} G_E[k]
 
     where ``W_k`` is the diagonal of ``z_reg_inv`` for block row ``k``.
+
+    The ``has_*_E`` flags say which off-diagonal blocks exist. An absent one
+    is an empty array that is never read: ``P_E`` (P block diagonal),
+    ``AtA_E`` (A without off-diagonal, so A^T A is block diagonal) or
+    ``G_E`` (G block diagonal with ``N`` block rows instead of ``N + 1``).
 
     Alongside the matrix, the kernel also writes ``delta_inv[b] = 1 / delta[b]``
     and copies ``z_reg_inv`` to ``z_reg_inv_out`` for the later solve.
@@ -56,19 +63,19 @@ def create_update_kkt_kernel(num_blocks: int, block_size: int,
     def update_kkt_kernel(
         # ---- inputs ----
         P_D:        wp.array4d(dtype=dtype),  # type: ignore   (B, N, d, d)
-        P_E:        wp.array4d(dtype=dtype),  # type: ignore   (B, N-1, d, d)
+        P_E:        wp.array4d(dtype=dtype),  # type: ignore   (B, N-1, d, d)  if has_P_E
         x_reg:      wp.array2d(dtype=dtype),  # type: ignore   (B, N*d)
         AtA_D:      wp.array4d(dtype=dtype),  # type: ignore   (B, N, d, d)    if p>0
-        AtA_E:      wp.array4d(dtype=dtype),  # type: ignore   (B, N-1, d, d)  if p>0
+        AtA_E:      wp.array4d(dtype=dtype),  # type: ignore   (B, N-1, d, d)  if p>0 and has_A_E
         delta:      wp.array(dtype=dtype),    # type: ignore   (B,)            raw delta
         G_D:        wp.array4d(dtype=dtype),  # type: ignore   (B, N, rg, d)   if m>0, rg means rows of per block of G
-        G_E:        wp.array4d(dtype=dtype),  # type: ignore   (B, N, rg, d)   if m>0
-        z_reg_inv:   wp.array2d(dtype=dtype),  # type: ignore   (B, (N+1)*rg)  if m>0
+        G_E:        wp.array4d(dtype=dtype),  # type: ignore   (B, N, rg, d)   if m>0 and has_G_E
+        z_reg_inv:   wp.array2d(dtype=dtype),  # type: ignore   (B, (N+has_G_E)*rg)  if m>0
         # ---- outputs ----
         KKT_D:      wp.array4d(dtype=dtype),  # type: ignore   (B, N, d, d)
         KKT_E:      wp.array4d(dtype=dtype),  # type: ignore   (B, N-1, d, d)
         delta_inv:  wp.array(dtype=dtype),    # type: ignore   (B,)            output
-        z_reg_inv_out: wp.array2d(dtype=dtype),  # type: ignore   (B, (N+1)*rg)   output, if m>0
+        z_reg_inv_out: wp.array2d(dtype=dtype),  # type: ignore   (B, (N+has_G_E)*rg)   output, if m>0
     ):
         b, k, i, j = wp.tid()
         N_static = wp.static(num_blocks)
@@ -82,11 +89,11 @@ def create_update_kkt_kernel(num_blocks: int, block_size: int,
             delta_inv[b] = delta_inv_b
 
         # ---- write z_reg_inv (designated writer per (b, idx), for solve()) ----
-        # Threads (b, k, i, 0) for k in [0, N+1), i in [0, d) cover all
-        # (N+1)*rg = m elements, thread i copying rows i, i + d, i + 2d, ...
-        # of block k, so rg may exceed d. Trailing j > 0 threads skip.
+        # Threads (b, k, i, 0) for k in [0, N+has_G_E), i in [0, d) cover all
+        # (N+has_G_E)*rg = m elements, thread i copying rows i, i + d, i + 2d,
+        # ... of block k, so rg may exceed d. Trailing j > 0 threads skip.
         if wp.static(m > 0):
-            if k <= N_static and j == 0:
+            if k < N_static + wp.static(int(has_G_E)) and j == 0:
                 for q in range(i, G_rows_per_block_static, d_static):
                     z_reg_inv_out[b, k * G_rows_per_block_static + q] = z_reg_inv[b, k * G_rows_per_block_static + q]
         # ---- diagonal block element (k in [0, N)) ----
@@ -100,18 +107,21 @@ def create_update_kkt_kernel(num_blocks: int, block_size: int,
                 acc_D = dtype(0.0)
                 for q in range(G_rows_per_block_static):
                     w_dk = z_reg_inv[b, k * G_rows_per_block_static + q]
-                    w_ek = z_reg_inv[b, (k + 1) * G_rows_per_block_static + q]
                     acc_D = acc_D + w_dk * G_D[b, k, q, i] * G_D[b, k, q, j]
-                    acc_D = acc_D + w_ek * G_E[b, k, q, i] * G_E[b, k, q, j]
+                    if wp.static(has_G_E):
+                        w_ek = z_reg_inv[b, (k + 1) * G_rows_per_block_static + q]
+                        acc_D = acc_D + w_ek * G_E[b, k, q, i] * G_E[b, k, q, j]
                 v_D = v_D + acc_D
             KKT_D[b, k, i, j] = v_D
 
         # ---- off-diagonal block element (only k < N-1) ----
         if k < N_static - 1:
-            v_E = P_E[b, k, i, j]
-            if wp.static(p > 0):
+            v_E = dtype(0.0)
+            if wp.static(has_P_E):
+                v_E = P_E[b, k, i, j]
+            if wp.static(p > 0 and has_A_E):
                 v_E = v_E + delta_inv_b * AtA_E[b, k, i, j]
-            if wp.static(m > 0):
+            if wp.static(m > 0 and has_G_E):
                 acc_E = dtype(0.0)
                 for q in range(G_rows_per_block_static):
                     w_kp1 = z_reg_inv[b, (k + 1) * G_rows_per_block_static + q]
