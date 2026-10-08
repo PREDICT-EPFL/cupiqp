@@ -277,6 +277,19 @@ class SparseSolver(SolverBase):
             Box bounds ``x_l <= x <= x_u``, ``(n,)`` or ``(B, n)``. An omitted
             side is absent for the lifetime of the solver.
 
+        Raises
+        ------
+        RuntimeError
+            If ``setup()`` has already been called on this instance.
+        TypeError
+            If a matrix is not a CSR triple, an index array is not integer,
+            or a value array is not a GPU array of the solver dtype.
+        ValueError
+            If a pattern is invalid, a value array has the wrong shape, or
+            the batched arrays disagree on the batch size.
+
+        Notes
+        -----
         ``indptr`` and ``indices`` are 1-D ``int32`` or ``int64`` arrays on the
         host (e.g. numpy) or the device; a host pattern is copied to the device
         once. The values must be device arrays of the solver dtype. Column
@@ -290,17 +303,6 @@ class SparseSolver(SolverBase):
         ``(T.crow_indices(), T.col_indices(), T.values())``. To set up ``B``
         equal problems, give at least one value array its batch axis, e.g.
         ``cupy.broadcast_to(c, (B, n))``.
-
-        Raises
-        ------
-        RuntimeError
-            If ``setup()`` has already been called on this instance.
-        TypeError
-            If a matrix is not a CSR triple, an index array is not integer,
-            or a value array is not a GPU array of the solver dtype.
-        ValueError
-            If a pattern is invalid, a value array has the wrong shape, or
-            the batched arrays disagree on the batch size.
         """
         if P is None:
             raise TypeError("SparseSolver.setup requires P.")

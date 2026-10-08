@@ -224,9 +224,6 @@ class DenseSolver(SolverBase):
             Box bounds ``x_l <= x <= x_u``, ``(n,)`` or ``(B, n)``. An omitted
             side is absent for the lifetime of the solver.
 
-        To set up ``B`` problems that are all equal for now, give at least one
-        argument its batch axis, e.g. ``cupy.broadcast_to(c, (B, n))``.
-
         Raises
         ------
         RuntimeError
@@ -236,6 +233,11 @@ class DenseSolver(SolverBase):
         ValueError
             If an input has the wrong rank or shape, the batched inputs
             disagree on the batch size, or only one of ``A`` / ``b`` is given.
+
+        Notes
+        -----
+        To set up ``B`` problems that are all equal for now, give at least one
+        argument its batch axis, e.g. ``cupy.broadcast_to(c, (B, n))``.
         """
         # Every non-None input must be a GPU dense array. cupiqp does not
         # silently do H2D copies.
