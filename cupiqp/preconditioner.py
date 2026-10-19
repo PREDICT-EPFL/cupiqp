@@ -69,8 +69,20 @@ class PreconditionerBase(ABC):
         ...
 
     @abstractmethod
+    def refresh_x_b_scaling(self):
+        """Rebuild ``x_b_scaling`` after the set of variables with a finite box
+        bound has changed, keeping the stored scaling factors."""
+        ...
+
+    @abstractmethod
     def unscale_solution(self, result: Variables, data: Data):
         """Transform a scaled IPM solution back to original coordinates, in place."""
+        ...
+
+    @abstractmethod
+    def scale_solution(self, result: Variables, data: Data):
+        """Inverse of :meth:`unscale_solution`: transform a user-space
+        primal-dual point into the solver's scaled coordinates, in place."""
         ...
 
     # ------------------------------------------------------------------
@@ -208,14 +220,16 @@ class RuizEquilibration(PreconditionerBase):
         self._dual_res_unscale_factor = wp.full((B, n), 1.0, dtype=self._dtype, device=device)
         self._primal_res_unscale_factor = wp.full((B, num_duals), 1.0, dtype=self._dtype, device=device)
 
-        # x_b_scaling: (B, n) -- 1 for variables with any finite box bound,
-        # 0 for variables without finite box bounds. Full-length dual storage
-        # allows this mask to differ across the batch.
-        self._x_b_scaling_init = wp.full((B, n), 1.0, dtype=self._dtype, device=device)
+        # x_b_scaling_init: (B, n) -- 1 for variables with any finite box
+        # bound, 0 for variables without finite box bounds. It is the Data
+        # object's own ``active_x_bound`` buffer, not a copy: the Data keeps
+        # that buffer current when bound values change in update(), and
+        # refresh_x_b_scaling() then rebuilds x_b_scaling from it. Without a
+        # mask every variable carries a box-bound slot (all-ones).
         if active_x_bound is not None:
-            # No per-variable bound mask supplied means every variable carries
-            # a box-bound slot, so the default scaling mask is all-ones.
-            wp.copy(self._x_b_scaling_init, as_warp_array(active_x_bound, "active_x_bound"))
+            self._x_b_scaling_init = as_warp_array(active_x_bound, "active_x_bound")
+        else:
+            self._x_b_scaling_init = wp.full((B, n), 1.0, dtype=self._dtype, device=device)
         self._x_b_scaling = wp.clone(self._x_b_scaling_init)
 
         # Per-iteration workspace: (B, n+p+m) and (B, n)
@@ -435,7 +449,16 @@ class RuizEquilibration(PreconditionerBase):
         # Applies D_x P D_x, D_y A D_x, D_z G D_x, D_x c, plus cost_scaling on P, c.
         self.scale_matrices(data, d_x, d_y, d_z, cost_scaling_factor=self._cost_scaling)
         self._scale_bounds(data)
-        # x_b_scaling = x_b_scaling_init * delta_b * d_x.
+        self.refresh_x_b_scaling()
+
+    def refresh_x_b_scaling(self):
+        """Rebuild ``x_b_scaling`` from the current box-bound activity mask and
+        the stored scaling: ``x_b_scaling = x_b_scaling_init * delta_b * d_x``.
+
+        Call after a bound update has changed which variables have a finite
+        box bound; the scaling factors themselves are left unchanged.
+        """
+        d_x = column_slice(self._delta, 0, self.n)
         wp.map(_product3, self._x_b_scaling_init, self._delta_b, d_x, out=self._x_b_scaling)
 
     # ------------------------------------------------------------------
@@ -445,15 +468,31 @@ class RuizEquilibration(PreconditionerBase):
     @nvtx.annotate("Preconditioner::unscale_solution")
     def unscale_solution(self, result: Variables, data: Data):
         """Transform scaled IPM solution back to original coordinates, in place."""
+        self._apply_solution_scaling(result, self._delta, self._delta_inv,
+                                     self._delta_b, self._delta_b_inv,
+                                     self._cost_scaling_inv)
+
+    def scale_solution(self, result: Variables, data: Data):
+        """Transform a user-space point into scaled coordinates, in place.
+
+        The exact inverse of :meth:`unscale_solution`: the same kernel with
+        every scaling factor replaced by its inverse.
+        """
+        self._apply_solution_scaling(result, self._delta_inv, self._delta,
+                                     self._delta_b_inv, self._delta_b,
+                                     self._cost_scaling)
+
+    def _apply_solution_scaling(self, result, delta, delta_inv, delta_b, delta_b_inv, cost_inv):
         total = (result.primals_all.shape[1] + result.duals_all.shape[1])
+        if total == 0:
+            return
         wp.launch(
             kernel=self._unscale_solution_kernel,
             dim=(self.B, total),
             inputs=[
                 result.x, result.s_l, result.s_u, result.s_bl, result.s_bu,
                 result.y, result.z_l, result.z_u, result.z_bl, result.z_bu,
-                self._delta, self._delta_inv, self._delta_b, self._delta_b_inv,
-                self._cost_scaling_inv,
+                delta, delta_inv, delta_b, delta_b_inv, cost_inv,
             ],
             device=self._device
         )
