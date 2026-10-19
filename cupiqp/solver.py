@@ -444,6 +444,12 @@ class SolverBase(ABC):
                 )
                 preconditioner_did_fresh_ruiz = True
 
+        # A box bound may flip between finite and infinite. The Data has
+        # refreshed its activity mask; the derived box scaling that the KKT
+        # system and the residuals multiply x with must follow.
+        if x_l is not None or x_u is not None:
+            self._preconditioner.refresh_x_b_scaling()
+
         self._preconditioner.compute_constraints_rhs_inf_norm_unscaled(
             self._data, self._constraints_rhs_inf_norm_unscaled
         )

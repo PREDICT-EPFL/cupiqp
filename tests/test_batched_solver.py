@@ -297,3 +297,40 @@ class TestPerProblemIterations:
                 f"problem {i}: batched iter {iters[i]} != standalone {ref[i][1]}")
         assert len(set(iters)) > 1, f"expected per-problem iters to differ: {iters}"
 
+
+def test_update_toggles_active_box_bounds():
+    """update(x_l) that flips box bounds finite<->infinite must match a fresh
+    setup with the new bounds. Guards the box scaling derived from the
+    activity mask at setup: a variable without a finite bound at setup must
+    still get its bound enforced once update() makes it finite."""
+    inf = np.inf
+    P = np.eye(3)
+    c = np.array([1.0, 2.0, 3.0])
+    x_l_1 = np.array([0.0, -inf, 0.0])   # x = [0, -2, 0]
+    x_l_2 = np.array([0.0, 0.0, -inf])   # x = [0, 0, -3]; entries 1 and 2 toggle
+
+    for preconditioner_iter in (0, 10):
+        settings = Settings()
+        settings.preconditioner_iter = preconditioner_iter
+        settings.verbose = False
+
+        ref = DenseSolver()
+        ref.settings = settings
+        ref.setup(cp.asarray(P), cp.asarray(c), x_l=cp.asarray(x_l_2))
+        ref.solve()
+        x_ref = cp.asnumpy(ref.result.x[0])
+        np.testing.assert_allclose(x_ref, [0.0, 0.0, -3.0], atol=1e-6)
+
+        solver = DenseSolver()
+        solver.settings = settings
+        solver.setup(cp.asarray(P), cp.asarray(c), x_l=cp.asarray(x_l_1))
+        solver.solve()
+        np.testing.assert_allclose(cp.asnumpy(solver.result.x[0]), [0.0, -2.0, 0.0], atol=1e-6)
+
+        solver.update(x_l=cp.asarray(x_l_2))
+        solver.solve()
+        assert solver.result.info.to_host().status[0] == Status.CUPIQP_SOLVED
+        np.testing.assert_allclose(cp.asnumpy(solver.result.x[0]), x_ref, atol=1e-6)
+        z_bl = cp.asnumpy(solver.result.z_bl[0])
+        assert z_bl[2] == 0.0          # now unbounded: dual exactly zero
+        assert abs(z_bl[1]) > 1e-3     # now bounded and binding
