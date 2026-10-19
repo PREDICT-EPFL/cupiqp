@@ -41,6 +41,8 @@ from .solver_kernels import (
     create_backward_compute_vector_grad_kernel,
     create_backward_copy_kernel,
     create_backward_pack_full_layout_kernel,
+    create_zero_invalid_rows_kernel,
+    mark_valid_gradients_kernel,
     create_update_termination_kernel,
     create_reset_solve_state_kernel,
     update_continue_flag_kernel,
@@ -174,6 +176,15 @@ class SolverBase(ABC):
         by ``solve()``."""
         return self._result
 
+    @property
+    def grad_valid(self) -> wp.array:
+        """``(B,)`` int32 device array written by ``backward()``: 1 where the
+        gradients of that problem are valid, 0 where they were zeroed because
+        the problem did not converge (``settings.gradient_on_failure`` is
+        ``"zero"``), or its KKT factorization or adjoint solve failed.
+        ``None`` before ``setup()`` with ``enable_grad``."""
+        return getattr(self, "_grad_valid", None)
+
     @nvtx.annotate("Solver::setup")
     def _setup_impl(self, P, c, A=None, b=None, G=None, h_u=None, h_l=None, x_u=None, x_l=None):
         """Bind the problem data and prepare the solver for ``solve()``.
@@ -306,6 +317,8 @@ class SolverBase(ABC):
             self._zero_grad_in.init(self._data)
             self._zero_grad_in.primals_all.zero_()
             self._zero_grad_in.duals_all.zero_()
+            # Per-problem validity of the gradients of the last backward().
+            self._grad_valid = wp.zeros((B,), dtype=wp.int32, device=self._device)
             # Full-layout scatter buffers feeding the matrix and vector
             # gradient assemblies. ineq groups live in length-m; bound
             # groups live in length-n.
@@ -345,6 +358,10 @@ class SolverBase(ABC):
         # One-iteration CUDA graph, for backends that cannot run the loop as a
         # conditional graph node (see _CudaGraphMode.ITERATION_GRAPH_WITH_HOST_LOOP).
         self._iteration_graph = None
+        # Lifecycle: which data the latest solve belongs to. data_revision
+        # counts update() calls; solve() stamps solve_revision with it.
+        self._data_revision = 0
+        self._solve_revision = -1
         self._setup_done = True
 
     def update(self,
@@ -394,6 +411,7 @@ class SolverBase(ABC):
         """Body of :meth:`update`; the caller holds the solver's stream scope."""
         if not self._setup_done:
             raise RuntimeError("Solver not setup yet. Call setup() first.")
+        self._data_revision += 1
 
         # TODO: in the future should allow only update some problems of the whole batch, and only marks the updated ones as unsolved
         self._result.info.reset_status()
@@ -569,6 +587,7 @@ class SolverBase(ABC):
 
         if self.settings.verbose:
             self._print_summary()
+        self._solve_revision = self._data_revision
         # Capture the converged iterate in SCALED coordinates before it is
         # unscaled below. Gradient smoothing warm-starts its relaxed Newton loop
         # from this converged point, which must live in the same scaled frame as
@@ -1042,6 +1061,7 @@ class SolverBase(ABC):
                 n, p, nhu, nhl, nxu, nxl, precond_on, dtype=dtype)
             self._backward_compute_vector_grad_kernel = create_backward_compute_vector_grad_kernel(
                 n, p, nhu, nhl, nxu, nxl, dtype=dtype)
+            self._zero_invalid_rows_kernel = create_zero_invalid_rows_kernel(dtype)
             self._backward_pack_full_layout_kernel = create_backward_pack_full_layout_kernel(
                 d.m, n, nhl, nhu, nxl, nxu, dtype=dtype)
             self._backward_copy_kernel = create_backward_copy_kernel(
@@ -1720,10 +1740,21 @@ class SolverBase(ABC):
         space throughout - the adjoint solve and scatter chain handles all
         preconditioner bookkeeping internally.
 
+        Problems of the batch whose solve did not end with status
+        ``CUPIQP_SOLVED`` follow ``settings.gradient_on_failure``:
+        ``"differentiate"`` (default) differentiates their final iterate
+        like that of any other problem, ``"zero"`` returns zero gradients for them. A problem
+        whose KKT factorization or adjoint solve failed always gets zero
+        gradients. ``solver.grad_valid`` says which problems' gradients are
+        valid; nothing is read on the host.
+
         Raises
         ------
         RuntimeError
-            If :meth:`solve` has not been called yet (no cached KKT factor).
+            If no ``solve()`` of the current data is cached: before the first
+            solve, or after an ``update()`` without a new solve.
+        ValueError
+            If ``settings.gradient_on_failure`` is not ``"differentiate"`` or ``"zero"``.
         """
         with wp.ScopedStream(self._stream, sync_enter=not self._stream.is_capturing):
             return self._backward_impl(grad_x, grad_y, grad_z_u, grad_z_l, grad_z_bu, grad_z_bl,
@@ -1742,11 +1773,18 @@ class SolverBase(ABC):
                 f"call setup() and solve() before backward()."
             )
 
-        if not (self._result.info.to_host().status_value == Status.CUPIQP_SOLVED.value).all():
+        # The unconverged problems no longer stop backward(); what does is
+        # differentiating a solve of other data, or none at all.
+        if self._solve_revision != self._data_revision:
             raise RuntimeError(
-                "Gradient computation requires every problem in the batch to be "
-                "solved (status CUPIQP_SOLVED) since the last setup()/update(); "
-                "call solve() and check the status before backward()."
+                "backward() differentiates the latest solve() of the current data, "
+                "and there is none: call solve() after setup() or update()."
+            )
+
+        if self.settings.gradient_on_failure not in ("differentiate", "zero"):
+            raise ValueError(
+                "settings.gradient_on_failure must be 'differentiate' or 'zero'; "
+                f"got {self.settings.gradient_on_failure!r}."
             )
 
         # The smoothing mode is fixed at setup() (it gates buffer allocation).
@@ -1800,6 +1838,32 @@ class SolverBase(ABC):
 
         # ---- Step 2: adjoint KKT solve
         self._compute_adjoint(self._grad_in, self._backward_adjoint_vector)
+
+        # Validity of each problem's gradients: the factorization and the
+        # adjoint solve must have succeeded, and, unless the policy is
+        # "differentiate", the solve must have converged. Every data gradient is a
+        # product with the adjoint variables, so zeroing the adjoint rows of
+        # the invalid problems zeros all their gradients. Decided on the
+        # device; nothing is read on the host.
+        wp.launch(
+            kernel=mark_valid_gradients_kernel,
+            dim=(B,),
+            inputs=[self._result.info.status, self._kkt_system.factor_status,
+                    self._kkt_system.solve_status,
+                    wp.int32(Status.CUPIQP_SOLVED.value),
+                    wp.int32(self.settings.gradient_on_failure == "zero"),
+                    self._grad_valid],
+            device=self._device
+        )
+        adjoint = self._backward_adjoint_vector
+        for buffer in (adjoint.primals_all, adjoint.duals_all):
+            if buffer.shape[1] > 0:
+                wp.launch(
+                    kernel=self._zero_invalid_rows_kernel,
+                    dim=(B, buffer.shape[1]),
+                    inputs=[self._grad_valid, buffer],
+                    device=self._device
+                )
 
         # ---- Step 3: write into full-layout buffers
         wp.launch(

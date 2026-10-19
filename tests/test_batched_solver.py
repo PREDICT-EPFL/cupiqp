@@ -334,3 +334,44 @@ def test_update_toggles_active_box_bounds():
         z_bl = cp.asnumpy(solver.result.z_bl[0])
         assert z_bl[2] == 0.0          # now unbounded: dual exactly zero
         assert abs(z_bl[1]) > 1e-3     # now bounded and binding
+
+
+def test_backward_with_unsolved_problem_in_batch():
+    """backward() must not raise when a problem of the batch did not converge.
+    Problem 1 is primal infeasible (x0 = 0 and x0 = 1). With "differentiate" the
+    solved problem's gradient is unaffected; with "zero" the failed problem's
+    gradients are exactly zero."""
+    P = np.eye(2)
+    c = np.array([1.0, 1.0])
+    A = np.array([[1.0, 0.0], [1.0, 0.0]])
+    b = np.array([[0.0, 0.0], [0.0, 1.0]])            # problem 1: infeasible
+    grad_x = cp.ones((2, 2))
+
+    def make(mode, b_in):
+        s = DenseSolver()
+        s.settings.enable_grad = True
+        s.settings.preconditioner_iter = 0
+        s.settings.verbose = False
+        s.settings.gradient_on_failure = mode
+        s.setup(cp.asarray(P), cp.asarray(c), A=cp.asarray(A), b=cp.asarray(b_in))
+        s.solve()
+        return s
+
+    reference = make("differentiate", b[0])
+    assert reference.result.info.to_host().status == [Status.CUPIQP_SOLVED]
+    grad_c_ref = reference.backward(grad_x=grad_x[:1]).c.numpy()[0]
+
+    for mode in ("differentiate", "zero"):
+        s = make(mode, b)
+        status = s.result.info.to_host().status
+        assert status[0] == Status.CUPIQP_SOLVED and status[1] != Status.CUPIQP_SOLVED
+        grads = s.backward(grad_x=grad_x)
+        grad_c = grads.c.numpy()
+        grad_P = grads.P.numpy()
+        # The batch runs more iterations than the single problem (it waits
+        # for the infeasible one to give up), so the iterates differ at the
+        # tolerance level.
+        np.testing.assert_allclose(grad_c[0], grad_c_ref, atol=1e-4)
+        if mode == "zero":
+            assert np.all(grad_c[1] == 0.0) and np.all(grad_P[1] == 0.0)
+            assert np.all(grads.b.numpy()[1] == 0.0)

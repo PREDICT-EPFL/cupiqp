@@ -2383,3 +2383,45 @@ def create_backward_pack_full_layout_kernel(m: int, n: int,
             return
 
     return backward_pack_full_layout_kernel
+
+
+@wp.kernel
+def mark_valid_gradients_kernel(
+    status:        wp.array(dtype=wp.int32),   # type: ignore  (B,)
+    factor_status: wp.array(dtype=wp.int32),   # type: ignore  (B,)
+    solve_status:  wp.array(dtype=wp.int32),   # type: ignore  (B,)
+    solved:        wp.int32,
+    require_solved: wp.int32,
+    valid:         wp.array(dtype=wp.int32),   # type: ignore  (B,) out
+):
+    """Per problem, whether the gradients of this backward are valid: the
+    KKT factorization and the adjoint solve succeeded and, when
+    ``require_solved`` is set, the solve ended with ``solved``.
+    Launch with ``dim=(B,)``."""
+    b = wp.tid()
+    ok = factor_status[b] == 0 and solve_status[b] == 0
+    if require_solved != 0 and status[b] != solved:
+        ok = False
+    valid[b] = wp.where(ok, 1, 0)
+
+
+def create_zero_invalid_rows_kernel(dtype=wp.float64):
+    """Kernel that zeros row ``b`` of a ``(B, width)`` buffer wherever
+    ``valid[b] == 0``. Launch with ``dim=(B, width)``.
+
+    Used by ``backward()``: zeroing the adjoint variables of the problems
+    whose gradients are invalid makes every data gradient derived from them
+    zero.
+    """
+    dtype = to_warp_dtype(dtype)
+
+    @wp.kernel
+    def zero_invalid_rows_kernel(
+        valid:  wp.array(dtype=wp.int32),    # type: ignore  (B,)
+        buffer: wp.array2d(dtype=dtype),     # type: ignore  (B, width) in-out
+    ):
+        b, i = wp.tid()
+        if valid[b] == 0:
+            buffer[b, i] = dtype(0.0)
+
+    return zero_invalid_rows_kernel
