@@ -2,16 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Mapping
 
 import torch
 
 from ...results import Info
-
-
-_SOLUTION_FIELDS = (
-    "x", "y", "z_u", "z_l", "z_bu", "z_bl", "s_u", "s_l", "s_bu", "s_bl"
-)
+from .utils import SOLUTION_FIELDS
 
 
 class StructureMismatchError(ValueError):
@@ -47,48 +43,51 @@ class TorchSolution:
     """
 
     x: torch.Tensor
-    y: Optional[torch.Tensor]
-    z_u: Optional[torch.Tensor]
-    z_l: Optional[torch.Tensor]
-    z_bu: Optional[torch.Tensor]
-    z_bl: Optional[torch.Tensor]
-    s_u: Optional[torch.Tensor]
-    s_l: Optional[torch.Tensor]
-    s_bu: Optional[torch.Tensor]
-    s_bl: Optional[torch.Tensor]
+    y: torch.Tensor | None
+    z_u: torch.Tensor | None
+    z_l: torch.Tensor | None
+    z_bu: torch.Tensor | None
+    z_bl: torch.Tensor | None
+    s_u: torch.Tensor | None
+    s_l: torch.Tensor | None
+    s_bu: torch.Tensor | None
+    s_bl: torch.Tensor | None
+    status: torch.Tensor
+    iterations: torch.Tensor
+    info: Info
 
     def __init__(
         self,
-        tensors: dict,
+        tensors: Mapping[str, torch.Tensor],
         status: torch.Tensor,
         iterations: torch.Tensor,
         info: Info
-    ):
-        for name in _SOLUTION_FIELDS:
+    ) -> None:
+        for name in SOLUTION_FIELDS:
             setattr(self, name, tensors.get(name))
         self.status = status
         self.iterations = iterations
         self.info = info
 
-    def clone(self, *, detach: bool = False) -> "TorchSolution":
+    def clone(self, *, detach: bool = False) -> TorchSolution:
         """Return a solution whose tensors own independent storage, so that
         later calls of the layer do not change it. Allocates; meant for
         keeping a result, not for the hot path."""
 
-        def copy_tensor(value: Optional[torch.Tensor]):
+        def copy_tensor(value: torch.Tensor | None) -> torch.Tensor | None:
             if value is None:
                 return None
             if detach:
                 value = value.detach()
             return value.clone()
 
-        return TorchSolution(
-            {name: copy_tensor(getattr(self, name)) for name in _SOLUTION_FIELDS},
-            self.status.clone(),
-            self.iterations.clone(),
-            self.info,
-        )
+        tensors = {
+            name: copied
+            for name in SOLUTION_FIELDS
+            if (copied := copy_tensor(getattr(self, name))) is not None
+        }
+        return TorchSolution(tensors, self.status.clone(), self.iterations.clone(), self.info)
 
     def __repr__(self) -> str:
-        present = [name for name in _SOLUTION_FIELDS if getattr(self, name) is not None]
+        present = [name for name in SOLUTION_FIELDS if getattr(self, name) is not None]
         return f"TorchSolution(fields={present}, batch_size={self.status.numel()})"

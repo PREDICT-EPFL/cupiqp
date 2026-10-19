@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 import warp as wp
 
+from ...data import Data
 from ...sparse.sparse_solver import SparseSolver
 from .base import SolverLayerBase
+from .utils import MATRIX_FIELDS, validate_cuda_tensor, validate_dense_tensor
 
 
 class SparseSolverLayer(SolverLayerBase):
@@ -23,11 +27,16 @@ class SparseSolverLayer(SolverLayerBase):
         x = layer(P=P_csr.values(), c=c_k)      # values only
         x.sum().backward()                      # gradients for both
 
-    Values are ``(nnz,)`` or ``(B, nnz)`` tensors, and their gradients have
-    the same shape. A 3-D CSR tensor at ``setup()`` must store the same
-    pattern for every problem; the first one is used and the others are not
-    checked against it. Changing a pattern requires ``reset()`` and a new
-    ``setup()``.
+    ``setup()`` takes ``P``, ``A`` and ``G`` as CUDA sparse CSR tensors of
+    the layer dtype, 2-D or 3-D with one shared pattern; store the full
+    ``P`` (both triangles). The vectors are dense tensors, shared or
+    batched. Values at every call are ``(nnz,)`` or ``(B, nnz)`` tensors,
+    and their gradients have the same shape. A 3-D CSR tensor at ``setup()``
+    must store the same pattern for every problem; the first one is used
+    and the others are not checked against it. Changing a pattern requires
+    ``reset()`` and a new ``setup()``. See :class:`SolverLayerBase` for
+    ``max_pending_solves`` (several solves awaiting one backward, as in a
+    rollout).
 
     Parameters
     ----------
@@ -43,51 +52,45 @@ class SparseSolverLayer(SolverLayerBase):
 
     _core_solver_cls = SparseSolver
 
-    def setup(
-        self,
-        P: torch.Tensor,
-        c: torch.Tensor,
-        A: torch.Tensor | None = None,
-        b: torch.Tensor | None = None,
-        G: torch.Tensor | None = None,
-        h_u: torch.Tensor | None = None,
-        h_l: torch.Tensor | None = None,
-        x_u: torch.Tensor | None = None,
-        x_l: torch.Tensor | None = None
-    ) -> None:
-        """Fix the problem structure, including the CSR patterns of ``P``,
-        ``A`` and ``G``, and load the values.
+    def _prepare_setup_inputs(self, inputs: dict[str, torch.Tensor | None]) -> dict[str, Any]:
+        core_setup_args = {}
+        for name, tensor in inputs.items():
+            if tensor is None:
+                core_setup_args[name] = None
+            elif name in MATRIX_FIELDS:
+                validate_cuda_tensor(name, tensor, self._device, self._dtype)
+                if tensor.layout != torch.sparse_csr:
+                    raise TypeError(
+                        f"'{name}' must be a CUDA sparse CSR tensor at setup(); got "
+                        f"layout {tensor.layout}."
+                    )
+                if tensor.dim() not in (2, 3):
+                    raise ValueError(
+                        f"'{name}' must be 2-D or 3-D (batched); got shape "
+                        f"{tuple(tensor.shape)}."
+                    )
+                if name == "P" and tensor.shape[-1] != tensor.shape[-2]:
+                    raise ValueError(f"'P' must be square; got shape {tuple(tensor.shape)}.")
+                # A batched CSR tensor stores one pattern per problem; the
+                # first one is used (all must be equal, see the class docs).
+                tensor = tensor.detach()
+                crow, col = tensor.crow_indices(), tensor.col_indices()
+                if tensor.dim() == 3:
+                    crow, col = crow[0], col[0]
+                core_setup_args[name] = (crow.contiguous(), col.contiguous(),
+                                         tensor.values().contiguous())
+            else:
+                validate_dense_tensor(name, tensor, self._device, self._dtype)
+                if tensor.dim() not in (1, 2):
+                    raise ValueError(
+                        f"'{name}' must be 1-D or 2-D (batched); got shape "
+                        f"{tuple(tensor.shape)}."
+                    )
+                core_setup_args[name] = tensor.detach().contiguous()
+        return core_setup_args
 
-        ``P``, ``A`` and ``G`` are CUDA sparse CSR tensors of the layer dtype,
-        2-D or 3-D with one shared pattern. Store the full ``P`` (both
-        triangles). The vectors are dense tensors, shared or batched. Does
-        not solve; call the layer afterwards.
-        """
-        self._setup(dict(P=P, c=c, A=A, b=b, G=G, h_u=h_u, h_l=h_l, x_u=x_u, x_l=x_l))
-
-    def _check_setup_matrix(self, name: str, tensor) -> None:
-        self._check_tensor(name, tensor)
-        if tensor.layout != torch.sparse_csr:
-            raise TypeError(
-                f"'{name}' must be a CUDA sparse CSR tensor at setup(); got "
-                f"layout {tensor.layout}."
-            )
-        if tensor.dim() not in (2, 3):
-            raise ValueError(
-                f"'{name}' must be 2-D or 3-D (batched); got shape {tuple(tensor.shape)}."
-            )
-        if name == "P" and tensor.shape[-1] != tensor.shape[-2]:
-            raise ValueError(f"'P' must be square; got shape {tuple(tensor.shape)}.")
-
-    def _setup_matrix_to_core(self, name: str, tensor):
-        tensor = tensor.detach()
-        crow, col = tensor.crow_indices(), tensor.col_indices()
-        if tensor.dim() == 3:
-            crow, col = crow[0], col[0]
-        return (crow.contiguous(), col.contiguous(), tensor.values().contiguous())
-
-    def _matrix_single_shape(self, name: str) -> tuple:
+    def _matrix_unbatched_shape(self, name: str) -> tuple[int, ...]:
         return (getattr(self._core_solver.data, name).nnz,)
 
-    def _matrix_gradient_array(self, name: str, gradients) -> wp.array:
-        return getattr(gradients, name).data
+    def _matrix_data_gradient_array(self, name: str, data_gradients: Data) -> wp.array:
+        return getattr(data_gradients, name).data

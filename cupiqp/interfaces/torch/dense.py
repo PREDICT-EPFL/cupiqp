@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 import warp as wp
 
+from ...data import Data
 from ...dense.dense_solver import DenseSolver
 from .base import SolverLayerBase
+from .utils import MATRIX_FIELDS, validate_dense_tensor
 
 
 class DenseSolverLayer(SolverLayerBase):
@@ -28,10 +32,13 @@ class DenseSolverLayer(SolverLayerBase):
         x = layer(c=c_k)                    # solve with a new linear cost
         x.sum().backward()                  # gradient for c_k
 
-    Each matrix is ``(rows, cols)`` or ``(B, rows, cols)`` and each vector
-    ``(k,)`` or ``(B, k)``; the batch size is read from the batched
-    arguments at ``setup()``. See :class:`cupiqp.DenseSolver` for the
-    meaning of every argument and for ``+/-inf`` bounds.
+    ``setup()`` takes the arguments of ``cupiqp.DenseSolver.setup`` as dense
+    CUDA tensors of the layer dtype: each matrix is ``(rows, cols)`` or
+    ``(B, rows, cols)`` and each vector ``(k,)`` or ``(B, k)``; the batch
+    size is read from the batched arguments. See :class:`cupiqp.DenseSolver`
+    for the meaning of every argument and for ``+/-inf`` bounds, and
+    :class:`SolverLayerBase` for ``max_pending_solves`` (several solves
+    awaiting one backward, as in a rollout).
 
     Parameters
     ----------
@@ -47,43 +54,30 @@ class DenseSolverLayer(SolverLayerBase):
 
     _core_solver_cls = DenseSolver
 
-    def setup(
-        self,
-        P: torch.Tensor,
-        c: torch.Tensor,
-        A: torch.Tensor | None = None,
-        b: torch.Tensor | None = None,
-        G: torch.Tensor | None = None,
-        h_u: torch.Tensor | None = None,
-        h_l: torch.Tensor | None = None,
-        x_u: torch.Tensor | None = None,
-        x_l: torch.Tensor | None = None
-    ) -> None:
-        """Fix the problem structure from these tensors and load their values.
+    def _prepare_setup_inputs(self, inputs: dict[str, torch.Tensor | None]) -> dict[str, Any]:
+        core_setup_args = {}
+        for name, tensor in inputs.items():
+            if tensor is None:
+                core_setup_args[name] = None
+                continue
+            validate_dense_tensor(name, tensor, self._device, self._dtype)
+            # A matrix is (rows, cols) or batched (B, rows, cols); a vector
+            # (k,) or batched (B, k).
+            low, high = (2, 3) if name in MATRIX_FIELDS else (1, 2)
+            if tensor.dim() not in (low, high):
+                raise ValueError(
+                    f"'{name}' must be {low}-D or {high}-D (batched); got shape "
+                    f"{tuple(tensor.shape)}."
+                )
+            if name == "P" and tensor.shape[-1] != tensor.shape[-2]:
+                raise ValueError(f"'P' must be square; got shape {tuple(tensor.shape)}.")
+            core_setup_args[name] = tensor.detach().contiguous()
+        return core_setup_args
 
-        Same arguments as ``cupiqp.DenseSolver.setup``: dense CUDA tensors of
-        the layer dtype, each shared or batched. Does not solve; call the
-        layer afterwards. Gradients are not tracked for ``setup()`` tensors,
-        only for those passed to the layer call.
-        """
-        self._setup(dict(P=P, c=c, A=A, b=b, G=G, h_u=h_u, h_l=h_l, x_u=x_u, x_l=x_l))
-
-    def _check_setup_matrix(self, name: str, tensor) -> None:
-        self._check_vector(name, tensor)
-        if tensor.dim() not in (2, 3):
-            raise ValueError(
-                f"'{name}' must be 2-D or 3-D (batched); got shape {tuple(tensor.shape)}."
-            )
-        if name == "P" and tensor.shape[-1] != tensor.shape[-2]:
-            raise ValueError(f"'P' must be square; got shape {tuple(tensor.shape)}.")
-
-    def _setup_matrix_to_core(self, name: str, tensor):
-        return tensor.detach().contiguous()
-
-    def _matrix_single_shape(self, name: str) -> tuple:
+    def _matrix_unbatched_shape(self, name: str) -> tuple[int, ...]:
         data = self._core_solver.data
         rows = {"P": data.n, "A": data.p, "G": data.m}[name]
         return (rows, data.n)
 
-    def _matrix_gradient_array(self, name: str, gradients) -> wp.array:
-        return getattr(gradients, name)
+    def _matrix_data_gradient_array(self, name: str, data_gradients: Data) -> wp.array:
+        return getattr(data_gradients, name)
