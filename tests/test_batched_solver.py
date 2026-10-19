@@ -1,6 +1,7 @@
 """Tests for BatchedSolver — end-to-end QP solving."""
 import numpy as np
 import cupy as cp
+import pytest
 
 from cupiqp import DenseSolver, Settings, Status
 
@@ -375,3 +376,34 @@ def test_backward_with_unsolved_problem_in_batch():
         if mode == "zero":
             assert np.all(grad_c[1] == 0.0) and np.all(grad_P[1] == 0.0)
             assert np.all(grads.b.numpy()[1] == 0.0)
+
+
+def test_structural_settings_are_frozen_at_setup():
+    """Settings that fix the data coordinates, buffers or KKT structure are
+    frozen by setup(): a later change is rejected by update(), solve() and
+    backward(); numerical settings may still change."""
+    rng = np.random.default_rng(3)
+    M = rng.standard_normal((3, 3))
+    solver = DenseSolver()
+    solver.settings.enable_grad = True
+    solver.settings.preconditioner_iter = 10
+    solver.settings.verbose = False
+    c = cp.asarray(rng.standard_normal(3))
+    solver.setup(cp.asarray(M @ M.T + 3 * np.eye(3)), c, x_l=-cp.ones(3), x_u=cp.ones(3))
+    solver.solve()
+    solver.settings.max_iter = 50                    # numerical: allowed
+    solver.solve()
+
+    solver.settings.preconditioner_iter = 0
+    for call in (solver.solve, lambda: solver.update(c=c),
+                 lambda: solver.backward(grad_x=cp.ones((1, 3)))):
+        with pytest.raises(RuntimeError, match=r"\['preconditioner_iter'\] changed after setup"):
+            call()
+    solver.settings.preconditioner_iter = 10
+
+    solver.settings.gradient_smoothing = True
+    with pytest.raises(RuntimeError, match=r"\['gradient_smoothing'\] changed after setup"):
+        solver.backward(grad_x=cp.ones((1, 3)))
+    solver.settings.gradient_smoothing = False
+    solver.solve()                                   # restored: fine again
+    solver.backward(grad_x=cp.ones((1, 3)))

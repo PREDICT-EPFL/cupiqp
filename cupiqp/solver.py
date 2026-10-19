@@ -362,7 +362,27 @@ class SolverBase(ABC):
         # counts update() calls; solve() stamps solve_revision with it.
         self._data_revision = 0
         self._solve_revision = -1
+        # Settings that fix coordinates, buffers or the KKT structure are
+        # frozen now; a later change is rejected by update/solve/backward.
+        self._frozen_settings = self._structural_settings()
         self._setup_done = True
+
+    _FROZEN_SETTINGS = ("enable_grad", "gradient_smoothing", "preconditioner_iter",
+                        "preconditioner_scale_cost", "preconditioner_reuse_on_update",
+                        "iterative_refinement_always_enabled")
+
+    def _structural_settings(self) -> tuple:
+        return tuple(getattr(self.settings, name) for name in self._FROZEN_SETTINGS)
+
+    def _check_frozen_settings(self, where: str) -> None:
+        current = self._structural_settings()
+        if current != self._frozen_settings:
+            changed = [n for n, a, b in zip(self._FROZEN_SETTINGS, self._frozen_settings, current) if a != b]
+            raise RuntimeError(
+                f"settings {changed} changed after setup(); they fix the data "
+                f"coordinates, the buffers or the KKT structure and cannot change "
+                f"before {where}. Create a new solver to change them."
+            )
 
     def update(self,
                P: Optional[Any] = None,
@@ -411,6 +431,7 @@ class SolverBase(ABC):
         """Body of :meth:`update`; the caller holds the solver's stream scope."""
         if not self._setup_done:
             raise RuntimeError("Solver not setup yet. Call setup() first.")
+        self._check_frozen_settings("update()")
         self._data_revision += 1
 
         # TODO: in the future should allow only update some problems of the whole batch, and only marks the updated ones as unsolved
@@ -537,6 +558,7 @@ class SolverBase(ABC):
         """Body of :meth:`solve`; the caller holds the solver's stream scope."""
         if not self._setup_done:
             raise RuntimeError("Solver not setup yet. Call setup() first.")
+        self._check_frozen_settings("solve()")
         capturing = self._stream.is_capturing
         if capturing:
             self._check_capturable()
@@ -1787,12 +1809,7 @@ class SolverBase(ABC):
                 f"got {self.settings.gradient_on_failure!r}."
             )
 
-        # The smoothing mode is fixed at setup() (it gates buffer allocation).
-        if self.settings.gradient_smoothing != self._grad_smoothing:
-            raise RuntimeError(
-                "settings.gradient_smoothing was changed after setup(); the "
-                "smoothing mode is fixed at setup. Create a new solver to change it."
-            )
+        self._check_frozen_settings("backward()")
 
         if self._grad_smoothing:
             # Settings are mutable between backward() calls; an invalid
