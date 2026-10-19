@@ -10,6 +10,7 @@ from .settings import Settings, DeviceSettings
 from .data import Data
 from .results import Result, Status, Variables
 from .kkt_systems import KKTSystem
+from .utils import as_warp_array
 from .typedef import STATUS_MAX_ITER_REACHED, STATUS_NUMERICAL_ISSUES
 from .solver_kernels import (
     REDUCTION_BLOCK_DIM,
@@ -41,9 +42,9 @@ from .solver_kernels import (
     create_backward_compute_vector_grad_kernel,
     create_backward_copy_kernel,
     create_backward_pack_full_layout_kernel,
+    create_update_termination_kernel,
     create_zero_invalid_rows_kernel,
     mark_valid_gradients_kernel,
-    create_update_termination_kernel,
     create_reset_solve_state_kernel,
     update_continue_flag_kernel,
     terminate_active_kernel,
@@ -317,6 +318,13 @@ class SolverBase(ABC):
             self._zero_grad_in.init(self._data)
             self._zero_grad_in.primals_all.zero_()
             self._zero_grad_in.duals_all.zero_()
+            # Linearization point of backward_from_state(): the caller's
+            # user-space state is copied here (never aliased), scaled for the
+            # refactorization, then unscaled for the gradient assembly.
+            self._backward_point = Variables()
+            self._backward_point.init(self._data)
+            self._backward_rho = wp.zeros((B,), dtype=self._dtype, device=self._device)
+            self._backward_delta = wp.zeros((B,), dtype=self._dtype, device=self._device)
             # Per-problem validity of the gradients of the last backward().
             self._grad_valid = wp.zeros((B,), dtype=wp.int32, device=self._device)
             # Full-layout scatter buffers feeding the matrix and vector
@@ -358,10 +366,12 @@ class SolverBase(ABC):
         # One-iteration CUDA graph, for backends that cannot run the loop as a
         # conditional graph node (see _CudaGraphMode.ITERATION_GRAPH_WITH_HOST_LOOP).
         self._iteration_graph = None
-        # Lifecycle: which data the latest solve belongs to. data_revision
-        # counts update() calls; solve() stamps solve_revision with it.
+        # Lifecycle: which data the latest solve and the cached KKT factor
+        # belong to. data_revision counts update() calls; solve() stamps the
+        # other two; backward_from_state() clears the factor one.
         self._data_revision = 0
         self._solve_revision = -1
+        self._factor_revision = -1
         # Settings that fix coordinates, buffers or the KKT structure are
         # frozen now; a later change is rejected by update/solve/backward.
         self._frozen_settings = self._structural_settings()
@@ -610,6 +620,7 @@ class SolverBase(ABC):
         if self.settings.verbose:
             self._print_summary()
         self._solve_revision = self._data_revision
+        self._factor_revision = self._data_revision
         # Capture the converged iterate in SCALED coordinates before it is
         # unscaled below. Gradient smoothing warm-starts its relaxed Newton loop
         # from this converged point, which must live in the same scaled frame as
@@ -1017,6 +1028,12 @@ class SolverBase(ABC):
         ``A``, ``G`` are in the backend's matrix form (a Warp array for dense,
         a CSR triple for sparse, a ``(diag, offdiag)`` pair for multistage).
         """
+
+    @abstractmethod
+    def setup(self, P: Any, c: Any, A: Any = None, b: Any = None, G: Any = None,
+              h_u: Any = None, h_l: Any = None, x_u: Any = None, x_l: Any = None) -> None:
+        """Fix the problem structure, load the data and allocate all GPU
+        memory. Each backend documents the form of its matrix arguments."""
 
     @abstractmethod
     def _init_preconditioner(self):
@@ -1465,22 +1482,24 @@ class SolverBase(ABC):
     # ------------------------------------------------------------------
     # Gradient smoothing
     # ------------------------------------------------------------------
-    def _run_smoothing_steps(self) -> None:
+    def _run_smoothing_steps(self, scaled_point: Variables, rho: wp.array, delta: wp.array) -> None:
         """Run the relaxed Newton loop for gradient smoothing.
 
-        From the scaled converged solution (``self._result_scaled``), drive
-        ``s * z -> mu`` and leave (a) the cached KKT factor at the relaxed point
-        and (b) the user-space relaxed iterate in ``self._result_smoothed`` --
-        which ``backward()`` then passes as the linearization point to the
-        adjoint solve and the matrix/vector gradient assembly.
+        From ``scaled_point``, a converged solution in scaled coordinates
+        (the last solve's, or a caller-supplied state), with the frozen regularization
+        ``rho``, ``delta`` of that solve, drive ``s * z -> mu`` and leave (a)
+        the cached KKT factor at the relaxed point and (b) the user-space
+        relaxed iterate in ``self._result_smoothed`` -- which ``backward()``
+        then passes as the linearization point to the adjoint solve and the
+        matrix/vector gradient assembly.
         """
         data = self._data
         pc = self._preconditioner
         settings = self.settings
         rv = self._result_smoothed
 
-        # Restart from the immutable scaled converged solution.
-        rv.copy_from(self._result_scaled)
+        # Restart from the (immutable) scaled converged solution.
+        rv.copy_from(scaled_point)
 
         # mu in scaled space: s_scaled * z_scaled = cost_scaling * mu_user
         # (the Ruiz constraint scaling cancels in the s*z product; cost scaling
@@ -1494,9 +1513,6 @@ class SolverBase(ABC):
                     data.finite_mask_all, rv.s_all, rv.z_all, self._smoothing_mu_scaled],
             device=self._device
         )
-
-        # Frozen regularization = the converged solve's final rho/delta
-        rho, delta = self._result.info.rho, self._result.info.delta
 
         converged = False
         for _ in range(settings.gradient_smoothing_max_iter):
@@ -1735,32 +1751,14 @@ class SolverBase(ABC):
              grad_z_u=None, grad_z_l=None, grad_z_bu=None, grad_z_bl=None,
              grad_s_u=None, grad_s_l=None, grad_s_bu=None, grad_s_bl=None):
         r"""Compute gradients of an outer scalar :math:`L` w.r.t. problem
-        data, given upstream cotangents on the solution variables.
+        data, given upstream cotangents on the solution variables, by
+        implicit differentiation of the latest ``solve()`` through its cached
+        KKT factor.
 
-        Orchestration (backend-agnostic):
-
-        1. Pack the per-field cotangent kwargs into ``self._grad_in``
-           (a pre-allocated ``Variables``); missing kwargs are treated
-           as zeros.
-        2. Solve the adjoint KKT system via :meth:`_compute_adjoint`,
-           producing user-space adjoint vectors.
-        3. Scatter the four active-size lambda groups (``z_u, z_l,
-           z_bu, z_bl``) and the two active-size ineq result groups
-           into full-``m`` / full-``n`` buffers
-           (``self._lam_z*_full``, ``self._z*_full``). Both the dG
-           outer product and the ``dh_*`` / ``dx_*`` vector gradients
-           consume these full-layout buffers.
-        4. Delegate to :meth:`_compute_data_gradients` for backend-
-           specific matrix-gradient assembly + ``Data`` subclass
-           construction.
-
-        Returns the backend's ``Data`` subclass populated with the
-        gradients in user space. Cotangents are GPU arrays of shape
-        ``(B, k)`` in the solver dtype; the returned gradients are the
-        solver's Warp arrays and are overwritten by the next ``backward()``.
-        Cotangents and returned gradients are interpreted in user (un-scaled)
-        space throughout - the adjoint solve and scatter chain handles all
-        preconditioner bookkeeping internally.
+        Cotangents are GPU arrays of shape ``(B, k)`` in the solver dtype;
+        missing ones are zero. Returns the backend's ``Data`` subclass holding
+        the gradients in user (unscaled) space as Warp arrays, overwritten by
+        the next backward.
 
         Problems of the batch whose solve did not end with status
         ``CUPIQP_SOLVED`` follow ``settings.gradient_on_failure``:
@@ -1774,57 +1772,172 @@ class SolverBase(ABC):
         ------
         RuntimeError
             If no ``solve()`` of the current data is cached: before the first
-            solve, or after an ``update()`` without a new solve.
-        ValueError
-            If ``settings.gradient_on_failure`` is not ``"differentiate"`` or ``"zero"``.
+            solve, after an ``update()`` without a new solve, or after a
+            :meth:`backward_from_state`, which replaces the cached factor.
         """
         with wp.ScopedStream(self._stream, sync_enter=not self._stream.is_capturing):
-            return self._backward_impl(grad_x, grad_y, grad_z_u, grad_z_l, grad_z_bu, grad_z_bl,
-                                       grad_s_u, grad_s_l, grad_s_bu, grad_s_bl)
+            self._check_backward_preconditions("backward()")
+            if self._factor_revision != self._data_revision:
+                raise RuntimeError(
+                    "backward() differentiates the latest solve() of the current data "
+                    "through its cached KKT factor, and there is none: call solve() "
+                    "after update(), and again after backward_from_state()."
+                )
+            if self._grad_smoothing:
+                self._run_smoothing_steps(self._result_scaled, self._result.info.rho,
+                                          self._result.info.delta)
+                point = self._result_smoothed
+            else:
+                point = self._result
+            return self._backward_impl(
+                (grad_x, grad_y, grad_z_u, grad_z_l, grad_z_bu, grad_z_bl,
+                 grad_s_u, grad_s_l, grad_s_bu, grad_s_bl),
+                point, self._result.info.status)
 
-    @nvtx.annotate("Solver::backward")
-    def _backward_impl(self, grad_x, grad_y, grad_z_u, grad_z_l, grad_z_bu, grad_z_bl,
-                       grad_s_u, grad_s_l, grad_s_bu, grad_s_bl):
-        """Body of :meth:`backward`; the caller holds the solver's stream scope."""
+    #: The solution fields of ``backward_from_state()``, in ``Result`` order.
+    _STATE_FIELDS = ("x", "y", "z_u", "z_l", "z_bu", "z_bl", "s_u", "s_l", "s_bu", "s_bl")
+
+    def backward_from_state(self, *,
+             x, y, z_u, z_l, z_bu, z_bl, s_u, s_l, s_bu, s_bl,
+             rho, delta, status,
+             grad_x=None, grad_y=None,
+             grad_z_u=None, grad_z_l=None, grad_z_bu=None, grad_z_bl=None,
+             grad_s_u=None, grad_s_l=None, grad_s_bu=None, grad_s_bl=None):
+        """Like :meth:`backward`, for a past solve whose final state the caller
+        saved.
+
+        Pass the final state of that solve as it was in ``solver.result``:
+        the ten solution fields ``x, y, z_u, z_l, z_bu, z_bl, s_u, s_l, s_bu,
+        s_bl``, each with the shape of the same field of ``solver.result``
+        (a constraint block absent at ``setup()`` is a ``(B, 0)`` array),
+        and the ``(B,)`` arrays ``rho`` and ``delta`` (``result.info.rho``,
+        ``result.info.delta``) and ``status`` (``result.info.status``,
+        int32). They are GPU arrays on the solver's device (Warp, CuPy, CUDA
+        Torch, ...), in the solver dtype except ``status``. Save them with
+        device copies right after ``solve()``; then many solves of one
+        solver can be differentiated after the fact (a rollout) at the
+        memory cost of one solution per solve. The arrays are only read.
+
+        The KKT system is assembled and factorized again at the given point,
+        with the given final regularization, and the adjoint is solved with
+        that factor; with ``gradient_smoothing`` the relaxed Newton loop
+        starts from the given point. Cotangents are as for :meth:`backward`.
+
+        The solver must hold the problem data of that solve: call ``update()``
+        with that data first if later solves changed it. Nothing checks that
+        the state belongs to this data. The scaling settings are frozen at
+        ``setup()``, so the same data give the same scaling. The
+        linearization point is the final iterate, while :meth:`backward` uses
+        the iterate of the last Newton step; the two agree to the solve
+        tolerance but are not bit-identical. ``gradient_on_failure`` applies
+        to the given ``status``. The cached factor of the latest solve is
+        replaced: afterwards :meth:`backward` needs a new ``solve()``.
+
+        Raises
+        ------
+        TypeError
+            If an argument is not a GPU array or has the wrong dtype.
+        ValueError
+            If an argument has the wrong shape or is on another device.
+        RuntimeError
+            Before the first ``solve()``, or without ``enable_grad``.
+        """
+        given = dict(x=x, y=y, z_u=z_u, z_l=z_l, z_bu=z_bu, z_bl=z_bl,
+                     s_u=s_u, s_l=s_l, s_bu=s_bu, s_bl=s_bl)
+        with wp.ScopedStream(self._stream, sync_enter=not self._stream.is_capturing):
+            self._check_backward_preconditions("backward_from_state()")
+            # All host-side validation first: nothing is modified on failure.
+            B = self._data.batch_size
+            state = {
+                name: self._validated_state_array(name, given[name], self._dtype,
+                                                  tuple(getattr(self._result, name).shape))
+                for name in self._STATE_FIELDS
+            }
+            rho = self._validated_state_array("rho", rho, self._dtype, (B,))
+            delta = self._validated_state_array("delta", delta, self._dtype, (B,))
+            status = self._validated_state_array("status", status, wp.int32, (B,))
+
+            self._factor_revision = -1
+            data = self._data
+            # Copy the state into solver-owned buffers (scaling and smoothing
+            # modify the working point; the caller's arrays stay untouched),
+            # move it to scaled coordinates with the saved regularization,
+            # then refactorize the regularized KKT system there, or start the
+            # smoothing loop from it.
+            point = self._backward_point
+            for name, array in state.items():
+                target = getattr(point, name)
+                if target.size > 0:
+                    wp.copy(target, array)
+            wp.copy(self._backward_rho, rho)
+            wp.copy(self._backward_delta, delta)
+            scaled = self.settings.preconditioner_iter > 0
+            if scaled:
+                self._preconditioner.scale_solution(point, data)
+            if self._grad_smoothing:
+                self._run_smoothing_steps(point, self._backward_rho, self._backward_delta)
+                point = self._result_smoothed
+            else:
+                self._kkt_system.update_scalings_and_factor(
+                    data, self._preconditioner, self.settings, self._enable_iterative_refinement,
+                    self._backward_rho, self._backward_delta, point)
+                if scaled:
+                    self._preconditioner.unscale_solution(point, data)
+            return self._backward_impl(
+                (grad_x, grad_y, grad_z_u, grad_z_l, grad_z_bu, grad_z_bl,
+                 grad_s_u, grad_s_l, grad_s_bu, grad_s_bl),
+                point, status)
+
+    def _validated_state_array(self, name: str, value, dtype, shape: tuple) -> wp.array:
+        """Zero-copy Warp view of one ``backward_from_state()`` argument,
+        checked for dtype, shape and device (also when it has no elements)."""
+        if value is None:
+            raise TypeError(
+                f"backward_from_state(): '{name}' is required; pass a (B, 0) array "
+                "for a constraint block absent at setup()."
+            )
+        array = as_warp_array(value, name=f"'{name}'", dtype=dtype)
+        if tuple(array.shape) != shape:
+            raise ValueError(
+                f"backward_from_state(): '{name}' must have shape {shape}; "
+                f"got {tuple(array.shape)}."
+            )
+        if array.device != self._device:
+            raise ValueError(
+                f"backward_from_state(): '{name}' must be on {self._device}; "
+                f"got {array.device}."
+            )
+        return array
+
+    def _check_backward_preconditions(self, where: str) -> None:
         if not self.settings.enable_grad:
             raise RuntimeError("Set enable_grad to True to enable gradient computation.")
-
-        if not getattr(self, "_setup_done", False) or self._result is None:
+        if not self._setup_done or self._solve_revision < 0:
             raise RuntimeError(
-                f"{type(self).__name__}.backward() requires a prior solve(); "
-                f"call setup() and solve() before backward()."
+                f"{type(self).__name__}.{where} requires a prior solve(); "
+                "call setup() and solve() first."
             )
-
-        # The unconverged problems no longer stop backward(); what does is
-        # differentiating a solve of other data, or none at all.
-        if self._solve_revision != self._data_revision:
-            raise RuntimeError(
-                "backward() differentiates the latest solve() of the current data, "
-                "and there is none: call solve() after setup() or update()."
-            )
-
+        self._check_frozen_settings(where)
         if self.settings.gradient_on_failure not in ("differentiate", "zero"):
             raise ValueError(
                 "settings.gradient_on_failure must be 'differentiate' or 'zero'; "
                 f"got {self.settings.gradient_on_failure!r}."
             )
-
-        self._check_frozen_settings("backward()")
-
-        if self._grad_smoothing:
+        if self._grad_smoothing and not self.settings.verify_settings():
             # Settings are mutable between backward() calls; an invalid
             # smoothing value must raise here, not produce a NaN gradient.
-            if not self.settings.verify_settings():
-                raise ValueError(
-                    "Invalid solver settings; check the Settings field values."
-                )
-            self._run_smoothing_steps()
-            result_for_calc_grad = self._result_smoothed
-        else:
-            result_for_calc_grad = self._result
+            raise ValueError("Invalid solver settings; check the Settings field values.")
 
+    @nvtx.annotate("Solver::backward")
+    def _backward_impl(self, cotangents: tuple, linearization_point: Variables, status: wp.array):
+        """Shared part of both backward entry points, after the KKT factor and
+        the linearization point are in place: pack the cotangents, solve the
+        adjoint system, mask the invalid problems, and assemble the data
+        gradients."""
         data = self._data
         B = data.batch_size
+        (grad_x, grad_y, grad_z_u, grad_z_l, grad_z_bu, grad_z_bl,
+         grad_s_u, grad_s_l, grad_s_bu, grad_s_bl) = cotangents
 
         # ---- Step 1
         zeros = self._zero_grad_in
@@ -1865,8 +1978,7 @@ class SolverBase(ABC):
         wp.launch(
             kernel=mark_valid_gradients_kernel,
             dim=(B,),
-            inputs=[self._result.info.status, self._kkt_system.factor_status,
-                    self._kkt_system.solve_status,
+            inputs=[status, self._kkt_system.factor_status, self._kkt_system.solve_status,
                     wp.int32(Status.CUPIQP_SOLVED.value),
                     wp.int32(self.settings.gradient_on_failure == "zero"),
                     self._grad_valid],
@@ -1881,7 +1993,6 @@ class SolverBase(ABC):
                     inputs=[self._grad_valid, buffer],
                     device=self._device
                 )
-
         # ---- Step 3: write into full-layout buffers
         wp.launch(
             kernel=self._backward_pack_full_layout_kernel,
@@ -1889,7 +2000,7 @@ class SolverBase(ABC):
             inputs=[
                 self._backward_adjoint_vector.z_u, self._backward_adjoint_vector.z_l,
                 self._backward_adjoint_vector.z_bu, self._backward_adjoint_vector.z_bl,
-                result_for_calc_grad.z_u, result_for_calc_grad.z_l,
+                linearization_point.z_u, linearization_point.z_l,
                 self._lam_zu_full, self._lam_zl_full,
                 self._lam_zbu_full, self._lam_zbl_full,
                 self._zu_full, self._zl_full,
@@ -1899,7 +2010,7 @@ class SolverBase(ABC):
 
         # ---- Step 4: backend-specific matrix and vector gradient
         # assembly + Data subclass construction.
-        return self._compute_data_gradients(self._backward_adjoint_vector, result_for_calc_grad)
+        return self._compute_data_gradients(self._backward_adjoint_vector, linearization_point)
 
     @abstractmethod
     def _compute_data_gradients(self, sol_adj: Variables, linearization_point: Variables):
