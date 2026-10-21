@@ -19,6 +19,7 @@ import functools
 
 import warp as wp
 from ..utils import to_warp_dtype
+from ..preconditioner_kernels import ruiz_limit_scaling
 
 
 wp.set_module_options({"enable_backward": False})
@@ -261,14 +262,6 @@ def create_gamma_from_norms_kernel(min_scaling: float, max_scaling: float, dtype
     lo = float(min_scaling)
     hi = float(max_scaling)
 
-    @wp.func
-    def _ruiz_limit_scaling(v: dtype, min_scaling: dtype, max_scaling: dtype) -> dtype:  # type: ignore
-        if v < min_scaling:
-            return dtype(1.0)
-        if v > max_scaling:
-            return max_scaling
-        return v
-
     @wp.kernel
     def gamma_from_norms_kernel(
         col_norms: wp.array2d(dtype=dtype),  # type: ignore  (B, n)
@@ -283,9 +276,9 @@ def create_gamma_from_norms_kernel(min_scaling: float, max_scaling: float, dtype
             total = total + col_norms[b, j]
             cn = wp.max(cn, wp.abs(c[b, j]))
         g = total / dtype(n)
-        g = _ruiz_limit_scaling(g, dtype(lo), dtype(hi))
+        g = ruiz_limit_scaling(g, dtype(lo), dtype(hi))
         g = wp.max(g, cn)
-        g = _ruiz_limit_scaling(g, dtype(lo), dtype(hi))
+        g = ruiz_limit_scaling(g, dtype(lo), dtype(hi))
         gamma[b] = dtype(1.0) / g
 
     return gamma_from_norms_kernel

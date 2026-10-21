@@ -16,6 +16,7 @@ import functools
 
 import warp as wp
 from ..utils import to_warp_dtype
+from ..preconditioner_kernels import ruiz_limit_scaling
 
 
 wp.set_module_options({"enable_backward": False})
@@ -140,14 +141,6 @@ def create_dense_compute_gamma_kernel(n: int,
     lo = float(min_scaling)
     hi = float(max_scaling)
 
-    @wp.func
-    def _ruiz_limit_scaling(d: dtype, min_scaling: dtype, max_scaling: dtype) -> dtype:
-        if d < min_scaling:
-            return dtype(1.0)
-        if d > max_scaling:
-            return max_scaling
-        return d
-
     @wp.kernel
     def dense_compute_gamma_kernel(
         P:     wp.array3d(dtype=dtype),   # type: ignore  (B, n, n)
@@ -166,13 +159,13 @@ def create_dense_compute_gamma_kernel(n: int,
                     col_max = wp.max(col_max, wp.abs(P[b, j, i]))
             total = total + wp.max(row_max, col_max)
         g = total / dtype(wp.static(n))
-        g = _ruiz_limit_scaling(g, dtype(lo), dtype(hi))
+        g = ruiz_limit_scaling(g, dtype(lo), dtype(hi))
 
         cn = dtype(0.0)
         for i in range(wp.static(n)):
             cn = wp.max(cn, wp.abs(c[b, i]))
         g = wp.max(g, cn)
-        g = _ruiz_limit_scaling(g, dtype(lo), dtype(hi))
+        g = ruiz_limit_scaling(g, dtype(lo), dtype(hi))
         gamma[b] = dtype(1.0) / g
 
     return dense_compute_gamma_kernel

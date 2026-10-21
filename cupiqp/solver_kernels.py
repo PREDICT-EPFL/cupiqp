@@ -6,6 +6,7 @@ thread striding over the row, so they are compiled once per dtype for any
 problem size. The element-wise kernels keep compile-time block widths.
 """
 import functools
+from typing import Any
 
 import warp as wp
 from .utils import to_warp_dtype
@@ -17,6 +18,29 @@ from .settings import SettingsFloatIdx, SettingsIntIdx
 
 
 wp.set_module_options({"enable_backward": False})
+
+
+# Element-wise helpers of the kernels below. They are generic in the floating
+# type and defined at module level: a @wp.func defined inside a kernel factory
+# makes Warp keep that factory's frame, and with it every calling frame up to
+# the solver's setup(), alive until the cyclic garbage collector runs.
+@wp.func
+def finite_value(v: Any, mask: Any):
+    """``v`` where ``mask`` marks a finite bound, else zero."""
+    return wp.where(mask > type(mask)(0.5), v, type(v)(0.0))
+
+
+@wp.func
+def step_candidate(a: Any, b: Any):
+    """Step ``alpha = -b / a`` at which ``b + alpha * a`` reaches zero when
+    ``a < 0``; 1 when ``a >= 0`` (no limit). The caller takes the minimum."""
+    return wp.where(a < type(a)(0.0), -b / a, type(a)(1.0))
+
+
+@wp.func
+def step_candidate_masked(a: Any, b: Any, mask: Any):
+    """:func:`step_candidate` on finite-bound entries, 1 elsewhere."""
+    return wp.where(mask > type(mask)(0.5), step_candidate(a, b), type(a)(1.0))
 
 
 # Threads per batch entry in the block-reduction kernels below. Each thread
@@ -43,14 +67,6 @@ def create_calculate_step_kernel(dtype=wp.float64):
     the row, then the block combines the partial minima.
     """
     dtype = to_warp_dtype(dtype)
-
-    @wp.func
-    def step_candidate(a: dtype, b: dtype) -> dtype:    # type: ignore
-        return wp.where(a < dtype(0.0), -b / a, dtype(1.0))
-
-    @wp.func
-    def step_candidate_masked(a: dtype, b: dtype, mask: dtype) -> dtype:    # type: ignore
-        return wp.where(mask > dtype(0.5), step_candidate(a, b), dtype(1.0))
 
     @wp.kernel(module="unique", enable_backward=False)
     def calculate_step_kernel(
@@ -395,10 +411,6 @@ def create_update_residual_nr_kernel(dtype=wp.float64):
     """
     dtype = to_warp_dtype(dtype)
 
-    @wp.func
-    def finite_value(v: dtype, mask: dtype) -> dtype:    # type: ignore
-        return wp.where(mask > dtype(0.5), v, dtype(0.0))
-
     @wp.kernel(module="unique", enable_backward=False)
     def update_residual_nr_kernel(
         minus_Px:                   wp.array2d(dtype=dtype),  # type: ignore  (B, n)
@@ -693,10 +705,6 @@ def create_update_smoothing_residual_nr_kernel(dtype=wp.float64):
     before the launch. Dispatch: ``wp.launch_tiled(..., dim=[B], block_dim=REDUCTION_BLOCK_DIM)``.
     """
     dtype = to_warp_dtype(dtype)
-
-    @wp.func
-    def finite_value(v: dtype, mask: dtype) -> dtype:    # type: ignore
-        return wp.where(mask > dtype(0.5), v, dtype(0.0))
 
     @wp.kernel(module="unique", enable_backward=False)
     def update_smoothing_residual_nr_kernel(

@@ -1,24 +1,32 @@
 import functools
+from typing import Any
 
 import warp as wp
 from .utils import to_warp_dtype
+from .solver_kernels import finite_value
 
 
 wp.set_module_options({"enable_backward": False})
+
+
+# Generic and at module level for the reason given in solver_kernels.py: a
+# @wp.func inside a kernel factory keeps the calling frames, and the solver,
+# alive until the cyclic garbage collector runs.
+@wp.func
+def ruiz_limit_scaling(d: Any, min_scaling: Any, max_scaling: Any):
+    """Ruiz scaling factor ``d`` limited to ``[min_scaling, max_scaling]``;
+    a factor below ``min_scaling`` is replaced by 1."""
+    if d < min_scaling:
+        return type(d)(1.0)
+    if d > max_scaling:
+        return max_scaling
+    return d
 
 
 @functools.lru_cache(maxsize=None)
 def create_clamp_and_rsqrt_kernel(n: int, p: int, m: int,
                               min_scaling: float, max_scaling: float, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
-    @wp.func
-    def _ruiz_limit_scaling(d: dtype, min_scaling: dtype, max_scaling: dtype) -> dtype:
-        if d < min_scaling:
-            return dtype(1.0)
-        if d > max_scaling:
-            return max_scaling
-        return d
-
     """Fused the following cupy chain:
 
         delta_iter[delta_iter < self.min_scaling] = 1.0
@@ -39,12 +47,12 @@ def create_clamp_and_rsqrt_kernel(n: int, p: int, m: int,
     ):
         b, k = wp.tid()
         delta = delta_iter[b, k]
-        delta = _ruiz_limit_scaling(delta, dtype(low), dtype(high))
+        delta = ruiz_limit_scaling(delta, dtype(low), dtype(high))
         delta_iter[b, k] = dtype(1.0) / wp.sqrt(delta)
 
         if k < wp.static(n):
             delta_b = delta_b_iter[b, k]
-            delta_b = _ruiz_limit_scaling(delta_b, dtype(low), dtype(high))
+            delta_b = ruiz_limit_scaling(delta_b, dtype(low), dtype(high))
             delta_b_iter[b, k] = dtype(1.0) / wp.sqrt(delta_b)
 
     return clamp_rsqrt_kernel
@@ -347,10 +355,6 @@ def create_compute_constraints_rhs_inf_norm_unscaled_kernel(dtype=wp.float64):
     over the blocks that exist (an absent block is ``(B, 0)``). Dispatch with
     ``wp.launch_tiled(dim=[B], block_dim=REDUCTION_BLOCK_DIM)``.
     """
-    @wp.func
-    def finite_value(v: dtype, mask: dtype) -> dtype:    # type: ignore
-        return wp.where(mask > dtype(0.5), v, dtype(0.0))
-
     @wp.kernel(module="unique", enable_backward=False)
     def kernel(
         delta_inv:   wp.array2d(dtype=dtype),  # type: ignore  (B, n+p+m)
