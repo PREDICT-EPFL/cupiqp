@@ -305,11 +305,6 @@ def create_accumulate_deltas_kernel(n: int, p: int, m: int, dtype=wp.float64):
     return accumulate_deltas_kernel
 
 
-# Threads per batch entry in the block-reduction kernels below; each thread
-# strides over its row, so the kernels are independent of the problem width.
-REDUCTION_BLOCK_DIM = 256
-
-
 @functools.lru_cache(maxsize=None)
 def create_ruiz_conv_check_kernel(dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
@@ -319,7 +314,7 @@ def create_ruiz_conv_check_kernel(dtype=wp.float64):
 
     ``conv_out`` is a one-element atomic-max accumulator; zero it before the
     launch and read it back once. Dispatch with
-    ``wp.launch_tiled(dim=[B], block_dim=REDUCTION_BLOCK_DIM)``.
+    ``wp.launch_tiled(dim=[B], block_dim=reduction_block_dim(width))``.
     """
     @wp.kernel(module="unique", enable_backward=False)
     def conv_check_kernel(
@@ -353,7 +348,7 @@ def create_compute_constraints_rhs_inf_norm_unscaled_kernel(dtype=wp.float64):
                       max_k |finite_mask_xl * delta_b_inv * x_l| )
 
     over the blocks that exist (an absent block is ``(B, 0)``). Dispatch with
-    ``wp.launch_tiled(dim=[B], block_dim=REDUCTION_BLOCK_DIM)``.
+    ``wp.launch_tiled(dim=[B], block_dim=reduction_block_dim(width))``.
     """
     @wp.kernel(module="unique", enable_backward=False)
     def kernel(

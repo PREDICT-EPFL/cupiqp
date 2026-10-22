@@ -43,12 +43,6 @@ def step_candidate_masked(a: Any, b: Any, mask: Any):
     return wp.where(mask > type(mask)(0.5), step_candidate(a, b), type(a)(1.0))
 
 
-# Threads per batch entry in the block-reduction kernels below. Each thread
-# strides over the row it reduces, so the kernels work for any problem width
-# and are compiled once per dtype rather than once per shape.
-REDUCTION_BLOCK_DIM = 256
-
-
 @functools.lru_cache(maxsize=None)
 def create_calculate_step_kernel(dtype=wp.float64):
     """Fused block-reduction kernel for step lengths (primal and dual).
@@ -62,7 +56,7 @@ def create_calculate_step_kernel(dtype=wp.float64):
     entries have mask value 0.0 and contribute candidate step 1.0, so they
     never restrict the line search.
 
-    ``tau`` is read from the device configuration. Dispatch with ``wp.launch_tiled(..., dim=[B], block_dim=REDUCTION_BLOCK_DIM)``:
+    ``tau`` is read from the device configuration. Dispatch with ``wp.launch_tiled(..., dim=[B], block_dim=reduction_block_dim(width))``:
     one CUDA block per batch entry; every thread reduces a strided subset of
     the row, then the block combines the partial minima.
     """
@@ -106,7 +100,7 @@ def create_calculate_mu_kernel(dtype=wp.float64):
         mu[b] = sum_i( mask[b, i] * s[b, i] * z[b, i] ) / num_finite_bounds[b]
 
     (``0`` when the problem has no finite bound). Dispatch with
-    ``wp.launch_tiled(..., dim=[B], block_dim=REDUCTION_BLOCK_DIM)``.
+    ``wp.launch_tiled(..., dim=[B], block_dim=reduction_block_dim(width))``.
     """
     dtype = to_warp_dtype(dtype)
 
@@ -146,7 +140,7 @@ def create_calculate_sigma_kernel(dtype=wp.float64):
         sigma[b]   = clip( acc / (mu[b] * num_finite_bounds[b]), 0, 1 ) ** 3
 
     or ``0`` when the denominator is not positive. Dispatch with
-    ``wp.launch_tiled(..., dim=[B], block_dim=REDUCTION_BLOCK_DIM)``.
+    ``wp.launch_tiled(..., dim=[B], block_dim=reduction_block_dim(width))``.
     """
     dtype = to_warp_dtype(dtype)
 
@@ -199,7 +193,7 @@ def create_init_guess_center_kernel(dtype=wp.float64):
 
     ``mu`` receives the clipped duality measure used for the projection;
     the caller recomputes mu afterwards. Dispatch with
-    ``wp.launch_tiled(..., dim=[B], block_dim=REDUCTION_BLOCK_DIM)``.
+    ``wp.launch_tiled(..., dim=[B], block_dim=reduction_block_dim(width))``.
     """
     dtype = to_warp_dtype(dtype)
 
@@ -285,7 +279,7 @@ def create_update_residuals_r_kernel(dtype=wp.float64):
         primal_res_reg_rel[b] = primal_res_reg[b] * primal_res_rel[b] / primal_res[b] if primal_res_rel[b] > 0 else primal_res_reg[b]
 
     ``num_duals == 0`` (no eq, no ineq, no box) gives zero prox-infeasibility
-    and residual. Dispatch: ``wp.launch_tiled(..., dim=[B], block_dim=REDUCTION_BLOCK_DIM)``.
+    and residual. Dispatch: ``wp.launch_tiled(..., dim=[B], block_dim=reduction_block_dim(width))``.
     """
     dtype = to_warp_dtype(dtype)
 
@@ -407,7 +401,7 @@ def create_update_residual_nr_kernel(dtype=wp.float64):
         dual_res_rel  = dual_res / max(1, dual_norm)
 
     All widths come from the array shapes; an absent block is ``(B, 0)``.
-    Dispatch: ``wp.launch_tiled(..., dim=[B], block_dim=REDUCTION_BLOCK_DIM)``.
+    Dispatch: ``wp.launch_tiled(..., dim=[B], block_dim=reduction_block_dim(width))``.
     """
     dtype = to_warp_dtype(dtype)
 
@@ -702,7 +696,7 @@ def create_update_smoothing_residual_nr_kernel(dtype=wp.float64):
 
     ``mu`` is the per-batch scaled target ``cost_scaling * gradient_smoothing_mu``.
     ``norm_out`` is a one-element atomic-max accumulator over the batch; zero it
-    before the launch. Dispatch: ``wp.launch_tiled(..., dim=[B], block_dim=REDUCTION_BLOCK_DIM)``.
+    before the launch. Dispatch: ``wp.launch_tiled(..., dim=[B], block_dim=reduction_block_dim(width))``.
     """
     dtype = to_warp_dtype(dtype)
 
@@ -1133,7 +1127,7 @@ def update_continue_flag_kernel(
 
     One block reduces the whole batch, so no cross-block reset/atomic pattern
     is needed. Dispatch with
-    ``wp.launch_tiled(..., dim=[1], block_dim=REDUCTION_BLOCK_DIM)``.
+    ``wp.launch_tiled(..., dim=[1], block_dim=reduction_block_dim(B))``.
     """
     _, i = wp.tid()
     any_active = wp.int32(0)
@@ -1228,7 +1222,7 @@ def create_solution_finite_kernel(dtype=wp.float64):
     Block reduction, one CUDA block per batch entry: every thread strides over
     the concatenated row and the block combines the flags, so the status is
     written exactly once and needs no clearing beforehand. Dispatch with
-    ``wp.launch_tiled(..., dim=[B], block_dim=REDUCTION_BLOCK_DIM)``.
+    ``wp.launch_tiled(..., dim=[B], block_dim=reduction_block_dim(width))``.
     """
     dtype = to_warp_dtype(dtype)
 
@@ -1267,7 +1261,7 @@ def any_flag_kernel(
 ):
     """``out[0] = 1`` if any ``flags[b]`` is nonzero, else ``0``. One block
     reduces the whole batch; dispatch with
-    ``wp.launch_tiled(..., dim=[1], block_dim=REDUCTION_BLOCK_DIM)``.
+    ``wp.launch_tiled(..., dim=[1], block_dim=reduction_block_dim(B))``.
     """
     _, i = wp.tid()
     acc = wp.int32(0)

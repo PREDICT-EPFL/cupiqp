@@ -10,10 +10,9 @@ from .settings import Settings, DeviceSettings
 from .data import Data
 from .results import Result, Status, Variables
 from .kkt_systems import KKTSystem
-from .utils import as_warp_array
+from .utils import as_warp_array, reduction_block_dim
 from .typedef import STATUS_MAX_ITER_REACHED, STATUS_NUMERICAL_ISSUES
 from .solver_kernels import (
-    REDUCTION_BLOCK_DIM,
     create_init_guess_rhs_kernel,
     create_init_guess_center_kernel,
     create_prepare_predictor_step_kernel,
@@ -802,7 +801,7 @@ class SolverBase(ABC):
             dim=[1],
             inputs=[self._unsolved_mask, self._current_iter,
                     self._device_settings.ints, self._continue_flag],
-            block_dim=REDUCTION_BLOCK_DIM,
+            block_dim=reduction_block_dim(self._data.batch_size),
             device=self._device
         )
 
@@ -875,7 +874,7 @@ class SolverBase(ABC):
                 dim=[self._data.batch_size],
                 inputs=[self._data.finite_mask_all, self._data.num_finite_bounds,
                         self._result.s_all, self._result.z_all, self._result.info.mu],
-                block_dim=REDUCTION_BLOCK_DIM,
+                block_dim=reduction_block_dim(self._data.num_ineq),
                 device=self._device
             )
             self._calculate_mu()
@@ -1004,7 +1003,7 @@ class SolverBase(ABC):
             kernel=any_flag_kernel,
             dim=[1],
             inputs=[self._needs_retry, self._any_retry],
-            block_dim=REDUCTION_BLOCK_DIM,
+            block_dim=reduction_block_dim(self._data.batch_size),
             device=self._device
         )
 
@@ -1087,6 +1086,28 @@ class SolverBase(ABC):
             self._smoothing_apply_step_kernel = create_smoothing_apply_step_kernel(dtype)
             if d.num_ineq == 0:
                 self._calculate_step_kernel = create_calculate_step_kernel(dtype)
+
+        # The block reductions are launched with a block width fitted to the
+        # rows each one reduces (reduction_block_dim at the launch site): a
+        # problem's row, or the whole batch for the batch-wide ones. Compile
+        # those variants now with the same widths: a variant first needed at
+        # its launch would be compiled inside a solve, possibly during CUDA
+        # graph capture.
+        block_dims = {
+            update_continue_flag_kernel: reduction_block_dim(d.batch_size),
+            any_flag_kernel: reduction_block_dim(d.batch_size),
+            self._update_residuals_r_kernel: reduction_block_dim(max(d.n, d.p + d.num_ineq)),
+            self._update_residual_nr_kernel: reduction_block_dim(max(d.n, d.p, d.m)),
+        }
+        if d.num_ineq > 0:
+            for kernel in (self._init_guess_center_kernel, self._calculate_step_kernel,
+                           self._calculate_mu_kernel, self._calculate_sigma_kernel):
+                block_dims[kernel] = reduction_block_dim(d.num_ineq)
+        if self.settings.enable_grad and self.settings.gradient_smoothing:
+            block_dims[self._update_smoothing_residual_nr_kernel] = reduction_block_dim(max(d.n, d.p, d.m))
+            block_dims[self._calculate_step_kernel] = reduction_block_dim(d.num_ineq)
+        for kernel, block_dim in block_dims.items():
+            wp.load_module(kernel.module, device=self._device, block_dim=block_dim)
 
         # Adjoint/backward-pass kernels.
         if self.settings.enable_grad:
@@ -1206,7 +1227,7 @@ class SolverBase(ABC):
                 self._device_settings.floats,
                 self._result.info.primal_step, self._result.info.dual_step,
             ],
-            block_dim=REDUCTION_BLOCK_DIM,
+            block_dim=reduction_block_dim(self._data.num_ineq),
             device=self._device
         )
 
@@ -1221,7 +1242,7 @@ class SolverBase(ABC):
                 self._data.finite_mask_all, self._data.num_finite_bounds,
                 self._result.info.mu,
             ],
-            block_dim=REDUCTION_BLOCK_DIM,
+            block_dim=reduction_block_dim(self._data.num_ineq),
             device=self._device
         )
 
@@ -1239,7 +1260,7 @@ class SolverBase(ABC):
                 self._result.info.mu,
                 self._result.info.sigma,
             ],
-            block_dim=REDUCTION_BLOCK_DIM,
+            block_dim=reduction_block_dim(self._data.num_ineq),
             device=self._device
         )
 
@@ -1383,7 +1404,7 @@ class SolverBase(ABC):
                 info.prev_primal_res,
                 info.prev_dual_res,
             ],
-            block_dim=REDUCTION_BLOCK_DIM,
+            block_dim=reduction_block_dim(max(self._data.n, self._data.p, self._data.m)),
             device=self._device
         )
 
@@ -1414,7 +1435,7 @@ class SolverBase(ABC):
                 info.dual_res_reg, info.dual_res_reg_rel,
                 info.primal_prox_inf, info.dual_prox_inf,
             ],
-            block_dim=REDUCTION_BLOCK_DIM,
+            block_dim=reduction_block_dim(max(self._data.n, self._data.p + self._data.num_ineq)),
             device=self._device
         )
 
@@ -1595,7 +1616,7 @@ class SolverBase(ABC):
                 res.s_l, res.s_u, res.s_bl, res.s_bu,
                 self._smoothing_residual_norm,
             ],
-            block_dim=REDUCTION_BLOCK_DIM,
+            block_dim=reduction_block_dim(max(data.n, data.p, data.m)),
             device=self._device
         )
         wp.copy(self._smoothing_residual_norm_host, self._smoothing_residual_norm)
@@ -1629,7 +1650,7 @@ class SolverBase(ABC):
                     step.s_all, step.z_all, self._device_settings.floats,
                     self._smoothing_alpha_s, self._smoothing_alpha_z,
                 ],
-                block_dim=REDUCTION_BLOCK_DIM,
+                block_dim=reduction_block_dim(data.num_ineq),
                 device=self._device
             )
 

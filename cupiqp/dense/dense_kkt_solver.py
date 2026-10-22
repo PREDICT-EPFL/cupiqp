@@ -27,7 +27,7 @@ class DenseKKTSolver(KKTSolverBase):
     def __init__(self, data: DenseData):
         n, p, m = data.n, data.p, data.m
         B = data.batch_size
-        super().__init__(B, data.dtype, data.device)
+        super().__init__(data)
         self._batch_size = B
         self._dtype = data.dtype
         self._device = data.device
@@ -143,7 +143,7 @@ class DenseKKTSolver(KKTSolverBase):
                         delta_y, delta_z],
                 device=self._device
             )
-        self._write_solve_status(delta_x, delta_y, delta_z)
+        self._write_solve_status(data, delta_x, delta_y, delta_z)
 
     @nvtx.annotate("DenseKKTSolver::eval_P_x")
     def eval_P_x(self, data: DenseData, alpha: float, x: wp.array, z: wp.array):

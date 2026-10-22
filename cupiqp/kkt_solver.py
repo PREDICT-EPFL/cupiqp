@@ -3,7 +3,8 @@ from abc import ABC, abstractmethod
 import warp as wp
 
 from .data import Data
-from .solver_kernels import create_solution_finite_kernel, REDUCTION_BLOCK_DIM
+from .utils import reduction_block_dim
+from .solver_kernels import create_solution_finite_kernel
 
 
 class KKTSolverBase(ABC):
@@ -14,13 +15,19 @@ class KKTSolverBase(ABC):
     [A         -delta*I     0    ] [Delta_y] = [rhs_y]
     [G           0     -(z_reg)  ] [Delta_z] = [rhs_z]
     """
-    def __init__(self, batch_size: int, dtype, device):
+    def __init__(self, data: Data):
         # Per-problem outcome flags, written on the device and never read on
         # the host by the solver: 0 = success, nonzero = failed. Their
         # addresses are fixed for the lifetime of the solver.
-        self._factor_status = wp.zeros(batch_size, dtype=wp.int32, device=device)
-        self._solve_status = wp.zeros(batch_size, dtype=wp.int32, device=device)
-        self._check_solution_finite_kernel = create_solution_finite_kernel(dtype)
+        device = data.device
+        self._factor_status = wp.zeros(data.batch_size, dtype=wp.int32, device=device)
+        self._solve_status = wp.zeros(data.batch_size, dtype=wp.int32, device=device)
+        self._check_solution_finite_kernel = create_solution_finite_kernel(data.dtype)
+        # The finite check reduces over the concatenated (x, y, z) row of
+        # n + p + m entries; compile the block-dim variant its launch uses now,
+        # not at its first launch (possibly during CUDA graph capture).
+        wp.load_module(self._check_solution_finite_kernel.module, device=device,
+                       block_dim=reduction_block_dim(data.n + data.p + data.m))
         self._device = device
 
     @abstractmethod
@@ -66,7 +73,7 @@ class KKTSolverBase(ABC):
         last KKT solution of that problem is finite, nonzero where it is not."""
         return self._solve_status
 
-    def _write_solve_status(self, lhs_x: wp.array, lhs_y: wp.array, lhs_z: wp.array) -> None:
+    def _write_solve_status(self, data: Data, lhs_x: wp.array, lhs_y: wp.array, lhs_z: wp.array) -> None:
         """Called by every backend at the end of ``solve()``: flag, per
         problem, a solution with a NaN or infinite entry in ``solve_status``.
 
@@ -81,7 +88,7 @@ class KKTSolverBase(ABC):
             kernel=self._check_solution_finite_kernel,
             dim=[lhs_x.shape[0]],
             inputs=[lhs_x, lhs_y, lhs_z, self._solve_status],
-            block_dim=REDUCTION_BLOCK_DIM,
+            block_dim=reduction_block_dim(data.n + data.p + data.m),
             device=self._device
         )
 

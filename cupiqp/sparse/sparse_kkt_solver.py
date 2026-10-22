@@ -34,7 +34,7 @@ class SparseKKTSolver(KKTSolverBase):
 
     def __init__(self, data: SparseData, use_deterministic_mode: bool = False):
         B = data.batch_size
-        super().__init__(B, data.dtype, data.device)
+        super().__init__(data)
         self._batch_size = B
         n, p, m = data.n, data.p, data.m
         self._dtype = data.dtype
@@ -272,7 +272,7 @@ class SparseKKTSolver(KKTSolverBase):
             wp.copy(delta_y, column_slice(sol, n, n + p))
         if m > 0:
             wp.copy(delta_z, column_slice(sol, n + p, n + p + m))
-        self._write_solve_status(delta_x, delta_y, delta_z)
+        self._write_solve_status(data, delta_x, delta_y, delta_z)
 
     @nvtx.annotate("SparseKKTSolver::eval_P_x")
     def eval_P_x(self, data: SparseData, alpha: float, x: wp.array, z: wp.array):

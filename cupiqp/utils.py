@@ -13,6 +13,27 @@ def to_warp_dtype(dtype: Any):
         return dtype
 
 
+def reduction_block_dim(width: int) -> int:
+    """Threads per block of the block-reduction kernels, for rows of at most
+    ``width`` entries: a problem's row for the per-problem reductions
+    (``dim=[B]``), the whole batch for the batch-wide ones (``dim=[1]``).
+
+    Each thread strides over the row it reduces, so the kernels work for any
+    width and their source does not depend on the shape; only the launch
+    width changes. One warp serves rows of up to 256 entries: a wider block
+    on a short row leaves most threads idle, while every block-wide
+    reduction still synchronizes all of them and the per-thread tiles take
+    shared memory that limits how many problems are resident per SM (a
+    256-thread block made these kernels about 2x slower for rows of tens of
+    entries on an RTX 5090). Wider rows get up to 256 threads, about eight
+    entries per thread.
+    """
+    block_dim = 32
+    while block_dim < 256 and 8 * block_dim < width:
+        block_dim *= 2
+    return block_dim
+
+
 def is_cuda_array(m) -> bool:
     """True iff ``m`` exposes the ``__cuda_array_interface__`` protocol.
 

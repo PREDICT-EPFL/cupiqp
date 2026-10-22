@@ -28,7 +28,7 @@ class MultistageKKTSolver(KKTSolverBase):
     """Multistage KKT solver with block-tridiagonal Cholesky factorization, batched."""
     def __init__(self, data: MultistageData):
         B = data.batch_size
-        super().__init__(B, data.dtype, data.device)
+        super().__init__(data)
         N = data.num_blocks
         d = data.block_size
 
@@ -271,7 +271,7 @@ class MultistageKKTSolver(KKTSolverBase):
                 ]
             )
             wp.map(sub_mul, delta_z, rhs_z, self._z_reg_inv, out=delta_z)
-        self._write_solve_status(delta_x, delta_y, delta_z)
+        self._write_solve_status(data, delta_x, delta_y, delta_z)
 
     @nvtx.annotate("MultistageKKTSolver::eval_P_x")
     def eval_P_x(self, data: MultistageData, alpha: float, x: wp.array, z: wp.array):

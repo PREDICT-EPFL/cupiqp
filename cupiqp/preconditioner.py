@@ -4,11 +4,10 @@ import nvtx
 import numpy as np
 import warp as wp
 
-from .utils import as_warp_array, column_slice
+from .utils import as_warp_array, column_slice, reduction_block_dim
 from .data import Data
 from .results import Variables
 from .preconditioner_kernels import (
-    REDUCTION_BLOCK_DIM,
     create_clamp_and_rsqrt_kernel,
     create_accumulate_deltas_kernel,
     create_ruiz_conv_check_kernel,
@@ -400,7 +399,7 @@ class RuizEquilibration(PreconditionerBase):
                 kernel=self._conv_check_kernel,
                 dim=[self.B],
                 inputs=[self._delta_iter, self._delta_b_iter, self._conv_buf],
-                block_dim=REDUCTION_BLOCK_DIM,
+                block_dim=reduction_block_dim(self._delta_iter.shape[1]),
                 device=self._device
             )
             wp.copy(self._conv_host, self._conv_buf)
@@ -516,7 +515,7 @@ class RuizEquilibration(PreconditionerBase):
                 data.finite_mask_hl, data.finite_mask_hu, data.finite_mask_xl, data.finite_mask_xu,
                 out,
             ],
-            block_dim=REDUCTION_BLOCK_DIM,
+            block_dim=reduction_block_dim(max(data.n, data.p, data.m)),
             device=self._device
         )
 
