@@ -213,6 +213,15 @@ class SolverLayerBase(torch.nn.Module, ABC):
     #: The core solver class this layer wraps; set by the subclass.
     _core_solver_cls: type[SolverBase]
 
+    #: Names of the tensors ``forward()`` takes, in order; each is one
+    #: autograd input with its own gradient. A subclass whose matrices are
+    #: split into blocks lists the blocks here.
+    _FORWARD_FIELDS = DATA_FIELDS
+    #: The forward fields that are matrices or matrix blocks: they go through
+    #: the matrix hooks. The other fields are vectors of the core's flat
+    #: ``(k,)`` layout.
+    _MATRIX_FORWARD_FIELDS = MATRIX_FIELDS
+
     def __init__(
         self,
         dtype: torch.dtype = torch.float64,
@@ -413,27 +422,26 @@ class SolverLayerBase(torch.nn.Module, ABC):
                     "of the arguments every call passes, e.g. ('c', 'h_u')."
                 )
             per_call = frozenset(per_call_fields)
-            unknown = sorted(n for n in per_call if n not in DATA_FIELDS)
-            absent = sorted(n for n in per_call if n in DATA_FIELDS and inputs[n] is None)
+            given = self._forward_fields_given(inputs)
+            unknown = sorted(n for n in per_call if n not in self._FORWARD_FIELDS)
+            absent = sorted(n for n in per_call if n in self._FORWARD_FIELDS and n not in given)
             if unknown or absent:
                 raise ValueError(
-                    f"per_call_fields must name arguments given to setup(); unknown "
-                    f"{unknown}, not given {absent}."
+                    f"per_call_fields must name forward() arguments given at setup(); "
+                    f"unknown {unknown}, not given {absent}."
                 )
         core_setup_args = self._prepare_setup_inputs(inputs)
         with self._ordered_solver_stream():
             self._core_solver.setup(**core_setup_args)
 
         data = self._core_solver.data
-        self._configured_data_fields = frozenset(
-            name for name in DATA_FIELDS if inputs[name] is not None
-        )
+        self._configured_data_fields = self._forward_fields_given(inputs)
         vector_shapes = {
             "c": (data.n,), "b": (data.p,), "h_u": (data.m,), "h_l": (data.m,),
             "x_u": (data.n,), "x_l": (data.n,),
         }
         self._unbatched_input_shapes = {
-            name: (tuple(self._matrix_unbatched_shape(name)) if name in MATRIX_FIELDS
+            name: (tuple(self._matrix_unbatched_shape(name)) if name in self._MATRIX_FORWARD_FIELDS
                    else vector_shapes[name])
             for name in self._configured_data_fields
         }
@@ -484,6 +492,12 @@ class SolverLayerBase(torch.nn.Module, ABC):
         solver's result buffer, overwritten by the next call; ``layer.result``
         holds the duals, slacks and the per-problem status.
         """
+        return self._forward_impl((P, c, A, b, G, h_u, h_l, x_u, x_l))
+
+    def _forward_impl(self, forward_inputs: tuple[torch.Tensor | None, ...]) -> torch.Tensor:
+        """Body of ``forward()``: ``forward_inputs`` holds one tensor (or
+        ``None``) per name of ``_FORWARD_FIELDS``. A subclass with other
+        forward arguments overrides ``forward()`` and calls this."""
         # Drop the previous result first: it may hold the last reference to an
         # abandoned autograd graph, whose finalizer then releases its lease.
         self._result = None
@@ -499,7 +513,6 @@ class SolverLayerBase(torch.nn.Module, ABC):
                 "max_pending_solves > 1."
             )
 
-        forward_inputs = (P, c, A, b, G, h_u, h_l, x_u, x_l)
         input_is_shared = self._validate_call_inputs(forward_inputs)
 
         requires_autograd = torch.is_grad_enabled() and any(
@@ -542,6 +555,16 @@ class SolverLayerBase(torch.nn.Module, ABC):
         contiguous or convert them to the core's format (for example CSR
         triples)."""
 
+    def _forward_fields_given(self, inputs: dict[str, Any]) -> frozenset[str]:
+        """The forward fields that exist after a ``setup()`` with these
+        arguments. Default: the arguments that are not ``None``."""
+        return frozenset(name for name in DATA_FIELDS if inputs[name] is not None)
+
+    def _core_update_args(self, field_tensors: dict[str, torch.Tensor]) -> dict[str, Any]:
+        """Keyword arguments of the core ``update()`` for these forward-field
+        tensors. Default: the fields are the core arguments."""
+        return field_tensors
+
     @abstractmethod
     def _matrix_unbatched_shape(self, name: str) -> tuple[int, ...]:
         """Shape without the batch axis of the tensor ``forward()`` takes for
@@ -567,14 +590,14 @@ class SolverLayerBase(torch.nn.Module, ABC):
         or of the leased saved state after saving the solve into it."""
         data_updates = {
             name: tensor.detach().contiguous()
-            for name, tensor in zip(DATA_FIELDS, forward_inputs) if tensor is not None
+            for name, tensor in zip(self._FORWARD_FIELDS, forward_inputs) if tensor is not None
         }
         saved_state = None
         if backward_lease is not None and backward_lease.uses_saved_state:
             saved_state = self._backward_state_pool.state_for(backward_lease)
         with self._ordered_solver_stream():
             if data_updates:
-                self._core_solver.update(**data_updates)
+                self._core_solver.update(**self._core_update_args(data_updates))
             self._core_solver.solve()
             if saved_state is not None:
                 self._save_backward_state(saved_state)
@@ -618,7 +641,7 @@ class SolverLayerBase(torch.nn.Module, ABC):
         is needed).
 
         ``solution_cotangents`` follow ``_solution_fields``;
-        ``input_needs_grad`` and ``input_is_shared`` follow ``DATA_FIELDS``.
+        ``input_needs_grad`` and ``input_is_shared`` follow ``_FORWARD_FIELDS``.
         A saved-state lease requires ``restored_data``, the tensors that call
         passed, which are loaded into the core before refactorizing; a
         factorization lease requires ``restored_data`` to be ``None``."""
@@ -635,7 +658,7 @@ class SolverLayerBase(torch.nn.Module, ABC):
             if backward_lease.uses_saved_state:
                 # The data of that call; later calls may have changed it.
                 # Always refactorized, also for the most recent call.
-                self._core_solver.update(**restored_data)
+                self._core_solver.update(**self._core_update_args(restored_data))
                 saved_state = self._backward_state_pool.state_for(backward_lease)
                 data_gradients = self._core_solver.backward_from_state(
                     **{name: getattr(saved_state, name) for name in SOLUTION_FIELDS},
@@ -649,11 +672,11 @@ class SolverLayerBase(torch.nn.Module, ABC):
         # Past the ordered block the Torch stream has waited for the solver,
         # so the reductions below may read the core gradient buffers.
         input_gradients = []
-        for name, needed, is_shared in zip(DATA_FIELDS, input_needs_grad, input_is_shared):
+        for name, needed, is_shared in zip(self._FORWARD_FIELDS, input_needs_grad, input_is_shared):
             if not needed:
                 input_gradients.append(None)
                 continue
-            if name in MATRIX_FIELDS:
+            if name in self._MATRIX_FORWARD_FIELDS:
                 batched_gradient_array = self._matrix_data_gradient_array(name, data_gradients)
             else:
                 batched_gradient_array = getattr(data_gradients, name)
@@ -713,7 +736,7 @@ class SolverLayerBase(torch.nn.Module, ABC):
         multi_pending = self._backward_state_pool is not None
         if multi_pending:
             passed_fields = frozenset(
-                name for name, tensor in zip(DATA_FIELDS, forward_inputs) if tensor is not None
+                name for name, tensor in zip(self._FORWARD_FIELDS, forward_inputs) if tensor is not None
             )
             if passed_fields != self._per_call_fields:
                 raise ValueError(
@@ -724,7 +747,7 @@ class SolverLayerBase(torch.nn.Module, ABC):
 
         batch_size = self._core_solver.data.batch_size
         input_is_shared = []
-        for name, tensor in zip(DATA_FIELDS, forward_inputs):
+        for name, tensor in zip(self._FORWARD_FIELDS, forward_inputs):
             if tensor is None:
                 input_is_shared.append(None)
                 continue

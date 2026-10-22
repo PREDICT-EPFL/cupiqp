@@ -13,15 +13,19 @@ through the solve by implicit differentiation of the KKT conditions::
     layer.result.status          # (B,) int32 status codes, on the device
 
 ``layer.result`` holds the duals, slacks and per-problem status of the
-latest call, all as CUDA tensors.
+latest call, all as CUDA tensors. ``SparseSolverLayer`` takes CSR patterns
+at setup and values per call; ``MultistageSolverLayer`` takes
+``(diag, offdiag)`` block pairs at setup and one tensor per block per call.
 """
 
 from .dense import DenseSolverLayer
+from .multistage import MultistageSolverLayer
 from .sparse import SparseSolverLayer
 from .types import StructureMismatchError, TorchSolution
 
 __all__ = [
     "DenseSolverLayer",
+    "MultistageSolverLayer",
     "SparseSolverLayer",
     "TorchSolution",
     "StructureMismatchError",

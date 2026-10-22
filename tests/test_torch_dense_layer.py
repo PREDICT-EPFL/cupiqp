@@ -972,6 +972,30 @@ def test_capacity_one_failed_forward_releases_the_lease():
     x.sum().backward()
 
 
+@pytest.mark.parametrize("max_pending_solves", [1, 3])
+def test_dropped_layer_is_freed_by_reference_counting(max_pending_solves):
+    """After setup, forward and backward, dropping the last reference frees
+    the layer (and its core solver) at once, without the cyclic garbage
+    collector, which could otherwise run during another solver's CUDA graph
+    capture."""
+    import weakref
+    qp = _rand_qp(n=4, p=1, m=2, seed=7)
+    gc.collect()
+    gc.disable()
+    try:
+        layer = _make_layer()
+        per_call = dict(per_call_fields=("c",)) if max_pending_solves > 1 else {}
+        layer.setup(**qp, max_pending_solves=max_pending_solves, **per_call)
+        c = qp["c"].clone().requires_grad_(True)
+        layer(c=c).sum().backward()
+        torch.cuda.synchronize()
+        ref = weakref.ref(layer)
+        del layer
+        assert ref() is None, "a reference cycle keeps the dropped layer alive"
+    finally:
+        gc.enable()
+
+
 def test_capacity_one_failed_backward_releases_the_lease():
     from unittest import mock
     qp = _box_qp()

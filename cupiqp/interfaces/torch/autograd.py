@@ -16,7 +16,6 @@ from typing import TYPE_CHECKING, Any
 import torch
 from torch.autograd.function import FunctionCtx, once_differentiable
 
-from .utils import DATA_FIELDS
 
 if TYPE_CHECKING:
     from .base import SolverLayerBase
@@ -65,7 +64,8 @@ class QPSolveFunction(torch.autograd.Function):
             # needs_input_grad covers (solver_layer, input_is_shared, *data_field_inputs).
             ctx.input_needs_grad = tuple(ctx.needs_input_grad[2:])
             ctx.provided_field_names = tuple(
-                name for name, tensor in zip(DATA_FIELDS, data_field_inputs) if tensor is not None
+                name for name, tensor in zip(solver_layer._FORWARD_FIELDS, data_field_inputs)
+                if tensor is not None
             )
             ctx.solution_count = solution_count
             ctx.backward_consumed = False
