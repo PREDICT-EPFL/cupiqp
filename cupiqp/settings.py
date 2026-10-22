@@ -2,7 +2,7 @@ import math
 import warnings
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Optional, Union
+from typing import Literal, Optional, Union
 
 import numpy as np
 import warp as wp
@@ -91,6 +91,15 @@ class Settings:
     gradient_smoothing_tol: float = 1e-5
     gradient_smoothing_max_iter: int = 5
 
+    # What backward() returns for problems of the batch whose last solve did
+    # not end with status CUPIQP_SOLVED:
+    #   "differentiate": differentiate their final iterate like that of any other problem;
+    #   "zero":          return zero gradients for those problems.
+    # A problem whose KKT factorization or adjoint solve fails inside
+    # backward() always gets zero gradients. The other problems get their
+    # gradients; solver.grad_valid says which ones are valid.
+    gradient_on_failure: Literal["differentiate", "zero"] = "differentiate"
+
 
     @classmethod
     def for_dtype(cls, dtype: Union[type[wp.float32], type[wp.float64]]) -> "Settings":
@@ -148,6 +157,7 @@ class Settings:
                and self.gradient_smoothing_mu > 0 and math.isfinite(self.gradient_smoothing_mu)
                and self.gradient_smoothing_tol > 0 and math.isfinite(self.gradient_smoothing_tol)
                and self.gradient_smoothing_max_iter > 0
+               and self.gradient_on_failure in ("differentiate", "zero")
                )
 
 

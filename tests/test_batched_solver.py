@@ -1,6 +1,7 @@
 """Tests for BatchedSolver — end-to-end QP solving."""
 import numpy as np
 import cupy as cp
+import pytest
 
 from cupiqp import DenseSolver, Settings, Status
 
@@ -297,3 +298,112 @@ class TestPerProblemIterations:
                 f"problem {i}: batched iter {iters[i]} != standalone {ref[i][1]}")
         assert len(set(iters)) > 1, f"expected per-problem iters to differ: {iters}"
 
+
+def test_update_toggles_active_box_bounds():
+    """update(x_l) that flips box bounds finite<->infinite must match a fresh
+    setup with the new bounds. Guards the box scaling derived from the
+    activity mask at setup: a variable without a finite bound at setup must
+    still get its bound enforced once update() makes it finite."""
+    inf = np.inf
+    P = np.eye(3)
+    c = np.array([1.0, 2.0, 3.0])
+    x_l_1 = np.array([0.0, -inf, 0.0])   # x = [0, -2, 0]
+    x_l_2 = np.array([0.0, 0.0, -inf])   # x = [0, 0, -3]; entries 1 and 2 toggle
+
+    for preconditioner_iter in (0, 10):
+        settings = Settings()
+        settings.preconditioner_iter = preconditioner_iter
+        settings.verbose = False
+
+        ref = DenseSolver()
+        ref.settings = settings
+        ref.setup(cp.asarray(P), cp.asarray(c), x_l=cp.asarray(x_l_2))
+        ref.solve()
+        x_ref = cp.asnumpy(ref.result.x[0])
+        np.testing.assert_allclose(x_ref, [0.0, 0.0, -3.0], atol=1e-6)
+
+        solver = DenseSolver()
+        solver.settings = settings
+        solver.setup(cp.asarray(P), cp.asarray(c), x_l=cp.asarray(x_l_1))
+        solver.solve()
+        np.testing.assert_allclose(cp.asnumpy(solver.result.x[0]), [0.0, -2.0, 0.0], atol=1e-6)
+
+        solver.update(x_l=cp.asarray(x_l_2))
+        solver.solve()
+        assert solver.result.info.to_host().status[0] == Status.CUPIQP_SOLVED
+        np.testing.assert_allclose(cp.asnumpy(solver.result.x[0]), x_ref, atol=1e-6)
+        z_bl = cp.asnumpy(solver.result.z_bl[0])
+        assert z_bl[2] == 0.0          # now unbounded: dual exactly zero
+        assert abs(z_bl[1]) > 1e-3     # now bounded and binding
+
+
+def test_backward_with_unsolved_problem_in_batch():
+    """backward() must not raise when a problem of the batch did not converge.
+    Problem 1 is primal infeasible (x0 = 0 and x0 = 1). With "differentiate" the
+    solved problem's gradient is unaffected; with "zero" the failed problem's
+    gradients are exactly zero."""
+    P = np.eye(2)
+    c = np.array([1.0, 1.0])
+    A = np.array([[1.0, 0.0], [1.0, 0.0]])
+    b = np.array([[0.0, 0.0], [0.0, 1.0]])            # problem 1: infeasible
+    grad_x = cp.ones((2, 2))
+
+    def make(mode, b_in):
+        s = DenseSolver()
+        s.settings.enable_grad = True
+        s.settings.preconditioner_iter = 0
+        s.settings.verbose = False
+        s.settings.gradient_on_failure = mode
+        s.setup(cp.asarray(P), cp.asarray(c), A=cp.asarray(A), b=cp.asarray(b_in))
+        s.solve()
+        return s
+
+    reference = make("differentiate", b[0])
+    assert reference.result.info.to_host().status == [Status.CUPIQP_SOLVED]
+    grad_c_ref = reference.backward(grad_x=grad_x[:1]).c.numpy()[0]
+
+    for mode in ("differentiate", "zero"):
+        s = make(mode, b)
+        status = s.result.info.to_host().status
+        assert status[0] == Status.CUPIQP_SOLVED and status[1] != Status.CUPIQP_SOLVED
+        grads = s.backward(grad_x=grad_x)
+        grad_c = grads.c.numpy()
+        grad_P = grads.P.numpy()
+        # The batch runs more iterations than the single problem (it waits
+        # for the infeasible one to give up), so the iterates differ at the
+        # tolerance level.
+        np.testing.assert_allclose(grad_c[0], grad_c_ref, atol=1e-4)
+        if mode == "zero":
+            assert np.all(grad_c[1] == 0.0) and np.all(grad_P[1] == 0.0)
+            assert np.all(grads.b.numpy()[1] == 0.0)
+
+
+def test_structural_settings_are_frozen_at_setup():
+    """Settings that fix the data coordinates, buffers or KKT structure are
+    frozen by setup(): a later change is rejected by update(), solve() and
+    backward(); numerical settings may still change."""
+    rng = np.random.default_rng(3)
+    M = rng.standard_normal((3, 3))
+    solver = DenseSolver()
+    solver.settings.enable_grad = True
+    solver.settings.preconditioner_iter = 10
+    solver.settings.verbose = False
+    c = cp.asarray(rng.standard_normal(3))
+    solver.setup(cp.asarray(M @ M.T + 3 * np.eye(3)), c, x_l=-cp.ones(3), x_u=cp.ones(3))
+    solver.solve()
+    solver.settings.max_iter = 50                    # numerical: allowed
+    solver.solve()
+
+    solver.settings.preconditioner_iter = 0
+    for call in (solver.solve, lambda: solver.update(c=c),
+                 lambda: solver.backward(grad_x=cp.ones((1, 3)))):
+        with pytest.raises(RuntimeError, match=r"\['preconditioner_iter'\] changed after setup"):
+            call()
+    solver.settings.preconditioner_iter = 10
+
+    solver.settings.gradient_smoothing = True
+    with pytest.raises(RuntimeError, match=r"\['gradient_smoothing'\] changed after setup"):
+        solver.backward(grad_x=cp.ones((1, 3)))
+    solver.settings.gradient_smoothing = False
+    solver.solve()                                   # restored: fine again
+    solver.backward(grad_x=cp.ones((1, 3)))

@@ -2,7 +2,7 @@ import warp as wp
 
 from .sparse_data import SparseData
 from ..preconditioner import RuizEquilibration
-from ..preconditioner_kernels import REDUCTION_BLOCK_DIM
+from ..utils import reduction_block_dim
 from .sparse_preconditioner_kernels import (
     create_sparse_scale_matrices_kernel,
     create_sparse_compute_kkt_norms_kernel,
@@ -109,7 +109,7 @@ class SparseRuizEquilibration(RuizEquilibration):
             kernel=self._sparse_compute_gamma_kernel,
             dim=[self.B],
             inputs=[self._P_norms, data.c, self._gamma_buf],
-            block_dim=REDUCTION_BLOCK_DIM,
+            block_dim=reduction_block_dim(self._P_norms.shape[1]),
             device=self._device
         )
         wp.launch(

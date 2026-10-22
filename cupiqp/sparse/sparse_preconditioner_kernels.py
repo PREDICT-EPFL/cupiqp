@@ -212,7 +212,7 @@ def create_sparse_compute_gamma_kernel(min_scaling: float, max_scaling: float, d
         g = clip(max(g, max_i |c[b, i]|), min, max)
         gamma[b] = 1 / g
 
-    Dispatch with ``wp.launch_tiled(dim=[B], block_dim=REDUCTION_BLOCK_DIM)``."""
+    Dispatch with ``wp.launch_tiled(dim=[B], block_dim=reduction_block_dim(n))``."""
     lo = float(min_scaling)
     hi = float(max_scaling)
 

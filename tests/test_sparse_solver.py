@@ -25,7 +25,7 @@ from cupyx.scipy.sparse import csr_matrix
 
 piqp = pytest.importorskip("piqp")
 
-from cupiqp import SparseSolver, Status, PIQP_INF
+from cupiqp import Settings, SparseSolver, Status, PIQP_INF
 
 
 def _make_qp(n, p, m, pattern, seed):
@@ -304,3 +304,40 @@ def test_sparse_float32_box_qp():
     solver.solve()
     assert all(st == Status.CUPIQP_SOLVED for st in solver.result.info.to_host().status)
     np.testing.assert_allclose(solver.result.x.numpy(), np.clip(-cp.asnumpy(c), -1.0, 1.0), atol=1e-3)
+
+
+def test_sparse_update_toggles_active_box_bounds():
+    """Sparse analogue of the dense box-bound toggle: update(x_l) flipping
+    entries finite<->infinite must match a fresh setup with the new bounds."""
+    import scipy.sparse as sp
+    inf = np.inf
+    P = sp.eye(3, format="csr")
+    c = cp.asarray([1.0, 2.0, 3.0])
+    x_l_1 = np.array([0.0, -inf, 0.0])
+    x_l_2 = np.array([0.0, 0.0, -inf])
+
+    def triple():
+        return (P.indptr, P.indices, cp.asarray(P.data))
+
+    for preconditioner_iter in (0, 10):
+        settings = Settings()
+        settings.preconditioner_iter = preconditioner_iter
+        settings.verbose = False
+
+        ref = SparseSolver()
+        ref.settings = settings
+        ref.setup(triple(), c, x_l=cp.asarray(x_l_2))
+        ref.solve()
+        x_ref = cp.asnumpy(ref.result.x[0])
+        np.testing.assert_allclose(x_ref, [0.0, 0.0, -3.0], atol=1e-6)
+
+        solver = SparseSolver()
+        solver.settings = settings
+        solver.setup(triple(), c, x_l=cp.asarray(x_l_1))
+        solver.solve()
+        np.testing.assert_allclose(cp.asnumpy(solver.result.x[0]), [0.0, -2.0, 0.0], atol=1e-6)
+
+        solver.update(x_l=cp.asarray(x_l_2))
+        solver.solve()
+        assert solver.result.info.to_host().status[0] == Status.CUPIQP_SOLVED
+        np.testing.assert_allclose(cp.asnumpy(solver.result.x[0]), x_ref, atol=1e-6)
