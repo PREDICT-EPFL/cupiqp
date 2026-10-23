@@ -138,7 +138,7 @@ in place, into the solver's buffers.
 ## Streams
 
 Each solver instance runs on **one CUDA stream** of its own: `setup`, `update`,
-`solve`, `backward` (and `OcpSolver.set`) make it Warp's current stream for their
+`solve` and `backward` make it Warp's current stream for their
 duration, so every kernel, copy, library call and CUDA graph of the solver is
 issued there. The stream is exposed as `solver.stream` (a `warp.Stream`).
 

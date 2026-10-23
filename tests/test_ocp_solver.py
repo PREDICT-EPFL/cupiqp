@@ -4,7 +4,10 @@ import cupy as cp
 import pytest
 
 import cupiqp
-from cupiqp import OcpSolver, OcpData, DenseSolver, Status
+# OcpSolver is not ready to be expose to public API yet
+from cupiqp import DenseSolver, Status
+from cupiqp.multistage.ocp_solver import OcpSolver
+from cupiqp.multistage.ocp_data import OcpData
 from cupiqp.settings import Settings
 
 
@@ -151,9 +154,9 @@ def _fill_ocp(s, N, nx, nu, Qs, Rs, As, Bs, x0, Es=None, Qf=None):
 # ----------------------------------------------------------------------
 
 def test_import_smoke():
-    assert hasattr(cupiqp, "OcpSolver")
-    assert cupiqp.OcpSolver is OcpSolver
-    assert cupiqp.OcpData is OcpData
+    # Experimental: importable from its submodule, but not part of the public API yet.
+    assert not hasattr(cupiqp, "OcpSolver")
+    assert not hasattr(cupiqp, "OcpData")
 
 
 def test_idxbx_state_box():

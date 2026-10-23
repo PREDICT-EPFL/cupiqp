@@ -82,7 +82,7 @@ class OcpSolver(MultistageSolver):
     Examples
     --------
     ```python
-    from cupiqp import OcpSolver
+    from cupiqp.multistage.ocp_solver import OcpSolver
 
     s = OcpSolver()
     s.setup(N=20, nx=2, nu=1, idxbu=[0])    # dimensions only; bound input 0

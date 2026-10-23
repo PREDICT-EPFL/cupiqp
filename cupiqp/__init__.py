@@ -10,7 +10,6 @@ from .dense.dense_data import DenseData
 from .sparse.sparse_data import SparseData
 
 from .multistage.multistage_data import MultistageData
-from .multistage.ocp_data import OcpData
 
 
 # Type-strict, backend-specific Solver subclasses.
@@ -19,7 +18,6 @@ from .multistage.ocp_data import OcpData
 from .dense.dense_solver import DenseSolver
 from .sparse.sparse_solver import SparseSolver
 from .multistage.multistage_solver import MultistageSolver
-from .multistage.ocp_solver import OcpSolver
 
 
 CUPIQP_UNSOLVED          = Status.CUPIQP_UNSOLVED
@@ -52,13 +50,11 @@ __all__ = [
     "DenseSolver",
     "SparseSolver",
     "MultistageSolver",
-    "OcpSolver",
     # Problem data
     "Data",
     "DenseData",
     "SparseData",
     "MultistageData",
-    "OcpData",
     # Configuration / results
     "Settings",
     "Result",
