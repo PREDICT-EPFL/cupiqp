@@ -25,7 +25,7 @@ $$
 
 Note the **one-sided** pieces: the inequality $2x_1 \le -1$ has no lower bound
 ($h_l = -\infty$), and each variable is bounded on only one side. We build everything
-**directly as GPU arrays** (cupy here; Warp, CUDA torch or JAX arrays work the same way) so the data already lives on the GPU. Results come back as `warp.array` objects on the GPU; call `.numpy()` for a host copy or view them from your framework of choice (`cupy.asarray(x)`, `torch.from_dlpack(x)`).
+**directly as GPU arrays** (cupy here; Warp, CUDA torch or JAX arrays work the same way) so the data already lives on the GPU. CuPy is not a dependency of cuPIQP; install it to run this page (`pip install cupy-cuda12x` or `cupy-cuda13x`). Results come back as `warp.array` objects on the GPU; call `.numpy()` for a host copy or view them from your framework of choice (`cupy.asarray(x)`, `torch.from_dlpack(x)`).
 
 ```python
 import cupy as cp

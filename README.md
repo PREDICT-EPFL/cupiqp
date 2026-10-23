@@ -27,7 +27,7 @@ where $P \succeq 0$ is positive semidefinite, $x \in \mathbb{R}^n$ is the decisi
 
 - **Warp-native** — the solver kernels are written in [Warp](https://github.com/NVIDIA/warp), and every result (solution, status, residuals) is a `warp.array` at a fixed address that your own Warp kernels read directly, without host round trips. Inputs can be any GPU array: `warp.array`, CuPy, CUDA PyTorch tensors, JAX arrays, ... are viewed zero-copy through the CUDA Array Interface or DLPack.
 - **Native batched solving** — solve $B$ independent QPs in parallel from a single solver instance by stacking inputs along a leading batch axis; the inner kernels operate on `(B, …)` tensors with no Python-side loop. Built for sampling-based control, RL rollouts, and parameter sweeps.
-- **Differentiable** — efficient computation of the VJPs via implicit differentiation by reusing the condensed factor from the forward solve (`solver.backward()`). PyTorch and JAX autograd layers are on the way.
+- **Differentiable** — efficient computation of the VJPs via implicit differentiation by reusing the condensed factor from the forward solve (`solver.backward()`). For PyTorch, `cupiqp.torch` provides `DenseSolverLayer`, `SparseSolverLayer` and `MultistageSolverLayer`, differentiable `torch.nn.Module` layers that plug into autograd.
 - **Scales to large QPs** — the same solver handles large sparse and dense QPs, competing with GPU solvers such as cuClarabel, cuOpt, and QOCO-GPU.
 - **Fully GPU-resident, asynchronous solver** — all iterations, KKT factorizations, and linear algebra run on the GPU, and the GPU itself decides when each problem has converged. `solve()` queues the work and returns without waiting.
 - **CUDA Graph capture** — the whole solve runs as one CUDA graph with near-zero kernel-launch overhead. You can also record `update()` and `solve()` into your own CUDA graph, next to your own Warp work, even inside your own `wp.capture_while` loop (sparse backend not supported yet).
@@ -44,7 +44,7 @@ where $P \succeq 0$ is positive semidefinite, $x \in \mathbb{R}^n$ is the decisi
   runtime libraries (cuBLAS, cuSOLVER, cuSPARSE, cuDSS) through nvmath-python.
 
 cuPIQP is not currently published on PyPI. From a local clone, install it
-with one CUDA extra:
+with the extra matching the CUDA version reported by `nvidia-smi`:
 
 ```bash
 git clone https://github.com/PREDICT-EPFL/cupiqp.git
@@ -54,12 +54,9 @@ python -m pip install ".[cuda12]"  # for a CUDA 12.x driver/runtime
 python -m pip install ".[cuda13]"  # for a CUDA 13.x driver/runtime
 ```
 
-If the NVIDIA runtime libraries matching your CUDA version are already installed,
-the base local install is:
-
-```bash
-python -m pip install .
-```
+Add the `torch` extra for the differentiable PyTorch layers, e.g.
+`python -m pip install ".[cuda12,torch]"`. If the NVIDIA runtime libraries matching
+your CUDA version are already installed, `python -m pip install .` is enough.
 
 
 ### Verifying the install
@@ -95,6 +92,7 @@ Installed automatically by `pip install .`; the CUDA extras add the matching NVI
 ## Quick Start
 
 Refer to [this simple example](./examples/getting_started.ipynb) to get started.
+For the PyTorch layers, see [this minimal example](./examples/torch_interface_example.py).
 
 ## Comparison with PIQP
 

@@ -7,7 +7,7 @@ KKT factorization and the storage category of your `P` / `A` / `G` inputs.
 
 | Solver | Matrices `P, A, G` | KKT backend | Use when |
 |---|---|---|---|
-| [`DenseSolver`](#densesolver) | dense `cupy` arrays | dense Cholesky | small-to-medium, dense problems |
+| [`DenseSolver`](#densesolver) | dense GPU arrays | dense Cholesky | small-to-medium, dense problems |
 | [`SparseSolver`](#sparsesolver) | one GPU CSR template + `(B, nnz)` values | sparse LDLᵀ (cuDSS) | large, structurally sparse problems |
 | [`MultistageSolver`](#multistagesolver) | `(diag, offdiag)` block arrays | block Cholesky | block-tridiagonal/-arrow KKT (e.g. OCPs) |
 
@@ -22,7 +22,7 @@ fixed-structure update pattern.
     actionable `TypeError` rather than copied to the device. Convert first:
 
     ```python
-    P_cuda = cupy.asarray(P_numpy)                  # cupy
+    P_cuda = wp.array(P_numpy, device="cuda")       # warp
     P_cuda = torch.tensor(P_numpy, device="cuda")   # torch
     ```
 

@@ -91,7 +91,7 @@ class SolverBase(ABC):
             raise TypeError(
                 "stream must be a warp.Stream or None; got "
                 f"{type(stream).__name__}. Order other frameworks' streams "
-                "with the solver through cupiqp.torch / cupiqp.jax, or with "
+                "with the solver through cupiqp.torch, or with "
                 "warp events on solver.stream."
             )
         self._stream = stream if stream is not None else wp.Stream("cuda")

@@ -30,11 +30,13 @@ nav = [
     { "Backends" = "guide/backends.md" },
     { "Batched Solving" = "guide/batched.md" },
     { "Differentiation" = "guide/differentiation.md" },
+    { "PyTorch Layers" = "guide/torch.md" },
   ] },
   { "API Reference" = [
     { "Solvers" = "api/solvers.md" },
     { "Settings" = "api/settings.md" },
     { "Results & Statuses" = "api/results.md" },
+    { "PyTorch Layers" = "api/torch.md" },
   ] },
 ]
 
