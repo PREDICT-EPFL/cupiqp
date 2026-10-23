@@ -1,0 +1,149 @@
+# Documentation site, built with Zensical (https://zensical.org).
+# Build with:    zensical build --clean
+# Preview with:  zensical serve
+# Dependencies:  python -m pip install --group docs   (pip >= 25.1)
+
+[project]
+site_name = "cuPIQP"
+site_description = "GPU-accelerated proximal interior-point solver for convex quadratic programs: batched, differentiable, and scalable on NVIDIA GPUs."
+site_author = "Fenglong Song"
+site_url = "https://predict-epfl.github.io/cupiqp/"
+copyright = "Copyright &copy; 2026 Fenglong Song, Automatic Control Laboratory, EPFL. Released under the BSD-2-Clause license."
+
+repo_name = "PREDICT-EPFL/cupiqp"
+repo_url = "https://github.com/PREDICT-EPFL/cupiqp"
+edit_uri = "edit/main/docs/"
+
+extra_javascript = [
+  "javascripts/mathjax.js",
+  "https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js",
+]
+
+# Live-reload the API pages when docstrings in the package change.
+watch = ["cupiqp"]
+
+nav = [
+  { "Home" = "index.md" },
+  { "Installation" = "installation.md" },
+  { "Getting Started" = "getting-started.md" },
+  { "User Guide" = [
+    { "Backends" = "guide/backends.md" },
+    { "Batched Solving" = "guide/batched.md" },
+    { "Differentiation" = "guide/differentiation.md" },
+  ] },
+  { "API Reference" = [
+    { "Solvers" = "api/solvers.md" },
+    { "Settings" = "api/settings.md" },
+    { "Results & Statuses" = "api/results.md" },
+  ] },
+]
+
+[project.theme]
+language = "en"
+icon.repo = "fontawesome/brands/github"
+features = [
+  "content.action.edit",
+  "content.code.annotate",
+  "content.code.copy",
+  "content.code.select",
+  "content.footnote.tooltips",
+  "content.tabs.link",
+  "content.tooltips",
+  "navigation.footer",
+  "navigation.indexes",
+  "navigation.instant",
+  "navigation.instant.prefetch",
+  "navigation.path",
+  "navigation.sections",
+  "navigation.top",
+  "navigation.tracking",
+  "search.highlight",
+  "search.suggest",
+  "toc.follow",
+]
+
+# Follow the system color scheme by default; the toggle cycles light / dark / system.
+[[project.theme.palette]]
+media = "(prefers-color-scheme)"
+primary = "indigo"
+accent = "indigo"
+toggle.icon = "lucide/sun-moon"
+toggle.name = "Switch to light mode"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: light)"
+scheme = "default"
+primary = "indigo"
+accent = "indigo"
+toggle.icon = "lucide/sun"
+toggle.name = "Switch to dark mode"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: dark)"
+scheme = "slate"
+primary = "indigo"
+accent = "indigo"
+toggle.icon = "lucide/moon"
+toggle.name = "Switch to system preference"
+
+[project.markdown_extensions]
+abbr = {}
+admonition = {}
+attr_list = {}
+def_list = {}
+footnotes = {}
+md_in_html = {}
+tables = {}
+toc = { permalink = true, toc_depth = 3 }
+pymdownx.arithmatex.generic = true
+pymdownx.details = {}
+pymdownx.emoji.emoji_generator = "zensical.extensions.emoji.to_svg"
+pymdownx.emoji.emoji_index = "zensical.extensions.emoji.twemoji"
+pymdownx.highlight.anchor_linenums = true
+pymdownx.highlight.line_spans = "__span"
+pymdownx.highlight.pygments_lang_class = true
+pymdownx.inlinehilite = {}
+pymdownx.keys = {}
+pymdownx.snippets = {}
+pymdownx.superfences = {}
+pymdownx.tabbed.alternate_style = true
+pymdownx.tabbed.combine_header_slug = true
+pymdownx.tasklist.custom_checkbox = true
+
+[project.plugins.search]
+
+# API reference generated from docstrings via griffe STATIC analysis (parses
+# the source AST, never imports cupiqp), so it builds on a CPU-only runner.
+[project.plugins.mkdocstrings]
+default_handler = "python"
+
+[project.plugins.mkdocstrings.handlers.python]
+paths = ["."]
+
+[project.plugins.mkdocstrings.handlers.python.options]
+# Let overrides without their own docstring (e.g. each backend's setup())
+# inherit the base SolverBase docstring.
+extensions = ["griffe_inherited_docstrings"]
+docstring_style = "numpy"
+docstring_section_style = "table"
+show_root_heading = true
+show_root_full_path = false
+show_symbol_type_heading = true
+show_symbol_type_toc = true
+show_if_no_docstring = false
+inherited_members = false
+members_order = "source"
+separate_signature = true
+show_signature_annotations = true
+merge_init_into_class = true
+filters = ["!^_"]
+heading_level = 2
+
+[[project.extra.social]]
+icon = "fontawesome/brands/github"
+link = "https://github.com/PREDICT-EPFL/cupiqp"
+
+[[project.extra.social]]
+icon = "fontawesome/solid/building-columns"
+link = "https://www.epfl.ch"
+name = "Automatic Control Laboratory, EPFL"

@@ -70,6 +70,26 @@ dev   = [
   "jaxlib>=0.4",
 ]
 
+# --- dependency groups -------------------------------------------------------
+#
+# Development-only dependencies that are not published with the package.
+# Install a group without installing cupiqp itself (pip >= 25.1):
+#
+#   pip install --group docs
+#
+# docs: CPU-only. mkdocstrings reads docstrings from the cupiqp source via
+# griffe's STATIC analysis (it parses the AST, it does not `import cupiqp`),
+# so the API docs build without a GPU installed.
+# Build with `zensical build --clean --strict`, preview with `zensical serve`.
+
+[dependency-groups]
+docs = [
+  "zensical>=0.0.71",
+  "mkdocstrings[python]>=1.0.8",       # older versions break with pymdown-extensions 12
+  "griffe-inherited-docstrings>=1.0",  # overrides inherit base docstrings (e.g. setup())
+  "black>=24.0",                       # lets mkdocstrings pretty-print the generated signatures
+]
+
 [project.urls]
 Homepage   = "https://github.com/PREDICT-EPFL/cupiqp"
 Repository = "https://github.com/PREDICT-EPFL/cupiqp"
