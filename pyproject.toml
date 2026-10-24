@@ -94,6 +94,12 @@ docs = [
   "black>=24.0",                       # lets mkdocstrings pretty-print the generated signatures
 ]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "slow: long-running tests (large benchmark problems); deselect with -m 'not slow'",
+]
+
 [project.urls]
 Homepage   = "https://github.com/PREDICT-EPFL/cupiqp"
 Repository = "https://github.com/PREDICT-EPFL/cupiqp"
