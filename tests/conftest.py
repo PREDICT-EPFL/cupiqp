@@ -4,7 +4,8 @@ Layout: ``linalg/`` (dense and sparse kernels and factorizations), ``kkt/``
 (KKT assembly and solves), ``problem_data/`` (Data containers), ``solver/``
 (end-to-end solves and input handling), ``runtime/`` (streams, CUDA graphs,
 memory and lifetime), ``gradients/`` (backward passes), ``torch_interface/``
-(the PyTorch interface) and ``experimental/`` (APIs not yet public).
+(the PyTorch interface), ``jax_interface/`` (the JAX interface) and
+``experimental/`` (APIs not yet public).
 Shared problem builders and conversions live in ``helpers.py``.
 
 Run GPU tests sequentially: concurrent pytest processes on one GPU produce
