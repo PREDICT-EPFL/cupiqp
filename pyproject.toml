@@ -67,6 +67,10 @@ cuda13 = ["nvmath-python[cu13]>=1.0.0"]
 # this extra only installs PyTorch itself. Install a CUDA build of PyTorch
 # that matches your driver (see https://pytorch.org/get-started/locally/).
 torch = ["torch>=2.4"]
+# The JAX interface (`cupiqp.jax`) ships in every install; this extra only
+# installs JAX itself. Install a CUDA build of JAX that matches your driver,
+# e.g. `pip install "jax[cuda12]"` (see https://docs.jax.dev/en/latest/installation.html).
+jax   = ["jax>=0.6"]
 
 test  = ["pytest>=7"]
 dev   = [

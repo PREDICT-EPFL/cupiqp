@@ -22,7 +22,8 @@ import warp as wp
 
 import cupiqp
 from cupiqp import Status
-from cupiqp.jax import DenseSolver, QPSolution, cache_size, clear_cache
+from cupiqp.jax import DenseSolver, QPSolution, release_solver_memory
+from cupiqp.interfaces.jax.base import cache_info   # test instrumentation, not public API
 
 from tests.helpers import primal_infeasible, random_qp, to_wp_dict
 
@@ -207,7 +208,7 @@ def test_infinite_bounds_change_without_recompilation():
         traces += 1
         return op.solve(**kw)
 
-    clear_cache()
+    release_solver_memory()
     patterns = [
         dict(qp),
         dict(qp, x_l=np.where(np.arange(6) % 2 == 0, -np.inf, qp["x_l"]), h_u=np.full(4, np.inf)),
@@ -219,7 +220,7 @@ def test_infinite_bounds_change_without_recompilation():
         assert solved(sol)
         assert_close(sol, core_solve(problem), unbatched=True)
     assert traces == 1
-    assert cache_size() == 1
+    assert cache_info()["live_solvers"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +265,20 @@ def test_vmap_in_axes_and_shared_arguments():
     expected = core_solve(stacked([dict(qps[0], c=q["c"], b=q["b"]) for q in qps]) | {
         "G": None, "h_u": None, "h_l": None, "x_u": None, "x_l": None})["x"]
     np.testing.assert_allclose(np.asarray(got), expected, **TOL[np.float64])
+
+
+def test_vmap_with_all_shared_solver_inputs():
+    base = to_jax(random_qp(27, n=5, p=0, m=0))
+    op = DenseSolver()
+
+    def solve(P, c):
+        return op.solve(P, c).x
+
+    vmapped = jax.jit(jax.vmap(solve, in_axes=(None, None), axis_size=3))
+    got = vmapped(base["P"], base["c"])
+    expected = jnp.broadcast_to(op.solve(base["P"], base["c"]).x, (3, 5))
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))
+    assert vmapped.lower(base["P"], base["c"]).as_text().count("custom_call") == 1
 
 
 def test_nested_batching_is_rejected():
@@ -408,9 +423,9 @@ def test_inputs_produced_on_the_xla_stream_are_seen():
         assert_close(sol, expected, unbatched=True)
 
 
-def test_cache_counts_signatures_and_clears():
-    clear_cache()
-    assert cache_size() == 0
+def test_cache_counts_and_releases_solvers():
+    release_solver_memory()
+    assert cache_info()["live_solvers"] == 0
     qp = to_jax(random_qp(13, n=4, p=1, m=2))
     op = DenseSolver()
     op.solve(qp["P"], qp["c"])
@@ -418,12 +433,99 @@ def test_cache_counts_signatures_and_clears():
     op.solve(qp["P"], jnp.stack([qp["c"]] * 2))                 # batched c: new signature
     op.solve(qp["P"], qp["c"], A=qp["A"], b=qp["b"])            # more blocks: new signature
     DenseSolver(dtype=jnp.float32).solve(qp["P"].astype(jnp.float32), qp["c"].astype(jnp.float32))
-    assert cache_size() == 4
+    assert cache_info()["live_solvers"] == 4
+    assert cache_info()["signatures"] >= 4                   # signatures outlive released solvers
     solve = jax.jit(lambda P, c: op.solve(P, c).x)
     before = np.asarray(solve(qp["P"], qp["c"]))
-    clear_cache()
-    assert cache_size() == 0
+    release_solver_memory()
+    assert cache_info()["live_solvers"] == 0
     np.testing.assert_array_equal(np.asarray(solve(qp["P"], qp["c"])), before)   # still works
-    assert cache_size() == 1                                                  # and is tracked again
-    clear_cache()
-    assert cache_size() == 0
+    assert cache_info()["live_solvers"] == 1                                                  # and is tracked again
+    release_solver_memory()
+    assert cache_info()["live_solvers"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Pure-function contract and supported settings
+# ---------------------------------------------------------------------------
+
+def test_result_does_not_depend_on_earlier_calls():
+    """The same problem gives bitwise the same solution and diagnostics
+    whatever the cached solver solved before."""
+    target = to_jax(random_qp(20, n=6, p=2, m=4))
+    others = [to_jax(random_qp(seed, n=6, p=2, m=4)) for seed in (21, 22)]
+    infeasible = to_jax(primal_infeasible(random_qp(23, n=6, p=2, m=4)))
+    solver = DenseSolver()
+    release_solver_memory()
+    first = solver.solve(**target)                       # fresh solver: setup path
+    for history in ([others[0]], [infeasible, others[1]], others):
+        for problem in history:
+            solver.solve(**problem)
+        assert_bitwise(solver.solve(**target), first)
+
+
+def test_stateful_and_side_effecting_settings_are_rejected():
+    qp = to_jax(random_qp(24, n=4, p=1, m=2))
+    for name in ("preconditioner_reuse_on_update", "verbose"):
+        solver = DenseSolver()
+        setattr(solver.settings, name, True)
+        before = cache_info()["signatures"]
+        with pytest.raises(ValueError, match=name):
+            solver.solve(**qp)
+        with pytest.raises(ValueError, match=name):
+            jax.jit(lambda **kw: solver.solve(**kw))(**qp)
+        assert cache_info()["signatures"] == before          # rejected before any FFI solve exists
+
+
+def test_backward_only_settings_do_not_create_signatures():
+    qp = to_jax(random_qp(25, n=4, p=1, m=2))
+    solver = DenseSolver()
+    reference = solver.solve(**qp)
+    before = cache_info()["signatures"]
+    solver.settings.enable_grad = True
+    solver.settings.gradient_smoothing = True
+    solver.settings.gradient_on_failure = "zero"
+    solver.settings.compute_timings = True
+    assert_bitwise(solver.solve(**qp), reference)
+    assert cache_info()["signatures"] == before
+
+
+def test_every_setting_is_classified():
+    """A field added to Settings must be classified for the JAX interface,
+    or it would silently join or escape the signature."""
+    from dataclasses import fields
+    from cupiqp.interfaces.jax.base import FORWARD_SETTINGS, IGNORED_SETTINGS, REJECTED_SETTINGS
+    classified = list(FORWARD_SETTINGS) + list(IGNORED_SETTINGS) + list(REJECTED_SETTINGS)
+    assert len(classified) == len(set(classified))
+    assert set(classified) == {f.name for f in fields(cupiqp.Settings)}
+
+
+def test_numpy_arrays_are_accepted():
+    qp = random_qp(26, n=4, p=1, m=2)
+    solver = DenseSolver()
+    assert_bitwise(solver.solve(**{k: np.asarray(v) for k, v in qp.items()}), solver.solve(**to_jax(qp)))
+    with pytest.raises(TypeError, match="must be an array"):
+        solver.solve([[1.0, 0.0], [0.0, 1.0]], np.ones(2))
+
+
+def test_release_right_after_async_dispatch():
+    """release_solver_memory() waits for solves that JAX dispatched but did not
+    finish; the results stay valid and the next call recreates the solver."""
+    qps = [random_qp(seed, n=64, p=16, m=32) for seed in range(64)]
+    args = batch_of(qps, tuple(qps[0]))
+    solver = DenseSolver()
+    solve = jax.jit(lambda **kw: solver.solve(**kw))
+    reference = as_numpy(solve(**args))
+    pending = solve(**args)                                # no block_until_ready
+    release_solver_memory()
+    assert cache_info()["live_solvers"] == 0
+    for name, value in as_numpy(pending).items():
+        np.testing.assert_array_equal(value, reference[name], err_msg=name)
+    assert_bitwise(solve(**args), pending)
+
+
+def test_uses_warp_top_level_jax_api():
+    import inspect
+    import cupiqp.interfaces.jax.base as runtime
+    assert "jax_experimental" not in inspect.getsource(runtime)
+    assert hasattr(wp, "jax_callable") and hasattr(wp, "JaxCallableGraphMode")
