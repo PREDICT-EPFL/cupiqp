@@ -28,6 +28,16 @@ def _make_random_qp(n=8, p=3, m=5, seed=42):
     return dict(P=P, c=c, A=A, b=b, G=G, h_u=h_u, h_l=h_l, x_u=x_u, x_l=x_l)
 
 
+def _make_hard_qp(n=8, p=3, m=5, seed=42):
+    """A random QP whose unconstrained optimum lies far outside the box, so
+    that several bounds are active at the solution. The solver needs more
+    iterations for it than for :func:`_make_random_qp`; batching one with
+    easy problems guarantees per-problem iteration counts that differ."""
+    qp = _make_random_qp(n, p, m, seed=seed)
+    qp["c"] = 1e3 * qp["c"]
+    return qp
+
+
 def _iter_settings(max_iter=None):
     """Deterministic config (no preconditioner / cuda graph) for iter tests."""
     settings = Settings()
@@ -183,11 +193,14 @@ class TestPerProblemIterations:
 
     def test_iter_is_per_problem_and_matches_individual(self):
         """Batched per-problem iter == standalone iter, and differs across
-        problems (before the fix every problem shared the global counter)."""
-        seeds = [42, 123, 77, 999]
-        B = len(seeds)
+        problems (before the fix every problem shared the global counter).
+        Three easy problems and one hard one: easy random problems all take
+        the same number of iterations, so the hard member is what makes the
+        counts differ."""
         n, p, m = 8, 3, 5
-        qps = [_make_random_qp(n, p, m, seed=s) for s in seeds]
+        qps = [_make_random_qp(n, p, m, seed=s) for s in (42, 123, 77)]
+        qps.append(_make_hard_qp(n, p, m, seed=999))
+        B = len(qps)
 
         ref = [_solve_single_iter(q) for q in qps]
         assert all(st == Status.CUPIQP_SOLVED for st, _ in ref)
@@ -246,10 +259,11 @@ class TestPerProblemIterations:
     def test_three_problems_per_problem_iter(self):
         """Three different problems in one batch each freeze at their own
         iteration count (the ``iter < 5`` warm-start branch of the rho/delta
-        update is exercised along the way)."""
-        seeds = [42, 123, 77]
+        update is exercised along the way). Two easy problems and one hard
+        one, so that the counts differ."""
         n, p, m = 8, 3, 5
-        qps = [_make_random_qp(n, p, m, seed=s) for s in seeds]
+        qps = [_make_random_qp(n, p, m, seed=s) for s in (42, 123)]
+        qps.append(_make_hard_qp(n, p, m, seed=77))
 
         ref = [_solve_single_iter(q, _iter_settings(), solver_cls=DenseSolver)
                for q in qps]
@@ -262,7 +276,7 @@ class TestPerProblemIterations:
         statuses = solver.result.info.to_host().status
         iters = [int(v) for v in solver.result.info.to_host().iter]
 
-        for i in range(len(seeds)):
+        for i in range(len(qps)):
             assert statuses[i] == Status.CUPIQP_SOLVED
             assert iters[i] == ref[i][1], (
                 f"problem {i}: batched iter {iters[i]} != standalone {ref[i][1]}")
