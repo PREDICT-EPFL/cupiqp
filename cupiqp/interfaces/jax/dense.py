@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import jax
+import warp as wp
 
 from ...dense.dense_solver import DenseSolver as _CoreDenseSolver
+
 from .base import JaxSolverBase, check_constraint_blocks
 from .types import QPSolution
 
@@ -53,8 +57,17 @@ class DenseSolver(JaxSolverBase):
     unmapped ones stay shared. Mapping over an argument that already has a
     batch axis (nested batching) is not supported.
 
-    **Gradients** are not supported yet; ``jax.grad`` through :meth:`solve`
-    raises.
+    **Gradients.** ``jax.grad`` and ``jax.vjp`` through :meth:`solve` work
+    for every array argument, by implicit differentiation of the KKT
+    conditions (the core's ``backward_from_state()``). The ten solution
+    fields are differentiable; ``status``, ``iterations``, ``primal_res``
+    and ``dual_res`` are diagnostics with no gradient (a loss on them gets a
+    zero gradient). A shared argument's gradient is summed over the batch.
+    The backward refactorizes the KKT system at the saved solution, so it
+    costs about one iteration of the forward; the residuals JAX keeps are
+    the inputs and the solution of each differentiated call. Settings used
+    by the backward (``gradient_on_failure``, ``gradient_smoothing*``) are
+    read when the gradient is traced. Second derivatives are not supported.
 
     **Failures do not raise.** A problem that does not converge, or is
     detected infeasible, is reported in ``solution.status`` with a code of
@@ -138,6 +151,9 @@ class DenseSolver(JaxSolverBase):
     def _input_rank(self, name: str) -> int:
         return 2 if name in ("P", "A", "G") else 1
 
+    def _gradient_arrays(self, gradients: Any, inputs: tuple[str, ...]) -> dict[str, wp.array]:
+        return {name: getattr(gradients, name) for name in inputs}
+
     def solve(
         self,
         P: jax.Array,
@@ -176,7 +192,7 @@ class DenseSolver(JaxSolverBase):
         -------
         QPSolution
             The solution, with a leading batch axis if any argument was
-            batched.
+            batched. Differentiable with respect to every array argument.
 
         Raises
         ------
@@ -194,4 +210,4 @@ class DenseSolver(JaxSolverBase):
         n = int(c.shape[-1])
         p = int(b.shape[-1]) if b is not None else 0
         m = int(G.shape[-2]) if G is not None else 0
-        return self._solve(given, n, p, m, {"P": (n, n), "A": (p, n), "G": (m, n)})
+        return self._compiled(given, n, p, m, {"P": (n, n), "A": (p, n), "G": (m, n)}).function(*given.values())

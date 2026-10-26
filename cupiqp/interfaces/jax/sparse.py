@@ -102,7 +102,8 @@ class SparseSolver(JaxSolverBase):
     for a vector), the dtype and :attr:`settings` are held by the solver
     object, :meth:`solve` works eagerly and under ``jax.jit`` and
     ``jax.vmap``, failures are reported in ``solution.status``, and
-    gradients are not supported yet.
+    gradients flow to every array argument (for a matrix, to its stored
+    values).
 
     Parameters
     ----------
@@ -197,6 +198,12 @@ class SparseSolver(JaxSolverBase):
             arguments[name] = (indptr, indices, inputs[name])
         return arguments
 
+    def _gradient_arrays(self, gradients: Any, inputs: tuple[str, ...]) -> dict[str, wp.array]:
+        """Matrix gradients are the gradients of the stored values, in the
+        order of the pattern."""
+        return {name: (getattr(gradients, name).data if name in self._csr else getattr(gradients, name))
+                for name in inputs}
+
     def solve(
         self,
         P: jax.Array,
@@ -235,7 +242,8 @@ class SparseSolver(JaxSolverBase):
         -------
         QPSolution
             The solution, with a leading batch axis if any argument was
-            batched.
+            batched. Differentiable with respect to every array argument;
+            matrix gradients are the gradients of the stored values.
 
         Raises
         ------
@@ -256,4 +264,4 @@ class SparseSolver(JaxSolverBase):
                 raise ValueError(f"the solver has no pattern for {name}, so {name} values must not be given.")
         check_constraint_blocks(A is not None, b is not None, G is not None, h_l is not None, h_u is not None)
         matrix_shapes = {name: (len(indices),) for name, (_, indices) in self._csr.items()}
-        return self._solve(given, self._n, self._p, self._m, matrix_shapes, self._pattern_key)
+        return self._compiled(given, self._n, self._p, self._m, matrix_shapes, self._pattern_key).function(*given.values())

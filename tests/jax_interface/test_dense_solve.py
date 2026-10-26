@@ -291,12 +291,6 @@ def test_nested_batching_is_rejected():
         op.solve(base["P"], cs[None])
 
 
-def test_grad_is_not_supported_yet():
-    base = to_jax(random_qp(7, n=4, p=1, m=2))
-    with pytest.raises(Exception, match="differentiated"):
-        jax.grad(lambda c: DenseSolver().solve(base["P"], c).x.sum())(base["c"])
-
-
 # ---------------------------------------------------------------------------
 # Statuses and settings
 # ---------------------------------------------------------------------------
@@ -477,14 +471,15 @@ def test_stateful_and_side_effecting_settings_are_rejected():
         assert cache_info()["signatures"] == before          # rejected before any FFI solve exists
 
 
-def test_backward_only_settings_do_not_create_signatures():
+def test_ignored_settings_do_not_create_signatures():
+    """Settings the interface does not read (enable_grad is set by the
+    interface itself, compute_timings) change nothing; gradient settings
+    are part of the signature (see test_dense_grad)."""
     qp = to_jax(random_qp(25, n=4, p=1, m=2))
     solver = DenseSolver()
     reference = solver.solve(**qp)
     before = cache_info()["signatures"]
     solver.settings.enable_grad = True
-    solver.settings.gradient_smoothing = True
-    solver.settings.gradient_on_failure = "zero"
     solver.settings.compute_timings = True
     assert_bitwise(solver.solve(**qp), reference)
     assert cache_info()["signatures"] == before
@@ -494,8 +489,8 @@ def test_every_setting_is_classified():
     """A field added to Settings must be classified for the JAX interface,
     or it would silently join or escape the signature."""
     from dataclasses import fields
-    from cupiqp.interfaces.jax.base import FORWARD_SETTINGS, IGNORED_SETTINGS, REJECTED_SETTINGS
-    classified = list(FORWARD_SETTINGS) + list(IGNORED_SETTINGS) + list(REJECTED_SETTINGS)
+    from cupiqp.interfaces.jax.base import BACKWARD_SETTINGS, FORWARD_SETTINGS, IGNORED_SETTINGS, REJECTED_SETTINGS
+    classified = list(FORWARD_SETTINGS) + list(BACKWARD_SETTINGS) + list(IGNORED_SETTINGS) + list(REJECTED_SETTINGS)
     assert len(classified) == len(set(classified))
     assert set(classified) == {f.name for f in fields(cupiqp.Settings)}
 
@@ -529,3 +524,16 @@ def test_uses_warp_top_level_jax_api():
     import cupiqp.interfaces.jax.base as runtime
     assert "jax_experimental" not in inspect.getsource(runtime)
     assert hasattr(wp, "jax_callable") and hasattr(wp, "JaxCallableGraphMode")
+
+
+def test_device_check_rejects_a_workspace_of_another_device():
+    """A compiled solve keeps its core solver on the device it was created
+    on and refuses to run it from another device. With one GPU the mismatch
+    is simulated with a workspace bound to the CPU device (test
+    instrumentation of the private module)."""
+    from cupiqp.interfaces.jax.base import Workspace, check_device
+    cuda = wp.get_device("cuda")
+    with wp.ScopedStream(wp.Stream(cuda)):
+        check_device(Workspace(stream=None, event=None, solver=None, device=cuda))      # same device: fine
+        with pytest.raises(RuntimeError, match="compiled for cpu"):
+            check_device(Workspace(stream=None, event=None, solver=None, device=wp.get_device("cpu")))

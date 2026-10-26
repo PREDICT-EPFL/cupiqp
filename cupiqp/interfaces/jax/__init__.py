@@ -21,7 +21,8 @@ JAX programs without leaving the device::
         return jnp.where(sol.status[:, None] == 0, sol.x, 0.0)
 
 Arguments are shared (single-problem shape) or batched (leading batch axis),
-exactly as for the core solvers. Gradients are not available yet.
+exactly as for the core solvers. ``jax.grad`` and ``jax.vjp`` work through
+``solve()`` with respect to every array argument.
 
 Importing this module imports JAX. The interface is written for one CUDA
 device: every compiled signature keeps one core solver, on the device XLA

@@ -2,20 +2,29 @@
 
 Read top to bottom:
 
-1. ``JaxSolverBase`` is the base of the public solvers. It holds the dtype and
-   the settings. A subclass implements ``solve()``, which checks its own
-   arguments and hands the arrays to ``JaxSolverBase._solve()``, plus three
-   small methods that say how its backend differs: the rank of each input,
-   and how the inputs become the core ``setup()`` / ``update()`` arguments.
-2. ``_solve()`` turns a call into a *signature*: everything that is static
+1. ``JaxSolverBase`` is the abstract base of the public solvers. It holds the
+   dtype and the settings. A subclass implements ``solve()``, which checks
+   its own arguments, finds the compiled solve with ``_compiled()`` and calls
+   it, plus a few small methods that say how its backend differs: the rank
+   of each input, the core ``setup()`` / ``update()`` arguments, and the
+   gradient of each input.
+2. ``_compiled()`` turns a call into a *signature*: everything that is static
    under ``jax.jit`` (solver class, dtype, forward settings, the inputs
    given with their shapes and batch layout, the backend structure such as
    a sparsity pattern). Each signature gets one ``CompiledSolve`` object, cached
    for the process.
 3. ``CompiledSolve`` owns one XLA custom call (``wp.jax_callable``) whose
-   callback runs one core solver, and one ``jax.jit``-ed
-   function with a ``vmap`` rule that turns a mapped call into one batched
-   call.
+   callback runs one core solver, and one ``jax.jit``-ed function: a
+   ``custom_vjp`` whose primal and whose two rules are ``custom_vmap``
+   functions, so that a mapped call becomes one batched call (JAX batches
+   the rules themselves under ``grad(vmap(f))`` and ``vmap(grad(f))``).
+4. ``CompiledBackward`` is the backward of one signature and one snapshot
+   of the backward settings: a second custom call whose callback runs a
+   second core solver with ``enable_grad`` and ``backward_from_state()``.
+   The forward keeps nothing for it: the ``custom_vjp`` residuals are the
+   forward inputs and the final state (solution, ``rho``, ``delta``,
+   ``status``), owned by JAX. The backward is therefore a pure function of
+   those arrays and the cotangents, at the cost of one KKT factorization.
 
 The custom call is registered as side-effect free, so XLA may drop,
 duplicate or reorder calls. That is sound because every call loads all of
@@ -34,10 +43,12 @@ from __future__ import annotations
 import gc
 import inspect
 import threading
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import warp as wp
 from jax.custom_batching import custom_vmap
@@ -52,7 +63,12 @@ SOLUTION_BLOCKS = {
     "z_l": ("h_l", "m"), "z_u": ("h_u", "m"), "z_bl": ("x_l", "n"), "z_bu": ("x_u", "n"),
     "s_l": ("h_l", "m"), "s_u": ("h_u", "m"), "s_bl": ("x_l", "n"), "s_bu": ("x_u", "n"),
 }
+SOLUTION_FIELDS = tuple(SOLUTION_BLOCKS)
 DIAGNOSTICS = ("status", "iterations", "primal_res", "dual_res")
+#: Forward outputs that are not in QPSolution: residuals of the custom_vjp only.
+_INTERNAL_OUTPUTS = ("rho", "delta")
+#: The custom_vjp residuals taken from the forward outputs, in order.
+_STATE = SOLUTION_FIELDS + ("rho", "delta", "status")
 
 #: Settings that shape a forward solve: they are part of the signature.
 FORWARD_SETTINGS = (
@@ -68,12 +84,15 @@ FORWARD_SETTINGS = (
     "iterative_refinement_static_regularization_rel",
     "use_deterministic_mode_for_cudss", "enable_cuda_graph",
 )
-#: Settings the forward solve does not read (backward only, timings). They
-#: are not part of the signature; ``enable_grad`` is always off here.
-IGNORED_SETTINGS = (
-    "enable_grad", "gradient_smoothing", "gradient_smoothing_mu", "gradient_smoothing_tol",
-    "gradient_smoothing_max_iter", "gradient_on_failure", "compute_timings",
+#: Settings read by the backward only: part of the backward signature, so a
+#: change creates a new backward solver but leaves the forward one.
+BACKWARD_SETTINGS = (
+    "gradient_smoothing", "gradient_smoothing_mu", "gradient_smoothing_tol",
+    "gradient_smoothing_max_iter", "gradient_on_failure",
 )
+#: Settings neither solve reads here. ``enable_grad`` is set by the interface:
+#: off for the forward solver, on for the backward one.
+IGNORED_SETTINGS = ("enable_grad", "compute_timings")
 #: Settings that must keep their default because they would make a call
 #: depend on earlier calls (reused scaling) or have a side effect (printing).
 REJECTED_SETTINGS = {
@@ -84,14 +103,14 @@ REJECTED_SETTINGS = {
 }
 
 
-def settings_snapshot(settings: Settings) -> tuple:
-    """The forward settings as a hashable tuple; rejects unsupported ones."""
+def settings_snapshot(settings: Settings, names: tuple[str, ...] = FORWARD_SETTINGS) -> tuple:
+    """The settings ``names`` as a hashable tuple; rejects unsupported ones."""
     for name, reason in REJECTED_SETTINGS.items():
         if getattr(settings, name):
             raise ValueError(
                 f"settings.{name} = True is not supported by the JAX interface: {reason}."
             )
-    return tuple((name, getattr(settings, name)) for name in FORWARD_SETTINGS)
+    return tuple((name, getattr(settings, name)) for name in names)
 
 
 def check_constraint_blocks(has_A: bool, has_b: bool, has_G: bool, has_h_l: bool, has_h_u: bool) -> None:
@@ -110,12 +129,14 @@ def check_constraint_blocks(has_A: bool, has_b: bool, has_G: bool, has_h_l: bool
 # ---------------------------------------------------------------------------
 
 
-class JaxSolverBase:
+class JaxSolverBase(ABC):
     """Base of the JAX solvers: the floating dtype and the settings.
 
     A subclass sets ``_core_class`` (the core solver it runs), implements
-    ``solve()`` and ``_input_rank()``, and overrides ``_setup_arguments()``
-    / ``_update_arguments()`` when its core takes the inputs in another form
+    ``solve()`` (which checks its arguments and runs
+    ``self._compiled(...).function``), ``_input_rank()`` and
+    ``_gradient_arrays()``, and overrides ``_setup_arguments()`` /
+    ``_update_arguments()`` when its core takes the inputs in another form
     than the FFI passes them.
     """
 
@@ -165,9 +186,18 @@ class JaxSolverBase:
 
     # -- what a backend defines ------------------------------------------
 
+    @abstractmethod
+    def solve(self, *args: Any, **kwargs: Any) -> QPSolution:
+        """Solve the QP (or the batch of QPs) given by the arrays."""
+
+    @abstractmethod
     def _input_rank(self, name: str) -> int:
         """Rank of the input ``name`` for one problem (a batch axis adds one)."""
-        raise NotImplementedError
+
+    @abstractmethod
+    def _gradient_arrays(self, gradients: Any, inputs: tuple[str, ...]) -> dict[str, wp.array]:
+        """The ``(B, ...)`` gradient array of each FFI input in ``inputs``,
+        from the core's gradient ``Data``."""
 
     def _setup_arguments(self, inputs: Mapping[str, wp.array]) -> dict[str, Any]:
         """The core ``setup()`` arguments for the FFI inputs."""
@@ -177,16 +207,9 @@ class JaxSolverBase:
         """The core ``update()`` arguments for the FFI inputs."""
         return dict(inputs)
 
-    def _solve_from_ffi_inputs(self, inputs: dict[str, Any]) -> QPSolution:
-        """``solve()`` called with the FFI inputs as keyword arguments. It
-        exists only for the ``vmap`` rule, which re-enters ``solve()`` with
-        batched arrays; a backend whose ``solve()`` takes the inputs in
-        another form (multistage pairs) overrides it to rebuild that form."""
-        return self.solve(**inputs)
-
     # -- the shared solve path -------------------------------------------
 
-    def _solve(
+    def _compiled(
         self,
         given: dict[str, Any],
         n: int,
@@ -194,9 +217,8 @@ class JaxSolverBase:
         m: int,
         matrix_shapes: Mapping[str, tuple[int, ...]],
         structure: Any = None,
-    ) -> QPSolution:
-        """Check the arrays of a call, find or build its compiled function,
-        and run it.
+    ) -> CompiledSolve:
+        """Check the arrays of a call and find or build its compiled solve.
 
         ``given`` maps the inputs the user passed, in the backend's order,
         to arrays; ``matrix_shapes`` is the single-problem shape of each
@@ -255,11 +277,12 @@ class JaxSolverBase:
             raise ValueError("the batch size must be at least 1.")
 
         signature = (type(self), self._dtype, settings_snapshot(self._settings),
+                     settings_snapshot(self._settings, BACKWARD_SETTINGS),
                      structure, tuple(layout), batch_size)
         compiled = CACHE.get(signature)
         if compiled is None:
             compiled = CACHE[signature] = CompiledSolve(self, signature, n, p, m)
-        return compiled.function(*given.values())
+        return compiled
 
 
 # ---------------------------------------------------------------------------
@@ -272,12 +295,39 @@ CACHE: dict[tuple, "CompiledSolve"] = {}
 @dataclass
 class Workspace:
     """A core solver with the stream it borrows and the event that orders
-    the XLA stream after it."""
+    the XLA stream after it, bound to the CUDA device it was created on."""
 
     stream: wp.Stream
     event: wp.Event
     solver: Any
+    device: Any
     is_setup: bool = False
+
+
+def new_workspace(solver: JaxSolverBase, dtype: Any, settings: Mapping[str, Any],
+                  enable_grad: bool) -> Workspace:
+    """A workspace on the device of Warp's current (the XLA) stream, with a
+    core solver configured from the settings snapshot ``settings``."""
+    device = wp.get_stream().device
+    stream = wp.Stream(device)
+    core = solver._core_class(dtype=dtype, stream=stream)
+    values = dict(settings)
+    core.settings = Settings.for_dtype(values.pop("dtype"))
+    for name, value in values.items():
+        setattr(core.settings, name, value)
+    core.settings.enable_grad = enable_grad
+    return Workspace(stream, wp.Event(device), core, device)
+
+
+def check_device(workspace: Workspace) -> None:
+    """The call runs on the device the workspace was created on."""
+    device = wp.get_stream().device
+    if device != workspace.device:
+        raise RuntimeError(
+            f"this solve was compiled for {workspace.device} and is now called on "
+            f"{device}; the JAX interface keeps one core solver per compiled call, "
+            "on one device."
+        )
 
 
 class CompiledSolve:
@@ -293,10 +343,13 @@ class CompiledSolve:
     """
 
     def __init__(self, solver: JaxSolverBase, signature: tuple, n: int, p: int, m: int) -> None:
-        _, dtype, settings, _, layout, batch_size = signature
+        _, dtype, settings, backward_settings, _, layout, batch_size = signature
+        self.signature = signature
+        self.dims = (n, p, m)
         self.solver = solver
         self.dtype = dtype
         self.settings = settings
+        self.backward_settings = backward_settings
         self.inputs = [(name, rank_shape, batched) for name, rank_shape, batched in layout]
         self.batch_size = batch_size
         self.unbatched = not any(batched for _, _, batched in layout)
@@ -305,11 +358,37 @@ class CompiledSolve:
         for name, (gate, dim) in SOLUTION_BLOCKS.items():
             width = {"n": n, "p": p, "m": m}[dim] if gate is None or gate in given else 0
             self.outputs[name] = (batch_size, width)
-        for name in DIAGNOSTICS:
+        for name in DIAGNOSTICS + _INTERNAL_OUTPUTS:
             self.outputs[name] = (batch_size,)
         self.workspace: Workspace | None = None  # created by the first call
         self.execution_lock = threading.Lock()   # one call at a time on the mutable workspace
+        self.backward: CompiledBackward | None = None   # built by the first gradient
         self.function = self._build_function()
+
+    def batched(self, in_batched, axis_size: int) -> CompiledSolve:
+        """The compiled solve of this call under ``jax.vmap``: the mapped
+        inputs gain a leading batch axis of size ``axis_size``, the others
+        stay shared. Only the batch layout changes, so the signature is this
+        one with that layout; nothing is validated again."""
+        if not self.unbatched:
+            raise NotImplementedError(
+                "jax.vmap over a solve() call whose arguments already carry a "
+                "batch axis (nested batching) is not supported; pass the batch "
+                "to a single call instead."
+            )
+        layout = tuple(
+            (name, shape, bool(batched)) for (name, shape, _), batched in zip(self.inputs, in_batched)
+        )
+        signature = self.signature[:5] + (layout, axis_size)
+        compiled = CACHE.get(signature)
+        if compiled is None:
+            compiled = CACHE[signature] = CompiledSolve(self.solver, signature, *self.dims)
+        return compiled
+
+    def backward_of(self) -> CompiledBackward:
+        if self.backward is None:
+            self.backward = CompiledBackward(self)
+        return self.backward
 
     # -- the XLA custom call ----------------------------------------------
 
@@ -351,14 +430,9 @@ class CompiledSolve:
         with self.execution_lock:
             xla_stream = wp.get_stream()
             if self.workspace is None:
-                stream = wp.Stream(xla_stream.device)
-                core = self.solver._core_class(dtype=self.dtype, stream=stream)
-                values = dict(self.settings)
-                core.settings = Settings.for_dtype(values.pop("dtype"))
-                for name, value in values.items():
-                    setattr(core.settings, name, value)
-                self.workspace = Workspace(stream, wp.Event(xla_stream.device), core)
+                self.workspace = new_workspace(self.solver, self.dtype, self.settings, enable_grad=False)
             workspace = self.workspace
+            check_device(workspace)
             core = workspace.solver
             # The first call also goes through update(), so that every call
             # takes the same path: a solve right after setup() differs from
@@ -380,7 +454,7 @@ class CompiledSolve:
                         source = result.info.status
                     elif name == "iterations":
                         source = result.info.iter
-                    elif name in ("primal_res", "dual_res"):
+                    elif name in ("primal_res", "dual_res", "rho", "delta"):
                         source = getattr(result.info, name)
                     else:
                         source = getattr(result, name)
@@ -388,39 +462,172 @@ class CompiledSolve:
             # XLA continues only once the outputs are written.
             xla_stream.wait_stream(workspace.stream, event=workspace.event)
 
-    # -- the jitted function and its vmap rule -----------------------------
+    # -- the jitted function: custom_vjp over custom_vmap functions --------
 
     def _build_function(self) -> Callable[..., QPSolution]:
         ffi = self._build_callable()
         names = list(self.outputs)
+        def run(arrays):
+            raw = dict(zip(names, ffi(*arrays)))
+            if self.unbatched:
+                raw = {name: value[0] for name, value in raw.items()}
+            return raw
+
+        def solution(raw):
+            return QPSolution(**{name: raw[name] for name in QPSolution._fields})
+
+        all_true = QPSolution(*([True] * len(QPSolution._fields)))
 
         @custom_vmap
-        def solve(*arrays):
-            values = dict(zip(names, ffi(*arrays)))
-            if self.unbatched:
-                values = {name: value[0] for name, value in values.items()}
-            return QPSolution(**values)
+        def primal(*arrays):
+            return solution(run(arrays))
 
-        @solve.def_vmap
-        def solve_vmap(axis_size, in_batched, *arrays):
-            # JAX moves each mapped axis to the front. Mapped inputs now carry
-            # a batch axis, the others are shared: that is a batched call of
-            # the same solver, so re-enter solve() with these arrays.
+        @primal.def_vmap
+        def primal_vmap(axis_size, in_batched, *arrays):
             if not any(in_batched):
-                return solve(*arrays), QPSolution(*([False] * len(QPSolution._fields)))
-            if not self.unbatched:
-                raise NotImplementedError(
-                    "jax.vmap over a solve() call whose arguments already carry a "
-                    "batch axis (nested batching) is not supported; pass the batch "
-                    "to a single call instead."
-                )
-            # Re-enter through the public solve(): it rebuilds the signature
-            # from the batched shapes. _solve_from_ffi_inputs() only maps the
-            # FFI input names back to the solve() arguments.
-            solution = self.solver._solve_from_ffi_inputs(dict(zip((name for name, _, _ in self.inputs), arrays)))
-            return solution, QPSolution(*([True] * len(QPSolution._fields)))
+                return primal(*arrays), QPSolution(*([False] * len(QPSolution._fields)))
+            return self.batched(in_batched, axis_size).function(*arrays), all_true
 
-        return jax.jit(solve)
+        @custom_vmap
+        def forward(*arrays):
+            raw = run(arrays)
+            return solution(raw), (arrays, tuple(raw[name] for name in _STATE))
+
+        @forward.def_vmap
+        def forward_vmap(axis_size, in_batched, *arrays):
+            if not any(in_batched):
+                return forward(*arrays), (QPSolution(*([False] * len(QPSolution._fields))),
+                                          (tuple(in_batched), (False,) * len(_STATE)))
+            compiled = self.batched(in_batched, axis_size)
+            return compiled.forward_rule(*arrays), (all_true, (tuple(in_batched), (True,) * len(_STATE)))
+
+        def backward(residuals, cotangents):
+            arrays, state = residuals
+            # Only the solution fields are differentiable: the cotangents of
+            # status and iterations are float0, those of the residual
+            # diagnostics are ignored.
+            cotangents = tuple(getattr(cotangents, name) for name in SOLUTION_FIELDS)
+            return self.backward_of().function(*arrays, *state, *cotangents)
+
+        function = jax.custom_vjp(primal)
+        function.defvjp(forward, backward)
+        self.forward_rule = forward
+        return jax.jit(function)
+
+
+class CompiledBackward:
+    """The backward of one compiled solve: a custom call whose callback runs
+    a core solver with ``enable_grad`` and ``backward_from_state()``, and the
+    ``custom_vmap`` function around it that returns one cotangent per
+    forward input. The signature of the solve carries the backward settings
+    too, so they are read whenever the forward is."""
+
+    def __init__(self, forward: CompiledSolve) -> None:
+        self.forward = forward
+        self.solver = forward.solver
+        self.dtype = forward.dtype
+        self.settings = forward.settings + forward.backward_settings
+        self.workspace: Workspace | None = None
+        self.execution_lock = threading.Lock()
+        B = forward.batch_size
+        self.inputs = forward.inputs
+        self.state_shapes = {name: forward.outputs[name] for name in _STATE}
+        self.cotangent_shapes = {f"grad_{name}": forward.outputs[name] for name in SOLUTION_FIELDS}
+        self.outputs = {f"d_{name}": (B,) + shape for name, shape, _ in forward.inputs}
+        self.function = self._build_function()
+
+    def _build_callable(self):
+        annotations = {}
+        for name, shape, batched in self.inputs:
+            annotations[name] = wp.array(dtype=self.dtype, ndim=len(shape) + int(batched))
+        for name, shape in self.state_shapes.items():
+            annotations[name] = wp.array(dtype=wp.int32 if name == "status" else self.dtype, ndim=len(shape))
+        for name, shape in self.cotangent_shapes.items():
+            annotations[name] = wp.array(dtype=self.dtype, ndim=len(shape))
+        for name, shape in self.outputs.items():
+            annotations[name] = wp.array(dtype=self.dtype, ndim=len(shape))
+        num_inputs = len(self.inputs) + len(self.state_shapes) + len(self.cotangent_shapes)
+        names = list(annotations)
+
+        def callback(*arrays):
+            self._run(dict(zip(names[:num_inputs], arrays[:num_inputs])),
+                      dict(zip(names[num_inputs:], arrays[num_inputs:])))
+
+        callback.__signature__ = inspect.Signature(
+            [inspect.Parameter(name, inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=annotations[name])
+             for name in names],
+            return_annotation=None,
+        )
+        callback.__annotations__ = {**annotations, "return": None}
+        callback.__name__ = f"cupiqp_{type(self.solver).__name__}_backward"
+        callback.__module__ = __name__
+        return wp.jax_callable(
+            callback, num_outputs=len(self.outputs), graph_mode=wp.JaxCallableGraphMode.NONE,
+            vmap_method=None, output_dims=self.outputs, has_side_effect=False,
+        )
+
+    def _run(self, inputs: dict[str, wp.array], outputs: dict[str, wp.array]) -> None:
+        """The callback body: load the data, differentiate the saved state
+        with the cotangents, write one gradient per forward input."""
+        with self.execution_lock:
+            xla_stream = wp.get_stream()
+            if self.workspace is None:
+                self.workspace = new_workspace(self.solver, self.dtype, self.settings, enable_grad=True)
+            workspace = self.workspace
+            check_device(workspace)
+            core = workspace.solver
+            data = {name: inputs[name] for name, _, _ in self.inputs}
+            if not workspace.is_setup:
+                try:
+                    core.setup(**self.solver._setup_arguments(data))
+                except Exception:
+                    self.workspace = None
+                    close_workspace(workspace)
+                    raise
+                workspace.is_setup = True
+            core.update(**self.solver._update_arguments(data))
+            state = {name: inputs[name] for name in _STATE}
+            cotangents = {
+                name: (inputs[name] if inputs[name].size else None) for name in self.cotangent_shapes
+            }
+            gradients = core.backward_from_state(**state, **cotangents)
+            arrays = self.solver._gradient_arrays(gradients, tuple(data))
+            with wp.ScopedStream(workspace.stream, sync_enter=False):
+                for name in data:
+                    wp.copy(outputs[f"d_{name}"], arrays[name])
+            xla_stream.wait_stream(workspace.stream, event=workspace.event)
+
+    def _build_function(self):
+        ffi = self._build_callable()
+        forward = self.forward
+        num_data = len(self.inputs)
+        batched = [is_batched for _, _, is_batched in self.inputs]
+
+        @custom_vmap
+        def backward(*arrays):
+            data, rest = arrays[:num_data], arrays[num_data:]
+            if forward.unbatched:
+                rest = tuple(value[None] for value in rest)
+            gradients = ffi(*data, *rest)
+            # A shared input's gradient is the sum over the problems.
+            return tuple(g if is_batched else g.sum(axis=0) for g, is_batched in zip(gradients, batched))
+
+        @backward.def_vmap
+        def backward_vmap(axis_size, in_batched, *arrays):
+            data, rest = arrays[:num_data], arrays[num_data:]
+            if not any(in_batched):
+                return backward(*arrays), (False,) * num_data
+            # The state and the cotangents of the batched call all carry the
+            # batch axis; a cotangent JAX instantiated as a constant zero does
+            # not and is broadcast.
+            rest = tuple(
+                value if batched else jnp.broadcast_to(value, (axis_size,) + value.shape)
+                for value, batched in zip(rest, in_batched[num_data:])
+            )
+            compiled = forward.batched(in_batched[:num_data], axis_size)
+            return compiled.backward_of().function(*data, *rest), tuple(in_batched[:num_data])
+
+        return backward
 
 
 def close_workspace(workspace: Workspace) -> None:
@@ -436,10 +643,13 @@ def release_solver_memory() -> None:
     interface keeps, and its GPU memory. Compiled functions stay valid;
     their next call creates its solver again (a slow first call)."""
     for compiled in CACHE.values():
-        with compiled.execution_lock:
-            if compiled.workspace is not None:
-                close_workspace(compiled.workspace)
-                compiled.workspace = None
+        for owner in (compiled, compiled.backward):
+            if owner is None:
+                continue
+            with owner.execution_lock:
+                if owner.workspace is not None:
+                    close_workspace(owner.workspace)
+                    owner.workspace = None
 
 
 def cache_info() -> dict[str, int]:
@@ -449,5 +659,8 @@ def cache_info() -> dict[str, int]:
     GPU memory."""
     return {
         "signatures": len(CACHE),
-        "live_solvers": sum(compiled.workspace is not None for compiled in CACHE.values()),
+        "live_solvers": sum(
+            owner is not None and owner.workspace is not None
+            for compiled in CACHE.values() for owner in (compiled, compiled.backward)
+        ),
     }

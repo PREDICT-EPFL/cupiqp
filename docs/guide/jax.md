@@ -10,8 +10,8 @@ same names) takes JAX arrays, solves on the GPU through an XLA custom call, and 
 [`SparseSolver`](../api/solvers.md#sparsesolver) or
 [`MultistageSolver`](../api/solvers.md#multistagesolver).
 
-Gradients (`jax.grad`) are not available yet; a differentiable version is the
-next phase of this interface.
+`jax.grad` and `jax.vjp` work through every solve; see
+[Gradients](#gradients) below.
 
 ## Installation
 
@@ -200,9 +200,45 @@ solver.settings.eps_abs = 1e-6
 Two settings would break the pure-function contract and raise a `ValueError`
 before anything runs. `preconditioner_reuse_on_update = True` reuses the
 scaling of an earlier call, so a result would depend on what was solved before.
-`verbose = True` prints, which is a side effect XLA may skip or repeat. Settings
-used only by the core's `backward()`, such as `gradient_smoothing`, are ignored
-and do not create a new solver.
+`verbose = True` prints, which is a side effect XLA may skip or repeat.
+
+## Gradients
+
+`jax.grad`, `jax.vjp` and `jax.value_and_grad` work through `solve()` with
+respect to every array argument, by implicit differentiation of the KKT
+conditions at the solution (the core's `backward_from_state()`).
+
+```python
+solver = DenseSolver()
+
+def loss(c):
+    return jnp.sum(solver.solve(P, c, G=G, h_l=h_l, h_u=h_u).x ** 2)
+
+g = jax.grad(loss)(c)                       # (n,)
+gs = jax.jit(jax.vmap(jax.grad(loss)))(cs)  # (B, n): one batched forward, one batched backward
+```
+
+- **What is differentiable.** The ten solution fields `x`, `y`, `z_*` and
+  `s_*`. The diagnostics `status`, `iterations`, `primal_res` and `dual_res`
+  are not: a loss that uses them gets no gradient through them.
+- **Shapes.** Each gradient has the shape its argument was given in. A shared
+  argument's gradient is the sum over the batch. For the sparse solver a
+  matrix gradient is the gradient of its stored values; for the multistage
+  solver each block array gets its own gradient.
+- **Failed problems** follow `settings.gradient_on_failure`, as in the core:
+  `"differentiate"` (default) differentiates the last iterate, `"zero"` gives
+  zero gradients. Read `status` from the forward to know which problems failed.
+- **Backward settings.** `gradient_on_failure` and the `gradient_smoothing*`
+  settings are part of the compiled call, like the forward settings.
+- **Cost and memory.** The backward refactorizes the KKT system at the saved
+  solution, about the cost of one forward iteration. JAX keeps the inputs and
+  the solution of every differentiated call until the backward runs; a
+  `lax.scan` over `T` solves keeps `T` of them.
+- **Purity.** The backward is a pure function of the forward's inputs and
+  solution, which JAX carries as residuals. It works under `jit`, `vmap`,
+  `lax.scan` and any order in which XLA runs forwards and backwards.
+- **Not supported:** second derivatives, forward mode (`jax.jvp`), and
+  gradients with respect to settings or sparsity patterns.
 
 ## What happens underneath
 
@@ -233,4 +269,4 @@ and do not create a new solver.
 | Inputs | JAX arrays, shared or batched | any GPU array, shared or batched |
 | Outputs | new JAX arrays per call | Warp views, overwritten by the next solve |
 | `jit` / `vmap` | yes | no (eager only; JAX arrays accepted as inputs) |
-| Gradients | not yet | `backward()` |
+| Gradients | `jax.grad`, `jax.vjp` | `backward()` |

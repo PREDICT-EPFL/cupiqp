@@ -81,7 +81,8 @@ class MultistageSolver(JaxSolverBase):
     batched (with a leading batch axis), the dtype and :attr:`settings` are
     held by the solver object, :meth:`solve` works eagerly and under
     ``jax.jit`` and ``jax.vmap``, failures are reported in
-    ``solution.status``, and gradients are not supported yet. The solution
+    ``solution.status``, and gradients flow to every array argument,
+    including each block array. The solution
     is in the flat layout, as in the core: ``x`` has shape ``(B, n)``; use
     ``x.reshape(B, N, d)`` for the per-stage view.
 
@@ -138,8 +139,16 @@ class MultistageSolver(JaxSolverBase):
 
     _update_arguments = _setup_arguments
 
-    def _solve_from_ffi_inputs(self, inputs: dict[str, Any]) -> QPSolution:
-        return self.solve(**self._setup_arguments(inputs))
+    def _gradient_arrays(self, gradients: Any, inputs: tuple[str, ...]) -> dict[str, wp.array]:
+        """Block gradients by their FFI names; vector gradients flat."""
+        arrays = {}
+        for name in inputs:
+            if name.endswith(("_diag", "_offdiag")):
+                arrays[name] = getattr(gradients, name)
+            else:
+                value = getattr(gradients, name)
+                arrays[name] = value.reshape((value.shape[0], -1)) if value.ndim == 3 else value
+        return arrays
 
     def solve(
         self,
@@ -232,4 +241,4 @@ class MultistageSolver(JaxSolverBase):
         for name, value in arguments.items():
             if value is not None:
                 given[name] = _flatten(value, *vector_blocks[name]) if name in vector_blocks else value
-        return self._solve(given, N * d, rows_A * r_A, rows_G * r_G, matrix_shapes)
+        return self._compiled(given, N * d, rows_A * r_A, rows_G * r_G, matrix_shapes).function(*given.values())
