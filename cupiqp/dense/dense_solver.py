@@ -97,14 +97,15 @@ class DenseSolver(SolverBase):
     A small inequality-constrained QP (one row is one-sided via ``-inf``):
 
     ```python
-    import cupy as cp
+    import numpy as np
+    import warp as wp
     from cupiqp import DenseSolver, Status
 
-    P = cp.eye(2)
-    c = cp.array([-1.0, -4.0])
-    G = cp.array([[1.0, 1.0]])      # constrain x1 + x2
-    h_l = cp.array([-cp.inf])       # no lower bound on the row
-    h_u = cp.array([1.0])           # x1 + x2 <= 1
+    P = wp.from_numpy(np.eye(2), dtype=wp.float64)
+    c = wp.from_numpy(np.array([-1.0, -4.0]), dtype=wp.float64)
+    G = wp.from_numpy(np.array([[1.0, 1.0]]), dtype=wp.float64)  # constrain x1 + x2
+    h_l = wp.from_numpy(np.array([-np.inf]), dtype=wp.float64)   # no lower bound on the row
+    h_u = wp.from_numpy(np.array([1.0]), dtype=wp.float64)       # x1 + x2 <= 1
 
     solver = DenseSolver()
     solver.setup(P=P, c=c, G=G, h_l=h_l, h_u=h_u)   # all shared: one problem
@@ -117,11 +118,13 @@ class DenseSolver(SolverBase):
     A batch of 8 problems that differ only in ``c``:
 
     ```python
+    rng = np.random.default_rng(0)
     solver = DenseSolver()
-    solver.setup(P=P, c=cp.random.standard_normal((8, 2)),   # batched c: B = 8
-                 G=G, h_l=h_l, h_u=h_u)                       # shared by all 8
+    c_batch = wp.from_numpy(rng.standard_normal((8, 2)), dtype=wp.float64)  # batched c: B = 8
+    solver.setup(P=P, c=c_batch, G=G, h_l=h_l, h_u=h_u)   # P, G, h_l, h_u shared by all 8
     solver.solve()
-    solver.update(c=cp.random.standard_normal((8, 2)))      # new values, same structure
+    c_new = wp.from_numpy(rng.standard_normal((8, 2)), dtype=wp.float64)
+    solver.update(c=c_new)                      # new values, same structure
     solver.solve()
     ```
 

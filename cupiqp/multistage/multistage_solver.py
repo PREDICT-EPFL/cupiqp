@@ -85,18 +85,20 @@ class MultistageSolver(SolverBase):
     Examples
     --------
     ```python
-    import cupy as cp
+    import numpy as np
+    import warp as wp
     from cupiqp import MultistageSolver
 
     N, d = 10, 3
-    P_diag = cp.broadcast_to(2.0 * cp.eye(d), (N, d, d))     # (N, d, d)
-    P_offdiag = cp.broadcast_to(-0.5 * cp.eye(d), (N - 1, d, d))
-    c = cp.ones((N, d))
+    P_diag = wp.from_numpy(np.tile(2.0 * np.eye(d), (N, 1, 1)), dtype=wp.float64)
+    P_offdiag = wp.from_numpy(np.tile(-0.5 * np.eye(d), (N - 1, 1, 1)), dtype=wp.float64)
+    rng = np.random.default_rng(0)
+    c = wp.from_numpy(rng.standard_normal((8, N, d)), dtype=wp.float64)  # batched: B = 8
+    x_l = wp.from_numpy(-np.ones((N, d)), dtype=wp.float64)
+    x_u = wp.from_numpy(np.ones((N, d)), dtype=wp.float64)
 
     s = MultistageSolver()
-    s.setup(P=(P_diag, P_offdiag),                          # shared by all problems
-            c=cp.random.standard_normal((8, N, d)),         # batched: B = 8
-            x_l=-cp.ones((N, d)), x_u=cp.ones((N, d)))
+    s.setup(P=(P_diag, P_offdiag), c=c, x_l=x_l, x_u=x_u)  # P and bounds shared by all 8
     s.solve()
     ```
 
