@@ -28,7 +28,7 @@ where $P \succeq 0$ is positive semidefinite, $x \in \mathbb{R}^n$ is the decisi
 - **Warp-native** — the solver kernels are written in [Warp](https://github.com/NVIDIA/warp), and every result (solution, status, residuals) is a `warp.array` at a fixed address that your own Warp kernels read directly, without host round trips. Inputs can be any GPU array: `warp.array`, CuPy, CUDA PyTorch tensors, JAX arrays, ... are viewed zero-copy through the CUDA Array Interface or DLPack.
 - **Native batched solving** — solve $B$ independent QPs in parallel from a single solver instance by stacking inputs along a leading batch axis; the inner kernels operate on `(B, …)` tensors with no Python-side loop. Built for sampling-based control, RL rollouts, and parameter sweeps.
 - **Differentiable** — efficient computation of the VJPs via implicit differentiation by reusing the condensed factor from the forward solve (`solver.backward()`). For PyTorch, `cupiqp.torch` provides `DenseSolverLayer`, `SparseSolverLayer` and `MultistageSolverLayer`, differentiable `torch.nn.Module` layers that plug into autograd.
-- **JAX-compatible** — `cupiqp.jax.DenseSolver`, `SparseSolver` and `MultistageSolver` solve QPs as pure JAX functions, under `jax.jit` and `jax.vmap` (one native batched solve, no loop); differentiable with `jax.grad`; see the [JAX interface guide](./docs/guide/jax.md).
+- **JAX-compatible** — `cupiqp.jax.DenseSolver`, `SparseSolver` and `MultistageSolver` solve QPs as pure JAX functions, under `jax.jit` and `jax.vmap` (one native batched solve, no loop); differentiable with `jax.grad`; see the [JAX interface guide](https://predict-epfl.github.io/cupiqp/guide/jax/).
 - **Scales to large QPs** — the same solver handles large sparse and dense QPs, competing with GPU solvers such as cuClarabel, cuOpt, and QOCO-GPU.
 - **Fully GPU-resident, asynchronous solver** — all iterations, KKT factorizations, and linear algebra run on the GPU, and the GPU itself decides when each problem has converged. `solve()` queues the work and returns without waiting.
 - **CUDA Graph capture** — the whole solve runs as one CUDA graph with near-zero kernel-launch overhead. You can also record `update()` and `solve()` into your own CUDA graph, next to your own Warp work, even inside your own `wp.capture_while` loop (sparse backend not supported yet).
@@ -44,21 +44,27 @@ where $P \succeq 0$ is positive semidefinite, $x \in \mathbb{R}^n$ is the decisi
   defines extras for CUDA 12.x and CUDA 13.x, which pull in the matching NVIDIA
   runtime libraries (cuBLAS, cuSOLVER, cuSPARSE, cuDSS) through nvmath-python.
 
-cuPIQP is not currently published on PyPI. From a local clone, install it
-with the extra matching the CUDA version reported by `nvidia-smi`:
+Install cuPIQP from PyPI with the extra matching the CUDA version reported by
+`nvidia-smi`:
+
+```bash
+python -m pip install "cupiqp[cuda12]"  # for a CUDA 12.x driver/runtime
+# or:
+python -m pip install "cupiqp[cuda13]"  # for a CUDA 13.x driver/runtime
+```
+
+Add the `torch` extra for the differentiable PyTorch layers, e.g.
+`python -m pip install "cupiqp[cuda12,torch]"`, or the `jax` extra for the JAX interface
+(then install a CUDA build of JAX, e.g. `python -m pip install "jax[cuda12]"`). If the NVIDIA runtime libraries matching
+your CUDA version are already installed, `python -m pip install cupiqp` is enough.
+
+To install the latest development version from source instead:
 
 ```bash
 git clone https://github.com/PREDICT-EPFL/cupiqp.git
 cd cupiqp
-python -m pip install ".[cuda12]"  # for a CUDA 12.x driver/runtime
-# or:
-python -m pip install ".[cuda13]"  # for a CUDA 13.x driver/runtime
+python -m pip install ".[cuda12]"  # or ".[cuda13]"
 ```
-
-Add the `torch` extra for the differentiable PyTorch layers, e.g.
-`python -m pip install ".[cuda12,torch]"`, or the `jax` extra for the JAX interface
-(then install a CUDA build of JAX, e.g. `python -m pip install "jax[cuda12]"`). If the NVIDIA runtime libraries matching
-your CUDA version are already installed, `python -m pip install .` is enough.
 
 
 ### Verifying the install
@@ -83,7 +89,7 @@ print(x.numpy())                                 # [[-1. -1. -1.]]
 
 ### Runtime dependencies (for reference)
 
-Installed automatically by `pip install .`; the CUDA extras add the matching NVIDIA runtime libraries:
+Installed automatically with cuPIQP; the CUDA extras add the matching NVIDIA runtime libraries:
 
 - [Warp](https://github.com/NVIDIA/warp) — the solver's arrays and JIT-compiled CUDA kernels.
 - [nvmath-python](https://developer.nvidia.com/nvmath-python) — cuBLAS / cuSOLVER / cuSPARSE / cuDSS bindings and CUDA runtime packages via the selected CUDA extra.
@@ -93,8 +99,8 @@ Installed automatically by `pip install .`; the CUDA extras add the matching NVI
 
 ## Quick Start
 
-Refer to [this simple example](./examples/getting_started.ipynb) to get started.
-For the PyTorch layers, see [this minimal example](./examples/torch_interface_example.py).
+Refer to [this simple example](https://github.com/PREDICT-EPFL/cupiqp/blob/main/examples/getting_started.ipynb) to get started.
+For the PyTorch layers, see [this minimal example](https://github.com/PREDICT-EPFL/cupiqp/blob/main/examples/torch_interface_example.py).
 
 ## Comparison with PIQP
 

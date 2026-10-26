@@ -14,11 +14,11 @@ implicit differentiation of the KKT conditions, to every tensor you passed in.
 ## Installation
 
 The layers ship with every install of cuPIQP; the `torch` extra installs PyTorch
-itself. From the repository root, combine it with the CUDA extra you need (see
+itself. Combine it with the CUDA extra you need (see
 [Installation](../installation.md)):
 
 ```bash
-python -m pip install ".[cuda12,torch]"
+python -m pip install "cupiqp[cuda12,torch]"
 ```
 
 `import cupiqp` does not import PyTorch. It is imported when you first access

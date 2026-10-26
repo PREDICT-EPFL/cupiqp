@@ -15,12 +15,35 @@
     `numpy.ndarray` are **rejected**, not silently copied to the device. Convert them
     explicitly first, e.g. with `wp.array(x_numpy, device="cuda")`.
 
+## Install from PyPI
+
+Install cuPIQP with the CUDA extra that matches the CUDA version reported by
+`nvidia-smi`. **Pick your CUDA version once** in the tabs below; every install
+command on this page then follows the same choice.
+
+=== "CUDA 12.x"
+
+    ```bash
+    python -m pip install "cupiqp[cuda12]"
+    ```
+
+=== "CUDA 13.x"
+
+    ```bash
+    python -m pip install "cupiqp[cuda13]"
+    ```
+
+If the NVIDIA runtime libraries matching your CUDA version are already installed in
+your environment, the bare install is enough:
+
+```bash
+python -m pip install cupiqp
+```
+
 ## Install from source
 
-cuPIQP is not currently published on PyPI. Clone the repository and install it with
-the CUDA extra that matches the CUDA version reported by `nvidia-smi`. **Pick your
-CUDA version once** in the tabs below; every install command on this page then
-follows the same choice.
+To get the latest development version, clone the repository and install it with
+the same CUDA extra:
 
 === "CUDA 12.x"
 
@@ -38,36 +61,30 @@ follows the same choice.
     python -m pip install ".[cuda13]"
     ```
 
-If the NVIDIA runtime libraries matching your CUDA version are already installed in
-your environment, the bare local install is enough:
-
-```bash
-python -m pip install .
-```
-
 ## Optional extras
 
 cuPIQP ships all three solver backends (**dense, sparse, and multistage**) and the
-PyTorch layers in every install. The extras only add third-party dependencies:
+PyTorch and JAX interfaces in every install. The extras only add third-party dependencies:
 
 | Extra    | Installs                                                        |
 | -------- | --------------------------------------------------------------- |
 | `cuda12` | NVIDIA runtime libraries for CUDA 12.x, through nvmath-python   |
 | `cuda13` | NVIDIA runtime libraries for CUDA 13.x, through nvmath-python   |
 | `torch`  | PyTorch, for the differentiable layers in [`cupiqp.torch`](guide/torch.md) |
+| `jax`    | JAX, for the interface in [`cupiqp.jax`](guide/jax.md)          |
 
-Extras combine, for example (from the repository root):
+Extras combine, for example:
 
 === "CUDA 12.x"
 
     ```bash
-    python -m pip install ".[cuda12,torch]"
+    python -m pip install "cupiqp[cuda12,torch]"
     ```
 
 === "CUDA 13.x"
 
     ```bash
-    python -m pip install ".[cuda13,torch]"
+    python -m pip install "cupiqp[cuda13,torch]"
     ```
 
 !!! note "Choosing the CUDA extra"

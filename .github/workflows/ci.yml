@@ -1,0 +1,125 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Lets release.yml run this whole workflow as the gate before publishing.
+  workflow_call:
+
+# Cancel older runs on the same branch/PR when a new commit is pushed.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # CPU-only static checks. These run on GitHub-hosted runners (no GPU), so we
+  # avoid importing cupiqp at runtime — CuPy/Warp would fail without CUDA.
+  # ---------------------------------------------------------------------------
+  static-checks:
+    name: static-checks (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install lint/build tooling
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ruff build
+
+      # Advisory for now: surface issues without failing the build until a
+      # ruff config is committed to pyproject.toml. Flip to a hard failure
+      # once the codebase is clean.
+      - name: Ruff lint (advisory)
+        continue-on-error: true
+        run: ruff check cupiqp tests
+
+      - name: Ruff format check (advisory)
+        continue-on-error: true
+        run: ruff format --check cupiqp tests
+
+      # Syntax-level check: compiles every .py file in the package and tests.
+      # Catches typos, indentation, and stale syntax without needing CUDA libs
+      # to be importable.
+      - name: Byte-compile package and tests
+        run: python -m compileall -q cupiqp tests
+
+      # Confirms the package builds an sdist + wheel cleanly.
+      - name: Build sdist and wheel
+        run: python -m build
+
+      - name: Upload built artifacts
+        if: matrix.python-version == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cupiqp-dist
+          path: dist/*
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # GPU tests on a self-hosted runner with an NVIDIA GPU + CUDA installed.
+  # The runner must be labeled `self-hosted`, `linux`, and `gpu`.
+  #
+  # SECURITY: this repo is public, so the `pull_request` trigger is gated to
+  # PRs from the same repo (not forks). Fork PRs would let arbitrary code run
+  # on your lab machine. For fork PR coverage, switch to `pull_request_target`
+  # only after adding manual approval (e.g. an `if: github.event.label.name`
+  # gate) — never enable it blindly.
+  # ---------------------------------------------------------------------------
+  gpu-tests:
+    name: gpu-tests
+    runs-on: [self-hosted, linux, gpu]
+    needs: static-checks
+    # Skip on fork PRs to keep the runner safe. When release.yml calls this
+    # workflow, github.event_name is the caller's event ('release' or
+    # 'workflow_dispatch'); both can only be triggered by maintainers.
+    if: >-
+      github.event_name == 'push'
+      || github.event_name == 'release'
+      || github.event_name == 'workflow_dispatch'
+      || github.event.pull_request.head.repo.full_name == github.repository
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show GPU and CUDA
+        run: |
+          nvidia-smi
+          nvcc --version || true
+
+      # The runner is expected to have a pre-built conda/venv env with the
+      # CUDA-bound deps (cupy-cuda13x or cuda12x, torch+cuXY, jax-cudaXY)
+      # already installed — see README. Point CI at it via the
+      # CUPIQP_CI_PYTHON repo/runner variable, falling back to `python`.
+      - name: Resolve Python interpreter
+        id: py
+        run: |
+          PY="${CUPIQP_CI_PYTHON:-python}"
+          echo "bin=$PY" >> "$GITHUB_OUTPUT"
+          "$PY" --version
+        env:
+          CUPIQP_CI_PYTHON: ${{ vars.CUPIQP_CI_PYTHON }}
+
+      - name: Install cupiqp into the runner env
+        run: |
+          ${{ steps.py.outputs.bin }} -m pip install --upgrade pip
+          ${{ steps.py.outputs.bin }} -m pip install -e ".[test]"
+
+      - name: Smoke import
+        run: ${{ steps.py.outputs.bin }} -c "import cupiqp; print(cupiqp.__file__)"
+
+      - name: Run pytest
+        run: ${{ steps.py.outputs.bin }} -m pytest tests/ -v --maxfail=5 --durations=20

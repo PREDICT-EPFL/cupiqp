@@ -21,7 +21,7 @@ JAX itself. Install a CUDA build of JAX that matches your driver (see the
 for example together with the CUDA extra you need:
 
 ```bash
-python -m pip install ".[cuda12,jax]"
+python -m pip install "cupiqp[cuda12,jax]"
 python -m pip install "jax[cuda12]"
 ```
 

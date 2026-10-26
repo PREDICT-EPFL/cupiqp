@@ -105,9 +105,11 @@ markers = [
 ]
 
 [project.urls]
-Homepage   = "https://github.com/PREDICT-EPFL/cupiqp"
-Repository = "https://github.com/PREDICT-EPFL/cupiqp"
-Issues     = "https://github.com/PREDICT-EPFL/cupiqp/issues"
+Homepage      = "https://github.com/PREDICT-EPFL/cupiqp"
+Documentation = "https://predict-epfl.github.io/cupiqp/"
+Repository    = "https://github.com/PREDICT-EPFL/cupiqp"
+Issues        = "https://github.com/PREDICT-EPFL/cupiqp/issues"
+Changelog     = "https://github.com/PREDICT-EPFL/cupiqp/blob/main/CHANGELOG.md"
 
 
 # --- packaging -------------------------------------------------------------
