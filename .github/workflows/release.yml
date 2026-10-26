@@ -6,8 +6,9 @@ name: Build and upload to PyPI
 # Release flow:
 #   1. Set `version` in pyproject.toml and date the entry in CHANGELOG.md.
 #   2. Merge into main, then create a GitHub Release with tag `v<version>`.
-#   3. Publishing the Release runs this workflow: the CI gate (static checks
-#      and GPU tests), then build, then upload to PyPI.
+#   3. Publishing the Release runs this workflow: the CI gate (static checks,
+#      and GPU tests if enabled), then build, then upload to PyPI.
+#      Without a GPU runner, run the GPU test suite locally before releasing.
 #
 # Dry run: start this workflow by hand from the Actions tab
 # (workflow_dispatch). It runs the same gate and build, then uploads to
@@ -30,7 +31,8 @@ on:
 jobs:
   tests:
     name: Tests
-    # Static checks plus the GPU tests on the self-hosted runner.
+    # Static checks, plus the GPU tests on the self-hosted runner when the
+    # repository variable GPU_RUNNER_ENABLED is 'true' (see ci.yml).
     uses: ./.github/workflows/ci.yml
 
   build:

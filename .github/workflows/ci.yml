@@ -73,6 +73,11 @@ jobs:
   # GPU tests on a self-hosted runner with an NVIDIA GPU + CUDA installed.
   # The runner must be labeled `self-hosted`, `linux`, and `gpu`.
   #
+  # Opt-in: the job runs only when the repository variable GPU_RUNNER_ENABLED
+  # is 'true' (Settings -> Secrets and variables -> Actions -> Variables).
+  # Without it the job is skipped instead of waiting for a runner that does
+  # not exist, and a skipped job does not block CI or releases.
+  #
   # SECURITY: this repo is public, so the `pull_request` trigger is gated to
   # PRs from the same repo (not forks). Fork PRs would let arbitrary code run
   # on your lab machine. For fork PR coverage, switch to `pull_request_target`
@@ -87,10 +92,11 @@ jobs:
     # workflow, github.event_name is the caller's event ('release' or
     # 'workflow_dispatch'); both can only be triggered by maintainers.
     if: >-
-      github.event_name == 'push'
-      || github.event_name == 'release'
-      || github.event_name == 'workflow_dispatch'
-      || github.event.pull_request.head.repo.full_name == github.repository
+      vars.GPU_RUNNER_ENABLED == 'true'
+      && (github.event_name == 'push'
+          || github.event_name == 'release'
+          || github.event_name == 'workflow_dispatch'
+          || github.event.pull_request.head.repo.full_name == github.repository)
 
     steps:
       - uses: actions/checkout@v4
