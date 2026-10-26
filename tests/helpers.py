@@ -128,3 +128,12 @@ def layer_statuses(layer) -> tuple:
     """Per-problem ``Status`` of the latest call of a PyTorch solver layer
     (an explicit device-to-host read)."""
     return tuple(Status(int(v)) for v in layer.result.status.cpu().tolist())
+
+
+def device_settings(settings, data):
+    """The device copy of ``settings`` for a KKTSystem built directly from
+    ``data`` in a unit test (the solver owns and uploads it otherwise)."""
+    from cupiqp.settings import DeviceSettings
+    device = DeviceSettings(data.dtype, data.device)
+    device.upload(settings)
+    return device

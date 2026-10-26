@@ -173,6 +173,9 @@ class SettingsFloatIdx(IntEnum):
     reg_lower_limit = 7
     reg_finetune_lower_limit = 8
     tau = 9
+    iterative_refinement_eps_abs = 10
+    iterative_refinement_eps_rel = 11
+    iterative_refinement_min_improvement_rate = 12
 
 
 class SettingsIntIdx(IntEnum):
@@ -182,6 +185,7 @@ class SettingsIntIdx(IntEnum):
     reg_finetune_dual_update_threshold = 2
     max_iter = 3
     max_factor_retires = 4
+    iterative_refinement_max_iter = 5
 
 
 class DeviceSettings:
@@ -235,6 +239,9 @@ class DeviceSettings:
             F.reg_lower_limit: settings.reg_lower_limit,
             F.reg_finetune_lower_limit: settings.reg_finetune_lower_limit,
             F.tau: settings.tau,
+            F.iterative_refinement_eps_abs: settings.iterative_refinement_eps_abs,
+            F.iterative_refinement_eps_rel: settings.iterative_refinement_eps_rel,
+            F.iterative_refinement_min_improvement_rate: settings.iterative_refinement_min_improvement_rate,
         }
         ints = {
             I.check_duality_gap: 1 if settings.check_duality_gap else 0,
@@ -242,6 +249,7 @@ class DeviceSettings:
             I.reg_finetune_dual_update_threshold: settings.reg_finetune_dual_update_threshold,
             I.max_iter: settings.max_iter if max_iter is None else int(max_iter),
             I.max_factor_retires: settings.max_factor_retires,
+            I.iterative_refinement_max_iter: settings.iterative_refinement_max_iter,
         }
         values = (tuple(floats.items()), tuple(ints.items()))
         if values == self._uploaded:

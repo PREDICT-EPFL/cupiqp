@@ -22,7 +22,7 @@ from cupiqp.dense.dense_preconditioner import DenseRuizEquilibration
 from cupiqp.kkt_systems import KKTSystem
 from cupiqp.results import Variables
 from cupiqp.settings import Settings
-from tests.helpers import to_wp, to_wp_dict
+from tests.helpers import to_wp, to_wp_dict, device_settings
 
 
 def _dense_data(**kw):
@@ -205,7 +205,7 @@ def _run_full_solve(B, n, p, m, seed=42, with_box=True):
     data = _make_data(B, n, p, m, seed=seed, with_box=with_box)
     settings = Settings()
     kkt_sys = KKTSystem()
-    kkt_sys.init(data, settings)
+    kkt_sys.init(data, settings, device_settings(settings, data))
     pc = DenseRuizEquilibration(B, data.n, data.p, data.m, has_h_l=data.has_h_l, has_h_u=data.has_h_u, has_x_l=data.has_x_l, has_x_u=data.has_x_u)
 
     rng = np.random.default_rng(seed + 200)
@@ -404,7 +404,7 @@ class TestKKTSystemEqualityOnly:
         )
         settings = Settings()
         kkt_sys = KKTSystem()
-        kkt_sys.init(data, settings)
+        kkt_sys.init(data, settings, device_settings(settings, data))
         pc = DenseRuizEquilibration(B, data.n, data.p, data.m, has_h_l=data.has_h_l, has_h_u=data.has_h_u, has_x_l=data.has_x_l, has_x_u=data.has_x_u)
 
         vars = Variables(); vars.init(data)
@@ -458,7 +458,7 @@ class TestKKTSystemCondensedMatvec:
         data = _make_data(B, n, p, m)
         settings = Settings()
         kkt_sys = KKTSystem()
-        kkt_sys.init(data, settings)
+        kkt_sys.init(data, settings, device_settings(settings, data))
         pc = DenseRuizEquilibration(B, data.n, data.p, data.m, has_h_l=data.has_h_l, has_h_u=data.has_h_u, has_x_l=data.has_x_l, has_x_u=data.has_x_u)
 
         vars = _make_positive_vars(data)
@@ -510,7 +510,7 @@ class TestKKTSystemMatvec:
         data = _make_data(B=B, n=n, p=p, m=m)
         settings = Settings()
         kkt_sys = KKTSystem()
-        kkt_sys.init(data, settings)
+        kkt_sys.init(data, settings, device_settings(settings, data))
 
         x = np.random.default_rng(0).standard_normal((B, n))
         z = _zeros(B, n)
@@ -526,7 +526,7 @@ class TestKKTSystemMatvec:
         data = _make_data(B=B, n=n, p=p, m=m)
         settings = Settings()
         kkt_sys = KKTSystem()
-        kkt_sys.init(data, settings)
+        kkt_sys.init(data, settings, device_settings(settings, data))
 
         x = np.random.default_rng(1).standard_normal((B, n))
         y = np.random.default_rng(2).standard_normal((B, p))
