@@ -1,18 +1,32 @@
+import functools
+from typing import Any
+
 import warp as wp
 from .utils import to_warp_dtype
+from .solver_kernels import finite_value
 
 
+wp.set_module_options({"enable_backward": False})
+
+
+# Generic and at module level for the reason given in solver_kernels.py: a
+# @wp.func inside a kernel factory keeps the calling frames, and the solver,
+# alive until the cyclic garbage collector runs.
+@wp.func
+def ruiz_limit_scaling(d: Any, min_scaling: Any, max_scaling: Any):
+    """Ruiz scaling factor ``d`` limited to ``[min_scaling, max_scaling]``;
+    a factor below ``min_scaling`` is replaced by 1."""
+    if d < min_scaling:
+        return type(d)(1.0)
+    if d > max_scaling:
+        return max_scaling
+    return d
+
+
+@functools.lru_cache(maxsize=None)
 def create_clamp_and_rsqrt_kernel(n: int, p: int, m: int,
                               min_scaling: float, max_scaling: float, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
-    @wp.func
-    def _ruiz_limit_scaling(d: dtype, min_scaling: dtype, max_scaling: dtype) -> dtype:
-        if d < min_scaling:
-            return dtype(1.0)
-        if d > max_scaling:
-            return max_scaling
-        return d
-
     """Fused the following cupy chain:
 
         delta_iter[delta_iter < self.min_scaling] = 1.0
@@ -33,17 +47,18 @@ def create_clamp_and_rsqrt_kernel(n: int, p: int, m: int,
     ):
         b, k = wp.tid()
         delta = delta_iter[b, k]
-        delta = _ruiz_limit_scaling(delta, dtype(low), dtype(high))
+        delta = ruiz_limit_scaling(delta, dtype(low), dtype(high))
         delta_iter[b, k] = dtype(1.0) / wp.sqrt(delta)
 
         if k < wp.static(n):
             delta_b = delta_b_iter[b, k]
-            delta_b = _ruiz_limit_scaling(delta_b, dtype(low), dtype(high))
+            delta_b = ruiz_limit_scaling(delta_b, dtype(low), dtype(high))
             delta_b_iter[b, k] = dtype(1.0) / wp.sqrt(delta_b)
 
     return clamp_rsqrt_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_calc_scaling_inv_and_scale_bounds_kernel(
     n: int, p: int, m: int,
     num_hl: int, num_hu: int, num_xl: int, num_xu: int,
@@ -155,6 +170,7 @@ dtype=wp.float64):
     return finalize_and_scale_bounds_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_scale_bounds_kernel(n: int, p: int, m: int, has_h_l: bool, has_h_u: bool, has_x_l: bool, has_x_u: bool, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Sentinel-safe in-place forward bound scaling, single launch (B, n+p+m).
@@ -202,6 +218,7 @@ def create_scale_bounds_kernel(n: int, p: int, m: int, has_h_l: bool, has_h_u: b
     return scale_bounds_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_unscale_bounds_kernel(n: int, p: int, m: int, has_h_l: bool, has_h_u: bool, has_x_l: bool, has_x_u: bool, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Sentinel-safe in-place inverse bound scaling, single launch (B, n+p+m).
@@ -255,6 +272,7 @@ def create_unscale_bounds_kernel(n: int, p: int, m: int, has_h_l: bool, has_h_u:
     return unscale_bounds_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_accumulate_deltas_kernel(n: int, p: int, m: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Fused per-iteration state update.
@@ -287,145 +305,168 @@ def create_accumulate_deltas_kernel(n: int, p: int, m: int, dtype=wp.float64):
     return accumulate_deltas_kernel
 
 
-def create_ruiz_conv_check_kernel(n: int, p: int, m: int, dtype=wp.float64):
+@functools.lru_cache(maxsize=None)
+def create_ruiz_conv_check_kernel(dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
-    @wp.func
-    def _diff_with_one(d: dtype) -> dtype:
-        return wp.abs(dtype(1.0) - d)
+    """Per-batch Ruiz convergence measure, reduced over the whole batch.
 
-    """Tile-based per-batch convergence reduction.
+        conv = max_b max( max_k |1 - delta_iter[b, k]|, max_k |1 - delta_b_iter[b, k]| )
 
-    Replaces the 4-launch cupy chain
-
-        c1 = float(cp.max(cp.abs(1 - delta_iter)))   # 2 launches + sync
-        c2 = float(cp.max(cp.abs(1 - delta_b_iter))) # 2 launches + sync
-        conv = max(c1, c2)
-
-    with one launch dispatched ``wp.launch_tiled(dim=[B])``. Writes per-batch
-    max of ``|1 - delta_iter|`` into ``conv_buf[2*b]`` and per-batch max of
-    ``|1 - delta_b_iter|`` into ``conv_buf[2*b + 1]``. Host then does one
-    ``float(cp.max(conv_buf))`` + one sync.
+    ``conv_out`` is a one-element atomic-max accumulator; zero it before the
+    launch and read it back once. Dispatch with
+    ``wp.launch_tiled(dim=[B], block_dim=reduction_block_dim(width))``.
     """
-    total = n + p + m
-
-    @wp.kernel
+    @wp.kernel(module="unique", enable_backward=False)
     def conv_check_kernel(
         delta_iter:   wp.array2d(dtype=dtype),   # type: ignore  (B, n+p+m)
         delta_b_iter: wp.array2d(dtype=dtype),   # type: ignore  (B, n)
-        conv_buf:     wp.array(dtype=dtype),     # type: ignore  (2B,) output
+        conv_out:     wp.array(dtype=dtype),     # type: ignore  (1,) output
     ):
-        b, _ = wp.tid()
-
-        d_tile = wp.tile_load(delta_iter[b], shape=total)
-        d_abs = wp.tile_map(_diff_with_one, d_tile)
-        max_d = wp.tile_max(d_abs)
-        wp.tile_store(conv_buf, max_d, offset=2 * b)
-
-        db_tile = wp.tile_load(delta_b_iter[b], shape=n)
-        db_abs = wp.tile_map(_diff_with_one, db_tile)
-        max_db = wp.tile_max(db_abs)
-        wp.tile_store(conv_buf, max_db, offset=2 * b + 1)
+        b, i = wp.tid()
+        bd = wp.block_dim()
+        v = dtype(0.0)
+        for k in range(i, delta_iter.shape[1], bd):
+            v = wp.max(v, wp.abs(dtype(1.0) - delta_iter[b, k]))
+        for k in range(i, delta_b_iter.shape[1], bd):
+            v = wp.max(v, wp.abs(dtype(1.0) - delta_b_iter[b, k]))
+        red = wp.tile_max(wp.tile(v))
+        if i == 0:
+            wp.atomic_max(conv_out, 0, red[0])
 
     return conv_check_kernel
 
 
-def create_compute_constraints_rhs_inf_norm_unscaled_kernel(
-    n: int, p: int, m: int,
-    num_hl: int, num_hu: int, num_xl: int, num_xu: int,
-dtype=wp.float64):
+@functools.lru_cache(maxsize=None)
+def create_compute_constraints_rhs_inf_norm_unscaled_kernel(dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
-    """Tile-based per-batch unscaled-RHS inf-norm reduction.
+    """Per-batch inf-norm of the user-space (unscaled) constraint right-hand sides.
 
-        Perform:
+        out[b] = max( max_k |delta_inv_y * b|,
+                      max_k |finite_mask_hu * delta_inv_z * h_u|,
+                      max_k |finite_mask_hl * delta_inv_z * h_l|,
+                      max_k |finite_mask_xu * delta_b_inv * x_u|,
+                      max_k |finite_mask_xl * delta_b_inv * x_l| )
 
-        out.fill(0.0)
-        if p > 0:        max(out, max_axis1(|delta_inv_y * b|))
-        if num_hu > 0:   max(out, max_axis1(|finite_mask_hu * delta_inv_z * h_u|))
-        if num_hl > 0:   max(out, max_axis1(|finite_mask_hl * delta_inv_z * h_l|))
-        if num_xu > 0:   max(out, max_axis1(|finite_mask_xu * delta_b_inv * x_u|))
-        if num_xl > 0:   max(out, max_axis1(|finite_mask_xl * delta_b_inv * x_l|))
+    over the blocks that exist (an absent block is ``(B, 0)``). Dispatch with
+    ``wp.launch_tiled(dim=[B], block_dim=reduction_block_dim(width))``.
     """
-    @wp.func
-    def finite_value(v: dtype, mask: dtype) -> dtype:
-        return wp.where(mask > dtype(0.5), v, dtype(0.0))
-
-    @wp.kernel
+    @wp.kernel(module="unique", enable_backward=False)
     def kernel(
         delta_inv:   wp.array2d(dtype=dtype),  # type: ignore  (B, n+p+m)
         delta_b_inv: wp.array2d(dtype=dtype),  # type: ignore  (B, n)
         data_b:      wp.array2d(dtype=dtype),  # type: ignore  (B, p)
-        data_h_l:    wp.array2d(dtype=dtype),  # type: ignore  (B, m)
-        data_h_u:    wp.array2d(dtype=dtype),  # type: ignore  (B, m)
-        data_x_l:    wp.array2d(dtype=dtype),  # type: ignore  (B, n)
-        data_x_u:    wp.array2d(dtype=dtype),  # type: ignore  (B, n)
-        finite_mask_hl:   wp.array2d(dtype=dtype),  # type: ignore  (B, m)
-        finite_mask_hu:   wp.array2d(dtype=dtype),  # type: ignore  (B, m)
-        finite_mask_xl:   wp.array2d(dtype=dtype),  # type: ignore  (B, n)
-        finite_mask_xu:   wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        data_h_l:    wp.array2d(dtype=dtype),  # type: ignore  (B, num_hl)
+        data_h_u:    wp.array2d(dtype=dtype),  # type: ignore  (B, num_hu)
+        data_x_l:    wp.array2d(dtype=dtype),  # type: ignore  (B, num_xl)
+        data_x_u:    wp.array2d(dtype=dtype),  # type: ignore  (B, num_xu)
+        finite_mask_hl:   wp.array2d(dtype=dtype),  # type: ignore  (B, num_hl)
+        finite_mask_hu:   wp.array2d(dtype=dtype),  # type: ignore  (B, num_hu)
+        finite_mask_xl:   wp.array2d(dtype=dtype),  # type: ignore  (B, num_xl)
+        finite_mask_xu:   wp.array2d(dtype=dtype),  # type: ignore  (B, num_xu)
         out:         wp.array(dtype=dtype),    # type: ignore  (B,)  output
     ):
         b, i = wp.tid()
-
-        m_val = dtype(0.0)
-
-        # Eq: contiguous slice — no gather.
-        if wp.static(p > 0):
-            b_tile = wp.tile_load(data_b[b], shape=p)
-            dy_tile = wp.tile_load(delta_inv[b], shape=p, offset=n)
-            m_eq = wp.tile_extract(
-                wp.tile_max(wp.tile_map(wp.abs, b_tile * dy_tile)), 0,
-            )
-            m_val = wp.max(m_val, m_eq)
-
-        # h_u: full-length inequality upper bounds, masked before use.
-        if wp.static(num_hu > 0):
-            finite_mask_hu_tile = wp.tile_load(finite_mask_hu[b], shape=num_hu)
-            hu_raw_tile = wp.tile_load(data_h_u[b], shape=num_hu)
-            hu_tile = wp.tile_map(finite_value, hu_raw_tile, finite_mask_hu_tile)
-            dz_hu_tile = wp.tile_load(delta_inv[b], shape=num_hu, offset=(n + p))
-            m_hu = wp.tile_extract(
-                wp.tile_max(wp.tile_map(wp.abs, hu_tile * dz_hu_tile)), 0,
-            )
-            m_val = wp.max(m_val, m_hu)
-
-        # h_l: full-length inequality lower bounds, masked before use.
-        if wp.static(num_hl > 0):
-            finite_mask_hl_tile = wp.tile_load(finite_mask_hl[b], shape=num_hl)
-            hl_raw_tile = wp.tile_load(data_h_l[b], shape=num_hl)
-            hl_tile = wp.tile_map(finite_value, hl_raw_tile, finite_mask_hl_tile)
-            dz_hl_tile = wp.tile_load(delta_inv[b], shape=num_hl, offset=(n + p))
-            m_hl = wp.tile_extract(
-                wp.tile_max(wp.tile_map(wp.abs, hl_tile * dz_hl_tile)), 0,
-            )
-            m_val = wp.max(m_val, m_hl)
-
-        # x_u: full-length box upper bounds, masked before use.
-        if wp.static(num_xu > 0):
-            finite_mask_xu_tile = wp.tile_load(finite_mask_xu[b], shape=num_xu)
-            xu_raw_tile = wp.tile_load(data_x_u[b], shape=num_xu)
-            xu_tile = wp.tile_map(finite_value, xu_raw_tile, finite_mask_xu_tile)
-            db_xu_tile = wp.tile_load(delta_b_inv[b], shape=num_xu)
-            m_xu = wp.tile_extract(
-                wp.tile_max(wp.tile_map(wp.abs, xu_tile * db_xu_tile)), 0,
-            )
-            m_val = wp.max(m_val, m_xu)
-
-        # x_l: full-length box lower bounds, masked before use.
-        if wp.static(num_xl > 0):
-            finite_mask_xl_tile = wp.tile_load(finite_mask_xl[b], shape=num_xl)
-            xl_raw_tile = wp.tile_load(data_x_l[b], shape=num_xl)
-            xl_tile = wp.tile_map(finite_value, xl_raw_tile, finite_mask_xl_tile)
-            db_xl_tile = wp.tile_load(delta_b_inv[b], shape=num_xl)
-            m_xl = wp.tile_extract(
-                wp.tile_max(wp.tile_map(wp.abs, xl_tile * db_xl_tile)), 0,
-            )
-            m_val = wp.max(m_val, m_xl)
-
-        # All threads in the tile see the same scalar m_val (tile_extract
-        # broadcasts); single-thread store avoids redundant writes.
+        bd = wp.block_dim()
+        n = delta_b_inv.shape[1]
+        p = data_b.shape[1]
+        v = dtype(0.0)
+        for k in range(i, p, bd):
+            v = wp.max(v, wp.abs(data_b[b, k] * delta_inv[b, n + k]))
+        for k in range(i, data_h_u.shape[1], bd):
+            v = wp.max(v, wp.abs(finite_value(data_h_u[b, k], finite_mask_hu[b, k]) * delta_inv[b, n + p + k]))
+        for k in range(i, data_h_l.shape[1], bd):
+            v = wp.max(v, wp.abs(finite_value(data_h_l[b, k], finite_mask_hl[b, k]) * delta_inv[b, n + p + k]))
+        for k in range(i, data_x_u.shape[1], bd):
+            v = wp.max(v, wp.abs(finite_value(data_x_u[b, k], finite_mask_xu[b, k]) * delta_b_inv[b, k]))
+        for k in range(i, data_x_l.shape[1], bd):
+            v = wp.max(v, wp.abs(finite_value(data_x_l[b, k], finite_mask_xl[b, k]) * delta_b_inv[b, k]))
+        red = wp.tile_max(wp.tile(v))
         if i == 0:
-            out[b] = m_val
+            out[b] = red[0]
 
     return kernel
 
 
+@functools.lru_cache(maxsize=None)
+def create_unscale_solution_kernel(dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
+    """Map a scaled IPM iterate back to original coordinates, in place.
+
+    One launch over ``dim=(B, n_primal + n_dual)`` covering both contiguous
+    variable buffers ``[x | s_l | s_u | s_bl | s_bu]`` and
+    ``[y | z_l | z_u | z_bl | z_bu]`` (an omitted block has width 0):
+
+        x    *= delta_x                     s_l, s_u   *= delta_inv_z
+        y    *= c_inv * delta_y             s_bl, s_bu *= delta_b_inv
+        z_l, z_u   *= c_inv * delta_z
+        z_bl, z_bu *= c_inv * delta_b
+    """
+    @wp.kernel
+    def unscale_solution_kernel(
+        x:    wp.array2d(dtype=dtype),   # type: ignore  (B, n)
+        s_l:  wp.array2d(dtype=dtype),   # type: ignore  (B, num_hl)
+        s_u:  wp.array2d(dtype=dtype),   # type: ignore  (B, num_hu)
+        s_bl: wp.array2d(dtype=dtype),   # type: ignore  (B, num_xl)
+        s_bu: wp.array2d(dtype=dtype),   # type: ignore  (B, num_xu)
+        y:    wp.array2d(dtype=dtype),   # type: ignore  (B, p)
+        z_l:  wp.array2d(dtype=dtype),   # type: ignore  (B, num_hl)
+        z_u:  wp.array2d(dtype=dtype),   # type: ignore  (B, num_hu)
+        z_bl: wp.array2d(dtype=dtype),   # type: ignore  (B, num_xl)
+        z_bu: wp.array2d(dtype=dtype),   # type: ignore  (B, num_xu)
+        delta:            wp.array2d(dtype=dtype),  # type: ignore  (B, n+p+m)
+        delta_inv:        wp.array2d(dtype=dtype),  # type: ignore  (B, n+p+m)
+        delta_b:          wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        delta_b_inv:      wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        cost_scaling_inv: wp.array(dtype=dtype),    # type: ignore  (B,)
+    ):
+        b, t = wp.tid()
+        n = x.shape[1]
+        p = y.shape[1]
+        num_hl = s_l.shape[1]
+        num_hu = s_u.shape[1]
+        num_xl = s_bl.shape[1]
+        num_xu = s_bu.shape[1]
+        c_inv = cost_scaling_inv[b]
+
+        end_x = n
+        end_sl = end_x + num_hl
+        end_su = end_sl + num_hu
+        end_sbl = end_su + num_xl
+        end_sbu = end_sbl + num_xu
+        end_y = end_sbu + p
+        end_zl = end_y + num_hl
+        end_zu = end_zl + num_hu
+        end_zbl = end_zu + num_xl
+        end_zbu = end_zbl + num_xu
+
+        if t < end_x:
+            x[b, t] = x[b, t] * delta[b, t]
+        elif t < end_sl:
+            k = t - end_x
+            s_l[b, k] = s_l[b, k] * delta_inv[b, n + p + k]
+        elif t < end_su:
+            k = t - end_sl
+            s_u[b, k] = s_u[b, k] * delta_inv[b, n + p + k]
+        elif t < end_sbl:
+            k = t - end_su
+            s_bl[b, k] = s_bl[b, k] * delta_b_inv[b, k]
+        elif t < end_sbu:
+            k = t - end_sbl
+            s_bu[b, k] = s_bu[b, k] * delta_b_inv[b, k]
+        elif t < end_y:
+            k = t - end_sbu
+            y[b, k] = y[b, k] * delta[b, n + k] * c_inv
+        elif t < end_zl:
+            k = t - end_y
+            z_l[b, k] = z_l[b, k] * delta[b, n + p + k] * c_inv
+        elif t < end_zu:
+            k = t - end_zl
+            z_u[b, k] = z_u[b, k] * delta[b, n + p + k] * c_inv
+        elif t < end_zbl:
+            k = t - end_zu
+            z_bl[b, k] = z_bl[b, k] * delta_b[b, k] * c_inv
+        elif t < end_zbu:
+            k = t - end_zbl
+            z_bu[b, k] = z_bu[b, k] * delta_b[b, k] * c_inv
+
+    return unscale_solution_kernel

@@ -1,67 +1,46 @@
 import os, importlib.util
+from typing import Optional, Union
 from abc import ABC, abstractmethod
-from typing import Union
 import numpy as np
-import cupy as cp
-from cupyx.scipy.sparse import csr_matrix
+import warp as wp
 import nvtx
-from nvmath.sparse.advanced import (
-    DirectSolver,
-    DirectSolverAlgType,
-    DirectSolverOptions,
-    DirectSolverMatrixType,
-    DirectSolverMatrixViewType,
-    ExecutionHybrid,
-    ExecutionCUDA,
-)
-from nvmath.bindings import cudss as cudss_bindings
+from cuda.bindings import runtime as cudart
+from nvmath.bindings import cudss
 
-from .batched_csr import UniformBatchedCsrMatrix
+from .batched_csr import UniformBatchedCsrMatrix, to_wp_int32
+
 
 
 class SparseDirectSolver(ABC):
-    """Abstract base for sparse direct solvers — natively supports batching.
+    """Abstract base for sparse direct solvers - natively supports batching.
 
-    ``matrix`` is either
-
-    * a ``cupyx.scipy.sparse.csr_matrix`` (B = 1) — dispatched to nvmath's
-      non-batched ``DirectSolver``; or
-    * a ``UniformBatchedCsrMatrix`` (B >= 1) — dispatched through cuDSS uniform
-      batching: one CSR structure with a packed per-batch values buffer.
+    ``matrix`` is a :class:`UniformBatchedCsrMatrix` (``B >= 1``): one CSR
+    structure with a packed per-batch values buffer, solved through cuDSS
+    uniform batching. The right-hand side and solution are Warp arrays of
+    shape ``(B, dim)`` owned by the solver.
     """
 
-    def __init__(self, matrix: Union[csr_matrix, UniformBatchedCsrMatrix]):
-        if isinstance(matrix, csr_matrix):
-            if matrix.shape[0] != matrix.shape[1]:
-                raise ValueError("Matrix must be square.")
-            self._batch_size = 1
-            self._dim = matrix.shape[0]
-            self._mat = matrix
-            self._mat_view = matrix
-        elif isinstance(matrix, UniformBatchedCsrMatrix):
-            if matrix.rows != matrix.cols:
-                raise ValueError("All matrices must be square.")
-            self._batch_size = matrix.batch_size
-            self._dim = matrix.rows
-            self._mat = matrix
-            # A view of the first matrix supplies the common CSR structure.
-            # Its data pointer starts the packed (B, nnz) values buffer used
-            # by cuDSS uniform batching.
-            self._mat_view = matrix[0]
-        else:
-            raise TypeError(
-                "matrix must be a csr_matrix or UniformBatchedCsrMatrix; got "
-                f"{type(matrix).__name__}."
-            )
+    def __init__(self, matrix: UniformBatchedCsrMatrix):
+        if matrix.rows != matrix.cols:
+            raise ValueError("All matrices must be square.")
+        self._batch_size = matrix.batch_size
+        self._dim = matrix.rows
+        self._mat = matrix
 
         # NOTE: the direct solver holds pointers into the matrix buffers
         # for in-place factorization and solves. Callers may update the
-        # values in place between solves but must not reallocate the
-        # underlying buffer (e.g. swap UniformBatchedCsrMatrix.data for a new array).
-        # rhs/sol must match the matrix dtype — cuDSS rejects a dtype mismatch.
-        dtype = matrix.data.dtype
-        self._rhs = cp.empty((self._batch_size, self._dim), dtype=dtype)
-        self._sol = cp.empty((self._batch_size, self._dim), dtype=dtype)
+        # values in place between solves; the buffers are never reallocated.
+        # rhs/sol must match the matrix dtype - cuDSS rejects a dtype mismatch.
+        self._rhs = wp.empty((self._batch_size, self._dim), dtype=matrix.dtype, device=matrix.device)
+        self._sol = wp.empty((self._batch_size, self._dim), dtype=matrix.dtype, device=matrix.device)
+        # Per-problem outcome of the last factor(): 0 = success, nonzero = failed.
+        self._factor_status = wp.zeros(self._batch_size, dtype=wp.int32, device=matrix.device)
+
+    @property
+    def factor_status(self) -> wp.array:
+        """``(B,)`` int32 device array written by ``factor()``: zero where the
+        factorization of that problem succeeded, nonzero where it failed."""
+        return self._factor_status
 
     @nvtx.annotate("SparseDirectSolver::plan")
     @abstractmethod
@@ -71,8 +50,9 @@ class SparseDirectSolver(ABC):
 
     @nvtx.annotate("SparseDirectSolver::factor")
     @abstractmethod
-    def factor(self, cuda_stream: int) -> bool:
-        """Numerical factorization of the matrix. Should be called after plan() and before solve()."""
+    def factor(self, cuda_stream: int) -> None:
+        """Numerical factorization of the matrix; the per-problem outcome is
+        written to ``factor_status``. Call after plan() and before solve()."""
         pass
 
     @nvtx.annotate("SparseDirectSolver::solve")
@@ -94,163 +74,208 @@ class SparseDirectSolver(ABC):
         return self._dim
 
     @property
-    def rhs(self) -> cp.ndarray:
-        """Expose the (first) right-hand side vector for in-place updates before calling solve()."""
+    def rhs(self) -> wp.array:
+        """The ``(B, dim)`` right-hand side buffer, filled in place before ``solve()``."""
         return self._rhs
 
     @property
-    def sol(self) -> cp.ndarray:
-        """Expose the (first) solution vector after calling solve()."""
+    def sol(self) -> wp.array:
+        """The ``(B, dim)`` solution buffer, valid after ``solve()``."""
         return self._sol
-    
 
-class CudssSparseDirectSolver(SparseDirectSolver):
-    def __init__(self, matrix: Union[csr_matrix, UniformBatchedCsrMatrix], use_deterministic_mode: bool = False, **cudss_kwargs):
+
+class _CudssSolver(SparseDirectSolver):
+    """Shared cuDSS plumbing for the batched solvers, on the Warp buffers directly.
+
+    The matrix descriptor points at the packed ``(B, nnz)`` values of
+    ``matrix`` and the dense descriptors at the ``(B, dim)`` ``rhs`` / ``sol``
+    buffers. Subclasses decide how cuDSS sees the batch (see
+    ``_system_layout``): one uniform batch, or one big block-diagonal system.
+    Nothing is copied or allocated per call.
+    """
+
+    def __init__(self, matrix: UniformBatchedCsrMatrix, use_deterministic_mode: bool = False) -> None:
         super().__init__(matrix)
-        batch_size = self._batch_size
+        _CUDSS_VALUE_TYPE = {wp.float32: cudss.DataType.R_32F, wp.float64: cudss.DataType.R_64F}
+        value_type = _CUDSS_VALUE_TYPE[matrix.dtype]
+        index_type = cudss.DataType.R_32I
 
-        # setup cuDSS solver
-        opts = DirectSolverOptions(
-            sparse_system_type=DirectSolverMatrixType.SYMMETRIC,
-            sparse_system_view=DirectSolverMatrixViewType.LOWER,  # NOTE: only take the lower triangular part of the matrix
-            multithreading_lib=self._find_cudss_mt_lib()
-        )
-        exe = ExecutionCUDA()  # Optional: ExecutionCUDA(). NOTE: hybrid mode seems more numerically stable
+        self._cudss_handle = cudss.create()
+        self._cudss_config = cudss.config_create()
+        self._cudss_data = cudss.data_create(self._cudss_handle)
 
-        # cuDSS uniform batching uses normal matrix descriptors whose value
-        # buffers contain all systems consecutively. ``_mat_view`` and
-        # ``_rhs[0]`` each point at the start of packed contiguous storage.
-        self._cudss_solver = DirectSolver(
-            a=self._mat_view,
-            b=self._rhs[0],
-            options=opts,
-            execution=exe,
-            stream=cp.cuda.get_current_stream().ptr,
+        # Dimension and entry count of the system cuDSS sees, its CSR pattern,
+        # and the uniform batch size (1 = no uniform batching).
+        dim, nnz, indptr, indices, ubatch_size = self._system_layout(matrix)
+        self._indptr, self._indices = indptr, indices  # kept alive for the descriptor
+
+        # Symmetric matrix, only the lower triangle is read. row_end = 0 means
+        # standard CSR (row r ends where row r + 1 starts).
+        self._cudss_a = cudss.matrix_create_csr(
+            dim, dim, nnz,
+            indptr.ptr, 0, indices.ptr, matrix.data.ptr,
+            index_type, index_type, value_type,
+            cudss.MatrixType.SYMMETRIC, cudss.MatrixViewType.LOWER, cudss.IndexBase.ZERO
         )
-        if batch_size > 1:
-            ubatch_size = np.array([batch_size], dtype=np.int32)
-            cudss_bindings.config_set(
-                self._cudss_solver.config_ptr,
-                cudss_bindings.ConfigParam.UBATCH_SIZE,
-                ubatch_size.ctypes.data,
-                ubatch_size.dtype.itemsize,
-            )
-        self._cudss_solver.plan_config.reordering_algorithm = DirectSolverAlgType.ALG_DEFAULT
-        self._cudss_solver.plan_config.use_superpanels = 0
-        self._cudss_solver.solution_config.ir_num_steps = 0  # NOTE: iterative refinement steps, to be tuned
+        # One column-major right-hand side / solution (per problem under uniform batching).
+        self._cudss_b = cudss.matrix_create_dn(
+            dim, 1, dim, self._rhs.ptr, value_type, cudss.Layout.COL_MAJOR)
+        self._cudss_x = cudss.matrix_create_dn(
+            dim, 1, dim, self._sol.ptr, value_type, cudss.Layout.COL_MAJOR)
+
+        # The multithreading layer speeds up the host part of the analysis.
+        mt_lib = self._find_cudss_mt_lib() or os.getenv("CUDSS_THREADING_LIB")
+        if mt_lib is not None and os.path.isfile(mt_lib):
+            cudss.set_threading_layer(self._cudss_handle, mt_lib)
+
+        # Workspace from the device's default memory pool (stream-ordered
+        # cudaMallocAsync) instead of cuDSS's default synchronous cudaMalloc.
+        err, pool = cudart.cudaDeviceGetDefaultMemPool(wp.get_device(matrix.device).ordinal)
+        if err != cudart.cudaError_t.cudaSuccess:
+            raise RuntimeError(f"cudaDeviceGetDefaultMemPool failed: {err}")
+        cudss.set_async_workspace_allocator(self._cudss_handle, int(pool))
+
+        if ubatch_size > 1:
+            self._config_set(cudss.ConfigParam.UBATCH_SIZE, ubatch_size)
+        self._config_set(cudss.ConfigParam.HYBRID_MEMORY_MODE, 0)  # equivalent to ExecutionCUDA in nvmath's DirectSolver wrapper
+        self._config_set(cudss.ConfigParam.USE_CUDA_REGISTER_MEMORY, 1)
+        self._config_set(cudss.ConfigParam.REORDERING_ALG, cudss.ReorderingAlg.DEFAULT)
+        self._config_set(cudss.ConfigParam.USE_SUPERPANELS, 0)
+        self._config_set(cudss.ConfigParam.IR_N_STEPS, 0)  # NOTE: iterative refinement steps, to be tuned
         # cudss has IR_TOL, but not implemented yet according to https://docs.nvidia.com/cuda/cudss/types.html#c.cudssConfigParam_t.CUDSS_CONFIG_IR_TOL
-        # self._cudss_solver.plan_config.pivot_type = cudss_bindings.PivotType.PIVOT_COL
-        # self._cudss_solver.plan_config.pivot_threshold = 1.0
-        # self._cudss_solver.factorization_config.pivot_eps = 1e-12
-
-        # Enable deterministic mode for bit-wise reproducible results across runs.
-        # Uses slower kernels but guarantees identical factorization every time.
-        # Not exposed by nvmath's high-level API, so we call config_set directly.
+        # NOTE: pivoting settings left at the cuDSS defaults; possible tuning knobs:
+        # self._config_set(cudss.ConfigParam.PIVOT_TYPE, cudss.PivotType.PIVOT_GLOBAL_COL)
+        # self._config_set(cudss.ConfigParam.PIVOT_THRESHOLD, 1.0)
+        # self._config_set(cudss.ConfigParam.PIVOT_EPSILON, 1e-12)
+        # Bit-wise reproducible results across runs; slower kernels.
         if use_deterministic_mode:
-            _det_flag = np.ones(1, dtype=np.int32)
-            cudss_bindings.config_set(
-                self._cudss_solver.config_ptr,
-                cudss_bindings.ConfigParam.DETERMINISTIC_MODE,
-                _det_flag.ctypes.data,
-                _det_flag.dtype.itemsize,
-            )
+            self._config_set(cudss.ConfigParam.DETERMINISTIC_MODE, 1)
 
-        # Use raw cuDSS handles for direct execute() calls in solve(),
-        # bypassing nvmath's _allocate_batched_result overhead.
-        self._cudss_handle = self._cudss_solver.handle
-        self._cudss_config = self._cudss_solver.config_ptr
-        self._cudss_data   = self._cudss_solver.data_ptr
-        self._cudss_a      = self._cudss_solver.a_ptr
-        self._cudss_x      = self._cudss_solver.x_ptr
-        self._cudss_b      = self._cudss_solver.b_ptr
+    @abstractmethod
+    def _system_layout(self, matrix: UniformBatchedCsrMatrix):
+        """``(dim, nnz, indptr, indices, ubatch_size)`` of the system handed to cuDSS:
+        its dimension and stored entries, the CSR pattern as int32 Warp arrays
+        over the packed values of ``matrix``, and the uniform batch size."""
 
-        # Uniform batching advances within these packed parent buffers; bind
-        # them explicitly rather than relying on first-row view pointers.
-        if isinstance(self._mat, UniformBatchedCsrMatrix):
-            cudss_bindings.matrix_set_csr_pointers(
-                self._cudss_a,
-                self._mat.indptr.data.ptr,
-                0,
-                self._mat.indices.data.ptr,
-                self._mat.data.data.ptr,
-            )
-        cudss_bindings.matrix_set_values(self._cudss_b, self._rhs.data.ptr)
-        cudss_bindings.matrix_set_values(self._cudss_x, self._sol.data.ptr)
+    def _config_set(self, param: cudss.ConfigParam, value: Union[int, float]) -> None:
+        buf = np.array([value], dtype=cudss.get_config_param_dtype(param))
+        cudss.config_set(self._cudss_config, param, buf.ctypes.data, buf.itemsize)
 
-    def __del__(self):
-        cudss_solver = getattr(self, "_cudss_solver", None)
-        if cudss_solver is not None:
+    def __del__(self) -> None:
+        # Matrices and data before the handle that created them.
+        for name, destroy in (("_cudss_a", cudss.matrix_destroy),
+                              ("_cudss_b", cudss.matrix_destroy),
+                              ("_cudss_x", cudss.matrix_destroy)):
+            ptr = getattr(self, name, None)
+            if ptr:
+                try:
+                    destroy(ptr)
+                except Exception:
+                    pass
+                setattr(self, name, None)
+        handle = getattr(self, "_cudss_handle", None)
+        if getattr(self, "_cudss_data", None) and handle:
             try:
-                cudss_solver.free()
+                cudss.data_destroy(handle, self._cudss_data)
             except Exception:
                 pass
-            self._cudss_solver = None
+            self._cudss_data = None
+        if getattr(self, "_cudss_config", None):
+            try:
+                cudss.config_destroy(self._cudss_config)
+            except Exception:
+                pass
+            self._cudss_config = None
+        if handle:
+            try:
+                cudss.destroy(handle)
+            except Exception:
+                pass
+            self._cudss_handle = None
 
-    @nvtx.annotate("CudssSparseDirectSolver::plan")
+    def _execute(self, phase: cudss.Phase, cuda_stream: int) -> None:
+        cudss.set_stream(self._cudss_handle, cuda_stream)
+        cudss.execute(
+            self._cudss_handle, phase,
+            self._cudss_config, self._cudss_data,
+            self._cudss_a, self._cudss_x, self._cudss_b
+        )
+
+    @nvtx.annotate("_CudssSolver::plan")
     def plan(self, cuda_stream: int) -> bool:
+        """Reordering and symbolic factorization (cuDSS ``ANALYSIS`` phase)."""
         try:
-            plan_info = self._cudss_solver.plan(stream=cuda_stream)
-            # cp.cuda.get_current_stream().synchronize()
+            self._execute(cudss.Phase.ANALYSIS, cuda_stream)
         except Exception as e:
             print(f"Planning failed: {e}")
             return False
 
         return True
 
-    @nvtx.annotate("CudssSparseDirectSolver::factor")
-    def factor(self, cuda_stream: int) -> bool:
-        try:
-            fac_info = self._cudss_solver.factorize(stream=cuda_stream)
-            # cp.cuda.get_current_stream().synchronize()
+    @nvtx.annotate("_CudssSolver::factor")
+    def factor(self, cuda_stream: int) -> None:
+        """Numerical factorization (cuDSS ``FACTORIZATION`` phase), launched on
+        the given stream without waiting for it.
 
-            if self._batch_size > 1:
-                return fac_info.info == 0
+        IMPORTANT: the factorization is ALWAYS ASSUMED TO SUCCEED. Nothing is
+        checked and ``factor_status`` stays zero for every problem, because
+        cuDSS reports its factorization outcome only through blocking host
+        queries (see the comment below). Consequently the solver never retries
+        a sparse factorization with raised regularization. A factorization
+        that does fail shows up per problem only through the finite check of
+        the solution (``solve_status``), since a zero pivot gives a non-finite
+        solve; a factorization that is merely inaccurate is not detected.
+        """
+        # Earlier versions checked the outcome on the host after factorize():
+        #
+        #   if self._batch_size > 1:
+        #       return fac_info.info == 0
+        #   # NOTE: this causes a D2H synchronization, which can be inefficient.
+        #   # More importantly, this prevents us from capturing cuda graphs.
+        #   if fac_info.info != 0:
+        #       return False
+        #   # For ExecuteCUDA, check the diagonal entries of the factorization to
+        #   # detect potential numerical issues. If any diagonal entry is very
+        #   # small, it may indicate the matrix is close to singular or
+        #   # indefinite, which can lead to very inaccurate results in
+        #   # subsequent computations.
+        #   # For ExecuteHybrid we cannot do this because fac_info.diag are
+        #   # always all zeros.
+        #   if isinstance(self._cudss_solver.execution_options, ExecutionCUDA):
+        #       # NOTE: the threshold here may need to be tuned based on the problem
+        #       if np.any(np.abs(fac_info.diag) < 1e-12):
+        #           return False
+        #
+        # Why it was dropped (measured with cuDSS 0.8):
+        # - CUDSS_DATA_INFO and CUDSS_DATA_DIAG are read with cudssDataGet,
+        #   which waits for all work queued on the stream, even when DIAG is
+        #   written to a device buffer, and fails inside a stream capture. Any
+        #   such check rules out CUDA graphs.
+        # - Under uniform batching DIAG returns the diagonal of one matrix only
+        #   (dim values, not B * dim), so it cannot give a per-problem status.
+        # - The reorderings the documentation lists for DIAG (COLAMD,
+        #   BTF_COLAMD) are rejected for symmetric matrices; DIAG does work
+        #   with DEFAULT, AMD, NESTED_DISSECTION and NONE.
+        # - An absolute pivot threshold misfires on these KKT matrices: the
+        #   -delta * I block has pivots of size delta by design (down to
+        #   reg_finetune_lower_limit = 1e-13), so 1e-12 would reject healthy,
+        #   quasi-definite factorizations after regularization finetuning.
+        self._execute(cudss.Phase.FACTORIZATION, cuda_stream)
 
-            # NOTE: this causes a D2H synchronization, which can be inefficient. More importantly, this prevents us from capturing cuda graphs.
-            if fac_info.info != 0:
-                # print(f"Factorization failed with info={fac_info.info}")
-                return False
-
-            # For ExecuteCUDA, check the diagonal entries of the factorization to detect potential numerical issues. 
-            # If any diagonal entry is very small, it may indicate the matrix is close to singular or indefinite, 
-            # which can lead to very inaccurate results in subsequent computations. 
-            # For ExecuteHybrid we cannot do this because fac_info.diag are always all zeros.
-            if isinstance(self._cudss_solver.execution_options, ExecutionCUDA):
-                if np.any(np.abs(fac_info.diag) < 1e-12):  # NOTE: the threshold here may need to be tuned based on the problem
-                    # print(f"\033[94mFactorization warning: small diagonal entries detected (min diag={fac_info.diag.min():.2e}). Matrix may be close to singular.\033[0m")
-                    # print(f"\033[94mFactorization info: {fac_info.info}, inertia: {fac_info.inertia}, "f"min/max diag: {np.abs(fac_info.diag).min():.2e}/{np.abs(fac_info.diag).max():.2e}\033[0m")
-                    return False
-
-        except Exception as e:
-            print(f"Factorization failed: {e}")
-            return False
-
-        return True
-
-    @nvtx.annotate("CudssSparseDirectSolver::solve")
-    def solve(self,
-              cuda_stream: int,
-              iterative_refinement: bool = False,
-              ir_abs_tol: float = 1e-12,
-              ir_rel_tol: float = 1e-12,
-              ir_max_iter: int = 10,
-              ir_min_improvement_rate: float = 5.0
-              ) -> None:
-        # Bypass nvmath's solve() which allocates B fresh arrays every call.
-        # x_ptr already points at self._sol (set once in __init__), so cuDSS
-        # writes directly into our buffer — zero allocation, zero copy.
-        cudss_bindings.set_stream(self._cudss_handle, cuda_stream)
-        cudss_bindings.execute(
-            self._cudss_handle, cudss_bindings.Phase.SOLVE,
-            self._cudss_config, self._cudss_data,
-            self._cudss_a, self._cudss_x, self._cudss_b,
-        )
-
-        if iterative_refinement:
-            raise NotImplementedError("Iterative refinement in CudssSparseDirectSolver is not implemented yet.")
+    @nvtx.annotate("_CudssSolver::solve")
+    def solve(self, cuda_stream: int) -> None:
+        """Solve phase, launched on the given stream. It captures into a CUDA graph, but not
+        into a conditional graph node: cuDSS issues small host-to-device
+        copies from pageable memory inside the solve phase, which conditional
+        node bodies reject (verified with cuDSS 0.8 for single, uniform-batch
+        and explicit-batch matrices). The factorization phase has no such
+        copies."""
+        # The solution descriptor points at self._sol: cuDSS writes directly
+        # into it, with no allocation and no copy.
+        self._execute(cudss.Phase.SOLVE, cuda_stream)
 
     @staticmethod
-    def _find_cudss_mt_lib():
+    def _find_cudss_mt_lib() -> Optional[str]:
         """Auto-discover the cuDSS multithreading layer library.
 
         Searches across CUDA version packages (nvidia.cu11, nvidia.cu12, nvidia.cu13, ...)
@@ -269,3 +294,49 @@ class CudssSparseDirectSolver(SparseDirectSolver):
                     if os.path.isfile(lib):
                         return lib
         return None
+
+
+class CudssUbatchSolver(_CudssSolver):
+    """cuDSS uniform batching: the shared ``dim x dim`` pattern with ``B``
+    value / right-hand-side buffers, handed over with ``UBATCH_SIZE = B``.
+    cuDSS walks the B problems behind one set of descriptors."""
+
+    def _system_layout(self, matrix: UniformBatchedCsrMatrix):
+        return self._dim, matrix.nnz, matrix.indptr, matrix.indices, self._batch_size
+
+
+class CudssStackedSolver(_CudssSolver):
+    """cuDSS on one big block-diagonal system, without uniform batching.
+
+    The ``B`` matrices are stacked along the diagonal into a single
+    ``(B * dim) x (B * dim)`` sparse matrix whose values are the packed
+    ``(B, nnz)`` buffer of ``matrix`` seen flat (block ``b`` owns entries
+    ``b * nnz`` to ``(b + 1) * nnz``), and the right-hand sides and solutions
+    are the ``(B, dim)`` buffers seen flat::
+
+        [ K_0                  ]   [ x_0   ]   [ rhs_0   ]
+        [     K_1              ] @ [ x_1   ] = [ rhs_1   ]
+        [           ...        ]   [  ...  ]   [  ...    ]
+        [               K_B-1  ]   [ x_B-1 ]   [ rhs_B-1 ]
+
+    The block-diagonal pattern is built once on the host at construction.
+    In-place updates of ``matrix.data`` are seen by the next ``factor()``.
+    """
+
+    def _system_layout(self, matrix: UniformBatchedCsrMatrix):
+        B, dim, nnz = self._batch_size, self._dim, matrix.nnz
+        if B * nnz >= 2 ** 31 or B * dim >= 2 ** 31:
+            raise ValueError(
+                f"The stacked sparse solver needs B * nnz = {B * nnz} and B * dim = {B * dim} "
+                f"below 2**31 (int32 indices)."
+            )
+        indptr_np = matrix.indptr.numpy().astype(np.int64)
+        indices_np = matrix.indices.numpy().astype(np.int64)
+        offsets = np.arange(B, dtype=np.int64)
+        # big_indptr[b * dim + r] = b * nnz + indptr[r]; big_indices[b * nnz + k] = indices[k] + b * dim
+        big_indptr = np.empty(B * dim + 1, dtype=np.int64)
+        big_indptr[:B * dim] = (indptr_np[:-1][None, :] + (offsets * nnz)[:, None]).reshape(-1)
+        big_indptr[-1] = B * nnz
+        big_indices = (indices_np[None, :] + (offsets * dim)[:, None]).reshape(-1)
+        device = matrix.device
+        return B * dim, B * nnz, to_wp_int32(big_indptr, device), to_wp_int32(big_indices, device), 1

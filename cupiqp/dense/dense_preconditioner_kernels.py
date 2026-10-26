@@ -12,10 +12,17 @@ Kernels defined here:
     - create_dense_apply_gamma_kernel         (apply gamma to P, c, cost_scaling)
 """
 
+import functools
+
 import warp as wp
 from ..utils import to_warp_dtype
+from ..preconditioner_kernels import ruiz_limit_scaling
 
 
+wp.set_module_options({"enable_backward": False})
+
+
+@functools.lru_cache(maxsize=None)
 def create_dense_compute_kkt_norms_kernel(n: int, p: int, m: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Fused KKT row/col inf-norm computation for the dense backend.
@@ -66,6 +73,7 @@ def create_dense_compute_kkt_norms_kernel(n: int, p: int, m: int, dtype=wp.float
     return dense_compute_kkt_norms_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_dense_scale_P_and_c_kernel(n: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Fused row+col scaling for P (symmetric) and c, plus optional cost factor.
@@ -92,6 +100,7 @@ def create_dense_scale_P_and_c_kernel(n: int, dtype=wp.float64):
     return dense_scale_P_and_c_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_dense_scale_A_or_G_kernel(rows: int, cols: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Fused row+col scaling for a dense rectangular (B, rows, cols) matrix.
@@ -112,6 +121,7 @@ def create_dense_scale_A_or_G_kernel(rows: int, cols: int, dtype=wp.float64):
     return dense_scale_A_or_G_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_dense_compute_gamma_kernel(n: int,
                                       min_scaling: float, max_scaling: float, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
@@ -131,14 +141,6 @@ def create_dense_compute_gamma_kernel(n: int,
     lo = float(min_scaling)
     hi = float(max_scaling)
 
-    @wp.func
-    def _ruiz_limit_scaling(d: dtype, min_scaling: dtype, max_scaling: dtype) -> dtype:
-        if d < min_scaling:
-            return dtype(1.0)
-        if d > max_scaling:
-            return max_scaling
-        return d
-
     @wp.kernel
     def dense_compute_gamma_kernel(
         P:     wp.array3d(dtype=dtype),   # type: ignore  (B, n, n)
@@ -157,18 +159,19 @@ def create_dense_compute_gamma_kernel(n: int,
                     col_max = wp.max(col_max, wp.abs(P[b, j, i]))
             total = total + wp.max(row_max, col_max)
         g = total / dtype(wp.static(n))
-        g = _ruiz_limit_scaling(g, dtype(lo), dtype(hi))
+        g = ruiz_limit_scaling(g, dtype(lo), dtype(hi))
 
         cn = dtype(0.0)
         for i in range(wp.static(n)):
             cn = wp.max(cn, wp.abs(c[b, i]))
         g = wp.max(g, cn)
-        g = _ruiz_limit_scaling(g, dtype(lo), dtype(hi))
+        g = ruiz_limit_scaling(g, dtype(lo), dtype(hi))
         gamma[b] = dtype(1.0) / g
 
     return dense_compute_gamma_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_dense_apply_gamma_kernel(n: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Apply computed gamma to P, c, and accumulate into cost_scaling.

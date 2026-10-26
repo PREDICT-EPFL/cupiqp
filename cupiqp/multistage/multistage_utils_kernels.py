@@ -1,7 +1,13 @@
+import functools
+
 import warp as wp
 from ..utils import to_warp_dtype
 
 
+wp.set_module_options({"enable_backward": False})
+
+
+@functools.lru_cache(maxsize=None)
 def create_block_tridiag_diaad_kernel(block_size: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """``diag(A[b]) += x[b]`` for each batch b. A is block-tridiagonal.
@@ -22,6 +28,7 @@ def create_block_tridiag_diaad_kernel(block_size: int, dtype=wp.float64):
     return _block_tridiag_diaad_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_block_tridiag_gead_kernel(num_blocks: int, block_size: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """``B[b] += alpha[b] * A[b]`` for each batch b. Both A and B are block-tridiag.
@@ -47,28 +54,33 @@ def create_block_tridiag_gead_kernel(num_blocks: int, block_size: int, dtype=wp.
     return _block_tridiag_gead_kernel
 
 
-def create_block_bidiag_gemv_n_kernel(num_blocks: int, rows_of_blocks: int, cols_of_blocks: int, dtype=wp.float64):
+@functools.lru_cache(maxsize=None)
+def create_block_bidiag_gemv_n_kernel(num_blocks: int, rows_of_blocks: int, cols_of_blocks: int,
+                                      has_E: bool = True, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """``y[b] = alpha * A[b] * x[b] + beta * y[b]``, A block lower bidiagonal.
 
-    A has N+1 block rows, N block columns.
-    Launch with ``dim=(B, num_blocks + 1, rows_of_blocks)``.
+    A has N block columns. With ``has_E`` it has N+1 block rows (block row
+    ``k`` is ``[E_{k-1}  D_k]``, the last one only ``E_{N-1}``); without it
+    A is block diagonal with N block rows and ``A_E`` is an empty array that
+    is never read.
+    Launch with ``dim=(B, num_blocks + has_E, rows_of_blocks)``.
     """
     @wp.kernel
     def _block_bidiag_gemv_n_kernel(
         alpha: dtype,                             # type: ignore
         A_D: wp.array4d(dtype=dtype),             # type: ignore   (B, N, r, c)
-        A_E: wp.array4d(dtype=dtype),             # type: ignore   (B, N, r, c)
+        A_E: wp.array4d(dtype=dtype),             # type: ignore   (B, N, r, c), or (B, 0, r, c) without has_E
         x: wp.array2d(dtype=dtype),               # type: ignore   (B, N*c)
         beta: dtype,                              # type: ignore
-        y: wp.array2d(dtype=dtype),               # type: ignore   (B, (N+1)*r)
+        y: wp.array2d(dtype=dtype),               # type: ignore   (B, (N+has_E)*r)
     ):
         b, block_row, local_row = wp.tid()
         N = wp.static(num_blocks)
         r = wp.static(rows_of_blocks)
         c = wp.static(cols_of_blocks)
 
-        if block_row > N:
+        if block_row >= N + wp.static(int(has_E)):
             return
 
         acc = dtype(0.0)
@@ -77,29 +89,38 @@ def create_block_bidiag_gemv_n_kernel(num_blocks: int, rows_of_blocks: int, cols
             for j in range(c):
                 acc += A_D[b, block_row, local_row, j] * x[b, block_row * c + j]
 
-        if block_row > 0:
-            for j in range(c):
-                acc += A_E[b, block_row - 1, local_row, j] * x[b, (block_row - 1) * c + j]
+        if wp.static(has_E):
+            if block_row > 0:
+                for j in range(c):
+                    acc += A_E[b, block_row - 1, local_row, j] * x[b, (block_row - 1) * c + j]
 
         idx = block_row * r + local_row
-        y[b, idx] = alpha * acc + beta * y[b, idx]
+        # beta == 0 must not read the output: it may hold uninitialized or
+        # stale +/-inf / NaN data, and 0 * inf is NaN.
+        if beta == dtype(0.0):
+            y[b, idx] = alpha * acc
+        else:
+            y[b, idx] = alpha * acc + beta * y[b, idx]
 
     return _block_bidiag_gemv_n_kernel
 
 
-def create_block_bidiag_gemv_t_kernel(num_blocks: int, rows_of_blocks: int, cols_of_blocks: int, dtype=wp.float64):
+@functools.lru_cache(maxsize=None)
+def create_block_bidiag_gemv_t_kernel(num_blocks: int, rows_of_blocks: int, cols_of_blocks: int,
+                                      has_E: bool = True, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """``z[b] = alpha * A[b]^T * y[b] + beta * z[b]``, A block lower bidiagonal.
 
-    A^T has N block rows (cols of A), N+1 block columns (rows of A).
+    A^T has N block rows (cols of A) and N+has_E block columns (rows of A);
+    without ``has_E`` A is block diagonal and ``A_E`` is never read.
     Launch with ``dim=(B, num_blocks, cols_of_blocks)``.
     """
     @wp.kernel
     def _block_bidiag_gemv_t_kernel(
         alpha: dtype,                             # type: ignore
         A_D: wp.array4d(dtype=dtype),             # type: ignore   (B, N, r, c)
-        A_E: wp.array4d(dtype=dtype),             # type: ignore   (B, N, r, c)
-        y: wp.array2d(dtype=dtype),               # type: ignore   (B, (N+1)*r)
+        A_E: wp.array4d(dtype=dtype),             # type: ignore   (B, N, r, c), or (B, 0, r, c) without has_E
+        y: wp.array2d(dtype=dtype),               # type: ignore   (B, (N+has_E)*r)
         beta: dtype,                              # type: ignore
         z: wp.array2d(dtype=dtype),               # type: ignore   (B, N*c)
     ):
@@ -118,26 +139,35 @@ def create_block_bidiag_gemv_t_kernel(num_blocks: int, rows_of_blocks: int, cols
             acc += A_D[b, k, p, local_col] * y[b, k * r + p]
 
         # E_k^T * y[k+1]
-        for p in range(r):
-            acc += A_E[b, k, p, local_col] * y[b, (k + 1) * r + p]
+        if wp.static(has_E):
+            for p in range(r):
+                acc += A_E[b, k, p, local_col] * y[b, (k + 1) * r + p]
 
         idx = k * c + local_col
-        z[b, idx] = alpha * acc + beta * z[b, idx]
+        # beta == 0 must not read the output: it may hold uninitialized or
+        # stale +/-inf / NaN data, and 0 * inf is NaN.
+        if beta == dtype(0.0):
+            z[b, idx] = alpha * acc
+        else:
+            z[b, idx] = alpha * acc + beta * z[b, idx]
 
     return _block_bidiag_gemv_t_kernel
 
 
-def create_block_tridiag_gemv_kernel(num_blocks: int, block_size: int, dtype=wp.float64):
+@functools.lru_cache(maxsize=None)
+def create_block_tridiag_gemv_kernel(num_blocks: int, block_size: int, has_E: bool = True, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """``z[b] = alpha * P[b] * x[b] + beta * z[b]``, P symmetric block-tridiagonal.
 
+    Without ``has_E`` P is block diagonal and ``P_E`` is an empty array that
+    is never read.
     Launch with ``dim=(B, num_blocks, block_size)``.
     """
     @wp.kernel
     def _block_tridiag_gemv_kernel(
         alpha: dtype,                             # type: ignore
         P_D: wp.array4d(dtype=dtype),             # type: ignore   (B, N, d, d)
-        P_E: wp.array4d(dtype=dtype),             # type: ignore   (B, N-1, d, d)
+        P_E: wp.array4d(dtype=dtype),             # type: ignore   (B, N-1, d, d), or (B, 0, d, d) without has_E
         x: wp.array2d(dtype=dtype),               # type: ignore   (B, N*d)
         beta: dtype,                              # type: ignore
         z: wp.array2d(dtype=dtype),               # type: ignore   (B, N*d)
@@ -155,23 +185,31 @@ def create_block_tridiag_gemv_kernel(num_blocks: int, block_size: int, dtype=wp.
         for j in range(d):
             acc += P_D[b, k, local_row, j] * x[b, k * d + j]
 
-        # P_E[k-1] * x[k-1]
-        if k > 0:
-            for j in range(d):
-                acc += P_E[b, k - 1, local_row, j] * x[b, (k - 1) * d + j]
+        if wp.static(has_E):
+            # P_E[k-1] * x[k-1]
+            if k > 0:
+                for j in range(d):
+                    acc += P_E[b, k - 1, local_row, j] * x[b, (k - 1) * d + j]
 
-        # P_E[k]^T * x[k+1]
-        if k < N - 1:
-            for j in range(d):
-                acc += P_E[b, k, j, local_row] * x[b, (k + 1) * d + j]
+            # P_E[k]^T * x[k+1]
+            if k < N - 1:
+                for j in range(d):
+                    acc += P_E[b, k, j, local_row] * x[b, (k + 1) * d + j]
 
         idx = k * d + local_row
-        z[b, idx] = alpha * acc + beta * z[b, idx]
+        # beta == 0 must not read the output: it may hold uninitialized or
+        # stale +/-inf / NaN data, and 0 * inf is NaN.
+        if beta == dtype(0.0):
+            z[b, idx] = alpha * acc
+        else:
+            z[b, idx] = alpha * acc + beta * z[b, idx]
 
     return _block_tridiag_gemv_kernel
 
 
-def create_block_syrk_kernel(num_blocks: int, rows_of_blocks: int, cols_of_blocks: int, dtype=wp.float64):
+@functools.lru_cache(maxsize=None)
+def create_block_syrk_kernel(num_blocks: int, rows_of_blocks: int, cols_of_blocks: int,
+                             has_E: bool = True, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Batched block-tridiagonal SYRK: ``C[b] = alpha * A[b]^T A[b] + beta * C[b]``.
 
@@ -188,16 +226,20 @@ def create_block_syrk_kernel(num_blocks: int, rows_of_blocks: int, cols_of_block
         C_D[b, k] = alpha * (D_k^T D_k + E_k^T E_k) + beta * C_D[b, k]   for k = 0..N-1
         C_E[b, k] = alpha * (D_{k+1}^T E_k)         + beta * C_E[b, k]   for k = 0..N-2
 
+    Without ``has_E`` A is block diagonal (rows 0..N-1 only): ``C`` is block
+    diagonal, ``C_D[b, k] = alpha * D_k^T D_k + beta * C_D[b, k]``, and
+    ``A_E`` / ``C_E`` are empty arrays that are never touched.
+
     Launch with ``dim=(B, num_blocks, cols_of_blocks, cols_of_blocks)``.
     """
     @wp.kernel
     def block_syrk_kernel(
         alpha: dtype,                        # type: ignore
         A_D: wp.array4d(dtype=dtype),        # type: ignore   (B, N, r, c)
-        A_E: wp.array4d(dtype=dtype),        # type: ignore   (B, N, r, c)
+        A_E: wp.array4d(dtype=dtype),        # type: ignore   (B, N, r, c), or empty without has_E
         beta: dtype,                         # type: ignore
         C_D: wp.array4d(dtype=dtype),        # type: ignore   (B, N, c, c)
-        C_E: wp.array4d(dtype=dtype),        # type: ignore   (B, N-1, c, c)
+        C_E: wp.array4d(dtype=dtype),        # type: ignore   (B, N-1, c, c), or empty without has_E
     ):
         b, k, i, j = wp.tid()
         N = wp.static(num_blocks)
@@ -207,19 +249,32 @@ def create_block_syrk_kernel(num_blocks: int, rows_of_blocks: int, cols_of_block
         acc_diag = dtype(0.0)
         for p in range(r):
             acc_diag += A_D[b, k, p, i] * A_D[b, k, p, j]
-            acc_diag += A_E[b, k, p, i] * A_E[b, k, p, j]
-        C_D[b, k, i, j] = alpha * acc_diag + beta * C_D[b, k, i, j]
+            if wp.static(has_E):
+                acc_diag += A_E[b, k, p, i] * A_E[b, k, p, j]
+        # beta == 0 must not read the output: it may hold uninitialized or
+        # stale +/-inf / NaN data, and 0 * inf is NaN.
+        if beta == dtype(0.0):
+            C_D[b, k, i, j] = alpha * acc_diag
+        else:
+            C_D[b, k, i, j] = alpha * acc_diag + beta * C_D[b, k, i, j]
 
         # Lower off-diagonal: alpha * D_{k+1}^T E_k
-        if k < N - 1:
-            acc_off = dtype(0.0)
-            for p in range(r):
-                acc_off += A_D[b, k + 1, p, i] * A_E[b, k, p, j]
-            C_E[b, k, i, j] = alpha * acc_off + beta * C_E[b, k, i, j]
+        if wp.static(has_E):
+            if k < N - 1:
+                acc_off = dtype(0.0)
+                for p in range(r):
+                    acc_off += A_D[b, k + 1, p, i] * A_E[b, k, p, j]
+                # beta == 0 must not read the output: it may hold uninitialized or
+                # stale +/-inf / NaN data, and 0 * inf is NaN.
+                if beta == dtype(0.0):
+                    C_E[b, k, i, j] = alpha * acc_off
+                else:
+                    C_E[b, k, i, j] = alpha * acc_off + beta * C_E[b, k, i, j]
 
     return block_syrk_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_weighted_block_syrk_kernel(num_blocks: int, rows_of_blocks: int, cols_of_blocks: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Batched weighted block SYRK: ``C[b] = alpha * A[b]^T diag(w[b]) A[b] + beta * C[b]``.
@@ -249,13 +304,23 @@ def create_weighted_block_syrk_kernel(num_blocks: int, rows_of_blocks: int, cols
             w_ek = w[b, (k + 1) * r + p]
             acc_diag += w_dk * A_D[b, k, p, i] * A_D[b, k, p, j]
             acc_diag += w_ek * A_E[b, k, p, i] * A_E[b, k, p, j]
-        C_D[b, k, i, j] = alpha * acc_diag + beta * C_D[b, k, i, j]
+        # beta == 0 must not read the output: it may hold uninitialized or
+        # stale +/-inf / NaN data, and 0 * inf is NaN.
+        if beta == dtype(0.0):
+            C_D[b, k, i, j] = alpha * acc_diag
+        else:
+            C_D[b, k, i, j] = alpha * acc_diag + beta * C_D[b, k, i, j]
 
         if k < N - 1:
             acc_off = dtype(0.0)
             for p in range(r):
                 w_kp1 = w[b, (k + 1) * r + p]
                 acc_off += w_kp1 * A_D[b, k + 1, p, i] * A_E[b, k, p, j]
-            C_E[b, k, i, j] = alpha * acc_off + beta * C_E[b, k, i, j]
+            # beta == 0 must not read the output: it may hold uninitialized or
+            # stale +/-inf / NaN data, and 0 * inf is NaN.
+            if beta == dtype(0.0):
+                C_E[b, k, i, j] = alpha * acc_off
+            else:
+                C_E[b, k, i, j] = alpha * acc_off + beta * C_E[b, k, i, j]
 
     return weighted_block_syrk_kernel

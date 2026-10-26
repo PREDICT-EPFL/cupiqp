@@ -1,13 +1,20 @@
+import functools
+
 import warp as wp
 from ..utils import to_warp_dtype
 
 
+wp.set_module_options({"enable_backward": False})
+
+
+@functools.lru_cache(maxsize=None)
 def create_multistage_data_gradients_kernel(
     N: int, d: int,
     N_a: int, r_a: int,
     N_g: int, r_g: int,
     p: int, m: int, n: int,
     num_hu: int, num_hl: int, num_xu: int, num_xl: int,
+    has_P_E: bool = True, has_A_E: bool = True, has_G_E: bool = True,
     dtype=wp.float64
     ):
     dtype = to_warp_dtype(dtype)
@@ -24,7 +31,7 @@ def create_multistage_data_gradients_kernel(
       ``A`` at the diagonal and sub-diagonal block positions.
     * ``dG_D, dG_E`` (``B, N_g, r_g, d``) — same for ``G``.
     * ``dc, db, dh_u, dh_l, dx_u, dx_l`` — vector grads, written as
-      flat ``(B, k)`` arrays that alias the underlying ``BlockVec.data``
+      flat ``(B, k)`` arrays that alias the underlying block vector buffers
       buffers via DLPack reshape.
 
     Mapping conventions (all in flat user-space layout):
@@ -37,16 +44,17 @@ def create_multistage_data_gradients_kernel(
     Absent constraint groups (``p == 0`` ⇒ ``N_a = r_a = 0``;
     ``m == 0`` ⇒ ``N_g = r_g = 0``) collapse their sub-ranges to size
     0 — callers must still pass valid (possibly empty) wp.array
-    arguments for those inputs/outputs.
+    arguments for those inputs/outputs. So do absent off-diagonal blocks
+    (``has_P_E`` / ``has_A_E`` / ``has_G_E`` False).
     """
     # Pre-compute compile-time region sizes / cumulative offsets.
     N_off = max(N - 1, 0)
     sz_dP_diag    = N * d * d
-    sz_dP_offdiag = N_off * d * d
+    sz_dP_offdiag = N_off * d * d if has_P_E else 0
     sz_dA_D       = N_a * r_a * d
-    sz_dA_E       = N_a * r_a * d
+    sz_dA_E       = N_a * r_a * d if has_A_E else 0
     sz_dG_D       = N_g * r_g * d
-    sz_dG_E       = N_g * r_g * d
+    sz_dG_E       = N_g * r_g * d if has_G_E else 0
 
     end_dP_diag    = sz_dP_diag
     end_dP_offdiag = end_dP_diag    + sz_dP_offdiag
@@ -85,7 +93,7 @@ def create_multistage_data_gradients_kernel(
         dA_E:              wp.array4d(dtype=dtype),  # type: ignore (B, N_a, r_a, d)
         dG_D:              wp.array4d(dtype=dtype),  # type: ignore (B, N_g, r_g, d)
         dG_E:              wp.array4d(dtype=dtype),  # type: ignore (B, N_g, r_g, d)
-        # Outputs — flat (B, k) vector grads (aliased to BlockVec.data).
+        # Outputs -- flat (B, k) vector grads (aliased to the block vector buffers).
         dc:   wp.array2d(dtype=dtype),  # type: ignore (B, n)
         db:   wp.array2d(dtype=dtype),  # type: ignore (B, p)
         dh_u: wp.array2d(dtype=dtype),  # type: ignore (B, m)

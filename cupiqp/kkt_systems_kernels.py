@@ -1,7 +1,14 @@
+import functools
+
 import warp as wp
+from .settings import SettingsFloatIdx, SettingsIntIdx
 from .utils import to_warp_dtype
 
 
+wp.set_module_options({"enable_backward": False})
+
+
+@functools.lru_cache(maxsize=None)
 def create_update_regularizations_step_1_kernel(num_ineq: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Create kernel operating on contiguous s_all/z_all buffers. Performs:
@@ -66,6 +73,7 @@ def create_update_regularizations_step_1_kernel(num_ineq: int, dtype=wp.float64)
     return update_regularizations_step_1_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_update_regularizations_step_2_kernel(nx: int, nz: int,
                                                 has_h_l: bool, has_h_u: bool,
                                                 has_x_l: bool, has_x_u: bool,
@@ -134,6 +142,7 @@ def create_update_regularizations_step_2_kernel(nx: int, nz: int,
 
     return update_regularizations_step_2_kernel
 
+@functools.lru_cache(maxsize=None)
 def create_eliminate_duals_kernel(nx: int, nz: int,
                                   has_h_l: bool, has_h_u: bool,
                                   has_x_l: bool, has_x_u: bool,
@@ -212,6 +221,7 @@ def create_eliminate_duals_kernel(nx: int, nz: int,
 
     return eliminate_duals_kernel
 
+@functools.lru_cache(maxsize=None)
 def create_eliminate_slacks_kernel(dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Batched element-wise kernel for eliminating slacks for inequalities.
@@ -231,6 +241,7 @@ def create_eliminate_slacks_kernel(dtype=wp.float64):
     return eliminate_slacks_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_eliminate_slacks_transposed_kernel(dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Transposed (K^T) variant of eliminate_slacks. Scales rhs_s by W = S/Z instead
@@ -253,7 +264,9 @@ def create_eliminate_slacks_transposed_kernel(dtype=wp.float64):
     return eliminate_slacks_transposed_kernel
 
 
-def create_recover_duals_kernel(num_hu: int, num_hl: int, num_xu: int, num_xl: int, dtype=wp.float64):
+@functools.lru_cache(maxsize=None)
+def create_recover_duals_kernel(num_hu: int, num_hl: int, num_xu: int, num_xl: int, dtype=wp.float64,
+                                box_rhs_eliminated: bool = False):
     dtype = to_warp_dtype(dtype)
     """Create kernel specialized for recovering duals.
 
@@ -266,6 +279,12 @@ def create_recover_duals_kernel(num_hu: int, num_hl: int, num_xu: int, num_xl: i
         lhs.z_l  =  w_l_delta_inv  * (-G_dx                 - updated_rhs_z_l)
         lhs.z_bu =  w_bu_delta_inv * ( xbs * lhs.x - rhs.z_bu + m_z_bu_inv * rhs.s_bu)
         lhs.z_bl = -w_bl_delta_inv * ( xbs * lhs.x + rhs.z_bl - m_z_bl_inv * rhs.s_bl)
+
+    The box rows eliminate the slack inline with the forward formula
+    ``rhs.z - rhs.s / Z``. With ``box_rhs_eliminated`` the caller passes the
+    already eliminated right-hand side as ``rhs_z_bu`` / ``rhs_z_bl`` and the
+    ``m_z_*_inv * rhs.s`` term is dropped; the transposed solve needs this,
+    because its elimination is ``rhs.z - (S / Z) rhs.s``.
     """
     @wp.kernel
     def recover_duals_kernel(
@@ -307,16 +326,23 @@ def create_recover_duals_kernel(num_hu: int, num_hl: int, num_xu: int, num_xl: i
             lhs_z_l[b, j] = (-G_dx[b, j] - rhs_z_l[b, j]) * w_l_delta_inv[b, j]
         elif t < num_hu_static + num_hl_static + num_xu_static:
             j = t - num_hu_static - num_hl_static
-            lhs_z_bu[b, j] = (x_b_scaling[b, j] * lhs_x[b, j] - rhs_z_bu[b, j] + m_z_bu_inv[b, j] * rhs_s_bu[b, j]) * w_bu_delta_inv[b, j]
+            if wp.static(box_rhs_eliminated):
+                lhs_z_bu[b, j] = (x_b_scaling[b, j] * lhs_x[b, j] - rhs_z_bu[b, j]) * w_bu_delta_inv[b, j]
+            else:
+                lhs_z_bu[b, j] = (x_b_scaling[b, j] * lhs_x[b, j] - rhs_z_bu[b, j] + m_z_bu_inv[b, j] * rhs_s_bu[b, j]) * w_bu_delta_inv[b, j]
         elif t < num_hu_static + num_hl_static + num_xu_static + num_xl_static:
             j = t - num_hu_static - num_hl_static - num_xu_static
-            lhs_z_bl[b, j] = -(x_b_scaling[b, j] * lhs_x[b, j] + rhs_z_bl[b, j] - m_z_bl_inv[b, j] * rhs_s_bl[b, j]) * w_bl_delta_inv[b, j]
+            if wp.static(box_rhs_eliminated):
+                lhs_z_bl[b, j] = -(x_b_scaling[b, j] * lhs_x[b, j] + rhs_z_bl[b, j]) * w_bl_delta_inv[b, j]
+            else:
+                lhs_z_bl[b, j] = -(x_b_scaling[b, j] * lhs_x[b, j] + rhs_z_bl[b, j] - m_z_bl_inv[b, j] * rhs_s_bl[b, j]) * w_bl_delta_inv[b, j]
         else:
             return
 
     return recover_duals_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_recover_slacks_kernel(dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Create kernel specialized for eliminating slacks. Performs the operation:
@@ -345,6 +371,7 @@ def create_recover_slacks_kernel(dtype=wp.float64):
     return recover_slacks_kernel
 
 
+@functools.lru_cache(maxsize=None)
 def create_recover_slacks_transposed_kernel(dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
     """Transposed (K^T) variant of recover_slacks. The slack rows in K^T read
@@ -363,3 +390,259 @@ def create_recover_slacks_transposed_kernel(dtype=wp.float64):
         lhs_s_all[b, i] = m_z_inv_all[b, i] * (-lhs_z_all[b, i] + rhs_s_all[b, i])
 
     return recover_slacks_transposed_kernel
+
+@functools.lru_cache(maxsize=None)
+def create_condensed_kkt_combine_kernel(dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
+    """Assemble the condensed KKT matrix-vector product from its pieces.
+
+    Given the backend matvecs ``P_x = P lhs_x``, ``AT_y = A^T lhs_y``,
+    ``GT_z = G^T (active * lhs_z)``, ``A_x = A lhs_x`` and ``G_x = G lhs_x``,
+    computes for every batch entry
+
+        K_x = P_x + x_reg * lhs_x + AT_y + GT_z
+        K_y = A_x - delta * lhs_y
+        K_z = active * G_x - (z_reg * lhs_z  on active rows, lhs_z on inactive rows)
+
+    Inactive inequality rows (``z_reg == 0``) are decoupled with a ``-1``
+    diagonal, matching the factorized augmented KKT. With ``residual == 0``
+    the products are written to ``out_*``; with ``residual == 1`` the kernel
+    writes ``out_* = rhs_* - K_*`` and accumulates ``max |out_*|`` into the
+    one-element ``norm_out`` (atomic; zero it first). Launch with
+    ``dim=(B, n + p + m)``.
+    """
+    @wp.kernel
+    def condensed_kkt_combine_kernel(
+        P_x:   wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        x_reg: wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        lhs_x: wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        AT_y:  wp.array2d(dtype=dtype),  # type: ignore  (B, n)   (unused if p == 0)
+        GT_z:  wp.array2d(dtype=dtype),  # type: ignore  (B, n)   (unused if m == 0)
+        A_x:   wp.array2d(dtype=dtype),  # type: ignore  (B, p)
+        lhs_y: wp.array2d(dtype=dtype),  # type: ignore  (B, p)
+        delta: wp.array(dtype=dtype),    # type: ignore  (B,)
+        G_x:   wp.array2d(dtype=dtype),  # type: ignore  (B, m)
+        active_G_row: wp.array2d(dtype=dtype),  # type: ignore  (B, m)
+        z_reg: wp.array2d(dtype=dtype),  # type: ignore  (B, m)
+        lhs_z: wp.array2d(dtype=dtype),  # type: ignore  (B, m)
+        rhs_x: wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        rhs_y: wp.array2d(dtype=dtype),  # type: ignore  (B, p)
+        rhs_z: wp.array2d(dtype=dtype),  # type: ignore  (B, m)
+        residual: wp.int32,              # type: ignore
+        out_x: wp.array2d(dtype=dtype),  # type: ignore  (B, n)
+        out_y: wp.array2d(dtype=dtype),  # type: ignore  (B, p)
+        out_z: wp.array2d(dtype=dtype),  # type: ignore  (B, m)
+        norm_out: wp.array(dtype=dtype), # type: ignore  (1,)
+    ):
+        b, t = wp.tid()
+        n = lhs_x.shape[1]
+        p = lhs_y.shape[1]
+        m = lhs_z.shape[1]
+        if t < n:
+            v = P_x[b, t] + x_reg[b, t] * lhs_x[b, t]
+            if p > 0:
+                v = v + AT_y[b, t]
+            if m > 0:
+                v = v + GT_z[b, t]
+            if residual == wp.int32(1):
+                v = rhs_x[b, t] - v
+                wp.atomic_max(norm_out, 0, wp.abs(v))
+            out_x[b, t] = v
+        elif t < n + p:
+            k = t - n
+            v = A_x[b, k] - delta[b] * lhs_y[b, k]
+            if residual == wp.int32(1):
+                v = rhs_y[b, k] - v
+                wp.atomic_max(norm_out, 0, wp.abs(v))
+            out_y[b, k] = v
+        elif t < n + p + m:
+            k = t - n - p
+            zr = z_reg[b, k]
+            diag_term = lhs_z[b, k]
+            if zr > dtype(0.0):
+                diag_term = zr * lhs_z[b, k]
+            v = active_G_row[b, k] * G_x[b, k] - diag_term
+            if residual == wp.int32(1):
+                v = rhs_z[b, k] - v
+                wp.atomic_max(norm_out, 0, wp.abs(v))
+            out_z[b, k] = v
+
+    return condensed_kkt_combine_kernel
+
+
+# ---------------------------------------------------------------------------
+# Iterative refinement of the condensed KKT solve, decided on the device
+# ---------------------------------------------------------------------------
+
+@functools.lru_cache(maxsize=None)
+def create_refinement_begin_kernel(dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
+    """Start of a refinement loop: no candidate evaluated yet (``error`` is
+    +inf, ``step`` is 0), both norm accumulators zeroed for their first
+    atomic max, and the loop runs if ``iterative_refinement_max_iter`` is
+    positive. Launch with ``dim=1``."""
+    @wp.kernel
+    def refinement_begin_kernel(
+        settings_i: wp.array(dtype=wp.int32),  # type: ignore  device integer settings
+        rhs_norm: wp.array(dtype=dtype),       # type: ignore  (1,) zeroed
+        new_error: wp.array(dtype=dtype),      # type: ignore  (1,) zeroed
+        error: wp.array(dtype=dtype),          # type: ignore  (1,) error of the current candidate
+        step: wp.array(dtype=wp.int32),        # type: ignore  (1,) refinement step
+        loop: wp.array(dtype=wp.int32),        # type: ignore  (1,) loop condition
+    ):
+        rhs_norm[0] = dtype(0.0)
+        new_error[0] = dtype(0.0)
+        error[0] = dtype(wp.inf)
+        step[0] = 0
+        loop[0] = wp.where(settings_i[SettingsIntIdx.iterative_refinement_max_iter] > 0, 1, 0)
+
+    return refinement_begin_kernel
+
+
+@functools.lru_cache(maxsize=None)
+def create_refinement_decide_kernel(dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
+    """One decision of the refinement loop, from the batch-wide residual norm
+    ``new_error`` of the current candidate. The same rules as PIQP's IR loop:
+
+    * a non-finite error stops without accepting;
+    * an error within ``eps_abs + eps_rel * ||rhs||`` stops, accepting the
+      candidate unless it is the initial solve (step 0);
+    * otherwise, after step 0, an improvement rate (previous / new error)
+      below ``min_improvement_rate`` stops, accepting the candidate only if
+      it improved at all; a faster improvement accepts it and continues.
+
+    ``accept`` tells the caller to copy the candidate into the solution,
+    ``correct`` to compute the next candidate; ``loop`` continues while not
+    stopped and fewer than ``iterative_refinement_max_iter`` steps ran.
+    ``new_error`` is reset to zero for the next candidate's atomic max.
+    Launch with ``dim=1``.
+    """
+    @wp.kernel
+    def refinement_decide_kernel(
+        settings_f: wp.array(dtype=dtype),     # type: ignore  device float settings
+        settings_i: wp.array(dtype=wp.int32),  # type: ignore  device integer settings
+        rhs_norm: wp.array(dtype=dtype),       # type: ignore  (1,) ||rhs||_inf over the batch
+        new_error: wp.array(dtype=dtype),      # type: ignore  (1,) ||rhs - K cand||_inf over the batch, reset
+        error: wp.array(dtype=dtype),          # type: ignore  (1,) error of the previous candidate, updated
+        step: wp.array(dtype=wp.int32),        # type: ignore  (1,) refinement step, advanced
+        accept: wp.array(dtype=wp.int32),      # type: ignore  (1,) 1: copy the candidate into the solution
+        correct: wp.array(dtype=wp.int32),     # type: ignore  (1,) 1: compute the next candidate
+        loop: wp.array(dtype=wp.int32),        # type: ignore  (1,) loop condition
+    ):
+        i = step[0]
+        previous = error[0]
+        current = new_error[0]
+        new_error[0] = dtype(0.0)
+        error[0] = current
+        tol = (settings_f[SettingsFloatIdx.iterative_refinement_eps_abs]
+               + settings_f[SettingsFloatIdx.iterative_refinement_eps_rel] * rhs_norm[0])
+        stop = 0
+        take = 0
+        if not wp.isfinite(current):
+            stop = 1
+        elif current <= tol:
+            stop = 1
+            if i > 0:
+                take = 1
+        elif i > 0:
+            rate = previous / current
+            if rate < settings_f[SettingsFloatIdx.iterative_refinement_min_improvement_rate]:
+                stop = 1
+                if rate > dtype(1.0):
+                    take = 1
+            else:
+                take = 1
+        accept[0] = take
+        correct[0] = 1 - stop
+        step[0] = i + 1
+        loop[0] = wp.where(
+            stop == 0 and i + 1 < settings_i[SettingsIntIdx.iterative_refinement_max_iter], 1, 0)
+
+    return refinement_decide_kernel
+
+
+@functools.lru_cache(maxsize=None)
+def create_refinement_accept_kernel(n: int, p: int, m: int, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
+    """Copy the candidate ``(cand_x, cand_y, cand_z)`` into the solution
+    ``(lhs_x, lhs_y, lhs_z)`` when ``accept[0]`` is set. Launch with
+    ``dim=(B, n + p + m)``."""
+    @wp.kernel
+    def refinement_accept_kernel(
+        accept: wp.array(dtype=wp.int32),   # type: ignore  (1,) decision of the decide kernel
+        cand_x: wp.array2d(dtype=dtype),    # type: ignore  (B, n) candidate
+        cand_y: wp.array2d(dtype=dtype),    # type: ignore  (B, p)
+        cand_z: wp.array2d(dtype=dtype),    # type: ignore  (B, m)
+        lhs_x: wp.array2d(dtype=dtype),     # type: ignore  (B, n) solution, updated
+        lhs_y: wp.array2d(dtype=dtype),     # type: ignore  (B, p)
+        lhs_z: wp.array2d(dtype=dtype),     # type: ignore  (B, m)
+    ):
+        if accept[0] == 0:
+            return
+        b, t = wp.tid()
+        n_s = wp.static(n)
+        p_s = wp.static(p)
+        if t < n_s:
+            lhs_x[b, t] = cand_x[b, t]
+        elif t < n_s + p_s:
+            lhs_y[b, t - n_s] = cand_y[b, t - n_s]
+        else:
+            lhs_z[b, t - n_s - p_s] = cand_z[b, t - n_s - p_s]
+
+    return refinement_accept_kernel
+
+
+@functools.lru_cache(maxsize=None)
+def create_refinement_rhs_norm_kernel(n: int, p: int, m: int, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
+    """``rhs_norm[0] = max(rhs_norm[0], max |(rhs_x, rhs_y, rhs_z)|)`` over the
+    batch, in one launch (atomic; the begin kernel zeroes ``rhs_norm``).
+    Launch with ``dim=(B, n + p + m)``."""
+    @wp.kernel
+    def refinement_rhs_norm_kernel(
+        rhs_x: wp.array2d(dtype=dtype),     # type: ignore  (B, n)
+        rhs_y: wp.array2d(dtype=dtype),     # type: ignore  (B, p)
+        rhs_z: wp.array2d(dtype=dtype),     # type: ignore  (B, m)
+        rhs_norm: wp.array(dtype=dtype),    # type: ignore  (1,) accumulated max
+    ):
+        b, t = wp.tid()
+        n_s = wp.static(n)
+        p_s = wp.static(p)
+        if t < n_s:
+            v = rhs_x[b, t]
+        elif t < n_s + p_s:
+            v = rhs_y[b, t - n_s]
+        else:
+            v = rhs_z[b, t - n_s - p_s]
+        wp.atomic_max(rhs_norm, 0, wp.abs(v))
+
+    return refinement_rhs_norm_kernel
+
+
+@functools.lru_cache(maxsize=None)
+def create_refinement_add_kernel(n: int, p: int, m: int, dtype=wp.float64):
+    dtype = to_warp_dtype(dtype)
+    """``(cand_x, cand_y, cand_z) += (lhs_x, lhs_y, lhs_z)``: the next
+    candidate from the correction, in one launch. Launch with
+    ``dim=(B, n + p + m)``."""
+    @wp.kernel
+    def refinement_add_kernel(
+        lhs_x: wp.array2d(dtype=dtype),     # type: ignore  (B, n) solution
+        lhs_y: wp.array2d(dtype=dtype),     # type: ignore  (B, p)
+        lhs_z: wp.array2d(dtype=dtype),     # type: ignore  (B, m)
+        cand_x: wp.array2d(dtype=dtype),    # type: ignore  (B, n) correction in, candidate out
+        cand_y: wp.array2d(dtype=dtype),    # type: ignore  (B, p)
+        cand_z: wp.array2d(dtype=dtype),    # type: ignore  (B, m)
+    ):
+        b, t = wp.tid()
+        n_s = wp.static(n)
+        p_s = wp.static(p)
+        if t < n_s:
+            cand_x[b, t] = cand_x[b, t] + lhs_x[b, t]
+        elif t < n_s + p_s:
+            cand_y[b, t - n_s] = cand_y[b, t - n_s] + lhs_y[b, t - n_s]
+        else:
+            cand_z[b, t - n_s - p_s] = cand_z[b, t - n_s - p_s] + lhs_z[b, t - n_s - p_s]
+
+    return refinement_add_kernel

@@ -47,7 +47,8 @@ When modifying the solver, keep the distinction clear between:
 
 ## GPU Programming Rules
 
-- Use CuPy for GPU array storage and lightweight NumPy-like operations.
+- The solver is `warp`-native, just like `Mujoco-warp`
+- Use `warp.array` for GPU array storage.
 - Use NVIDIA Warp for custom GPU kernels, especially batched small dense block operations.
 - Use cuDSS for sparse direct factorization when appropriate.
 - Use cuBLAS/cuSOLVER for dense linear algebra where possible.
@@ -57,7 +58,7 @@ When modifying the solver, keep the distinction clear between:
 - Keep CUDA stream semantics explicit.
 - If adding a new GPU operation, make sure it runs on the intended stream.
 - Avoid mixing default stream behavior with custom streams unless explicitly handled.
-- Be careful when combining CuPy streams and Warp streams.
+- `CuPy` can be used for sparse solver for convenience when latency is not urgent, such as in setup phase. Be careful when combining `CuPy` streams and Warp streams.
 - CUDA Graph capture should avoid unsupported operations such as certain cuSPARSE calls.
 - Do not assume a library call is graph-capturable unless verified.
 

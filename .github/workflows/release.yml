@@ -1,0 +1,121 @@
+name: Build and upload to PyPI
+
+# Publishes cuPIQP to PyPI with trusted publishing (OIDC), so no API token is
+# stored in the repository.
+#
+# Release flow:
+#   1. Set `version` in pyproject.toml and date the entry in CHANGELOG.md.
+#   2. Merge into main, then create a GitHub Release with tag `v<version>`.
+#   3. Publishing the Release runs this workflow: the CI gate (static checks,
+#      and GPU tests if enabled), then build, then upload to PyPI.
+#      Without a GPU runner, run the GPU test suite locally before releasing.
+#
+# Dry run: start this workflow by hand from the Actions tab
+# (workflow_dispatch). It runs the same gate and build, then uploads to
+# TestPyPI instead of PyPI.
+#
+# One-time setup:
+#   - On pypi.org and test.pypi.org, add a (pending) trusted publisher with
+#     owner `PREDICT-EPFL`, repository `cupiqp`, workflow `release.yml`, and
+#     environment `pypi` (PyPI) or `testpypi` (TestPyPI).
+#   - In the GitHub repository settings, create the environments `pypi` and
+#     `testpypi`. Adding required reviewers to `pypi` gives a manual approval
+#     step before the upload.
+
+on:
+  workflow_dispatch:
+  release:
+    types:
+      - published
+
+jobs:
+  tests:
+    name: Tests
+    # Static checks, plus the GPU tests on the self-hosted runner when the
+    # repository variable GPU_RUNNER_ENABLED is 'true' (see ci.yml).
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: Build sdist and wheel
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The version is static in pyproject.toml, so make sure the release tag
+      # matches it. PyPI never accepts the same version twice.
+      - name: Check tag matches package version
+        if: github.event_name == 'release'
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          VERSION=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")
+          echo "tag: $TAG, pyproject version: $VERSION"
+          if [ "$TAG" != "v$VERSION" ]; then
+            echo "::error::Release tag $TAG does not match pyproject version v$VERSION"
+            exit 1
+          fi
+
+      - name: Build sdist and wheel
+        run: pipx run build
+
+      - name: Check metadata
+        run: pipx run twine check --strict dist/*
+
+      # The runner has no GPU. Importing cupiqp needs no GPU, so this checks
+      # that the wheel installs with its dependencies and imports cleanly.
+      - name: Smoke test wheel
+        run: |
+          python -m pip install dist/*.whl
+          cd "$(mktemp -d)" && python -c "import cupiqp, cupiqp.dense, cupiqp.sparse, cupiqp.multistage; print(cupiqp.__version__)"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+
+  upload_pypi:
+    name: Upload to PyPI
+    needs: [tests, build]
+    if: github.event_name == 'release' && github.event.action == 'published'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/cupiqp
+    permissions:
+      id-token: write
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  upload_testpypi:
+    name: Upload to TestPyPI
+    needs: [tests, build]
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/cupiqp
+    permissions:
+      id-token: write
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/

@@ -6,7 +6,10 @@ Every solver owns a `Settings` dataclass at `solver.settings`. Mutate its fields
 `setup()` or between solves:
 
 ```python
-solver = DenseSolver(dtype="float64")
+import warp as wp
+from cupiqp import DenseSolver
+
+solver = DenseSolver(dtype=wp.float64)
 solver.settings.verbose = True
 solver.settings.max_iter = 100
 solver.settings.eps_abs = 1e-6
@@ -19,9 +22,10 @@ You can also build a `Settings` object directly. The factory
 defaults** (see [Precision](#precision-and-dtype)):
 
 ```python
+import warp as wp
 from cupiqp import Settings
 
-settings = Settings.for_dtype("float32")
+settings = Settings.for_dtype(wp.float32)
 settings.max_iter = 200
 ```
 
@@ -34,11 +38,10 @@ settings.max_iter = 200
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `dtype` | `"float32"` \| `"float64"` | `"float64"` | Solver arithmetic precision (fixed at construction). |
-| `device` | `str` | `"cuda"` | Compute device. |
+| `dtype` | `wp.float32` \| `wp.float64` | `wp.float64` | Solver arithmetic precision (fixed at construction). |
 
 `float32` and `float64` carry **different default tolerances**, since you cannot ask for
-`float64`-level accuracy in `float32` arithmetic. `Settings.for_dtype("float32")` loosens
+`float64`-level accuracy in `float32` arithmetic. `Settings.for_dtype(wp.float32)` loosens
 the tolerances accordingly. If you tighten a `float32` tolerance below its recommended
 floor, the solver emits a warning that convergence may fail.
 
@@ -111,23 +114,22 @@ cuPIQP equilibrates the problem with a Ruiz preconditioner before solving.
 
 | Field | Default | Description |
 |---|---|---|
-| `enable_cuda_graph` | `True` | Capture the repeated IPM iteration as a CUDA graph and replay it with near-zero launch overhead. |
+| `enable_cuda_graph` | `True` | Record the solve as a CUDA graph on the first `solve()` and replay it afterwards: the whole solve, with the IPM loop running on the GPU, for the dense and multistage backends; one IPM iteration for the sparse backend. Recording does not slow the first solve, and later solves are typically several times faster for small problems. Set it to `False` only for debugging: every kernel is then launched from Python, so an error is reported at the kernel that caused it. |
 | `use_deterministic_mode_for_cudss` | `False` | Bit-wise reproducible cuDSS factorizations (slower); sparse backend only. |
-| `kkt_solver` | backend-specific | KKT factorization: `"dense_cholesky"`, `"sparse_ldlt"`, or `"multistage_block_cholesky"`. Set automatically by the chosen solver class. |
-
-!!! note "`kkt_solver` is set by the solver class"
-    Each solver subclass fixes `kkt_solver` to match its backend
-    (`DenseSolver → "dense_cholesky"`, etc.). You normally do not set it by hand.
 
 ### Differentiation, diagnostics, and logging
 
 | Field | Default | Description |
 |---|---|---|
 | `enable_grad` | `False` | Allocate backward buffers; see [Differentiation](../guide/differentiation.md). |
+| `gradient_smoothing` | `False` | Enable qpax-style relaxed-KKT gradient smoothing. Fixed at `setup()`. Requires `enable_grad`. See [Differentiation](../guide/differentiation.md#gradient-smoothing). |
+| `gradient_smoothing_mu` | `1e-3` | Target complementarity `s * z = mu` at the relaxed point. Larger smooths more (more bias); smaller approaches the unsmoothed gradient. |
+| `gradient_smoothing_tol` | `1e-5` | Convergence tolerance of the inner relaxed-Newton solve (separate from the forward `eps_abs`). |
+| `gradient_smoothing_max_iter` | `5` | Maximum relaxed-Newton iterations per backward (separate from the forward `max_iter`). |
 | `verbose` | `False` | Print the banner and the per-iteration log during `solve()`. |
 
 ### Validation
 
 `settings.verify_settings()` returns `True` when every field is within its valid range
-(positive tolerances, `0 < tau ≤ 1`, a recognized `kkt_solver` and `dtype`, etc.). Use
+(positive tolerances, `0 < tau ≤ 1`, a recognized `dtype`, etc.). Use
 it as a quick sanity check after programmatically constructing settings.

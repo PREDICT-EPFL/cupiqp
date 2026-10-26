@@ -29,7 +29,13 @@ with primal decision variables $x \in \mathbb{R}^n$, matrices $P\in \mathbb{S}_+
 
 - **Native batched solving** — solve multiple independent QPs with the same dimension and sparsity pattern in parallel from a single solver instance by stacking inputs along a leading batch axis.
 - **Differentiable** — efficiently compute VJPs via implicit differentiation
-  by reusing the condensed factor from the forward solve.
+  by reusing the condensed factor from the forward solve, with optional
+  [gradient smoothing](guide/differentiation.md#gradient-smoothing) for smooth
+  derivatives across active-set changes. The [PyTorch layers](guide/torch.md)
+  plug the solve into `torch.autograd`.
+- **Warp-native** — every input, internal buffer and result is a `warp.array`.
+  Inputs can be any CUDA array (CuPy, PyTorch, JAX, ...), viewed zero-copy through
+  the CUDA Array Interface or DLPack.
 - **Scales to large QPs** — the same solver handles large sparse and dense QPs.
 - **Robust** - implements proximal iterior point method, with modern techniques including preconditioner, iterative refinement, etc.
 - **GPU-resident** — the IPM iterations, KKT factorizations, and linear algebra run on the GPU.
@@ -43,7 +49,7 @@ cuPIQP implements the same
 
 |                       | **PIQP** (CPU)                                          | **cuPIQP** (GPU)                                |
 | --------------------- | ------------------------------------------------------- | ----------------------------------------------- |
-| **Language**          | C++ (with C / Python / Matlab / Julia / Rust bindings)  | Python (CuPy + Warp)                            |
+| **Language**          | C++ (with C / Python / Matlab / Julia / Rust bindings)  | Python ([Warp](https://github.com/NVIDIA/warp)-native) |
 | **Execution**         | CPU (multi-threaded via OpenMP)                         | GPU-resident (CUDA)                             |
 | **Batched solving**   | Limited                             | Massive |
 | **Differentiable**    | No                                                      | Yes, via implicit differentiation               |
@@ -52,10 +58,11 @@ cuPIQP implements the same
 
 CuPIQP is built on multiple existing libraries, including:
 
-- [CuPy](https://cupy.dev/) — GPU array library (`cupy-cuda12x` or `cupy-cuda13x`).
-- [Warp](https://github.com/NVIDIA/warp) — JIT-compiled CUDA kernels.
+- [Warp](https://github.com/NVIDIA/warp) — the solver's arrays and JIT-compiled CUDA kernels.
 - [nvmath-python](https://developer.nvidia.com/nvmath-python) — cuBLAS / cuSOLVER /
   cuSPARSE / cuDSS bindings and CUDA runtime packages via the selected CUDA extra.
+- [SciPy](https://scipy.org/) — sparse backend only, to build the KKT sparsity pattern
+  once at `setup()`.
 - [NVTX](https://github.com/NVIDIA/NVTX) — profiling annotations.
 - [socu](https://github.com/PREDICT-EPFL/socu) — required by `MultistageSolver` as the
   block-structured linear-system solver (installed by default as a core dependency).
@@ -68,7 +75,8 @@ Framework-independent dependencies (`numpy`, `scipy`, `warp-lang`, `nvmath-pytho
 - New here? Start with [Installation](installation.md) and
   [Getting Started](getting-started.md).
 - Building a controller or learning loop? See [Batched Solving](guide/batched.md).
-- Differentiating through a solution? See [Differentiation](guide/differentiation.md).
+- Differentiating through a solution? See [Differentiation](guide/differentiation.md),
+  or [PyTorch Layers](guide/torch.md) to train through the solver with `torch.autograd`.
 - Looking for a specific class or setting? See the [API Reference](api/solvers.md).
 
 ## Citing

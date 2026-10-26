@@ -19,7 +19,6 @@ keywords = [
   "interior-point method",
   "gpu",
   "cuda",
-  "cupy",
   "warp",
   "differentiable",
 ]
@@ -37,81 +36,86 @@ classifiers = [
 
 # Runtime dependencies installed for every `pip install .`.
 #
-# numpy / scipy / warp-lang / nvmath-python / nvtx resolve cleanly from PyPI.
-# `socu` (block-structured Warp kernels backing `MultistageSolver`) is NOT on
-# PyPI yet, so it is pulled straight from GitHub via a PEP 508 direct reference.
-# It is listed here as a core dependency so the multistage backend works out of
-# the box after a plain `pip install .`.
-#
-# WARNING: the `socu @ git+...` direct reference makes this project
-# NON-uploadable to PyPI (PyPI rejects direct-URL dependencies). Before any
-# PyPI release, publish socu to PyPI and pin it as "socu>=x".
-#
-# CUDA-bound packages (cupy-cuda12x / cuda13x, torch+cuXY, jax-cudaXY) are still
-# NOT listed here — install them via the matching extra (see optional extras).
+# `socu` provides the block-structured Warp kernels behind `MultistageSolver`.
+# The CUDA runtime libraries are NOT listed here; install them via the
+# matching CUDA extra (see optional extras).
 dependencies = [
   "numpy>=2.0",
   "scipy>=1.13",
-  "warp-lang>=1.12",
-  "nvmath-python>=0.7.0",
+  "warp-lang>=1.17",
+  "nvmath-python>=1.0.0",
   "nvtx>=0.2",
-  "socu @ git+https://github.com/PREDICT-EPFL/socu.git",
+  "socu>=0.1.0",
 ]
 
 [project.optional-dependencies]
-# --- CUDA / CuPy ---------------------------------------------------------
-# CuPy ships as separate wheels per CUDA major version (cupy-cuda12x for
-# CUDA 12.x, cupy-cuda13x for CUDA 13.x). Pick the one matching the CUDA
-# version reported by ``nvidia-smi``. nvmath-python's CUDA extras provide
-# the matching NVIDIA runtime libraries, including cuDSS for the sparse backend:
+# --- CUDA ---------------------------------------------------------------
+# Pick the extra matching the CUDA version reported by ``nvidia-smi``.
+# nvmath-python's CUDA extras provide the matching NVIDIA runtime libraries
+# (cuBLAS, cuSOLVER, cuSPARSE, and cuDSS for the sparse backend):
 #
 #   pip install "cupiqp[cuda12]"   -> CUDA 12.x driver/runtime
 #   pip install "cupiqp[cuda13]"   -> CUDA 13.x driver/runtime
 #
 # These are mutually exclusive — installing both will resolve, but only the
 # wheel matching the driver actually loads at runtime.
-cuda12 = ["cupy-cuda12x", "nvmath-python[cu12]>=0.7.0"]
-cuda13 = ["cupy-cuda13x", "nvmath-python[cu13]>=0.7.0"]
+cuda12 = ["nvmath-python[cu12]>=1.0.0"]
+cuda13 = ["nvmath-python[cu13]>=1.0.0"]
 
-# --- Differentiable layers ----------------------------------------------
-# The `cupiqp.torch` and `cupiqp.jax` packages are always shipped in the
-# wheel, but they can only be imported when the matching ML framework is
-# installed. These extras pull that framework in so the corresponding package
-# becomes usable:
-#
-#   pip install "cupiqp[cuda13,torch]"   -> enables `from cupiqp.torch import ...`
-#   pip install "cupiqp[cuda13,jax]"     -> enables `from cupiqp.jax import ...`
-#
-# Version floors are minimum-tested versions, not pins — pick the wheel
-# variant whose CUDA build matches your stack.
+# --- frameworks ---------------------------------------------------------
+# The differentiable PyTorch layers (`cupiqp.torch`) ship in every install;
+# this extra only installs PyTorch itself. Install a CUDA build of PyTorch
+# that matches your driver (see https://pytorch.org/get-started/locally/).
 torch = ["torch>=2.4"]
-jax   = ["jax>=0.4", "jaxlib>=0.4"]
+# The JAX interface (`cupiqp.jax`) ships in every install; this extra only
+# installs JAX itself. Install a CUDA build of JAX that matches your driver,
+# e.g. `pip install "jax[cuda12]"` (see https://docs.jax.dev/en/latest/installation.html).
+jax   = ["jax>=0.6"]
 
-# NOTE: the multistage backend (`MultistageSolver`) is a first-class backend
-# alongside dense and sparse. Its `socu` dependency ships by default via the
-# core [dependencies] above, so there is deliberately NO `multistage` extra.
-
-# Everything — both differentiable layers (multistage already ships by default):
-#   pip install "cupiqp[cuda13,all]"
-all   = ["torch>=2.4", "jax>=0.4", "jaxlib>=0.4"]
 test  = ["pytest>=7"]
 dev   = [
   "pytest>=7",
   "torch>=2.4",
-  "jax>=0.4",
-  "jaxlib>=0.4",
+]
+
+# --- dependency groups -------------------------------------------------------
+#
+# Development-only dependencies that are not published with the package.
+# Install a group without installing cupiqp itself (pip >= 25.1):
+#
+#   pip install --group docs
+#
+# docs: CPU-only. mkdocstrings reads docstrings from the cupiqp source via
+# griffe's STATIC analysis (it parses the AST, it does not `import cupiqp`),
+# so the API docs build without a GPU installed.
+# Build with `zensical build --clean --strict`, preview with `zensical serve`.
+
+[dependency-groups]
+docs = [
+  "zensical>=0.0.71",
+  "mkdocstrings[python]>=1.0.8",       # older versions break with pymdown-extensions 12
+  "griffe-inherited-docstrings>=1.0",  # overrides inherit base docstrings (e.g. setup())
+  "black>=24.0",                       # lets mkdocstrings pretty-print the generated signatures
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "slow: long-running tests (large benchmark problems); deselect with -m 'not slow'",
 ]
 
 [project.urls]
-Homepage   = "https://github.com/PREDICT-EPFL/cupiqp"
-Repository = "https://github.com/PREDICT-EPFL/cupiqp"
-Issues     = "https://github.com/PREDICT-EPFL/cupiqp/issues"
+Homepage      = "https://github.com/PREDICT-EPFL/cupiqp"
+Documentation = "https://predict-epfl.github.io/cupiqp/"
+Repository    = "https://github.com/PREDICT-EPFL/cupiqp"
+Issues        = "https://github.com/PREDICT-EPFL/cupiqp/issues"
+Changelog     = "https://github.com/PREDICT-EPFL/cupiqp/blob/main/CHANGELOG.md"
 
 
 # --- packaging -------------------------------------------------------------
 #
 # The `cupiqp` package and its subpackages (`cupiqp.dense`, `cupiqp.sparse`,
-# `cupiqp.multistage`, `cupiqp.torch`, `cupiqp.jax`) each ship an
+# `cupiqp.multistage`) each ship an
 # `__init__.py`, so they are regular packages. `namespaces = true` (the
 # default) is kept so setuptools still discovers everything matching
 # `cupiqp*`. The `__init__.py` files in the KKT-backend subpackages also let

@@ -22,14 +22,10 @@ factorization used. See [Backends](../guide/backends.md) for guidance on choosin
       inherited_members: true
       members: [setup, solve, update, backward]
 
-`SparseSolver` takes a batch of sparse matrices as a single
-`UniformBatchedCsrMatrix` — cuPIQP's own batched CSR container (the preferred,
-fastest batched input; see `setup` above):
-
-::: cupiqp.UniformBatchedCsrMatrix
-    options:
-      show_if_no_docstring: true
-      members: false
+`SparseSolver.setup` takes `P`, `A`, `G` as CSR triples `(indptr, indices, values)`, with
+the pattern on the host or the device and the values on the device; each value array and vector is shared or batched, and the batch size is read
+from the batched ones. `update` takes each matrix's values alone, `(nnz,)` or `(B, nnz)`
+(see `setup` and `update` above).
 
 ## MultistageSolver
 
@@ -38,22 +34,8 @@ fastest batched input; see `setup` above):
       inherited_members: true
       members: [setup, solve, update, backward]
 
-`MultistageSolver` takes its problem data as the block-structured objects below —
-build them, fill in their data, and pass them to `setup` (see above for which
-argument expects which type):
-
-::: cupiqp.BlockTridiagMat
-    options:
-      show_if_no_docstring: true
-      members: false
-
-::: cupiqp.BlockBidiagMat
-    options:
-      show_if_no_docstring: true
-      members: false
-
-::: cupiqp.BlockVec
-    options:
-      show_if_no_docstring: true
-      members: false
+`MultistageSolver` takes plain GPU arrays: each block-structured matrix is a
+`(diag, offdiag)` tuple and each vector an array, shared by every problem or with a
+leading batch axis, at `setup` and at `update` (see `setup` and `update` above for the
+block layout).
 

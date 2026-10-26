@@ -21,6 +21,12 @@ The main design goal is to keep the solver architecture close to PIQP while intr
 
 ---
 
+## Warp-Native Data and Validation
+
+cuPIQP is Warp-native. All solver-owned data, workspaces, intermediate results, and outputs must be stored as `warp.array`. CuPy may only be used inside the sparse backend where its CSR support is required; do not introduce CuPy arrays or CuPy views into the common, dense, multistage, or OCP paths. Validate external inputs once at the public API boundary, including dtype, device, shape, and layout, then convert or copy them into canonical Warp-owned storage. Internal classes and functions must accept and trust these canonical Warp arrays instead of repeatedly calling conversion helpers such as `as_warp()` or duplicating input validation. Keep internal interfaces narrow, explicit, and clean; use assertions only for genuine developer invariants when necessary.
+
+---
+
 ## Solver Architecture
 
 The solver is organized around an interior-point method loop. The algorithmic layer should remain independent of the concrete linear algebra backend.
