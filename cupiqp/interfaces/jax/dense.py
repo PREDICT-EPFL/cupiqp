@@ -85,7 +85,8 @@ class DenseSolver(JaxSolverBase):
         Solver configuration; by default the defaults of the core solver
         for ``dtype``. Also available, and mutable, as :attr:`settings`.
         ``preconditioner_reuse_on_update`` and ``verbose`` must stay
-        ``False``; gradient settings are ignored.
+        ``False``. ``gradient_on_failure`` and the ``gradient_smoothing*``
+        settings apply to gradients through :meth:`solve`.
 
     Examples
     --------
@@ -133,7 +134,9 @@ class DenseSolver(JaxSolverBase):
     Two settings are rejected because they would break the pure-function
     contract: ``preconditioner_reuse_on_update`` (results would depend on
     earlier calls) and ``verbose`` (printing is a side effect XLA may skip).
-    Settings used only by the core's ``backward()`` are ignored.
+    The gradient settings (``gradient_on_failure``, ``gradient_smoothing*``)
+    are part of the compiled call like the forward settings; ``enable_grad``
+    and ``compute_timings`` are ignored.
 
     JAX reserves most of the GPU memory when its backend starts, which can
     leave the core solver unable to create its cuSOLVER or cuDSS handles.

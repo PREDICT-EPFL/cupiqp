@@ -208,6 +208,16 @@ scaling of an earlier call, so a result would depend on what was solved before.
 respect to every array argument, by implicit differentiation of the KKT
 conditions at the solution (the core's `backward_from_state()`).
 
+!!! warning "Experimental: accuracy follows the core's backward"
+    The JAX gradient equals the core's `backward_from_state()` exactly. That
+    adjoint solve is known to be inaccurate on some problems: it uses the
+    regularized KKT factor, which biases gradients of the equality
+    multipliers `y` (up to about 1e-3 relative without inequalities), and at
+    a converged point inactive inequalities make it ill-conditioned, with
+    errors up to tens of percent on a few unpreconditioned problems. Keep
+    `preconditioner_iter > 0` (the default) and check gradients by finite
+    differences before relying on them.
+
 ```python
 solver = DenseSolver()
 
