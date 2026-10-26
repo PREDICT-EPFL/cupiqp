@@ -1861,12 +1861,17 @@ class SolverBase(ABC):
         ValueError
             If an argument has the wrong shape or is on another device.
         RuntimeError
-            Before the first ``solve()``, or without ``enable_grad``.
+            Before ``setup()``, or without ``enable_grad``. No ``solve()`` of
+            this instance is needed: a state saved from another solver of the
+            same structure can be differentiated here.
         """
         given = dict(x=x, y=y, z_u=z_u, z_l=z_l, z_bu=z_bu, z_bl=z_bl,
                      s_u=s_u, s_l=s_l, s_bu=s_bu, s_bl=s_bl)
         with wp.ScopedStream(self._stream, sync_enter=not self._stream.is_capturing):
-            self._check_backward_preconditions("backward_from_state()")
+            # Needs the data and the given state, not a solve of this
+            # instance: the scaling is computed by setup()/update(), and the
+            # settings the backward kernels read are uploaded here.
+            self._check_backward_preconditions("backward_from_state()", needs_solve=False)
             # All host-side validation first: nothing is modified on failure.
             B = self._data.batch_size
             state = {
@@ -1879,6 +1884,7 @@ class SolverBase(ABC):
             status = self._validated_state_array("status", status, wp.int32, (B,))
 
             self._factor_revision = -1
+            self._device_settings.upload(self.settings)
             data = self._data
             # Copy the state into solver-owned buffers (scaling and smoothing
             # modify the working point; the caller's arrays stay untouched),
@@ -1930,14 +1936,16 @@ class SolverBase(ABC):
             )
         return array
 
-    def _check_backward_preconditions(self, where: str) -> None:
+    def _check_backward_preconditions(self, where: str, needs_solve: bool = True) -> None:
         if not self.settings.enable_grad:
             raise RuntimeError("Set enable_grad to True to enable gradient computation.")
-        if not self._setup_done or self._solve_revision < 0:
+        if needs_solve and (not self._setup_done or self._solve_revision < 0):
             raise RuntimeError(
                 f"{type(self).__name__}.{where} requires a prior solve(); "
                 "call setup() and solve() first."
             )
+        if not self._setup_done:
+            raise RuntimeError(f"{type(self).__name__}.{where} requires setup() first.")
         self._check_frozen_settings(where)
         if self.settings.gradient_on_failure not in ("differentiate", "zero"):
             raise ValueError(
