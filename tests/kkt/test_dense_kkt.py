@@ -17,7 +17,7 @@ from cupiqp.dense.dense_preconditioner import DenseRuizEquilibration
 from cupiqp.kkt_systems import KKTSystem
 from cupiqp.results import Variables
 from cupiqp.settings import Settings
-from tests.helpers import DEVICE, to_wp, to_wp_dict
+from tests.helpers import DEVICE, to_wp, to_wp_dict, device_settings
 
 
 def _zeros(*shape):
@@ -346,7 +346,7 @@ class TestDenseKKTSystemCondensedSolve:
 
         settings = Settings()
         kkt = KKTSystem()
-        kkt.init(data, settings)
+        kkt.init(data, settings, device_settings(settings, data))
         preconditioner = make_preconditioner(data)
 
         vars_ = Variables()
@@ -413,7 +413,7 @@ class TestDenseKKTSystemIR:
         settings_no_ir = Settings()
         settings_no_ir.iterative_refinement_max_iter = 0
         kkt_no_ir = KKTSystem()
-        kkt_no_ir.init(data, settings_no_ir)
+        kkt_no_ir.init(data, settings_no_ir, device_settings(settings_no_ir, data))
         preconditioner = make_preconditioner(data)
 
         vars_no_ir = Variables()
@@ -450,7 +450,7 @@ class TestDenseKKTSystemIR:
         settings_ir = Settings()
         settings_ir.iterative_refinement_max_iter = 10
         kkt_ir = KKTSystem()
-        kkt_ir.init(data, settings_ir)
+        kkt_ir.init(data, settings_ir, device_settings(settings_ir, data))
         preconditioner = make_preconditioner(data)
 
         vars_ir = Variables()
@@ -469,7 +469,7 @@ class TestDenseKKTSystemIR:
             data, to_wp(rhs_x), to_wp(rhs_y), to_wp(rhs_z), lhs_x2, lhs_y2, lhs_z2)
 
         kkt_ir.iterative_refinement(
-            data, settings_ir,
+            data,
             to_wp(rhs_x), to_wp(rhs_y), to_wp(rhs_z),
             lhs_x2, lhs_y2, lhs_z2)
 

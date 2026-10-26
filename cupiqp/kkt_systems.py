@@ -1,15 +1,18 @@
-import math
 
 import warp as wp
 import nvtx
 
 from .results import Variables
 from .data import Data
-from .settings import Settings
+from .settings import DeviceSettings, Settings
 from .utils import column_slice
 from .preconditioner import PreconditionerBase
 from .kkt_systems_kernels import (
-    create_inf_norm_2d_kernel,
+    create_refinement_accept_kernel,
+    create_refinement_add_kernel,
+    create_refinement_begin_kernel,
+    create_refinement_decide_kernel,
+    create_refinement_rhs_norm_kernel,
     create_eliminate_slacks_kernel,
     create_eliminate_slacks_transposed_kernel,
     create_eliminate_duals_kernel,
@@ -66,8 +69,13 @@ class KKTSystem:
     def __init__(self):
         return
 
-    def init(self, data: Data, settings: Settings):
+    def init(self, data: Data, settings: Settings, device_settings: DeviceSettings):
+        """Allocate the KKT system of ``data``. ``device_settings`` are the
+        runtime settings on the device (owned by the solver and refreshed at
+        every solve); the iterative refinement reads its tolerances and
+        iteration limit from them, so that a captured solve sees changes."""
         self._settings = settings
+        self._device_settings = device_settings
         self._use_iterative_refinement = False
         self._batch_size = data.batch_size
         B = self._batch_size
@@ -152,6 +160,16 @@ class KKTSystem:
         # Pre-allocated buffers for condensed KKT iterative refinement
         self._iter_refine_error_xyz = wp.zeros((B, n + p + m), dtype=self._dtype, device=self._device)
         self._iter_refine_delta_xyz = wp.zeros((B, n + p + m), dtype=self._dtype, device=self._device)
+        # Device state of the refinement loop: the batch-wide norm of the
+        # right-hand side and the error of the current candidate, and
+        # [step, accept, correct, loop] as one int32 buffer.
+        self._refine_rhs_norm = wp.zeros(1, dtype=self._dtype, device=self._device)
+        self._refine_error = wp.zeros(1, dtype=self._dtype, device=self._device)
+        self._refine_state = wp.zeros(4, dtype=wp.int32, device=self._device)
+        self._refine_step = self._refine_state[0:1]
+        self._refine_accept = self._refine_state[1:2]
+        self._refine_correct = self._refine_state[2:3]
+        self._refine_loop = self._refine_state[3:4]
 
         # Create Warp kernels
         self._update_regularization_step_1_kernel = create_update_regularizations_step_1_kernel(num_ineq=num_ineq, dtype=self._dtype)
@@ -162,10 +180,16 @@ class KKTSystem:
         self._eliminate_duals_kernel = create_eliminate_duals_kernel(
             n, m, has_h_l=data.has_h_l, has_h_u=data.has_h_u, has_x_l=data.has_x_l, has_x_u=data.has_x_u, dtype=self._dtype)
         self._recover_duals_kernel = create_recover_duals_kernel(data.num_hu, data.num_hl, data.num_xu, data.num_xl, dtype=self._dtype)
+        self._recover_duals_transposed_kernel = create_recover_duals_kernel(
+            data.num_hu, data.num_hl, data.num_xu, data.num_xl, dtype=self._dtype, box_rhs_eliminated=True)
         self._recover_slacks_kernel = create_recover_slacks_kernel(dtype=self._dtype)
         self._recover_slacks_transposed_kernel = create_recover_slacks_transposed_kernel(dtype=self._dtype)
         self._condensed_kkt_combine_kernel = create_condensed_kkt_combine_kernel(dtype=self._dtype)
-        self._inf_norm_2d_kernel = create_inf_norm_2d_kernel(dtype=self._dtype)
+        self._refinement_begin_kernel = create_refinement_begin_kernel(dtype=self._dtype)
+        self._refinement_rhs_norm_kernel = create_refinement_rhs_norm_kernel(n, p, m, dtype=self._dtype)
+        self._refinement_add_kernel = create_refinement_add_kernel(n, p, m, dtype=self._dtype)
+        self._refinement_decide_kernel = create_refinement_decide_kernel(dtype=self._dtype)
+        self._refinement_accept_kernel = create_refinement_accept_kernel(n, p, m, dtype=self._dtype)
 
     @property
     def batch_size(self) -> int:
@@ -274,10 +298,10 @@ class KKTSystem:
         # implicit-differentiation gradients where the minor regularization-floor
         # error is accepted).
         # TODO: currently only do IR in the QP solve procedure, no IR in the implicit differentiation.
-        if not transpose and self._use_iterative_refinement and settings.iterative_refinement_max_iter > 0:
+        if not transpose and self._use_iterative_refinement:
+            # The iteration limit is a device setting: zero skips the loop.
             self.iterative_refinement(
-                data, settings,
-                self._rhs_x_bar, rhs.y, self._rhs_z_bar,
+                data, self._rhs_x_bar, rhs.y, self._rhs_z_bar,
                 lhs.x, lhs.y, self._work_z)
         self._recover_lhs(data, preconditioner, rhs, lhs, transpose=transpose)
 
@@ -332,9 +356,12 @@ class KKTSystem:
     def _recover_lhs(self, data: Data, preconditioner: PreconditionerBase, rhs: Variables, lhs: Variables, transpose: bool = False):
         """Back-substitute lhs.z_* and lhs.s_* from the condensed (lhs.x, lhs.y).
 
-        The dual back-sub (z_u, z_l, z_bu, z_bl) is direction-agnostic -- the row
-        equations for those blocks have the same structure in K and K^T once the
-        slack has been eliminated. Only the final slack recovery differs:
+        The dual back-sub (z_u, z_l, z_bu, z_bl) uses the slack-eliminated
+        right-hand side of :meth:`_prepare_rhs`, which differs between K and
+        K^T. The inequality rows read it from ``_updated_rhs_z_*`` in both
+        directions; the box rows eliminate inline with the forward formula,
+        so the transposed solve uses a kernel variant that reads the
+        eliminated box rows instead. The final slack recovery differs too:
         forward uses ``lhs.s = (rhs.s - S lhs.z) / Z``, transpose drops the S
         factor.
         """
@@ -344,15 +371,22 @@ class KKTSystem:
             self.eval_G_xn(data, 1., lhs.x, self._work_z)
 
         if data.num_ineq > 0:
+            if transpose:
+                # Box rows from the K^T elimination rhs.z - (S/Z) rhs.s.
+                box_kernel = self._recover_duals_transposed_kernel
+                rhs_z_bu, rhs_z_bl = self._updated_rhs_z_bu, self._updated_rhs_z_bl
+            else:
+                box_kernel = self._recover_duals_kernel
+                rhs_z_bu, rhs_z_bl = rhs.z_bu, rhs.z_bl
             wp.launch(
-                kernel=self._recover_duals_kernel,
+                kernel=box_kernel,
                 dim=(B, data.num_ineq),
                 inputs=[
                     self._work_z, lhs.x,
                     self._w_u_delta_inv, self._updated_rhs_z_u, lhs.z_u,
                     self._w_l_delta_inv, self._updated_rhs_z_l, lhs.z_l,
-                    self._w_bu_delta_inv, self._m_z_bu_inv, rhs.z_bu, rhs.s_bu, lhs.z_bu,
-                    self._w_bl_delta_inv, self._m_z_bl_inv, rhs.z_bl, rhs.s_bl, lhs.z_bl,
+                    self._w_bu_delta_inv, self._m_z_bu_inv, rhs_z_bu, rhs.s_bu, lhs.z_bu,
+                    self._w_bl_delta_inv, self._m_z_bl_inv, rhs_z_bl, rhs.s_bl, lhs.z_bl,
                     preconditioner.x_b_scaling],
                 device=self._device
             )
@@ -373,30 +407,22 @@ class KKTSystem:
                     device=self._device
                 )
 
-    def _inf_norm(self, *arrays) -> float:
-        """Host-side max of ``|a|`` over the given ``(B, k)`` arrays (one sync)."""
-        stream = wp.get_stream("cuda")
-        self._norm_buf.zero_()
-        for a in arrays:
-            if a.shape[1] > 0:
-                wp.launch(self._inf_norm_2d_kernel, dim=tuple(a.shape), inputs=[a, self._norm_buf],
-                          device=self._device)
-        wp.copy(self._norm_host, self._norm_buf)
-        wp.synchronize_stream(stream)
-        return float(self._norm_host.numpy()[0])
-
     @nvtx.annotate("KKTSystem::iterative_refinement")
-    def iterative_refinement(self, data: Data, settings: Settings,
+    def iterative_refinement(self, data: Data,
                              rhs_x: wp.array, rhs_y: wp.array, rhs_z: wp.array,
-                             lhs_x: wp.array, lhs_y: wp.array, lhs_z: wp.array) -> bool:
+                             lhs_x: wp.array, lhs_y: wp.array, lhs_z: wp.array) -> None:
         """Iterative refinement on the condensed 3-block KKT system.
 
         Refines (lhs_x, lhs_y, lhs_z) in-place so that
             K_condensed * [lhs_x; lhs_y; lhs_z] ~= [rhs_x; rhs_y; rhs_z].
 
-        All arrays are (B, k) shaped.
-        Matches PIQP's solve() IR loop (kkt_system.tpp lines 294-339).
-        Returns False if a non-finite residual is encountered.
+        All arrays are (B, k) shaped. Matches PIQP's solve() IR loop
+        (kkt_system.tpp lines 294-339), with batch-wide infinity norms. Every
+        decision is taken on the device and the loop is a
+        ``wp.capture_while``, so the refinement runs without host
+        synchronization and can be captured into a CUDA graph (a conditional
+        node, on backends whose solve supports one). A non-finite residual
+        stops the loop and leaves the solution as it was.
         """
         n, p, m = data.n, data.p, data.m
         ref_err_x = column_slice(self._iter_refine_error_xyz, 0, n)
@@ -405,81 +431,55 @@ class KKTSystem:
         ref_lhs_x = column_slice(self._iter_refine_delta_xyz, 0, n)
         ref_lhs_y = column_slice(self._iter_refine_delta_xyz, n, n+p)
         ref_lhs_z = column_slice(self._iter_refine_delta_xyz, n+p, None)
+        floats, ints = self._device_settings.floats, self._device_settings.ints
 
-        def accept_candidate():
-            wp.copy(lhs_x, ref_lhs_x)
-            if p > 0:
-                wp.copy(lhs_y, ref_lhs_y)
-            if m > 0:
-                wp.copy(lhs_z, ref_lhs_z)
+        def evaluate_and_decide(cand_x, cand_y, cand_z):
+            # Residual of the candidate into ref_err, its norm into _norm_buf
+            # (zeroed by the begin kernel, then by each decision).
+            self._condensed_kkt_apply(data, cand_x, cand_y, cand_z, rhs_x, rhs_y, rhs_z,
+                                      ref_err_x, ref_err_y, ref_err_z, residual=True)
+            wp.launch(
+                kernel=self._refinement_decide_kernel, dim=1,
+                inputs=[floats, ints, self._refine_rhs_norm, self._norm_buf, self._refine_error,
+                        self._refine_step, self._refine_accept, self._refine_correct,
+                        self._refine_loop],
+                device=self._device,
+            )
 
-        rhs_norm = self._inf_norm(rhs_x, rhs_y, rhs_z)
-
-        # Initial error computed on first iteration; subsequent iterations
-        # reuse ref_err from candidate evaluation at end of previous iteration.
-        refine_error = math.inf
-        VERBOSE_IR = False
-        tol = settings.iterative_refinement_eps_abs + settings.iterative_refinement_eps_rel * rhs_norm
-
-        for i in range(settings.iterative_refinement_max_iter):
-            # Compute error: initial solve (i==0) or candidate (i>0)
-            if i == 0:
-                refine_error_new = self.get_refinement_error(
-                    data, lhs_x, lhs_y, lhs_z, rhs_x, rhs_y, rhs_z,
-                    ref_err_x, ref_err_y, ref_err_z)
-            else:
-                refine_error_new = self.get_refinement_error(
-                    data, ref_lhs_x, ref_lhs_y, ref_lhs_z, rhs_x, rhs_y, rhs_z,
-                    ref_err_x, ref_err_y, ref_err_z)
-
-            prev_refine_error = refine_error
-            refine_error = refine_error_new
-
-            if VERBOSE_IR:
-                if i == 0:
-                    print(f"  IR iter {i}: error={refine_error:.2e}, tol={tol:.2e}")
-                else:
-                    print(f"  IR iter {i}: error={refine_error:.2e}, improvement={prev_refine_error/refine_error:.2f}x")
-
-            if not math.isfinite(refine_error):
-                if VERBOSE_IR:
-                    print(f"  IR: non-finite error, aborting")
-                return False
-
-            if refine_error <= tol:
-                if VERBOSE_IR:
-                    print(f"  IR: converged at iter {i}")
-                if i > 0:
-                    accept_candidate()
-                break
-
-            if i > 0:
-                improvement_rate = prev_refine_error / refine_error
-                if improvement_rate < settings.iterative_refinement_min_improvement_rate:
-                    if improvement_rate > 1.0:
-                        if VERBOSE_IR:
-                            print(f"  IR: slow improvement ({improvement_rate:.2f}x < {settings.iterative_refinement_min_improvement_rate:.1f}x), accepting candidate")
-                        accept_candidate()
-                    else:
-                        if VERBOSE_IR:
-                            print(f"  IR: no improvement ({improvement_rate:.2f}x), rejecting candidate")
-                    break
-                # Accept candidate
-                accept_candidate()
-
-            # Solve for correction: K * ref_lhs = ref_err
+        def correct():
+            # Next candidate: ref_lhs = lhs + K^-1 ref_err.
             self._kkt_solver.solve(data,
                                    ref_err_x, ref_err_y, ref_err_z,
                                    ref_lhs_x, ref_lhs_y, ref_lhs_z)
+            wp.launch(
+                kernel=self._refinement_add_kernel, dim=(self._batch_size, n + p + m),
+                inputs=[lhs_x, lhs_y, lhs_z, ref_lhs_x, ref_lhs_y, ref_lhs_z],
+                device=self._device,
+            )
 
-            # Build candidate in ref_lhs: ref_lhs = lhs + correction
-            wp.map(wp.add, ref_lhs_x, lhs_x, out=ref_lhs_x)
-            if p > 0:
-                wp.map(wp.add, ref_lhs_y, lhs_y, out=ref_lhs_y)
-            if m > 0:
-                wp.map(wp.add, ref_lhs_z, lhs_z, out=ref_lhs_z)
+        def first_step():
+            # Step 0 evaluates the solution itself (never accepted).
+            evaluate_and_decide(lhs_x, lhs_y, lhs_z)
+            wp.capture_if(self._refine_correct, correct)
 
-        return True
+        def later_step():
+            evaluate_and_decide(ref_lhs_x, ref_lhs_y, ref_lhs_z)
+            wp.launch(
+                kernel=self._refinement_accept_kernel, dim=(self._batch_size, n + p + m),
+                inputs=[self._refine_accept, ref_lhs_x, ref_lhs_y, ref_lhs_z, lhs_x, lhs_y, lhs_z],
+                device=self._device,
+            )
+            wp.capture_if(self._refine_correct, correct)
+
+        wp.launch(kernel=self._refinement_begin_kernel, dim=1,
+                  inputs=[ints, self._refine_rhs_norm, self._norm_buf, self._refine_error,
+                          self._refine_step, self._refine_loop],
+                  device=self._device)
+        # ||rhs||_inf over the batch, for the relative tolerance.
+        wp.launch(kernel=self._refinement_rhs_norm_kernel, dim=(self._batch_size, n + p + m),
+                  inputs=[rhs_x, rhs_y, rhs_z, self._refine_rhs_norm], device=self._device)
+        wp.capture_if(self._refine_loop, first_step)
+        wp.capture_while(self._refine_loop, later_step)
 
     def _condensed_kkt_apply(self, data: Data,
                              lhs_x: wp.array, lhs_y: wp.array, lhs_z: wp.array, 

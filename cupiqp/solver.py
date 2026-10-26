@@ -56,9 +56,9 @@ class _CudaGraphMode(Enum):
     """How one ``solve()`` uses CUDA graphs (chosen by ``SolverBase._cuda_graph_mode``)."""
 
     NO_GRAPH = "no_graph"
-    """Plain kernel launches. Graphs are disabled, or something in the solve
-    needs the host every iteration (verbose printing, the host-driven
-    iterative refinement)."""
+    """Plain kernel launches. Graphs are disabled, verbose printing needs the
+    host every iteration, or iterative refinement is on with a backend whose
+    one-iteration graph cannot contain the refinement's conditional loop."""
 
     ITERATION_GRAPH_WITH_HOST_LOOP = "iteration_graph_with_host_loop"
     """One IPM iteration is a CUDA graph; the host relaunches it while the
@@ -268,7 +268,10 @@ class SolverBase(ABC):
         self._res.init(self._data)
         self._prox_vars.init(self._data)
 
-        self._kkt_system.init(self._data, self.settings)
+        # Runtime settings read by the kernels (and by the KKT system's
+        # iterative refinement); refreshed from self.settings at every solve.
+        self._device_settings = DeviceSettings(self._dtype, self._device)
+        self._kkt_system.init(self._data, self.settings, self._device_settings)
         # Problems in the batch that have terminated must not evolve while other problems continue iterating.
         self._unsolved_mask = wp.full(B, True, dtype=wp.bool, device=self._device)
         self._finetune_mask = wp.zeros(B, dtype=wp.bool, device=self._device)
@@ -297,8 +300,6 @@ class SolverBase(ABC):
 
         self._work_x = wp.empty((B, data.n), dtype=self._dtype, device=self._device)
 
-        # Runtime settings read by the kernels; refreshed from self.settings at every solve.
-        self._device_settings = DeviceSettings(self._dtype, self._device)
 
         if self.settings.enable_grad:
             # Working variables for implicit differentiation
@@ -556,9 +557,10 @@ class SolverBase(ABC):
         so that your work and the solver's are recorded on one stream. Pass
         the same input arrays to ``update()`` at every launch (the graph
         reads them by address), and keep the settings of the last solve
-        before the capture. Verbose mode,
-        ``iterative_refinement_always_enabled`` and the sparse backend are not
-        supported inside a capture.
+        before the capture. Verbose mode and the sparse backend are not
+        supported inside a capture; iterative refinement
+        (``iterative_refinement_always_enabled``) is, its loop is decided on
+        the device like the interior-point loop.
         """
         with wp.ScopedStream(self._stream, sync_enter=not self._stream.is_capturing):
             self._solve_impl()
@@ -636,8 +638,6 @@ class SolverBase(ABC):
         reason = None
         if settings.verbose:
             reason = "verbose mode reads the solver state on the host every iteration"
-        elif settings.iterative_refinement_always_enabled:
-            reason = "iterative refinement decides its iterations on the host"
         elif not self._kkt_system.supports_conditional_capture:
             reason = ("this backend's KKT solve cannot run inside a CUDA "
                       "conditional graph node, which the IPM loop needs")
@@ -647,11 +647,14 @@ class SolverBase(ABC):
     def _cuda_graph_mode(self) -> "_CudaGraphMode":
         """How this solve() uses CUDA graphs; see ``_CudaGraphMode``."""
         settings = self.settings
-        if (not settings.enable_cuda_graph or settings.verbose
-                or settings.iterative_refinement_always_enabled):
+        if not settings.enable_cuda_graph or settings.verbose:
             return _CudaGraphMode.NO_GRAPH
         if self._kkt_system.supports_conditional_capture:
             return _CudaGraphMode.SOLVE_GRAPH_WITH_DEVICE_LOOP
+        if settings.iterative_refinement_always_enabled:
+            # The refinement loop is a conditional node, which the
+            # one-iteration graph of this backend cannot contain.
+            return _CudaGraphMode.NO_GRAPH
         return _CudaGraphMode.ITERATION_GRAPH_WITH_HOST_LOOP
 
     def _launch_iteration_graph(self) -> None:
@@ -1861,12 +1864,17 @@ class SolverBase(ABC):
         ValueError
             If an argument has the wrong shape or is on another device.
         RuntimeError
-            Before the first ``solve()``, or without ``enable_grad``.
+            Before ``setup()``, or without ``enable_grad``. No ``solve()`` of
+            this instance is needed: a state saved from another solver of the
+            same structure can be differentiated here.
         """
         given = dict(x=x, y=y, z_u=z_u, z_l=z_l, z_bu=z_bu, z_bl=z_bl,
                      s_u=s_u, s_l=s_l, s_bu=s_bu, s_bl=s_bl)
         with wp.ScopedStream(self._stream, sync_enter=not self._stream.is_capturing):
-            self._check_backward_preconditions("backward_from_state()")
+            # Needs the data and the given state, not a solve of this
+            # instance: the scaling is computed by setup()/update(), and the
+            # settings the backward kernels read are uploaded here.
+            self._check_backward_preconditions("backward_from_state()", needs_solve=False)
             # All host-side validation first: nothing is modified on failure.
             B = self._data.batch_size
             state = {
@@ -1879,6 +1887,7 @@ class SolverBase(ABC):
             status = self._validated_state_array("status", status, wp.int32, (B,))
 
             self._factor_revision = -1
+            self._device_settings.upload(self.settings)
             data = self._data
             # Copy the state into solver-owned buffers (scaling and smoothing
             # modify the working point; the caller's arrays stay untouched),
@@ -1930,14 +1939,16 @@ class SolverBase(ABC):
             )
         return array
 
-    def _check_backward_preconditions(self, where: str) -> None:
+    def _check_backward_preconditions(self, where: str, needs_solve: bool = True) -> None:
         if not self.settings.enable_grad:
             raise RuntimeError("Set enable_grad to True to enable gradient computation.")
-        if not self._setup_done or self._solve_revision < 0:
+        if needs_solve and (not self._setup_done or self._solve_revision < 0):
             raise RuntimeError(
                 f"{type(self).__name__}.{where} requires a prior solve(); "
                 "call setup() and solve() first."
             )
+        if not self._setup_done:
+            raise RuntimeError(f"{type(self).__name__}.{where} requires setup() first.")
         self._check_frozen_settings(where)
         if self.settings.gradient_on_failure not in ("differentiate", "zero"):
             raise ValueError(

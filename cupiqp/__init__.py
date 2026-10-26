@@ -28,8 +28,9 @@ CUPIQP_DUAL_INFEASIBLE   = Status.CUPIQP_DUAL_INFEASIBLE
 CUPIQP_NUMERICAL_ISSUES  = Status.CUPIQP_NUMERICAL_ISSUES
 
 # Framework interfaces are loaded on first access so that ``import cupiqp``
-# does not import torch; ``import cupiqp.torch`` works as well.
-_LAZY_SUBMODULES = ("torch",)
+# imports neither torch nor jax; ``import cupiqp.torch`` and
+# ``import cupiqp.jax`` work as well.
+_LAZY_SUBMODULES = ("torch", "jax")
 
 
 def __getattr__(name: str):

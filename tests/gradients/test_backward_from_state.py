@@ -408,13 +408,29 @@ def test_rejected_call_leaves_the_cached_factor():
     np.testing.assert_array_equal(got, expected)
 
 
+def test_backward_from_state_needs_no_solve_of_its_own():
+    """A solver that never solved differentiates a state another solver of
+    the same structure produced: backward_from_state() depends on the data
+    and the state only (the JAX interface relies on this)."""
+    qp = _dense_qp(batch_size=2, seed=9)
+    producer = _dense_solver(qp)
+    producer.solve()
+    _assert_solved(producer)
+    state = _saved_state(producer)
+    grad_x = to_wp(np.ones((2, 5)))
+    expected = _grads_to_numpy(producer.backward_from_state(**state, grad_x=grad_x), ("P", "c", "b"))
+
+    fresh = _dense_solver(qp)
+    got = _grads_to_numpy(fresh.backward_from_state(**state, grad_x=grad_x), ("P", "c", "b"))
+    for name in expected:
+        np.testing.assert_allclose(got[name], expected[name], rtol=1e-10, atol=1e-12, err_msg=name)
+    with pytest.raises(RuntimeError, match="prior solve"):
+        fresh.backward(grad_x=grad_x)          # backward() still needs the cached factor
+
+
 def test_lifecycle_and_cached_factor():
     qp = _dense_qp(batch_size=2, seed=9)
     solver = _dense_solver(qp)
-    state = {name: to_wp(np.zeros((2, 0))) for name in STATE_FIELDS}
-    with pytest.raises(RuntimeError, match="prior solve"):
-        solver.backward_from_state(**state, rho=to_wp(np.zeros(2)), delta=to_wp(np.zeros(2)),
-                                   status=to_wp(np.zeros(2, dtype=np.int32)))
     solver.solve()
     state = _saved_state(solver)
     # An update() does not invalidate the saved state; the caller restores data.

@@ -193,3 +193,66 @@ def test_to_host_inside_capture_raises():
     solver = _warm_dense()
     with pytest.raises(RuntimeError, match="captured"):
         _captured(solver, solver.result.info.to_host)
+
+
+def _reference_with_refinement(problem, costs, enable_cuda_graph):
+    ref = DenseSolver()
+    ref.settings.iterative_refinement_always_enabled = True
+    ref.settings.enable_cuda_graph = enable_cuda_graph
+    ref.setup(c=to_wp(costs[0]), **problem)
+    xs = []
+    for c in costs:
+        ref.update(c=to_wp(c))
+        ref.solve()
+        assert (ref.result.info.status.numpy() == Status.CUPIQP_SOLVED).all()
+        xs.append(ref.result.x.numpy())
+    return xs
+
+
+def test_solve_with_iterative_refinement_can_be_captured():
+    """Iterative refinement decides its iterations on the device, so a solve
+    that uses it can be recorded into the user's graph. Replays give bitwise
+    the same solution as plain calls, with or without the solver's own
+    graph."""
+    rng = np.random.default_rng(3)
+    problem = _dense_problem(rng)
+    costs = _costs(rng, 3)
+    expected = _reference_with_refinement(problem, costs, enable_cuda_graph=False)
+    for got, want in zip(_reference_with_refinement(problem, costs, enable_cuda_graph=True), expected):
+        np.testing.assert_array_equal(got, want)
+
+    solver = DenseSolver()
+    solver.settings.iterative_refinement_always_enabled = True
+    c_buf = wp.array(costs[0], dtype=wp.float64)
+    solver.setup(c=c_buf, **problem)
+    solver.solve()  # warm-up
+    x_out = wp.zeros((B, N), dtype=wp.float64)
+    with wp.ScopedStream(solver.stream), wp.ScopedCapture() as capture:
+        solver.update(c=c_buf)
+        solver.solve()
+        wp.copy(x_out, solver.result.x)
+    for c, x_ref in zip(costs, expected):
+        c_buf.assign(c)
+        wp.capture_launch(capture.graph, stream=solver.stream)
+        np.testing.assert_array_equal(x_out.numpy(), x_ref)
+
+
+def test_sparse_solve_with_iterative_refinement_runs_without_graphs():
+    """The sparse backend cannot nest the refinement loop in its per-iteration
+    graph; with refinement on it solves without graphs instead, and agrees
+    with a solve without refinement to the solver tolerance."""
+    rng = np.random.default_rng(4)
+    M = rng.standard_normal((N, N))
+    P = M @ M.T + N * np.eye(N)
+    G = rng.standard_normal((3, N))
+    problem = dict(P=csr_triple(P), c=to_wp(rng.standard_normal(N)), G=csr_triple(G),
+                   h_l=to_wp(-np.ones(3)), h_u=to_wp(np.ones(3)))
+    results = []
+    for refine in (False, True):
+        solver = SparseSolver()
+        solver.settings.iterative_refinement_always_enabled = refine
+        solver.setup(**problem)
+        solver.solve()
+        assert solver.result.info.to_host().status == [Status.CUPIQP_SOLVED]
+        results.append(solver.result.x.numpy())
+    np.testing.assert_allclose(results[1], results[0], rtol=1e-6, atol=1e-8)

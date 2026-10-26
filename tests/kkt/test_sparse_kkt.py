@@ -17,7 +17,7 @@ from cupiqp.results import Variables
 from cupiqp.settings import Settings
 from cupiqp.sparse.sparse_data import SparseData
 from cupiqp.sparse.sparse_preconditioner import SparseRuizEquilibration
-from tests.helpers import csr_triple, to_wp
+from tests.helpers import csr_triple, to_wp, device_settings
 
 
 # ---------------------------------------------------------------------------
@@ -89,7 +89,7 @@ def _factor(data: SparseData, settings: Settings, use_static_reg: bool,
     Returns ``(kkt, preconditioner, variables)``.
     """
     kkt = KKTSystem()
-    kkt.init(data, settings)
+    kkt.init(data, settings, device_settings(settings, data))
     preconditioner = _make_preconditioner(data)
 
     variables = Variables()
@@ -197,7 +197,7 @@ def test_condensed_solve_with_ir(n: int, p: int, m: int) -> None:
         data, to_wp(rhs_x), to_wp(rhs_y), to_wp(rhs_z), lhs_x2, lhs_y2, lhs_z2,
     )
     kkt_ir.iterative_refinement(
-        data, settings_ir,
+        data,
         to_wp(rhs_x), to_wp(rhs_y), to_wp(rhs_z),
         lhs_x2, lhs_y2, lhs_z2,
     )
@@ -242,7 +242,7 @@ def test_update_data(n: int, p: int, m: int, B: int) -> None:
 
     # Fresh KKT built from the updated data, factored at the same point.
     kkt2 = KKTSystem()
-    kkt2.init(data, settings)
+    kkt2.init(data, settings, device_settings(settings, data))
     precond2 = _make_preconditioner(data)
     kkt2.update_scalings_and_factor(data, precond2, settings, False, rho_arr, delta_arr, variables)
     assert not kkt2.factor_status.numpy().any()
