@@ -264,7 +264,8 @@ def create_eliminate_slacks_transposed_kernel(dtype=wp.float64):
 
 
 @functools.lru_cache(maxsize=None)
-def create_recover_duals_kernel(num_hu: int, num_hl: int, num_xu: int, num_xl: int, dtype=wp.float64):
+def create_recover_duals_kernel(num_hu: int, num_hl: int, num_xu: int, num_xl: int, dtype=wp.float64,
+                                box_rhs_eliminated: bool = False):
     dtype = to_warp_dtype(dtype)
     """Create kernel specialized for recovering duals.
 
@@ -277,6 +278,12 @@ def create_recover_duals_kernel(num_hu: int, num_hl: int, num_xu: int, num_xl: i
         lhs.z_l  =  w_l_delta_inv  * (-G_dx                 - updated_rhs_z_l)
         lhs.z_bu =  w_bu_delta_inv * ( xbs * lhs.x - rhs.z_bu + m_z_bu_inv * rhs.s_bu)
         lhs.z_bl = -w_bl_delta_inv * ( xbs * lhs.x + rhs.z_bl - m_z_bl_inv * rhs.s_bl)
+
+    The box rows eliminate the slack inline with the forward formula
+    ``rhs.z - rhs.s / Z``. With ``box_rhs_eliminated`` the caller passes the
+    already eliminated right-hand side as ``rhs_z_bu`` / ``rhs_z_bl`` and the
+    ``m_z_*_inv * rhs.s`` term is dropped; the transposed solve needs this,
+    because its elimination is ``rhs.z - (S / Z) rhs.s``.
     """
     @wp.kernel
     def recover_duals_kernel(
@@ -318,10 +325,16 @@ def create_recover_duals_kernel(num_hu: int, num_hl: int, num_xu: int, num_xl: i
             lhs_z_l[b, j] = (-G_dx[b, j] - rhs_z_l[b, j]) * w_l_delta_inv[b, j]
         elif t < num_hu_static + num_hl_static + num_xu_static:
             j = t - num_hu_static - num_hl_static
-            lhs_z_bu[b, j] = (x_b_scaling[b, j] * lhs_x[b, j] - rhs_z_bu[b, j] + m_z_bu_inv[b, j] * rhs_s_bu[b, j]) * w_bu_delta_inv[b, j]
+            if wp.static(box_rhs_eliminated):
+                lhs_z_bu[b, j] = (x_b_scaling[b, j] * lhs_x[b, j] - rhs_z_bu[b, j]) * w_bu_delta_inv[b, j]
+            else:
+                lhs_z_bu[b, j] = (x_b_scaling[b, j] * lhs_x[b, j] - rhs_z_bu[b, j] + m_z_bu_inv[b, j] * rhs_s_bu[b, j]) * w_bu_delta_inv[b, j]
         elif t < num_hu_static + num_hl_static + num_xu_static + num_xl_static:
             j = t - num_hu_static - num_hl_static - num_xu_static
-            lhs_z_bl[b, j] = -(x_b_scaling[b, j] * lhs_x[b, j] + rhs_z_bl[b, j] - m_z_bl_inv[b, j] * rhs_s_bl[b, j]) * w_bl_delta_inv[b, j]
+            if wp.static(box_rhs_eliminated):
+                lhs_z_bl[b, j] = -(x_b_scaling[b, j] * lhs_x[b, j] + rhs_z_bl[b, j]) * w_bl_delta_inv[b, j]
+            else:
+                lhs_z_bl[b, j] = -(x_b_scaling[b, j] * lhs_x[b, j] + rhs_z_bl[b, j] - m_z_bl_inv[b, j] * rhs_s_bl[b, j]) * w_bl_delta_inv[b, j]
         else:
             return
 

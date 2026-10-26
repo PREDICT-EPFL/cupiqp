@@ -162,6 +162,8 @@ class KKTSystem:
         self._eliminate_duals_kernel = create_eliminate_duals_kernel(
             n, m, has_h_l=data.has_h_l, has_h_u=data.has_h_u, has_x_l=data.has_x_l, has_x_u=data.has_x_u, dtype=self._dtype)
         self._recover_duals_kernel = create_recover_duals_kernel(data.num_hu, data.num_hl, data.num_xu, data.num_xl, dtype=self._dtype)
+        self._recover_duals_transposed_kernel = create_recover_duals_kernel(
+            data.num_hu, data.num_hl, data.num_xu, data.num_xl, dtype=self._dtype, box_rhs_eliminated=True)
         self._recover_slacks_kernel = create_recover_slacks_kernel(dtype=self._dtype)
         self._recover_slacks_transposed_kernel = create_recover_slacks_transposed_kernel(dtype=self._dtype)
         self._condensed_kkt_combine_kernel = create_condensed_kkt_combine_kernel(dtype=self._dtype)
@@ -332,9 +334,12 @@ class KKTSystem:
     def _recover_lhs(self, data: Data, preconditioner: PreconditionerBase, rhs: Variables, lhs: Variables, transpose: bool = False):
         """Back-substitute lhs.z_* and lhs.s_* from the condensed (lhs.x, lhs.y).
 
-        The dual back-sub (z_u, z_l, z_bu, z_bl) is direction-agnostic -- the row
-        equations for those blocks have the same structure in K and K^T once the
-        slack has been eliminated. Only the final slack recovery differs:
+        The dual back-sub (z_u, z_l, z_bu, z_bl) uses the slack-eliminated
+        right-hand side of :meth:`_prepare_rhs`, which differs between K and
+        K^T. The inequality rows read it from ``_updated_rhs_z_*`` in both
+        directions; the box rows eliminate inline with the forward formula,
+        so the transposed solve uses a kernel variant that reads the
+        eliminated box rows instead. The final slack recovery differs too:
         forward uses ``lhs.s = (rhs.s - S lhs.z) / Z``, transpose drops the S
         factor.
         """
@@ -344,15 +349,22 @@ class KKTSystem:
             self.eval_G_xn(data, 1., lhs.x, self._work_z)
 
         if data.num_ineq > 0:
+            if transpose:
+                # Box rows from the K^T elimination rhs.z - (S/Z) rhs.s.
+                box_kernel = self._recover_duals_transposed_kernel
+                rhs_z_bu, rhs_z_bl = self._updated_rhs_z_bu, self._updated_rhs_z_bl
+            else:
+                box_kernel = self._recover_duals_kernel
+                rhs_z_bu, rhs_z_bl = rhs.z_bu, rhs.z_bl
             wp.launch(
-                kernel=self._recover_duals_kernel,
+                kernel=box_kernel,
                 dim=(B, data.num_ineq),
                 inputs=[
                     self._work_z, lhs.x,
                     self._w_u_delta_inv, self._updated_rhs_z_u, lhs.z_u,
                     self._w_l_delta_inv, self._updated_rhs_z_l, lhs.z_l,
-                    self._w_bu_delta_inv, self._m_z_bu_inv, rhs.z_bu, rhs.s_bu, lhs.z_bu,
-                    self._w_bl_delta_inv, self._m_z_bl_inv, rhs.z_bl, rhs.s_bl, lhs.z_bl,
+                    self._w_bu_delta_inv, self._m_z_bu_inv, rhs_z_bu, rhs.s_bu, lhs.z_bu,
+                    self._w_bl_delta_inv, self._m_z_bl_inv, rhs_z_bl, rhs.s_bl, lhs.z_bl,
                     preconditioner.x_b_scaling],
                 device=self._device
             )
