@@ -104,6 +104,38 @@ def stack_qps(qps: list) -> dict:
     return {k: np.stack([q[k] for q in qps]) for k in qps[0]}
 
 
+def assemble_multistage(N, d, P_D, P_E, A_D=None, A_E=None, G_D=None, G_E=None):
+    """Dense ``(P, A, G)`` of one multistage problem from its blocks.
+
+    P is block tridiagonal with lower off-diagonal blocks ``P_E`` (block
+    diagonal when ``P_E`` is None). A and G are block bidiagonal: ``N + 1``
+    block rows with lower off-diagonal blocks, ``N`` without. An absent A or
+    G (``A_D`` / ``G_D`` None) gives a ``(0, N * d)`` matrix.
+    """
+    n = N * d
+    P = np.zeros((n, n))
+    for k in range(N):
+        P[k * d:(k + 1) * d, k * d:(k + 1) * d] = P_D[k]
+    if P_E is not None:
+        for k in range(N - 1):
+            P[(k + 1) * d:(k + 2) * d, k * d:(k + 1) * d] = P_E[k]
+            P[k * d:(k + 1) * d, (k + 1) * d:(k + 2) * d] = P_E[k].T
+
+    def bidiag(D, E):
+        if D is None:
+            return np.zeros((0, n))
+        r = D.shape[1]
+        M = np.zeros(((N + (E is not None)) * r, n))
+        for k in range(N):
+            M[k * r:(k + 1) * r, k * d:(k + 1) * d] = D[k]
+        if E is not None:
+            for k in range(N):
+                M[(k + 1) * r:(k + 2) * r, k * d:(k + 1) * d] = E[k]
+        return M
+
+    return P, bidiag(A_D, A_E), bidiag(G_D, G_E)
+
+
 # ----------------------------------------------------------------------
 # Solvers and results
 # ----------------------------------------------------------------------

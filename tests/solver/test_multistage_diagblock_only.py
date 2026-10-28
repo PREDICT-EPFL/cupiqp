@@ -11,31 +11,7 @@ import numpy as np
 import pytest
 
 from cupiqp import DenseSolver, MultistageSolver, Status
-from tests.helpers import to_wp
-
-
-def _assemble(N, d, P_D, P_E, A_D, A_E, G_D, G_E):
-    """Dense P, A, G of one problem; A / G have N + 1 block rows with off-diagonals, N without."""
-    n = N * d
-    P = np.zeros((n, n))
-    for k in range(N):
-        P[k * d:(k + 1) * d, k * d:(k + 1) * d] = P_D[k]
-    if P_E is not None:
-        for k in range(N - 1):
-            P[(k + 1) * d:(k + 2) * d, k * d:(k + 1) * d] = P_E[k]
-            P[k * d:(k + 1) * d, (k + 1) * d:(k + 2) * d] = P_E[k].T
-
-    def bidiag(D, E):
-        r = D.shape[1]
-        M = np.zeros(((N + (E is not None)) * r, n))
-        for k in range(N):
-            M[k * r:(k + 1) * r, k * d:(k + 1) * d] = D[k]
-        if E is not None:
-            for k in range(N):
-                M[(k + 1) * r:(k + 2) * r, k * d:(k + 1) * d] = E[k]
-        return M
-
-    return P, bidiag(A_D, A_E), bidiag(G_D, G_E)
+from tests.helpers import assemble_multistage, to_wp
 
 
 def _problem(N, d, rA, rG, B, has_P_E, has_A_E, has_G_E, seed):
@@ -47,7 +23,7 @@ def _problem(N, d, rA, rG, B, has_P_E, has_A_E, has_G_E, seed):
         A_D=rng.standard_normal((B, N, rA, d)), A_E=rng.standard_normal((B, N, rA, d)) if has_A_E else None,
         G_D=rng.standard_normal((B, N, rG, d)), G_E=rng.standard_normal((B, N, rG, d)) if has_G_E else None,
     )
-    dense = [_assemble(N, d, *(None if v is None else v[i] for v in blocks.values())) for i in range(B)]
+    dense = [assemble_multistage(N, d, *(None if v is None else v[i] for v in blocks.values())) for i in range(B)]
     x0 = rng.uniform(-0.3, 0.3, (B, N * d))
     b = np.stack([dense[i][1] @ x0[i] for i in range(B)])
     Gx = np.stack([dense[i][2] @ x0[i] for i in range(B)])
