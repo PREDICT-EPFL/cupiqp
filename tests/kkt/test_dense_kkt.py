@@ -215,49 +215,41 @@ class TestDenseKKTSolverMatvec:
 
 
 class TestDenseKKTSolverAssembly:
-    """KKT matrix assembly matches per-problem reference."""
+    """The factored KKT matrix matches the per-problem reference assembly."""
 
+    # (n, p, m) covering both factorization paths of update_and_factor_kkt:
+    # the Warp tile Cholesky (small n) and cuSOLVER (large n), with the Warp
+    # and cuBLAS products of G.
     @pytest.mark.parametrize("B", BATCH_SIZES)
-    def test_kkt_matrix_assembly(self, B):
-        n, p, m = 5, 2, 4
+    @pytest.mark.parametrize("n,p,m", [(5, 2, 4), (8, 0, 45), (24, 5, 12), (56, 4, 20)])
+    def test_kkt_matrix_assembly(self, B, n, p, m):
         data = random_dense_qp(B, n, p=p, m=m)
         solver = DenseKKTSolver(data)
 
         rng = np.random.default_rng(99 + B)
         x_reg = np.abs(rng.standard_normal((B, n))) + 0.1
         # z_reg_inv = condensed row weight (w_l + w_u); z_reg = 1/weight is the
-        # explicit augmented diagonal magnitude. Both are passed to update_kkt.
+        # explicit augmented diagonal magnitude. Both are passed in.
         z_reg_inv = np.abs(rng.standard_normal((B, m))) + 0.1
         z_reg = 1.0 / z_reg_inv
         delta = np.abs(rng.standard_normal(B)) + 0.1
 
-        solver.update_kkt(data, to_wp(delta), to_wp(x_reg), to_wp(z_reg), to_wp(z_reg_inv))
+        solver.update_and_factor_kkt(data, to_wp(delta), to_wp(x_reg), to_wp(z_reg), to_wp(z_reg_inv))
+        assert not solver.factor_status.numpy().any()
+
+        # With rhs_y = rhs_z = 0 the condensed solve returns K^{-1} rhs_x, so
+        # K_ref @ delta_x must reproduce rhs_x.
+        rhs_x = rng.standard_normal((B, n))
+        delta_x, delta_y, delta_z = _empty(B, n), _empty(B, p), _empty(B, m)
+        solver.solve(data, to_wp(rhs_x), _zeros(B, p), _zeros(B, m), delta_x, delta_y, delta_z)
 
         P, A, G = data.P.numpy(), data.A.numpy(), data.G.numpy()
-        kkt_mat = solver._kkt_mat.numpy()
+        delta_x = delta_x.numpy()
         for i in range(B):
-            Pi = P[i]
-            Ai = A[i]
-            Gi = G[i]
-            xr = x_reg[i]
-            zr = z_reg_inv[i]  # weight used in the reference assembly
-            d = float(delta[i])
-
-            ref_kkt = Pi + np.diag(xr) + (1.0 / d) * (Ai.T @ Ai)
-            G_sc = np.sqrt(zr)[:, None] * Gi
-            ref_kkt += G_sc.T @ G_sc
-
-            actual_kkt = kkt_mat[i]
-
-            # The Cholesky solvers read the row-major upper triangle
-            # (cuSOLVER FILL_MODE_LOWER in its column-major view); the syrk
-            # paths populate only that triangle. Compare the triangle the
-            # solver actually uses.
-            for r in range(n):
-                for c in range(r, n):
-                    np.testing.assert_allclose(
-                        actual_kkt[r, c], ref_kkt[r, c], atol=1e-10,
-                        err_msg=f"batch={i}, ({r},{c})")
+            ref_kkt = P[i] + np.diag(x_reg[i]) + (1.0 / float(delta[i])) * (A[i].T @ A[i])
+            ref_kkt += G[i].T @ (z_reg_inv[i][:, None] * G[i])
+            np.testing.assert_allclose(ref_kkt @ delta_x[i], rhs_x[i], atol=1e-9,
+                                       err_msg=f"batch={i}")
 
 
 class TestDenseKKTSolverSolve:
@@ -280,8 +272,7 @@ class TestDenseKKTSolverSolve:
         rhs_y = rng.standard_normal((B, p)) if p > 0 else np.empty((B, 0))
         rhs_z = rng.standard_normal((B, m)) if m > 0 else np.empty((B, 0))
 
-        solver.update_kkt(data, to_wp(delta), to_wp(x_reg), to_wp(z_reg), to_wp(z_reg_inv))
-        solver.factor()
+        solver.update_and_factor_kkt(data, to_wp(delta), to_wp(x_reg), to_wp(z_reg), to_wp(z_reg_inv))
         assert not solver.factor_status.numpy().any()
 
         delta_x = _empty(B, n)
@@ -325,7 +316,9 @@ class TestDenseKKTSolverSolve:
         # Large batch
         (64, 8, 3, 5),
         # n sweep at fixed B=4 with p=max(1, n//3), m=max(1, n//2)
-        *[(4, n, max(1, n // 3), max(1, n // 2)) for n in (2, 4, 8, 12, 16)],
+        *[(4, n, max(1, n // 3), max(1, n // 2)) for n in (2, 4, 8, 12, 16, 24, 48, 56)],
+        # Many inequality rows, and the large-n paths at B=1
+        (4, 8, 2, 70), (1, 24, 4, 12), (1, 56, 4, 20),
     ])
     def test_full_pipeline(self, B, n, p, m):
         self._run_solve(B=B, n=n, p=p, m=m, seed=B * 100 + n + p + m)

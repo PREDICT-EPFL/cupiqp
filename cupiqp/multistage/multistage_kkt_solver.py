@@ -143,9 +143,10 @@ class MultistageKKTSolver(KKTSolverBase):
                 ]
             )
 
-    @nvtx.annotate("MultistageKKTSolver::update_kkt")
-    def update_kkt(self, data: MultistageData, delta: wp.array, x_reg: wp.array, z_reg: wp.array, z_reg_inv: wp.array) -> None:
-        """KKT[b] = P[b] + diag(x_reg[b]) + (1/delta[b])*A[b]^T A[b] + G[b]^T diag(z_reg_inv[b]) G[b].
+    @nvtx.annotate("MultistageKKTSolver::update_and_factor_kkt")
+    def update_and_factor_kkt(self, data: MultistageData, delta: wp.array, x_reg: wp.array, z_reg: wp.array, z_reg_inv: wp.array) -> None:
+        """KKT[b] = P[b] + diag(x_reg[b]) + (1/delta[b])*A[b]^T A[b] + G[b]^T diag(z_reg_inv[b]) G[b],
+        then the block-tridiagonal Cholesky factorization of every KKT[b].
 
         The condensed multistage backend uses z_reg_inv. The explicit diagonal z_reg is
         accepted for interface symmetry but not used here.
@@ -178,6 +179,12 @@ class MultistageKKTSolver(KKTSolverBase):
             ]
         )
 
+        self._launch_capturable(self._cholesky_factor_launch, self._cholesky_factor_launch_raw)
+        self._factor_status.zero_()
+        for view in self._factor_scan_views:
+            wp.launch(self._has_nan_rows_kernel, dim=view.shape, inputs=[view, self._factor_status],
+                      device=self._device)
+
     @staticmethod
     def _launch_capturable(graph_launch, raw_launch) -> None:
         """Run the raw kernel sequence when the current stream is being captured
@@ -186,14 +193,6 @@ class MultistageKKTSolver(KKTSolverBase):
             raw_launch()
         else:
             graph_launch()
-
-    @nvtx.annotate("MultistageKKTSolver::factor")
-    def factor(self) -> None:
-        self._launch_capturable(self._cholesky_factor_launch, self._cholesky_factor_launch_raw)
-        self._factor_status.zero_()
-        for view in self._factor_scan_views:
-            wp.launch(self._has_nan_rows_kernel, dim=view.shape, inputs=[view, self._factor_status],
-                      device=self._device)
 
     @nvtx.annotate("MultistageKKTSolver::solve")
     def solve(self, data: MultistageData,

@@ -37,24 +37,20 @@ class KKTSolverBase(ABC):
         pass
 
     @abstractmethod
-    def update_kkt(self, data: Data, delta: float, x_reg: wp.array, z_reg: wp.array, z_reg_inv: wp.array) -> bool:
-        """Refresh the KKT matrix with new regularization scalings."""
-        pass
+    def update_and_factor_kkt(self, data: Data, delta: wp.array, x_reg: wp.array, z_reg: wp.array, z_reg_inv: wp.array) -> None:
+        """Refresh the KKT matrix with new regularization scalings and factor
+        it, launched on the current stream without waiting for it.
 
-    @abstractmethod
-    def factor(self) -> None:
-        """Factor the KKT matrix, launched on the current stream without
-        waiting for it.
-
-        Nothing is read on the host; once the factorization has run on the
-        GPU, ``factor_status`` holds one entry per problem.
+        Backends may fuse the assembly into the factorization. Nothing is
+        read on the host; once the factorization has run on the GPU,
+        ``factor_status`` holds one entry per problem.
         """
         pass
 
     @property
     def supports_conditional_capture(self) -> bool:
         """Whether ``solve()`` can be captured inside a conditional CUDA graph
-        node (the body of ``wp.capture_while``). ``factor()`` and ``solve()``
+        node (the body of ``wp.capture_while``). ``update_and_factor_kkt()`` and ``solve()``
         of every backend capture into a plain graph; a conditional node
         additionally rejects copies from pageable host memory, which some
         libraries issue internally. Without it the solver captures one IPM
@@ -63,7 +59,7 @@ class KKTSolverBase(ABC):
 
     @property
     def factor_status(self) -> wp.array:
-        """``(B,)`` int32 device array written by ``factor()``: zero where the
+        """``(B,)`` int32 device array written by ``update_and_factor_kkt()``: zero where the
         factorization of that problem succeeded, nonzero where it failed."""
         return self._factor_status
 

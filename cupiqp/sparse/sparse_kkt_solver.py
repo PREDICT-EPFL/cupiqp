@@ -72,7 +72,7 @@ class SparseKKTSolver(KKTSolverBase):
         # -- P-diagonal CSR indices (for vectorized P diag extraction) --
         # P may have zero diagonal entries that are not stored in the CSR.
         # An entry at position k is on the diagonal iff its row == its col;
-        # we keep only those positions so update_kkt can gather without any
+        # we keep only those positions so update_and_factor_kkt can gather without any
         # boolean-mask step (CUDA-graph safe).
         #
         # For example,
@@ -221,9 +221,9 @@ class SparseKKTSolver(KKTSolverBase):
             # refresh P_diag if P is updated
             self._refresh_P_diag_buffer(data.P)
 
-    @nvtx.annotate("SparseKKTSolver::update_kkt")
-    def update_kkt(self, data: SparseData, delta: wp.array, x_reg: wp.array, z_reg: wp.array, z_reg_inv: wp.array) -> None:
-        """Update diagonal blocks of all batched KKT matrices."""
+    @nvtx.annotate("SparseKKTSolver::update_and_factor_kkt")
+    def update_and_factor_kkt(self, data: SparseData, delta: wp.array, x_reg: wp.array, z_reg: wp.array, z_reg_inv: wp.array) -> None:
+        """Update the diagonal blocks of all batched KKT matrices, then refactor them with cuDSS."""
         wp.launch(
             kernel=self._update_kkt_diag_kernel,
             dim=(self._batch_size, data.n + data.p + data.m),
@@ -234,16 +234,13 @@ class SparseKKTSolver(KKTSolverBase):
             ],
             device=self._device
         )
+        self._lin_sys_solver.factor(cuda_stream=wp.get_stream("cuda").cuda_stream)
 
     @property
     def supports_conditional_capture(self) -> bool:
         # The cuDSS solve phase copies from pageable host memory, which a
         # conditional graph node rejects.
         return False
-
-    @nvtx.annotate("SparseKKTSolver::factor")
-    def factor(self) -> None:
-        self._lin_sys_solver.factor(cuda_stream=wp.get_stream("cuda").cuda_stream)
 
     @nvtx.annotate("SparseKKTSolver::solve")
     def solve(self, data: SparseData, rhs_x: wp.array, rhs_y: wp.array, rhs_z: wp.array,

@@ -77,9 +77,9 @@ class DenseKKTSolver(KKTSolverBase):
         if update_A and data.p > 0:
             self._compute_AtA(data)
 
-    @nvtx.annotate("DenseKKTSolver::update_kkt")
-    def update_kkt(self, data: DenseData, delta: wp.array, x_reg: wp.array, z_reg: wp.array, z_reg_inv: wp.array) -> None:
-        """Assemble the condensed KKT matrix (CUDA graph safe)."""
+    @nvtx.annotate("DenseKKTSolver::update_and_factor_kkt")
+    def update_and_factor_kkt(self, data: DenseData, delta: wp.array, x_reg: wp.array, z_reg: wp.array, z_reg_inv: wp.array) -> None:
+        """Assemble and factor the condensed KKT matrix (CUDA graph safe)."""
 
         # For inactive rows G[i], z_reg_inv[i] is already zero.
         # Therefore the contribution of G[i] to the condensed KKT is zero.
@@ -96,8 +96,6 @@ class DenseKKTSolver(KKTSolverBase):
         if data.m > 0:
             self._GtG_syrk(self._G_scaled, self._kkt_mat, accumulate=True)
 
-    @nvtx.annotate("DenseKKTSolver::factor")
-    def factor(self) -> None:
         # B=1: CholeskyInplaceSolver expects (n, n); B>1: BatchedCholeskyInplaceSolver expects (B, n, n)
         factor_input = self._kkt_mat[0] if self._batch_size == 1 else self._kkt_mat
         self._cholesky_solver.factorize(factor_input)

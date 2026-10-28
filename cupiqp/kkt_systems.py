@@ -208,9 +208,9 @@ class KKTSystem:
 
         The variable vars is the current primal/dual variable values at this iteration, i.e., values of x, y, z_u, z_l, s_u, s_l, z_bu, z_bl, s_bu, s_bl at the current iteration.
         """
-        self._update_reg_and_kkt(data, preconditioner, delta, rho, vars)
+        self._update_regularization(data, preconditioner, delta, rho, vars)
         self._use_iterative_refinement = iterative_refinement
-        self._kkt_solver.factor()
+        self._kkt_solver.update_and_factor_kkt(data, self._delta, self._x_reg, self._z_reg, self._z_reg_inv)
 
     @property
     def supports_conditional_capture(self) -> bool:
@@ -229,10 +229,9 @@ class KKTSystem:
         problem's KKT solution is finite, nonzero where it is not."""
         return self._kkt_solver.solve_status
 
-    @nvtx.annotate("KKTSystem::_update_reg_and_kkt")
-    def _update_reg_and_kkt(self, data: Data, preconditioner: PreconditionerBase, delta: wp.array, rho: wp.array, vars: Variables):
-        """Update the regularization terms x_reg and z_reg for the condensed KKT system after eliminating slacks and duals of inequalities and box constraints.
-        Also update the condensed KKT matrix with the new regularization terms."""
+    @nvtx.annotate("KKTSystem::_update_regularization")
+    def _update_regularization(self, data: Data, preconditioner: PreconditionerBase, delta: wp.array, rho: wp.array, vars: Variables):
+        """Update the regularization terms x_reg and z_reg for the condensed KKT system after eliminating slacks and duals of inequalities and box constraints."""
         B = self._batch_size
         wp.launch(
             kernel=self._update_regularization_step_1_kernel,
@@ -258,9 +257,6 @@ class KKTSystem:
             ],
             device=self._device
         )
-
-        # Update KKT matrix
-        self._kkt_solver.update_kkt(data, self._delta, self._x_reg, self._z_reg, self._z_reg_inv)
 
     @nvtx.annotate("KKTSystem::solve")
     def solve(self, data: Data, preconditioner: PreconditionerBase, settings: Settings, rhs: Variables, lhs: Variables,
