@@ -7,13 +7,11 @@ references: dense matrix products for the matvecs, a dense solve of the
 condensed system for ``update_and_factor_kkt`` + ``solve``, and the dense
 backend's ``KKTSystem`` for the full pipeline.
 
-Every test covers each combination of present / absent off-diagonal blocks
-of P, A and G (absent blocks are compiled out of the kernels), single and
+The tests cover present and absent off-diagonal blocks of P, A and G
+(absent blocks are compiled out of the kernels), single and
 batched problems, one stage (``N = 1``, no coupling at all) as well as
 several, and both precisions (float64 / float32).
 """
-import itertools
-
 import numpy as np
 import pytest
 import warp as wp
@@ -90,30 +88,41 @@ def _dense_twin(data, dense):
     return twin
 
 
+# NOTE: keep the number of distinct shapes small. The multistage kernels are
+# specialized and compiled per (N, d, rA, rG), per present / absent
+# off-diagonal block (has_P_E, has_A_E, has_G_E) and per dtype, and every
+# test also builds a dense twin of the assembled problem, whose kernels are
+# compiled per (n, p, m). So every new shape or flag combination costs a
+# fresh compile, which dominates the run time of this file on a cold cache.
+# The batch size is not part of the specialization, so B is free to vary.
+# Hence:
+#   - every test uses the base shape (N, d, rA, rG) = (5, 3, 2, 4), which
+#     already has more G rows than variables per block;
+#   - the other shapes change one dimension of it: one stage (N = 1), no
+#     equality (rA = 0) and no inequality (rG = 0), with all off-diagonal
+#     blocks present;
+#   - the off-diagonal flags run on the base shape only, all present, all
+#     absent, and each one absent alone (the combinations the matvec tests
+#     also use);
+#   - B = 1 and B = 3, because B = 1 and B > 1 take different paths.
 BATCH_SIZES = [1, 3]
 
-# (N, d, rA, rG): several stages, one stage, no equality, no inequality,
-# and more constraint rows than variables per block.
-SHAPES = [
-    pytest.param(5, 3, 2, 4, id="N5-d3-rA2-rG4"),
-    pytest.param(1, 4, 2, 3, id="N1-d4-rA2-rG3"),
-    pytest.param(4, 3, 0, 2, id="N4-d3-noA"),
-    pytest.param(4, 3, 2, 0, id="N4-d3-noG"),
-    pytest.param(3, 2, 3, 5, id="N3-d2-rA3-rG5"),
+PIPELINE_CASES = [
+    # B, N, d, rA, rG, has_P_E, has_A_E, has_G_E
+    pytest.param(1, 5, 3, 2, 4, True,  True,  True,  id="B1-N5-d3-rA2-rG4"),
+    pytest.param(3, 5, 3, 2, 4, True,  True,  True,  id="B3-N5-d3-rA2-rG4"),
+    pytest.param(1, 5, 3, 2, 4, False, False, False, id="B1-N5-d3-rA2-rG4-noE"),
+    pytest.param(3, 5, 3, 2, 4, False, False, False, id="B3-N5-d3-rA2-rG4-noE"),
+    pytest.param(3, 5, 3, 2, 4, False, True,  True,  id="B3-N5-d3-rA2-rG4-noP_E"),
+    pytest.param(3, 5, 3, 2, 4, True,  False, True,  id="B3-N5-d3-rA2-rG4-noA_E"),
+    pytest.param(3, 5, 3, 2, 4, True,  True,  False, id="B3-N5-d3-rA2-rG4-noG_E"),
+    pytest.param(1, 1, 3, 2, 4, True,  True,  True,  id="B1-N1-d3-rA2-rG4"),  # one stage
+    pytest.param(3, 1, 3, 2, 4, True,  True,  True,  id="B3-N1-d3-rA2-rG4"),
+    pytest.param(1, 5, 3, 0, 4, True,  True,  True,  id="B1-N5-d3-rA0-rG4"),  # no equality
+    pytest.param(3, 5, 3, 0, 4, True,  True,  True,  id="B3-N5-d3-rA0-rG4"),
+    pytest.param(1, 5, 3, 2, 0, True,  True,  True,  id="B1-N5-d3-rA2-rG0"),  # no inequality
+    pytest.param(3, 5, 3, 2, 0, True,  True,  True,  id="B3-N5-d3-rA2-rG0"),
 ]
-
-
-def _pipeline_cases():
-    """(B, N, d, rA, rG, has_P_E, has_A_E, has_G_E) cases of the solve
-    tests: every off-diagonal structure on the first shape, and every shape
-    and batch size with all and with no off-diagonal blocks."""
-    cases = {(3, 5, 3, 2, 4, *flags) for flags in itertools.product([True, False], repeat=3)}
-    cases |= {(B, *shape.values, *flags) for B in BATCH_SIZES for shape in SHAPES
-              for flags in ((True,) * 3, (False,) * 3)}
-    return [pytest.param(*c, id="B{}-N{}-d{}-rA{}-rG{}-PE{:d}-AE{:d}-GE{:d}".format(*c)) for c in sorted(cases)]
-
-
-PIPELINE_CASES = _pipeline_cases()
 
 
 # ===========================================================================
@@ -229,12 +238,12 @@ class TestMultistageKKTSolverSolve:
                         seed=B * 100 + N * 10 + 4 * has_P_E + 2 * has_A_E + has_G_E, dtype=dtype)
 
     def test_large_batch(self, dtype):
-        self._run_solve(64, 6, 4, 3, 5, True, True, True, seed=7, dtype=dtype)
+        self._run_solve(64, 5, 3, 2, 4, True, True, True, seed=7, dtype=dtype)
 
     def test_refactor_with_new_regularization(self, dtype):
         """A second ``update_and_factor_kkt`` replaces the first factor."""
-        B, N, d = 3, 4, 3
-        data, dense = random_multistage_data(B, N, d, 2, 3, seed=11, dtype=dtype)
+        B, N, d = 3, 5, 3
+        data, dense = random_multistage_data(B, N, d, 2, 4, seed=11, dtype=dtype)
         n, p, m = data.n, data.p, data.m
         solver = MultistageKKTSolver(data)
         rng = np.random.default_rng(12)
@@ -258,8 +267,8 @@ class TestMultistageKKTSolverSolve:
 
     def test_factor_status_flags_only_the_failed_problem(self, dtype):
         """A NaN in one problem's data is reported for that problem alone."""
-        B, N, d = 4, 3, 2
-        data, _ = random_multistage_data(B, N, d, 1, 2, seed=5, dtype=dtype)
+        B, N, d = 4, 5, 3
+        data, _ = random_multistage_data(B, N, d, 2, 4, seed=5, dtype=dtype)
         solver = MultistageKKTSolver(data)
         x_reg = np.ones((B, data.n))
         x_reg[2, 3] = np.nan

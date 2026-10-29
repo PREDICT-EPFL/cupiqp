@@ -60,16 +60,24 @@ def _mask_rhs_infinite_rows(rhs: Variables, data: SparseData) -> None:
         rhs.s_all = to_wp(rhs.s_all.numpy() * mask, data.dtype)
 
 
-# (n, p, m): constraint-set variations and a couple of larger sizes.
+# NOTE: keep the number of distinct shapes small. The KKT kernels are
+# specialized and compiled per (n, p, m), constraint layout and dtype, so
+# every new shape costs a fresh compile of the kernel set, which dominates
+# the run time of this file on a cold cache. The batch size is not part of
+# the specialization, so B is free to vary. Hence all tests share the
+# shapes below: every constraint layout on (n, p, m) = (10, 3, 5), with p
+# and / or m set to zero for a missing block, plus (20, 8, 9). The sparse
+# backend has no size-dependent code path, so no larger shape is needed.
+# The same shapes are used in test_kkt_system.py and test_dense_kkt.py, so a
+# run of tests/kkt compiles them once.
 SHAPES = [
-    (10, 0, 5),    # no equality constraints
-    (10, 3, 0),    # no inequality constraints
-    (10, 0, 0),    # only bound constraints
-    (20, 5, 8),    # mixed
-    (30, 10, 15),  # larger
-    (60, 20, 30),  # even larger
+    pytest.param(10, 3, 5, id="n10-p3-m5"),
+    pytest.param(10, 0, 5, id="n10-p0-m5"),  # no equality
+    pytest.param(10, 3, 0, id="n10-p3-m0"),  # no inequality
+    pytest.param(10, 0, 0, id="n10-p0-m0"),  # box bounds only
+    pytest.param(20, 8, 9, id="n20-p8-m9"),
 ]
-BATCH_SIZES = [1, 4]
+BATCH_SIZES = [1, 8]
 
 
 # ===========================================================================
@@ -103,7 +111,7 @@ def test_condensed_factorize_solve(n: int, p: int, m: int, B: int, dtype) -> Non
 def test_inactive_rows_are_decoupled(dtype) -> None:
     """A G row with both bounds infinite is decoupled from the condensed
     system: its right-hand side changes no other component of the solution."""
-    n, p, m = 10, 3, 6
+    n, p, m = 10, 3, 5
     qp = random_sparse_qp(5, n, p, m, density=0.3)
     qp["h_l"][[1, 4]] = -np.inf
     qp["h_u"][[1, 4]] = np.inf
@@ -115,9 +123,6 @@ def test_inactive_rows_are_decoupled(dtype) -> None:
 # ===========================================================================
 # Iterative refinement
 # ===========================================================================
-IR_SHAPES = [(20, 8, 9), (10, 0, 5), (10, 3, 0), (30, 10, 15)]
-
-
 def _ir_kkt(n, p, m, dtype):
     """A factored sparse KKTSystem with refinement enabled, and a rhs."""
     data = _sparse_data(random_sparse_qp(42, n, p, m, density=0.3, inf_fraction=0.3), 1, dtype)
@@ -129,7 +134,7 @@ def _ir_kkt(n, p, m, dtype):
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("n,p,m", IR_SHAPES)
+@pytest.mark.parametrize("n,p,m", SHAPES)
 def test_ir_does_not_increase_residual(n: int, p: int, m: int, dtype) -> None:
     """Refining a direct solve never increases its residual: refinement
     accepts a correction only if it lowers the residual of the same
@@ -143,7 +148,7 @@ def test_ir_does_not_increase_residual(n: int, p: int, m: int, dtype) -> None:
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("n,p,m", IR_SHAPES)
+@pytest.mark.parametrize("n,p,m", SHAPES)
 def test_ir_corrects_a_perturbed_solution(n: int, p: int, m: int, dtype) -> None:
     """Refinement started from a perturbed solution (residual of order one)
     reduces the residual to the solve accuracy of the dtype."""
@@ -162,7 +167,7 @@ def test_ir_corrects_a_perturbed_solution(n: int, p: int, m: int, dtype) -> None
 # ===========================================================================
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("B", BATCH_SIZES)
-@pytest.mark.parametrize("n,p,m", [(20, 8, 9), (10, 0, 5), (12, 4, 0)])
+@pytest.mark.parametrize("n,p,m", SHAPES)
 def test_update_data(n: int, p: int, m: int, B: int, dtype) -> None:
     """Update the P/A/G values, re-factor, and confirm the solve matches a fresh KKT."""
     arr = random_sparse_qp(3, n, p, m, density=0.3, inf_fraction=0.3)

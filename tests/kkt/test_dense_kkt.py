@@ -31,27 +31,51 @@ def random_dense_data(B=1, n=20, p=8, m=9, seed=42, dtype=wp.float64) -> DenseDa
     return data
 
 
-# Batch sizes exercised everywhere. B=1 is the original "single problem"
-# path; the others cover the genuine batched code paths.
-BATCH_SIZES = [1, 3, 8]
+# NOTE: keep the number of distinct shapes small. The dense KKT kernels are
+# specialized and compiled per (n, p, m), constraint layout and dtype, so
+# every new shape costs a fresh compile of the kernel set, which dominates
+# the run time of this file on a cold cache. The batch size is not part of
+# the specialization, so B is free to vary. Hence:
+#   - SIZES covers every constraint layout on (n, p, m) = (10, 3, 5), with p
+#     and / or m set to zero for a missing block, plus (20, 8, 9). n = 10
+#     runs the Warp matrix-product kernels, n = 20 the cuBLAS ones (see
+#     WARP_MATMUL_MAX_COLS / _ROWS in cupiqp/dense/dense_matmul.py);
+#   - only the tests of a backend path that SIZES misses add a shape:
+#     TALL_G_SIZES for the cuBLAS products of a G with many rows, and
+#     CHOLESKY_SIZES for both sides of the tile Cholesky limits;
+#   - each shape runs at B = 1 and B = 8 only, because B = 1 and B > 1 take
+#     different matrix-product and factorization paths.
+# The same shapes are used in test_kkt_system.py and test_sparse_kkt.py, so a
+# run of tests/kkt compiles them once.
+SIZES = [
+    pytest.param(1, 10, 3, 5, id="B1-n10-p3-m5"),
+    pytest.param(8, 10, 3, 5, id="B8-n10-p3-m5"),
+    pytest.param(1, 10, 0, 5, id="B1-n10-p0-m5"),  # no equality
+    pytest.param(8, 10, 0, 5, id="B8-n10-p0-m5"),
+    pytest.param(1, 10, 3, 0, id="B1-n10-p3-m0"),  # no inequality
+    pytest.param(8, 10, 3, 0, id="B8-n10-p3-m0"),
+    pytest.param(1, 10, 0, 0, id="B1-n10-p0-m0"),  # box bounds only
+    pytest.param(8, 10, 0, 0, id="B8-n10-p0-m0"),
+    pytest.param(1, 20, 8, 9, id="B1-n20-p8-m9"),  # cuBLAS products
+    pytest.param(8, 20, 8, 9, id="B8-n20-p8-m9"),
+]
 
+# More G rows than WARP_MATMUL_MAX_ROWS: the products of G run on cuBLAS,
+# those of A on Warp.
+TALL_G_SIZES = [
+    pytest.param(1, 10, 3, 40, id="B1-n10-p3-m40"),
+    pytest.param(8, 10, 3, 40, id="B8-n10-p3-m40"),
+]
 
-def batch_cases(shapes):
-    """``(B, n, p, m)`` cases: every ``(n, p, m)`` shape at B=3, and the
-    first shape at the other batch sizes."""
-    return [(3, *s) for s in shapes] + [(B, *shapes[0]) for B in BATCH_SIZES if B != 3]
-
-# (B, n, p, m) grid for the matvec primitives. Mixes B, dim n, and the
-# constraint counts p/m so the eval_* tests exercise rectangular A and G
-# of varying aspect ratios, not just a fixed reference shape.
-MATVEC_SIZES = [
-    pytest.param( 1,   4,  1,  2, id="B1-n4-p1-m2"),
-    pytest.param( 1,  16,  0,  5, id="B1-n16-p0-m5"),    # no equality
-    pytest.param( 1,  16,  6,  0, id="B1-n16-p6-m0"),    # no inequality
-    pytest.param( 3,   5,  2,  3, id="B3-n5-p2-m3"),
-    pytest.param( 4,  10,  4,  6, id="B4-n10-p4-m6"),
-    pytest.param( 4,  20,  8, 15, id="B4-n20-p8-m15"),   # p, m close to n
-    pytest.param( 8,  32, 12, 16, id="B8-n32-p12-m16"),
+# The tile Cholesky runs up to n = 48 in float64 and n = 64 in float32,
+# cuSOLVER above.
+CHOLESKY_SIZES = [
+    pytest.param(1, 48, 16, 24, id="B1-n48-p16-m24"),  # largest float64 tile
+    pytest.param(8, 48, 16, 24, id="B8-n48-p16-m24"),
+    pytest.param(1, 64, 21, 32, id="B1-n64-p21-m32"),  # largest float32 tile, float64 cuSOLVER
+    pytest.param(8, 64, 21, 32, id="B8-n64-p21-m32"),
+    pytest.param(1, 72, 24, 36, id="B1-n72-p24-m36"),  # cuSOLVER in both
+    pytest.param(8, 72, 24, 36, id="B8-n72-p24-m36"),
 ]
 
 
@@ -62,7 +86,7 @@ MATVEC_SIZES = [
 class TestDenseKKTSolverMatvec:
     """Batched matrix-vector primitives on the solver."""
 
-    @pytest.mark.parametrize("B,n,p,m", MATVEC_SIZES)
+    @pytest.mark.parametrize("B,n,p,m", SIZES + TALL_G_SIZES)
     def test_eval_P_x(self, dtype, B, n, p, m):
         data = random_dense_data(B, n, p=p, m=m, dtype=dtype)
         solver = DenseKKTSolver(data)
@@ -76,7 +100,7 @@ class TestDenseKKTSolverMatvec:
             expected = 2.0 * P[i] @ x[i]
             np.testing.assert_allclose(z[i], expected, **MATVEC_TOL[dtype])
 
-    @pytest.mark.parametrize("B,n,p,m", MATVEC_SIZES)
+    @pytest.mark.parametrize("B,n,p,m", SIZES + TALL_G_SIZES)
     def test_eval_A_xn_and_AT_xt(self, dtype, B, n, p, m):
         if p == 0:
             pytest.skip("no equality constraints - A has zero rows")
@@ -96,7 +120,7 @@ class TestDenseKKTSolverMatvec:
             np.testing.assert_allclose(y[i], A[i] @ x[i], **MATVEC_TOL[dtype])
             np.testing.assert_allclose(zt[i], A[i].T @ xt[i], **MATVEC_TOL[dtype])
 
-    @pytest.mark.parametrize("B,n,p,m", MATVEC_SIZES)
+    @pytest.mark.parametrize("B,n,p,m", SIZES + TALL_G_SIZES)
     def test_eval_G_xn_and_GT_xt(self, dtype, B, n, p, m):
         if m == 0:
             pytest.skip("no inequality constraints - G has zero rows")
@@ -121,10 +145,7 @@ class TestDenseKKTSolverMatvec:
 class TestDenseKKTSolverAssembly:
     """The factored KKT matrix matches the per-problem reference assembly."""
 
-    # (n, p, m) covering both factorization paths of update_and_factor_kkt:
-    # the Warp tile Cholesky (small n; up to 48 in float64, 64 in float32)
-    # and cuSOLVER (large n), with the Warp and cuBLAS products of G.
-    @pytest.mark.parametrize("B,n,p,m", batch_cases([(24, 5, 12), (5, 2, 4), (8, 0, 45), (56, 4, 20), (72, 4, 20)]))
+    @pytest.mark.parametrize("B,n,p,m", SIZES + TALL_G_SIZES + CHOLESKY_SIZES)
     def test_kkt_matrix_assembly(self, dtype, B, n, p, m):
         data = random_dense_data(B, n, p=p, m=m, dtype=dtype)
         solver = DenseKKTSolver(data)
@@ -199,16 +220,7 @@ class TestDenseKKTSolverSolve:
                 np.testing.assert_allclose(delta_z[i], ref_dz, err_msg=f"delta_z mismatch at batch {i}",
                                            **KKT_SOLVE_TOL[dtype])
 
-    # Constraint shapes (full / no-eq / no-ineq / only-bounds) and batch sizes,
-    # a large batch, an n sweep across the tile Cholesky limits (48 in
-    # float64, 64 in float32) at B=4 with p=max(1, n//3), m=max(1, n//2),
-    # many inequality rows, and the large-n path at B=1.
-    @pytest.mark.parametrize("B,n,p,m", [
-        *batch_cases([(6, 3, 4), (5, 0, 3), (5, 2, 0), (4, 0, 0)]),
-        (64, 8, 3, 5),
-        *[(4, n, max(1, n // 3), max(1, n // 2)) for n in (2, 16, 48, 56, 64, 72)],
-        (4, 8, 2, 70), (1, 72, 4, 20),
-    ])
+    @pytest.mark.parametrize("B,n,p,m", SIZES + TALL_G_SIZES + CHOLESKY_SIZES)
     def test_full_pipeline(self, dtype, B, n, p, m):
         self._run_solve(B=B, n=n, p=p, m=m, dtype=dtype, seed=B * 100 + n + p + m)
 
@@ -223,13 +235,7 @@ def _random_rhs(B, n, p, m, seed, dtype):
 class TestDenseKKTSystemCondensedSolve:
     """``KKTSystem`` round-trip: K * solve(rhs) ~= rhs via mul_condensed_kkt."""
 
-    @pytest.mark.parametrize("B,n,p,m", batch_cases([
-        (30, 10, 15),
-        (10, 0, 5),
-        (10, 3, 0),
-        (10, 0, 0),
-        (60, 20, 30),
-    ]))
+    @pytest.mark.parametrize("B,n,p,m", SIZES)
     def test_condensed_factorize_solve(self, dtype, B, n, p, m):
         """The round trip holds on the active rows; inactive rows are covered
         by ``test_inactive_rows_are_decoupled``."""
@@ -252,7 +258,7 @@ class TestDenseKKTSystemCondensedSolve:
     def test_inactive_rows_are_decoupled(self, dtype):
         """A G row with both bounds infinite is decoupled from the condensed
         system: its right-hand side changes no other component of the solution."""
-        B, n, p, m = 2, 10, 3, 6
+        B, n, p, m = 2, 10, 3, 5
         qp = random_dense_qp(5, n, p, m, batch_size=B)
         qp["h_l"][:, [1, 4]] = -np.inf
         qp["h_u"][:, [1, 4]] = np.inf
@@ -262,11 +268,8 @@ class TestDenseKKTSystemCondensedSolve:
         assert_inactive_rows_decoupled(kkt, data, *_random_rhs(B, n, p, m, seed=6, dtype=dtype))
 
 
-IR_SHAPES = [(20, 8, 9), (10, 0, 5), (10, 3, 0), (30, 10, 15)]
-
-
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("B,n,p,m", batch_cases(IR_SHAPES))
+@pytest.mark.parametrize("B,n,p,m", SIZES)
 class TestDenseKKTSystemIR:
     """Iterative refinement at the KKTSystem level, against the residual of
     the same operator before and after refinement."""

@@ -3,13 +3,9 @@
 Verifies the full pipeline: regularization -> eliminate -> condensed solve
 -> recover, against a per-problem NumPy reference.
 
-The full-solve tests are parametrized over a matrix of ``(B, n, p, m)``
-sizes and both precisions (float64 / float32) that covers:
-
-  * single-problem mode (B = 1) and batched mode (B > 1),
-  * with / without general inequality (``m > 0`` / ``m == 0``),
-  * with / without equality (``p > 0`` / ``p == 0``),
-  * with / without box bounds.
+The tests cover both precisions (float64 / float32), single-problem mode
+(B = 1) and batched mode (B > 1), and every constraint layout: with / without
+general inequality, equality and box bounds.
 
 Problems and right-hand sides are built with NumPy on the host and moved to
 the GPU as Warp arrays, the only array type the KKT internals take.
@@ -248,56 +244,53 @@ def _run_full_solve(B, n, p, m, dtype, seed=42, with_box=True):
 # Size matrices for the parametrized tests
 # ======================================================================
 
+# NOTE: keep the number of distinct shapes small. The KKT kernels are
+# specialized and compiled per (n, p, m), constraint layout and dtype, so
+# every new shape costs a fresh compile of the whole kernel set, which
+# dominates the run time of this file on a cold cache. The batch size is not
+# part of the specialization, so B is free to vary. Hence:
+#   - all tests share the shapes (n, p, m) = (10, 3, 5) and (20, 8, 9);
+#     n = 10 runs the Warp matrix-product kernels, n = 20 the cuBLAS ones
+#     (see WARP_MATMUL_MAX_COLS in cupiqp/dense/dense_matmul.py);
+#   - a missing block sets p and / or m of (10, 3, 5) to zero instead of
+#     picking a new shape;
+#   - each shape runs at B = 1 and B = 8 only, because B = 1 and B > 1 take
+#     different matrix-product paths.
+# (20, 8, 9), (10, 0, 5) and (10, 3, 0) are also in IR_SHAPES of
+# test_dense_kkt.py, so a run of both files compiles them once.
+
 # All four constraint types present: equality A, inequality G, box bounds.
-# Mix of single (B=1) and batched (B>1) problems.
 FULL_SIZES = [
-    pytest.param( 1,  3, 1,  2, id="B1-n3-p1-m2"),
-    pytest.param( 1,  6, 3,  4, id="B1-n6-p3-m4"),
-    pytest.param( 1, 10, 3,  5, id="B1-n10-p3-m5"),
-    pytest.param( 1, 16, 5,  8, id="B1-n16-p5-m8"),
-    pytest.param( 1, 24, 8, 12, id="B1-n24-p8-m12"),
-    pytest.param( 2,  5, 2,  3, id="B2-n5-p2-m3"),
-    pytest.param( 4,  6, 3,  4, id="B4-n6-p3-m4"),
-    pytest.param( 8, 10, 3,  5, id="B8-n10-p3-m5"),
-    pytest.param(16,  8, 3,  5, id="B16-n8-p3-m5"),
-    pytest.param(32, 12, 4,  6, id="B32-n12-p4-m6"),
-    pytest.param(64, 16, 5,  8, id="B64-n16-p5-m8"),
+    pytest.param(1, 10, 3, 5, id="B1-n10-p3-m5"),
+    pytest.param(8, 10, 3, 5, id="B8-n10-p3-m5"),
+    pytest.param(1, 20, 8, 9, id="B1-n20-p8-m9"),
+    pytest.param(8, 20, 8, 9, id="B8-n20-p8-m9"),
 ]
 
 # No general inequality (m = 0); equality + box bounds.
 NO_INEQ_SIZES = [
-    pytest.param( 1,  5, 3, 0, id="B1-n5-p3"),
-    pytest.param( 1, 10, 5, 0, id="B1-n10-p5"),
-    pytest.param( 3,  5, 2, 0, id="B3-n5-p2"),
-    pytest.param( 8,  8, 3, 0, id="B8-n8-p3"),
-    pytest.param(32, 12, 4, 0, id="B32-n12-p4"),
+    pytest.param(1, 10, 3, 0, id="B1-n10-p3"),
+    pytest.param(8, 10, 3, 0, id="B8-n10-p3"),
 ]
 
 # No equality (p = 0); inequality + box bounds.
 NO_EQ_SIZES = [
-    pytest.param( 1,  6, 0, 4, id="B1-n6-m4"),
-    pytest.param( 1, 10, 0, 6, id="B1-n10-m6"),
-    pytest.param( 3,  6, 0, 4, id="B3-n6-m4"),
-    pytest.param(16,  8, 0, 5, id="B16-n8-m5"),
-    pytest.param(32, 12, 0, 8, id="B32-n12-m8"),
+    pytest.param(1, 10, 0, 5, id="B1-n10-m5"),
+    pytest.param(8, 10, 0, 5, id="B8-n10-m5"),
 ]
 
 # Box bounds only (p = 0, m = 0).
 BOX_ONLY_SIZES = [
-    pytest.param( 1,  8, 0, 0, id="B1-n8"),
-    pytest.param( 1, 16, 0, 0, id="B1-n16"),
-    pytest.param( 4,  8, 0, 0, id="B4-n8"),
-    pytest.param(16, 10, 0, 0, id="B16-n10"),
+    pytest.param(1, 10, 0, 0, id="B1-n10"),
+    pytest.param(8, 10, 0, 0, id="B8-n10"),
 ]
 
 # Equality only, no inequality of any kind (no G, no box bounds).
 # This is a *different* DenseData code path from BOX_ONLY: ``num_ineq``
 # is zero, so no slacks/duals get allocated.
 EQ_ONLY_SIZES = [
-    pytest.param( 1,  5, 3, id="B1-n5-p3"),
-    pytest.param( 1, 10, 5, id="B1-n10-p5"),
-    pytest.param( 3,  5, 2, id="B3-n5-p2"),
-    pytest.param( 8,  8, 3, id="B8-n8-p3"),
+    pytest.param(1, 10, 3, id="B1-n10-p3"),
+    pytest.param(8, 10, 3, id="B8-n10-p3"),
 ]
 
 
@@ -377,14 +370,7 @@ class TestKKTSystemCondensedMatvec:
     """After ``solve``, multiplying ``lhs`` by the condensed KKT operator
     should reproduce the original ``rhs`` (within solver tolerance)."""
 
-    CONDENSED_SIZES = [
-        pytest.param( 1, 10, 3, 5, id="B1-n10-p3-m5"),
-        pytest.param( 1, 20, 5, 8, id="B1-n20-p5-m8"),
-        pytest.param( 4,  8, 2, 4, id="B4-n8-p2-m4"),
-        pytest.param(16, 12, 3, 6, id="B16-n12-p3-m6"),
-    ]
-
-    @pytest.mark.parametrize("B,n,p,m", CONDENSED_SIZES)
+    @pytest.mark.parametrize("B,n,p,m", FULL_SIZES)
     def test_K_times_lhs_recovers_rhs(self, dtype, B, n, p, m):
         data = _make_data(B, n, p, m, dtype)
         kkt_sys, _, _ = factored_kkt_system(data)
@@ -413,13 +399,7 @@ class TestKKTSystemCondensedMatvec:
 class TestKKTSystemMatvec:
     """Sanity check for forwarded matvec operations."""
 
-    MATVEC_SIZES = [
-        pytest.param( 1,  4, 1, 2, id="B1-n4-p1-m2"),
-        pytest.param( 4,  5, 3, 2, id="B4-n5-p3-m2"),
-        pytest.param(16, 10, 4, 6, id="B16-n10-p4-m6"),
-    ]
-
-    @pytest.mark.parametrize("B,n,p,m", MATVEC_SIZES)
+    @pytest.mark.parametrize("B,n,p,m", FULL_SIZES)
     def test_eval_P_x(self, dtype, B, n, p, m):
         data = _make_data(B=B, n=n, p=p, m=m, dtype=dtype)
         kkt_sys = kkt_system(data, Settings.for_dtype(dtype))
@@ -433,7 +413,7 @@ class TestKKTSystemMatvec:
             expected = P[i] @ x[i]
             np.testing.assert_allclose(z[i], expected, **MATVEC_TOL[dtype])
 
-    @pytest.mark.parametrize("B,n,p,m", MATVEC_SIZES)
+    @pytest.mark.parametrize("B,n,p,m", FULL_SIZES)
     def test_eval_A_xn_and_AT_xt(self, dtype, B, n, p, m):
         data = _make_data(B=B, n=n, p=p, m=m, dtype=dtype)
         kkt_sys = kkt_system(data, Settings.for_dtype(dtype))
