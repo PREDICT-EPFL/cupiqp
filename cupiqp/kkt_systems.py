@@ -19,8 +19,7 @@ from .kkt_systems_kernels import (
     create_recover_slacks_kernel,
     create_recover_slacks_transposed_kernel,
     create_recover_duals_kernel,
-    create_update_regularizations_step_1_kernel,
-    create_update_regularizations_step_2_kernel,
+    create_update_regularizations_kernel,
     create_condensed_kkt_combine_kernel
 )
 
@@ -172,8 +171,7 @@ class KKTSystem:
         self._refine_loop = self._refine_state[3:4]
 
         # Create Warp kernels
-        self._update_regularization_step_1_kernel = create_update_regularizations_step_1_kernel(num_ineq=num_ineq, dtype=self._dtype)
-        self._update_regularization_step_2_kernel = create_update_regularizations_step_2_kernel(
+        self._update_regularization_kernel = create_update_regularizations_kernel(
             n, m, has_h_l=data.has_h_l, has_h_u=data.has_h_u, has_x_l=data.has_x_l, has_x_u=data.has_x_u, dtype=self._dtype)
         self._eliminate_slacks_kernel = create_eliminate_slacks_kernel(dtype=self._dtype)
         self._eliminate_slacks_transposed_kernel = create_eliminate_slacks_transposed_kernel(dtype=self._dtype)
@@ -232,29 +230,12 @@ class KKTSystem:
     @nvtx.annotate("KKTSystem::_update_regularization")
     def _update_regularization(self, data: Data, preconditioner: PreconditionerBase, delta: wp.array, rho: wp.array, vars: Variables):
         """Update the regularization terms x_reg and z_reg for the condensed KKT system after eliminating slacks and duals of inequalities and box constraints."""
-        B = self._batch_size
         wp.launch(
-            kernel=self._update_regularization_step_1_kernel,
-            dim=(B, max(data.num_ineq, 1)),
-            inputs=[vars.s_all, vars.z_all, data.finite_mask_all,
-                    self._m_s_all, self._m_z_inv_all, self._w_delta_inv_all,
-                    rho, delta, self._rho, self._delta],
-            device=self._device
-        )
-        wp.launch(
-            kernel=self._update_regularization_step_2_kernel,
-            dim=(B, data.n + data.m),
-            inputs=[
-                self._w_bu_delta_inv,
-                self._w_bl_delta_inv,
-                preconditioner.x_b_scaling,
-                self._rho,
-                self._x_reg,
-                self._w_u_delta_inv,
-                self._w_l_delta_inv,
-                self._z_reg,
-                self._z_reg_inv,
-            ],
+            kernel=self._update_regularization_kernel,
+            dim=(self._batch_size, data.n + data.m),
+            inputs=[vars.s_all, vars.z_all, data.finite_mask_all, preconditioner.x_b_scaling, rho, delta,
+                    self._m_s_all, self._m_z_inv_all, self._w_delta_inv_all, self._rho, self._delta,
+                    self._x_reg, self._z_reg, self._z_reg_inv],
             device=self._device
         )
 

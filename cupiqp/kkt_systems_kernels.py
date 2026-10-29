@@ -9,130 +9,113 @@ wp.set_module_options({"enable_backward": False})
 
 
 @functools.lru_cache(maxsize=None)
-def create_update_regularizations_step_1_kernel(num_ineq: int, dtype=wp.float64):
+def create_update_regularizations_kernel(nx: int, nz: int,
+                                         has_h_l: bool, has_h_u: bool,
+                                         has_x_l: bool, has_x_u: bool,
+                                         dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
-    """Create kernel operating on contiguous s_all/z_all buffers. Performs:
+    """Create kernel computing the condensed KKT regularization terms in one pass.
 
-        self._rho = rho
-        self._delta = delta
+    On the contiguous ``[hl | hu | xl | xu]`` cone buffers, with every entry
+    of an inactive (infinite) bound set to zero, it computes::
 
-        self._m_s_u = vars.s_u
-        self._m_s_l = vars.s_l
-        self._m_s_bu = vars.s_bu
-        self._m_s_bl = vars.s_bl
-        self._m_z_u_inv = 1. / vars.z_u
-        self._m_z_l_inv = 1. / vars.z_l
-        self._m_z_bu_inv = 1. / vars.z_bu
-        self._m_z_bl_inv = 1. / vars.z_bl
+        rho_out = rho_in,  delta_out = delta_in
+        m_s     = s
+        m_z_inv = 1 / z
+        w_delta_inv = 1 / (s * z_inv + delta)
 
-        self._w_bu_delta_inv = 1. / (self._m_s_bu * self._m_z_bu_inv + delta)
-        self._w_bl_delta_inv = 1. / (self._m_s_bl * self._m_z_bl_inv + delta)
-        self._w_u_delta_inv = 1. / (self._m_s_u * self._m_z_u_inv + delta)
-        self._w_l_delta_inv = 1. / (self._m_s_l * self._m_z_l_inv + delta)
+        x_reg = rho + x_b_scaling**2 * (w_bu_delta_inv + w_bl_delta_inv)
+        z_reg = 1 / (w_u_delta_inv + w_l_delta_inv),  z_reg_inv = its inverse
 
-        Since s and z are stored contiguously, it becomes:
+    The full-length cone layout stores a present bound block without compacting
+    finite entries, so the box blocks have length ``nx`` and the inequality
+    blocks length ``nz``. Thread ``t < nx`` owns variable ``t``: its box cone
+    entries and ``x_reg[b, t]``. Thread ``nx + tz`` owns row ``tz`` of ``G``:
+    its inequality cone entries and ``z_reg[b, tz]``. Every cone entry is thus
+    written by exactly one thread, which also consumes it. An omitted block
+    (``has_*`` False) has no storage and contributes nothing.
 
-        rho_out[b]            = rho_in[b]                          (when i == 0)
-        delta_out[b]          = delta_in[b]                        (when i == 0)
-        m_s_all[b, i]         = vars_s_all[b, i]                   (when i < num_ineq)
-        m_z_inv_all[b, i]     = 1.0 / vars_z_all[b, i]             (when i < num_ineq)
-        w_delta_inv_all[b, i] = 1.0 / (s * z_inv + delta_in[b])    (when i < num_ineq)
+    NOTE: if there are inactive rows in G s.t. -inf <= G[i] * x <= +inf, the
+    corresponding z_reg[i] will be 0.
 
-        Launch dim is ``(B, max(num_ineq, 1))`` so that the ``i == 0`` thread
-        always exists to copy rho/delta even when there are no inequalities.
+    Launch dim is ``(B, nx + nz)``.
     """
-    @wp.kernel
-    def update_regularizations_step_1_kernel(
+    num_hl = nz if has_h_l else 0
+    num_hu = nz if has_h_u else 0
+    num_xl = nx if has_x_l else 0
+    off_hu = num_hl
+    off_xl = num_hl + num_hu
+    off_xu = off_xl + num_xl
+
+    @wp.func
+    def update_w_delta_inv(
         vars_s_all: wp.array2d(dtype=dtype),        # type: ignore
         vars_z_all: wp.array2d(dtype=dtype),        # type: ignore
         finite_mask_all: wp.array2d(dtype=dtype),   # type: ignore
         m_s_all: wp.array2d(dtype=dtype),           # type: ignore
         m_z_inv_all: wp.array2d(dtype=dtype),       # type: ignore
         w_delta_inv_all: wp.array2d(dtype=dtype),   # type: ignore
+        delta: dtype,                               # type: ignore
+        b: int,
+        i: int,
+    ):
+        """Write m_s, m_z_inv and w_delta_inv of inequality entry ``i``; return w_delta_inv."""
+        if finite_mask_all[b, i] > dtype(0.5):
+            s = vars_s_all[b, i]
+            z_inv = dtype(1.0) / vars_z_all[b, i]
+            w = dtype(1.0) / (s * z_inv + delta)
+            m_s_all[b, i] = s
+            m_z_inv_all[b, i] = z_inv
+            w_delta_inv_all[b, i] = w
+            return w
+        else:
+            m_s_all[b, i] = dtype(0.0)
+            m_z_inv_all[b, i] = dtype(0.0)
+            w_delta_inv_all[b, i] = dtype(0.0)
+            return dtype(0.0)
+
+    @wp.kernel
+    def update_regularizations_kernel(
+        vars_s_all: wp.array2d(dtype=dtype),        # type: ignore
+        vars_z_all: wp.array2d(dtype=dtype),        # type: ignore
+        finite_mask_all: wp.array2d(dtype=dtype),   # type: ignore
+        x_b_scaling: wp.array2d(dtype=dtype),       # type: ignore
         rho_in: wp.array(dtype=dtype),              # type: ignore
         delta_in: wp.array(dtype=dtype),            # type: ignore
+        m_s_all: wp.array2d(dtype=dtype),           # type: ignore
+        m_z_inv_all: wp.array2d(dtype=dtype),       # type: ignore
+        w_delta_inv_all: wp.array2d(dtype=dtype),   # type: ignore
         rho_out: wp.array(dtype=dtype),             # type: ignore
         delta_out: wp.array(dtype=dtype),           # type: ignore
-    ):
-        b, i = wp.tid()
-        num_ineq_static = wp.static(num_ineq)
-        if i == 0:
-            rho_out[b] = rho_in[b]
-            delta_out[b] = delta_in[b]
-        if i < num_ineq_static:
-            if finite_mask_all[b, i] > dtype(0.5):
-                s = vars_s_all[b, i]
-                z_inv = dtype(1.0) / vars_z_all[b, i]
-                m_s_all[b, i] = s
-                m_z_inv_all[b, i] = z_inv
-                w_delta_inv_all[b, i] = dtype(1.0) / (s * z_inv + delta_in[b])
-            else:
-                m_s_all[b, i] = dtype(0.0)
-                m_z_inv_all[b, i] = dtype(0.0)
-                w_delta_inv_all[b, i] = dtype(0.0)
-    return update_regularizations_step_1_kernel
-
-
-@functools.lru_cache(maxsize=None)
-def create_update_regularizations_step_2_kernel(nx: int, nz: int,
-                                                has_h_l: bool, has_h_u: bool,
-                                                has_x_l: bool, has_x_u: bool,
-                                                dtype=wp.float64):
-    dtype = to_warp_dtype(dtype)
-    """Create kernel specialized for the condensed KKT regularization terms.
-
-    The full-length cone layout stores a present bound block without compacting
-    finite entries. ``w_*_delta_inv`` is already zero on inactive entries, so the
-    full-index formulas are simple and do not need inverse gather maps::
-
-        x_reg[:] = rho
-        x_reg += x_b_scaling**2 * (w_bu_delta_inv + w_bl_delta_inv)
-
-        z_reg[:] = 1. / (w_u_delta_inv + w_l_delta_inv)
-
-    The ``z_reg`` row weight is per row of ``G`` and is always full ``(B, m)``.
-    An omitted inequality side (``has_h_l`` / ``has_h_u`` False) has an empty
-    ``(B, 0)`` ``w_*_delta_inv`` and contributes nothing to the row weight;
-    likewise an omitted box block (``has_x_l`` / ``has_x_u``) contributes nothing
-    to ``x_reg``. All optional reads are guarded by the static presence flags.
-
-    NOTE: if there are inactive rows in G s.t. -inf <= G[i] * x <= +inf, the
-    corresponding z_reg[i] will be 0.
-
-    Each thread writes only to its own unique slot: one variable regularization
-    entry ``x_reg[b, t]`` or one inequality row weight ``z_reg[b, tz]``.
-    """
-    @wp.kernel
-    def update_regularizations_step_2_kernel(
-        w_bu_delta_inv: wp.array2d(dtype=dtype),  # type: ignore
-        w_bl_delta_inv: wp.array2d(dtype=dtype),  # type: ignore
-        x_b_scaling: wp.array2d(dtype=dtype),  # type: ignore
-        rho: wp.array(dtype=dtype),  # type: ignore
-        x_reg: wp.array2d(dtype=dtype),  # type: ignore
-        w_u_delta_inv: wp.array2d(dtype=dtype),  # type: ignore
-        w_l_delta_inv: wp.array2d(dtype=dtype),  # type: ignore
-        z_reg: wp.array2d(dtype=dtype),  # type: ignore
-        z_reg_inv: wp.array2d(dtype=dtype), # type: ignore
+        x_reg: wp.array2d(dtype=dtype),             # type: ignore
+        z_reg: wp.array2d(dtype=dtype),             # type: ignore
+        z_reg_inv: wp.array2d(dtype=dtype),         # type: ignore
     ):
         b, t = wp.tid()
-        nx_static = wp.static(nx)
-        nz_static = wp.static(nz)
+        delta = delta_in[b]
+        if t == 0:
+            rho_out[b] = rho_in[b]
+            delta_out[b] = delta
 
-        if t < nx_static:
-            xb_scaling = x_b_scaling[b, t]
+        if t < wp.static(nx):
             box_weight = dtype(0.0)
             if wp.static(has_x_u):
-                box_weight += w_bu_delta_inv[b, t]
+                box_weight += update_w_delta_inv(vars_s_all, vars_z_all, finite_mask_all, m_s_all, m_z_inv_all,
+                                          w_delta_inv_all, delta, b, wp.static(off_xu) + t)
             if wp.static(has_x_l):
-                box_weight += w_bl_delta_inv[b, t]
-            x_reg[b, t] = rho[b] + xb_scaling * xb_scaling * box_weight
-        elif t < nx_static + nz_static:
-            tz = t - nx_static
+                box_weight += update_w_delta_inv(vars_s_all, vars_z_all, finite_mask_all, m_s_all, m_z_inv_all,
+                                          w_delta_inv_all, delta, b, wp.static(off_xl) + t)
+            xb_scaling = x_b_scaling[b, t]
+            x_reg[b, t] = rho_in[b] + xb_scaling * xb_scaling * box_weight
+        elif t < wp.static(nx + nz):
+            tz = t - wp.static(nx)
             tmp = dtype(0.0)
             if wp.static(has_h_u):
-                tmp += w_u_delta_inv[b, tz]
+                tmp += update_w_delta_inv(vars_s_all, vars_z_all, finite_mask_all, m_s_all, m_z_inv_all,
+                                   w_delta_inv_all, delta, b, wp.static(off_hu) + tz)
             if wp.static(has_h_l):
-                tmp += w_l_delta_inv[b, tz]
+                tmp += update_w_delta_inv(vars_s_all, vars_z_all, finite_mask_all, m_s_all, m_z_inv_all,
+                                   w_delta_inv_all, delta, b, tz)
             if tmp > dtype(0.0):  # means this row of G is active
                 z_reg[b, tz] = dtype(1.0) / tmp
                 z_reg_inv[b, tz] = tmp
@@ -140,7 +123,8 @@ def create_update_regularizations_step_2_kernel(nx: int, nz: int,
                 z_reg[b, tz] = dtype(0.0)
                 z_reg_inv[b, tz] = dtype(0.0)
 
-    return update_regularizations_step_2_kernel
+    return update_regularizations_kernel
+
 
 @functools.lru_cache(maxsize=None)
 def create_eliminate_duals_kernel(nx: int, nz: int,
