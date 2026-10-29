@@ -13,14 +13,14 @@ import pytest
 import warp as wp
 
 from cupiqp import DenseSolver, MultistageSolver, Status
-from tests.helpers import primal_infeasible, random_qp, stack_qps, to_wp, to_wp_dict
+from tests.helpers import primal_infeasible, random_dense_qp, stack_qps, to_wp, to_wp_dict
 
 
 def _batch(np_dtype, seed=0, size=4):
     """Three well-posed problems plus one primal infeasible problem, whose
     stagnation exercises the infeasibility and finetune thresholds."""
     rng = np.random.default_rng(seed)
-    qps = [random_qp(rng) for _ in range(size - 1)]
+    qps = [random_dense_qp(rng) for _ in range(size - 1)]
     qps.append(primal_infeasible(qps[0]))
     return to_wp_dict(stack_qps(qps), np_dtype)
 

@@ -26,44 +26,12 @@ import warp as wp
 piqp = pytest.importorskip("piqp")
 
 from cupiqp import Settings, SparseSolver, Status, PIQP_INF
-from tests.helpers import csr_triple, to_wp
-
-
-def _make_qp(n, p, m, pattern, seed):
-    """Strictly-feasible convex QP with a chosen finite/infinite bound pattern.
-
-    ``pattern`` maps any of 'hl','hu','xl','xu' to a boolean finite-mask;
-    missing keys default to all-finite.
-    """
-    rng = np.random.default_rng(seed)
-    M = rng.standard_normal((n, n))
-    P = M @ M.T + n * np.eye(n)
-    P = 0.5 * (P + P.T)
-    c = rng.standard_normal(n)
-    x0 = rng.standard_normal(n)
-
-    A = rng.standard_normal((p, n)) if p else np.zeros((0, n))
-    b = A @ x0 if p else np.zeros((0,))
-    G = rng.standard_normal((m, n)) if m else np.zeros((0, n))
-    Gx0 = G @ x0 if m else np.zeros((0,))
-
-    def fin(key, length):
-        msk = pattern.get(key)
-        return np.ones(length, bool) if msk is None else np.asarray(msk, bool)
-
-    h_l = Gx0 - (0.5 + rng.random(m)); h_u = Gx0 + (0.5 + rng.random(m))
-    h_l[~fin('hl', m)] = -np.inf; h_u[~fin('hu', m)] = np.inf
-    x_l = x0 - (0.5 + rng.random(n)); x_u = x0 + (0.5 + rng.random(n))
-    x_l[~fin('xl', n)] = -np.inf; x_u[~fin('xu', n)] = np.inf
-    return dict(P=P, c=c, A=A, b=b, G=G, h_l=h_l, h_u=h_u, x_l=x_l, x_u=x_u)
+from tests.helpers import assert_all_solved, csr_triple, quiet, random_feasible_qp, to_wp
 
 
 def _solve_piqp(qp):
     n, p, m = qp['P'].shape[0], qp['A'].shape[0], qp['G'].shape[0]
-    s = piqp.DenseSolver()
-    s.settings.eps_abs = 1e-10
-    s.settings.eps_rel = 1e-10
-    s.settings.verbose = False
+    s = quiet(piqp.DenseSolver(), eps_abs=1e-10, eps_rel=1e-10)
     s.setup(
         np.asfortranarray(qp['P']), qp['c'],
         np.asfortranarray(qp['A']) if p else None, qp['b'] if p else None,
@@ -77,10 +45,7 @@ def _solve_piqp(qp):
 
 def _solve_sparse(qp):
     n, p, m = qp['P'].shape[0], qp['A'].shape[0], qp['G'].shape[0]
-    s = SparseSolver()
-    s.settings.eps_abs = 1e-10
-    s.settings.eps_rel = 1e-10
-    s.settings.verbose = False
+    s = quiet(SparseSolver(), eps_abs=1e-10, eps_rel=1e-10)
     kw = dict(P=csr_triple(qp['P']), c=to_wp(qp['c']))
     if p:
         kw.update(A=csr_triple(qp['A']), b=to_wp(qp['b']))
@@ -109,24 +74,25 @@ def _setup_batched(s, qps, blocks=('P', 'c', 'A', 'b', 'G', 'h_l', 'h_u', 'x_l',
     s.setup(**inputs)
 
 
+# ``infinite`` marks the bound entries that are +/-inf.
 _CASES = {
-    'all_finite': dict(n=8, p=2, m=5, pattern={}, seed=1),
-    'oneside_hu': dict(n=8, p=2, m=5, pattern={'hl': [False] * 5}, seed=2),
-    'oneside_xl': dict(n=7, p=1, m=4, pattern={'xu': [False] * 7}, seed=3),
+    'all_finite': dict(n=8, p=2, m=5, infinite={}, seed=1),
+    'oneside_hu': dict(n=8, p=2, m=5, infinite={'h_l': [True] * 5}, seed=2),
+    'oneside_xl': dict(n=7, p=1, m=4, infinite={'x_u': [True] * 7}, seed=3),
     'mixed': dict(n=9, p=2, m=6,
-                  pattern={'hl': [True, False, True, False, True, False],
-                           'hu': [False, True, True, False, True, True],
-                           'xl': [True, False, True, True, False, True, False, True, True],
-                           'xu': [False, True, True, False, True, False, True, True, False]},
+                  infinite={'h_l': [False, True, False, True, False, True],
+                            'h_u': [True, False, False, True, False, False],
+                            'x_l': [False, True, False, False, True, False, True, False, False],
+                            'x_u': [True, False, False, True, False, True, False, False, True]},
                   seed=4),
-    'only_box': dict(n=8, p=0, m=0, pattern={}, seed=5),
+    'only_box': dict(n=8, p=0, m=0, infinite={}, seed=5),
 }
 
 
 @pytest.mark.parametrize("name", list(_CASES))
 def test_sparse_matches_piqp(name):
     cfg = _CASES[name]
-    qp = _make_qp(cfg['n'], cfg['p'], cfg['m'], cfg['pattern'], cfg['seed'])
+    qp = random_feasible_qp(cfg['seed'], cfg['n'], cfg['p'], cfg['m'], infinite=cfg['infinite'])
     n, p, m = cfg['n'], cfg['p'], cfg['m']
 
     x_ref = _solve_piqp(qp)
@@ -159,9 +125,9 @@ def test_sparse_batched_per_element_masks():
     match independent single-problem sparse solves."""
     n, p, m = 6, 1, 4
     qps = [
-        _make_qp(n, p, m, {}, 10),
-        _make_qp(n, p, m, {'hl': [False] * m}, 11),
-        _make_qp(n, p, m, {'xu': [False] * n}, 12),
+        random_feasible_qp(10, n, p, m),
+        random_feasible_qp(11, n, p, m, infinite={'h_l': [True] * m}),
+        random_feasible_qp(12, n, p, m, infinite={'x_u': [True] * n}),
     ]
     B = len(qps)
 
@@ -169,9 +135,7 @@ def test_sparse_batched_per_element_masks():
 
     # Shared sparsity pattern across the batch (same P/A/G structure here);
     # bounds differ per element, including which entries are infinite.
-    s = SparseSolver()
-    s.settings.eps_abs = 1e-10
-    s.settings.verbose = False
+    s = quiet(SparseSolver(), eps_abs=1e-10)
     _setup_batched(s, qps)
     s.solve()
     for i in range(B):
@@ -180,10 +144,7 @@ def test_sparse_batched_per_element_masks():
 
 def _setup_sparse(qp):
     n, p, m = qp['P'].shape[0], qp['A'].shape[0], qp['G'].shape[0]
-    s = SparseSolver()
-    s.settings.eps_abs = 1e-10
-    s.settings.eps_rel = 1e-10
-    s.settings.verbose = False
+    s = quiet(SparseSolver(), eps_abs=1e-10, eps_rel=1e-10)
     kw = dict(P=csr_triple(qp['P']), c=to_wp(qp['c']),
               x_l=to_wp(qp['x_l']), x_u=to_wp(qp['x_u']))
     if p:
@@ -272,10 +233,7 @@ def test_sparse_batched_update_toggles_active_inequality_rows():
         sr.solve()
         refs.append(sr.result.x.numpy()[0])
 
-    s = SparseSolver()
-    s.settings.eps_abs = 1e-10
-    s.settings.eps_rel = 1e-10
-    s.settings.verbose = False
+    s = quiet(SparseSolver(), eps_abs=1e-10, eps_rel=1e-10)
     _setup_batched(s, qps1, blocks=('P', 'c', 'G', 'h_l', 'h_u', 'x_l', 'x_u'))
     s.solve()
     s.update(
@@ -296,7 +254,7 @@ def test_sparse_float32_box_qp():
     solver.setup(P=csr_triple(np.eye(n), np.float32), c=to_wp(c),
                  x_l=to_wp(-np.ones(n), np.float32), x_u=to_wp(np.ones(n), np.float32))
     solver.solve()
-    assert all(st == Status.CUPIQP_SOLVED for st in solver.result.info.to_host().status)
+    assert_all_solved(solver)
     np.testing.assert_allclose(solver.result.x.numpy(), np.clip(-c, -1.0, 1.0), atol=1e-3)
 
 

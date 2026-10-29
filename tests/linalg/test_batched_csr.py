@@ -1,11 +1,10 @@
 import numpy as np
 import pytest
-import scipy.sparse as sp_cpu
+import scipy.sparse as sp
 import warp as wp
-from scipy.sparse import csr_matrix
 
 from cupiqp.sparse.batched_csr import UniformBatchedCsrMatrix
-from tests.helpers import csr_triple, to_wp
+from tests.helpers import DTYPES, csr_triple, to_wp
 
 
 # ---------------------------------------------------------------------------
@@ -13,33 +12,34 @@ from tests.helpers import csr_triple, to_wp
 # ---------------------------------------------------------------------------
 def random_csr_template(
     m: int, n: int, density: float = 0.5, seed: int = 42,
-) -> csr_matrix:
-    """A host ``csr_matrix`` with random nonzeros at density ``density``."""
+) -> sp.csr_matrix:
+    """A host ``sp.csr_matrix`` with random nonzeros at density ``density``."""
     rng = np.random.default_rng(seed)
-    A_cpu = sp_cpu.random(
+    A_cpu = sp.random(
         m, n, density=density, format='csr', random_state=rng, dtype=np.float64,
     )
-    return csr_matrix(A_cpu)
+    return sp.csr_matrix(A_cpu)
 
 
-def random_values(B: int, nnz: int, seed: int = 0) -> wp.array:
-    """A random ``(B, nnz)`` float64 Warp array of values."""
+def random_values(B: int, nnz: int, seed: int = 0, dtype=wp.float64) -> wp.array:
+    """A random ``(B, nnz)`` Warp array of values."""
     rng = np.random.default_rng(seed)
-    return to_wp(rng.standard_normal((B, nnz)))
+    return to_wp(rng.standard_normal((B, nnz)), dtype)
 
 
 def build_from_template(
-    template: csr_matrix, B: int, seed: int = 0,
+    template: sp.csr_matrix, B: int, seed: int = 0, dtype=wp.float64,
 ) -> tuple[UniformBatchedCsrMatrix, wp.array]:
     """Construct a uniform batched CSR sharing the template's sparsity."""
     indptr, indices, _ = csr_triple(template)
-    values = random_values(B, template.nnz, seed=seed)
+    values = random_values(B, template.nnz, seed=seed, dtype=dtype)
     mat = UniformBatchedCsrMatrix(
         batch_size=B,
         indptr=indptr,
         indices=indices,
         data=values,
         shape=template.shape,
+        dtype=dtype,
     )
     return mat, values
 
@@ -48,32 +48,37 @@ def build_from_template(
 # Construction and storage
 # ===========================================================================
 
-def test_storage_is_warp() -> None:
-    """indptr / indices are int32 Warp arrays, data is a (B, nnz) Warp array."""
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_storage_is_warp(dtype) -> None:
+    """indptr / indices are int32 Warp arrays, data is a (B, nnz) Warp array
+    of the matrix dtype."""
     tpl = random_csr_template(4, 5, seed=1)
-    mat, values = build_from_template(tpl, B=3, seed=2)
+    mat, values = build_from_template(tpl, B=3, seed=2, dtype=dtype)
     assert isinstance(mat.indptr, wp.array) and mat.indptr.dtype is wp.int32
     assert isinstance(mat.indices, wp.array) and mat.indices.dtype is wp.int32
-    assert isinstance(mat.data, wp.array) and mat.data.dtype is wp.float64
+    assert isinstance(mat.data, wp.array) and mat.data.dtype is dtype
     assert mat.data.shape == (3, tpl.nnz)
     np.testing.assert_array_equal(mat.indptr.numpy(), tpl.indptr)
     np.testing.assert_array_equal(mat.indices.numpy(), tpl.indices)
     np.testing.assert_allclose(mat.data.numpy(), values.numpy())
 
 
-def test_construction_copies_values() -> None:
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_construction_copies_values(dtype) -> None:
     """The values are copied: mutating the source afterwards has no effect."""
     tpl = random_csr_template(3, 4, seed=2)
-    mat, values = build_from_template(tpl, B=2, seed=3)
+    mat, values = build_from_template(tpl, B=2, seed=3, dtype=dtype)
     values.zero_()
     assert not bool(np.allclose(mat.data.numpy(), 0.0))
 
 
-def test_construction_broadcasts_shared_values() -> None:
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_construction_broadcasts_shared_values(dtype) -> None:
     """``(nnz,)`` values are replicated into every matrix of the batch."""
     tpl = random_csr_template(3, 4, seed=5)
-    mat = UniformBatchedCsrMatrix(3, *csr_triple(tpl), shape=tpl.shape)
-    np.testing.assert_allclose(mat.data.numpy(), np.broadcast_to(tpl.data, (3, tpl.nnz)))
+    triple = csr_triple(tpl, wp.dtype_to_numpy(dtype))
+    mat = UniformBatchedCsrMatrix(3, *triple, shape=tpl.shape, dtype=dtype)
+    np.testing.assert_array_equal(mat.data.numpy(), np.broadcast_to(triple[2].numpy(), (3, tpl.nnz)))
 
 
 def test_construction_wrong_data_shape_raises() -> None:
@@ -120,7 +125,7 @@ def test_pattern_keeps_explicit_zeros() -> None:
     mat = UniformBatchedCsrMatrix(2, indptr, indices, values, shape=tpl.shape)
 
     pat = mat.pattern()
-    assert isinstance(pat, sp_cpu.csr_matrix)
+    assert isinstance(pat, sp.csr_matrix)
     assert pat.nnz == tpl.nnz
     np.testing.assert_array_equal(pat.data, np.ones(tpl.nnz))
     np.testing.assert_array_equal(pat.indptr, tpl.indptr)
@@ -131,9 +136,11 @@ def test_pattern_keeps_explicit_zeros() -> None:
 # empty()
 # ===========================================================================
 
-def test_empty_classmethod() -> None:
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_empty_classmethod(dtype) -> None:
     """``empty(B, rows, cols)`` returns a zero-nnz batched CSR with the declared shape."""
-    mat = UniformBatchedCsrMatrix.empty(batch_size=4, rows=5, cols=7)
+    mat = UniformBatchedCsrMatrix.empty(batch_size=4, rows=5, cols=7, dtype=dtype)
+    assert mat.dtype is dtype
     assert mat.batch_size == 4
     assert mat.nnz == 0
     assert mat.shape == (4, 5, 7)

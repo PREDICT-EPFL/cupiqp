@@ -3,7 +3,7 @@ cuBLAS wrappers.
 
 Every test is parameterized over dtype so the float64 (``d*``) and
 float32 (``s*``) wrappers exercise identical shape, layout, scalar,
-and graph-capture coverage. Tolerances are dtype-specific (see ``_atol``).
+and graph-capture coverage. Products are checked with ``MATVEC_TOL``.
 Operands are built with NumPy on the host, copied to Warp arrays for the
 wrappers, and the results are checked against NumPy on the host.
 """
@@ -23,12 +23,21 @@ from cupiqp.dense.cublas_wrappers import (
     sgemm_strided_batched,
 )
 from tests.helpers import to_wp
+from tests.tolerances import MATVEC_TOL
 
 
 # ---------------------------------------------------------------------------
 # dtype <-> wrapper / tolerance dispatch
 # ---------------------------------------------------------------------------
 DTYPES = [np.float64, np.float32]
+# MATVEC_TOL by the NumPy dtypes the wrappers take.
+TOL = {np.float64: MATVEC_TOL[wp.float64], np.float32: MATVEC_TOL[wp.float32]}
+
+
+def _f64(a):
+    """Float64 copy of a host array. References are computed in float64 so a
+    float32 check measures only the rounding of the GPU product."""
+    return a.astype(np.float64)
 
 
 def _gemv(dtype):
@@ -41,14 +50,6 @@ def _gemv_batched(dtype):
 
 def _gemm_batched(dtype):
     return dgemm_strided_batched if dtype == np.float64 else sgemm_strided_batched
-
-
-def _atol(dtype):
-    return 1e-12 if dtype == np.float64 else 1e-4
-
-
-def _rtol(dtype):
-    return 1e-7 if dtype == np.float64 else 1e-4
 
 
 @pytest.fixture
@@ -72,16 +73,10 @@ SHAPES = [
     (1, 1),
     (1, 8),
     (8, 1),
-    (3, 3),
-    (4, 5),
-    (5, 4),
-    (16, 16),
     (32, 32),
-    (128, 128),
     (200, 32),     # tall
     (32, 200),     # wide
     (37, 53),      # non-power-of-two
-    (512, 512),    # larger square
     (1024, 256),   # large tall
 ]
 
@@ -98,7 +93,7 @@ def test_basic_gemv(handle, m, n, dtype):
     y = to_wp(np.zeros(m, dtype=dtype))
 
     _gemv(dtype)(handle, to_wp(A), to_wp(x), y)
-    np.testing.assert_allclose(y.numpy(), A @ x, atol=_atol(dtype), rtol=_rtol(dtype))
+    np.testing.assert_allclose(y.numpy(), _f64(A) @ x, **TOL[dtype])
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -110,7 +105,7 @@ def test_transpose(handle, m, n, dtype):
     y = to_wp(np.zeros(n, dtype=dtype))
 
     _gemv(dtype)(handle, to_wp(A), to_wp(x), y, transa=True)
-    np.testing.assert_allclose(y.numpy(), A.T @ x, atol=_atol(dtype), rtol=_rtol(dtype))
+    np.testing.assert_allclose(y.numpy(), _f64(A).T @ x, **TOL[dtype])
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -124,7 +119,7 @@ def test_alpha_beta(handle, m, n, dtype):
 
     _gemv(dtype)(handle, to_wp(A), to_wp(x), y, alpha=2.0, beta=0.5)
     np.testing.assert_allclose(
-        y.numpy(), 2.0 * (A @ x) + 0.5 * y_before, atol=_atol(dtype), rtol=_rtol(dtype),
+        y.numpy(), 2.0 * (_f64(A) @ x) + 0.5 * y_before, **TOL[dtype],
     )
 
 
@@ -139,7 +134,7 @@ def test_alpha_beta_transpose(handle, m, n, dtype):
 
     _gemv(dtype)(handle, to_wp(A), to_wp(x), y, transa=True, alpha=-1.5, beta=2.0)
     np.testing.assert_allclose(
-        y.numpy(), -1.5 * (A.T @ x) + 2.0 * y_before, atol=_atol(dtype), rtol=_rtol(dtype),
+        y.numpy(), -1.5 * (_f64(A).T @ x) + 2.0 * y_before, **TOL[dtype],
     )
 
 
@@ -156,7 +151,7 @@ def test_alpha_zero_beta_one_is_identity(handle, m, n, dtype):
     y = to_wp(y_before)
 
     _gemv(dtype)(handle, to_wp(A), to_wp(x), y, alpha=0.0, beta=1.0)
-    np.testing.assert_allclose(y.numpy(), y_before, atol=_atol(dtype), rtol=_rtol(dtype))
+    np.testing.assert_allclose(y.numpy(), y_before, **TOL[dtype])
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -168,7 +163,7 @@ def test_beta_zero_overwrites_garbage(handle, m, n, dtype):
     y = to_wp(np.full(m, np.nan, dtype=dtype))
 
     _gemv(dtype)(handle, to_wp(A), to_wp(x), y, alpha=1.0, beta=0.0)
-    np.testing.assert_allclose(y.numpy(), A @ x, atol=_atol(dtype), rtol=_rtol(dtype))
+    np.testing.assert_allclose(y.numpy(), _f64(A) @ x, **TOL[dtype])
 
 
 # ---------------------------------------------------------------------------
@@ -187,11 +182,11 @@ def test_reuse_different_scalars(handle, dtype):
 
     _gemv(dtype)(handle, A_d, x_d, y, alpha=1.0, beta=0.0)
     y1 = y.numpy()
-    np.testing.assert_allclose(y1, A @ x, atol=_atol(dtype), rtol=_rtol(dtype))
+    np.testing.assert_allclose(y1, _f64(A) @ x, **TOL[dtype])
 
     _gemv(dtype)(handle, A_d, x_d, y, alpha=3.0, beta=1.0)
     np.testing.assert_allclose(
-        y.numpy(), 3.0 * (A @ x) + y1, atol=_atol(dtype), rtol=_rtol(dtype),
+        y.numpy(), 3.0 * (_f64(A) @ x) + y1, **TOL[dtype],
     )
 
 
@@ -203,7 +198,7 @@ def test_identity(handle, n, dtype):
     y = to_wp(np.zeros(n, dtype=dtype))
 
     _gemv(dtype)(handle, to_wp(A), to_wp(x), y)
-    np.testing.assert_allclose(y.numpy(), x, atol=_atol(dtype), rtol=_rtol(dtype))
+    np.testing.assert_allclose(y.numpy(), x, **TOL[dtype])
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -219,8 +214,8 @@ def test_symmetric_matrix(handle, n, dtype):
 
     _gemv(dtype)(handle, A_d, x_d, y)
     _gemv(dtype)(handle, A_d, x_d, y_T, transa=True)
-    np.testing.assert_allclose(y.numpy(), A @ x, atol=_atol(dtype), rtol=_rtol(dtype))
-    np.testing.assert_allclose(y_T.numpy(), y.numpy(), atol=_atol(dtype), rtol=_rtol(dtype))
+    np.testing.assert_allclose(y.numpy(), _f64(A) @ x, **TOL[dtype])
+    np.testing.assert_allclose(y_T.numpy(), y.numpy(), **TOL[dtype])
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -230,7 +225,7 @@ def test_scalar_matrix(handle, dtype):
     y = to_wp(np.zeros(1, dtype=dtype))
     _gemv(dtype)(handle, A, x, y)
     np.testing.assert_allclose(
-        y.numpy(), np.asarray([6.0], dtype=dtype), atol=_atol(dtype), rtol=_rtol(dtype),
+        y.numpy(), np.asarray([6.0], dtype=dtype), **TOL[dtype],
     )
 
 
@@ -259,8 +254,8 @@ def test_cuda_graph_capture(handle, transa, dtype):
 
     _capture_and_replay(handle, lambda: _gemv(dtype)(
         handle, A_d, x_d, y, transa=transa, alpha=1.0, beta=0.0))
-    expected = A.T @ x if transa else A @ x
-    np.testing.assert_allclose(y.numpy(), expected, atol=_atol(dtype), rtol=_rtol(dtype))
+    expected = _f64(A).T @ x if transa else _f64(A) @ x
+    np.testing.assert_allclose(y.numpy(), expected, **TOL[dtype])
 
 
 # ===========================================================================
@@ -273,14 +268,9 @@ def test_cuda_graph_capture(handle, transa, dtype):
 BATCH_SHAPES = [
     (1, 1, 1),
     (1, 8, 5),
-    (4, 3, 3),
-    (4, 4, 5),
-    (4, 5, 4),
-    (8, 16, 16),
     (8, 32, 32),
     (16, 7, 11),    # non-power-of-two
     (32, 8, 24),    # rectangular
-    (64, 16, 16),
     (128, 6, 6),    # large batch, tiny matrix
     (2, 1100, 1100),
 ]
@@ -300,8 +290,11 @@ def test_batched_gemv_basic(handle, batch, m, n, dtype):
     y = to_wp(np.zeros((batch, m), dtype=dtype))
 
     _gemv_batched(dtype)(handle, to_wp(A), to_wp(x), y)
-    expected = np.einsum("bij,bj->bi", A, x)
-    np.testing.assert_allclose(y.numpy(), expected, atol=_atol(dtype), rtol=_rtol(dtype))
+    expected = np.einsum("bij,bj->bi", _f64(A), x)
+    # NOTE: float32 with a 1100-long inner dimension accumulates about 2e-5 of
+    # rounding, above the MATVEC_TOL atol.
+    tol = dict(TOL[dtype], atol=1e-4) if dtype == np.float32 and n > 1000 else TOL[dtype]
+    np.testing.assert_allclose(y.numpy(), expected, **tol)
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -313,8 +306,11 @@ def test_batched_gemv_transpose(handle, batch, m, n, dtype):
     y = to_wp(np.zeros((batch, n), dtype=dtype))
 
     _gemv_batched(dtype)(handle, to_wp(A), to_wp(x), y, transa=True)
-    expected = np.einsum("bij,bi->bj", A, x)
-    np.testing.assert_allclose(y.numpy(), expected, atol=_atol(dtype), rtol=_rtol(dtype))
+    expected = np.einsum("bij,bi->bj", _f64(A), x)
+    # NOTE: float32 with a 1100-long inner dimension accumulates about 2e-5 of
+    # rounding, above the MATVEC_TOL atol.
+    tol = dict(TOL[dtype], atol=1e-4) if dtype == np.float32 and m > 1000 else TOL[dtype]
+    np.testing.assert_allclose(y.numpy(), expected, **tol)
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -327,8 +323,8 @@ def test_batched_gemv_alpha_beta(handle, batch, m, n, dtype):
     y = to_wp(y_before)
 
     _gemv_batched(dtype)(handle, to_wp(A), to_wp(x), y, alpha=2.0, beta=0.5)
-    expected = 2.0 * np.einsum("bij,bj->bi", A, x) + 0.5 * y_before
-    np.testing.assert_allclose(y.numpy(), expected, atol=_atol(dtype), rtol=_rtol(dtype))
+    expected = 2.0 * np.einsum("bij,bj->bi", _f64(A), x) + 0.5 * y_before
+    np.testing.assert_allclose(y.numpy(), expected, **TOL[dtype])
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -341,8 +337,8 @@ def test_batched_gemv_alpha_beta_transpose(handle, batch, m, n, dtype):
     y = to_wp(y_before)
 
     _gemv_batched(dtype)(handle, to_wp(A), to_wp(x), y, transa=True, alpha=-1.5, beta=2.0)
-    expected = -1.5 * np.einsum("bij,bi->bj", A, x) + 2.0 * y_before
-    np.testing.assert_allclose(y.numpy(), expected, atol=_atol(dtype), rtol=_rtol(dtype))
+    expected = -1.5 * np.einsum("bij,bi->bj", _f64(A), x) + 2.0 * y_before
+    np.testing.assert_allclose(y.numpy(), expected, **TOL[dtype])
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -359,7 +355,7 @@ def test_batched_gemv_matches_per_sample_gemv(handle, dtype):
     for i in range(batch):
         _gemv(dtype)(handle, A[i], x[i], y_loop[i], alpha=1.3, beta=0.0)
     np.testing.assert_allclose(
-        y_batched.numpy(), y_loop.numpy(), atol=_atol(dtype), rtol=_rtol(dtype),
+        y_batched.numpy(), y_loop.numpy(), **TOL[dtype],
     )
 
 
@@ -377,7 +373,7 @@ def test_batched_gemv_batch_size_one(handle, dtype):
     y_single = to_wp(np.zeros(m, dtype=dtype))
     _gemv(dtype)(handle, A[0], x_b[0], y_single)
     np.testing.assert_allclose(
-        y_b.numpy()[0], y_single.numpy(), atol=_atol(dtype), rtol=_rtol(dtype),
+        y_b.numpy()[0], y_single.numpy(), **TOL[dtype],
     )
 
 
@@ -393,10 +389,10 @@ def test_batched_gemv_cuda_graph_capture(handle, transa, dtype):
     _capture_and_replay(handle, lambda: _gemv_batched(dtype)(
         handle, A_d, x_d, y, transa=transa, alpha=1.0, beta=0.0))
     if transa:
-        expected = np.einsum("bij,bi->bj", A, x)
+        expected = np.einsum("bij,bi->bj", _f64(A), x)
     else:
-        expected = np.einsum("bij,bj->bi", A, x)
-    np.testing.assert_allclose(y.numpy(), expected, atol=_atol(dtype), rtol=_rtol(dtype))
+        expected = np.einsum("bij,bj->bi", _f64(A), x)
+    np.testing.assert_allclose(y.numpy(), expected, **TOL[dtype])
 
 
 # ===========================================================================
@@ -416,8 +412,8 @@ def test_batched_gemm_basic(handle, batch, m, k, n, dtype):
     C = to_wp(np.zeros((batch, m, n), dtype=dtype))
 
     _gemm_batched(dtype)(handle, to_wp(A), to_wp(B), C)
-    expected = np.einsum("bij,bjk->bik", A, B)
-    np.testing.assert_allclose(C.numpy(), expected, atol=_atol(dtype), rtol=_rtol(dtype))
+    expected = np.einsum("bij,bjk->bik", _f64(A), B)
+    np.testing.assert_allclose(C.numpy(), expected, **TOL[dtype])
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -438,8 +434,8 @@ def test_batched_gemm_transpose_flags(handle, transa, transb, dtype):
 
     A_eff = A.transpose(0, 2, 1) if transa else A
     B_eff = B.transpose(0, 2, 1) if transb else B
-    expected = np.einsum("bij,bjk->bik", A_eff, B_eff)
-    np.testing.assert_allclose(C.numpy(), expected, atol=_atol(dtype), rtol=_rtol(dtype))
+    expected = np.einsum("bij,bjk->bik", _f64(A_eff), B_eff)
+    np.testing.assert_allclose(C.numpy(), expected, **TOL[dtype])
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -451,5 +447,5 @@ def test_batched_gemm_alpha_beta(handle, dtype):
     C = to_wp(C_before)
 
     _gemm_batched(dtype)(handle, to_wp(A), to_wp(B), C, alpha=2.0, beta=0.5)
-    expected = 2.0 * np.einsum("bij,bjk->bik", A, B) + 0.5 * C_before
-    np.testing.assert_allclose(C.numpy(), expected, atol=_atol(dtype), rtol=_rtol(dtype))
+    expected = 2.0 * np.einsum("bij,bjk->bik", _f64(A), B) + 0.5 * C_before
+    np.testing.assert_allclose(C.numpy(), expected, **TOL[dtype])

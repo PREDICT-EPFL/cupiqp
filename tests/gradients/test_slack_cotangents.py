@@ -9,12 +9,10 @@ active bound). Losses without slack cotangents were not affected."""
 
 import numpy as np
 import pytest
-import warp as wp
 
 import cupiqp
-from cupiqp import Status
 
-from tests.helpers import csr_triple, random_qp, to_wp
+from tests.helpers import assert_all_solved, csr_triple, random_dense_qp, to_wp
 
 
 SLACKS_AND_INPUTS = [
@@ -27,7 +25,7 @@ def active_box_qp(seed=0, n=6, p=2, m=4) -> dict:
     """A random QP whose solution has an active lower and an active upper box
     bound (strictly complementary), so that the slack gradients at an active
     bound are exercised."""
-    qp = random_qp(seed, n=n, p=p, m=m)
+    qp = random_dense_qp(seed, n=n, p=p, m=m)
     P, c, A = qp["P"], qp["c"], qp["A"]
     kkt = np.block([[P, A.T], [A, np.zeros((p, p))]])
     x_star = np.linalg.solve(kkt, np.concatenate([-c, qp["b"]]))[:n]
@@ -44,7 +42,7 @@ def make_solver(cls, qp, preconditioner_iter):
     to_dev = csr_triple if cls is cupiqp.SparseSolver else to_wp
     solver.setup(**{k: (to_dev(v) if k in ("P", "A", "G") else to_wp(v)) for k, v in qp.items()})
     solver.solve()
-    assert all(s == Status.CUPIQP_SOLVED for s in solver.result.info.to_host().status)
+    assert_all_solved(solver)
     return solver
 
 

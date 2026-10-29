@@ -7,63 +7,35 @@ import gc
 
 import numpy as np
 import pytest
-torch = pytest.importorskip("torch")
 import warp as wp
 
 import cupiqp
 from cupiqp import Status
 from cupiqp.torch import DenseSolverLayer, StructureMismatchError, TorchSolution
 
-from tests.helpers import layer_statuses
+from tests.helpers import quiet, random_feasible_qp, tight
+from tests.torch_interface.torch_helpers import DEVICE, DTYPE, layer_statuses, requires_cuda, tensor, torch
 
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-
-DEVICE = "cuda"
-DTYPE = torch.float64
-
-
-def _t(values, dtype=DTYPE):
-    return torch.tensor(values, dtype=dtype, device=DEVICE)
-
+pytestmark = requires_cuda
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 def _rand_qp(n=4, p=1, m=2, seed=0, with_bounds=True, dtype=DTYPE):
-    """A random strictly convex QP with a non-empty interior, as torch tensors."""
-    rng = np.random.default_rng(seed)
-    M = rng.standard_normal((n, n))
-    P = M @ M.T + n * np.eye(n)
-    c = rng.standard_normal(n)
-    A = rng.standard_normal((p, n)) if p > 0 else None
-    b = rng.standard_normal(p) if p > 0 else None
-    G = rng.standard_normal((m, n)) if m > 0 else None
-    if m > 0:
-        mid = rng.standard_normal(m)
-        rad = 1.0 + rng.random(m)
-        h_l, h_u = mid - rad, mid + rad
-    else:
-        h_l = h_u = None
-    if with_bounds:
-        mid = rng.standard_normal(n)
-        rad = 2.0 + rng.random(n)
-        x_l, x_u = mid - rad, mid + rad
-    else:
-        x_l = x_u = None
-
-    def t(a):
-        return None if a is None else torch.tensor(a, dtype=dtype, device=DEVICE)
-
-    return dict(P=t(P), c=t(c), A=t(A), b=t(b), G=t(G), h_u=t(h_u), h_l=t(h_l),
-                x_u=t(x_u), x_l=t(x_l))
+    """A random strictly convex QP with a non-empty interior, as torch tensors;
+    the absent constraint fields are None."""
+    qp = random_feasible_qp(seed, n, p, m)
+    absent = (("A", "b") if p == 0 else ()) + (("G", "h_l", "h_u") if m == 0 else ()) \
+        + (() if with_bounds else ("x_l", "x_u"))
+    return {k: None if k in absent else tensor(v, dtype) for k, v in qp.items()}
 
 
 def _box_qp(dtype=DTYPE):
     """Box QP with the interior solution x = (0.5, 0.3)."""
     return dict(
         P=torch.eye(2, dtype=dtype, device=DEVICE),
-        c=_t([-0.5, -0.3], dtype),
+        c=tensor([-0.5, -0.3], dtype),
         x_l=torch.zeros(2, dtype=dtype, device=DEVICE),
         x_u=torch.ones(2, dtype=dtype, device=DEVICE),
     )
@@ -73,14 +45,7 @@ BOX_X = [[0.5, 0.3]]
 
 
 def _make_layer(preconditioner_iter=0, **settings):
-    layer = DenseSolverLayer()
-    layer.settings.preconditioner_iter = preconditioner_iter
-    layer.settings.verbose = False
-    layer.settings.eps_abs = 1e-11
-    layer.settings.eps_rel = 1e-11
-    for name, value in settings.items():
-        setattr(layer.settings, name, value)
-    return layer
+    return tight(DenseSolverLayer(), **{"preconditioner_iter": preconditioner_iter, **settings})
 
 
 def _solve(layer, qp):
@@ -190,9 +155,8 @@ def test_device_argument_and_stream_device():
     qp = _box_qp()
     layer = DenseSolverLayer(device="cuda")
     assert layer.device == torch.device("cuda", torch.cuda.current_device())
-    layer.settings.verbose = False
-    layer.setup(**qp)
-    torch.testing.assert_close(layer(), _t(BOX_X))
+    quiet(layer).setup(**qp)
+    torch.testing.assert_close(layer(), tensor(BOX_X))
     with pytest.raises(ValueError, match="CUDA"):
         DenseSolverLayer(device="cpu")
     stream = torch.cuda.Stream()
@@ -211,7 +175,7 @@ def test_forward_returns_batched_view_and_result():
     x = layer()
     assert isinstance(x, torch.Tensor) and x.is_cuda and x.dtype == DTYPE
     assert x.shape == (1, 2)
-    torch.testing.assert_close(x, _t(BOX_X))
+    torch.testing.assert_close(x, tensor(BOX_X))
     assert x.data_ptr() == layer.result.x.data_ptr()        # a view, no copy
     assert layer_statuses(layer) == (Status.CUPIQP_SOLVED,)
     assert layer.result.status.shape == (1,)
@@ -244,17 +208,17 @@ def test_outputs_are_views_overwritten_by_the_next_call():
     x1 = layer()
     kept = x1.clone()
     x2 = layer(c=-qp["c"])
-    torch.testing.assert_close(kept, _t(BOX_X))
-    torch.testing.assert_close(x2, _t([[0.0, 0.0]]))
+    torch.testing.assert_close(kept, tensor(BOX_X))
+    torch.testing.assert_close(x2, tensor([[0.0, 0.0]]))
     assert x1.data_ptr() == x2.data_ptr()
 
 
 def test_forward_matches_core_solver_batched():
     batch_size, n = 3, 4
     rng = np.random.default_rng(5)
-    P = _t(np.stack([(lambda M: M @ M.T + n * np.eye(n))(rng.standard_normal((n, n)))
+    P = tensor(np.stack([(lambda M: M @ M.T + n * np.eye(n))(rng.standard_normal((n, n)))
                      for _ in range(batch_size)]))
-    c = _t(rng.standard_normal((batch_size, n)))
+    c = tensor(rng.standard_normal((batch_size, n)))
     layer = _make_layer()
     layer.setup(P, c)
     x = layer()
@@ -280,31 +244,29 @@ def test_shared_matrix_with_batched_vector():
 
 def test_float32():
     qp = _box_qp(dtype=torch.float32)
-    layer = DenseSolverLayer(dtype=torch.float32)
-    layer.settings.verbose = False
+    layer = quiet(DenseSolverLayer(dtype=torch.float32))
     layer.setup(**qp)
     x = layer()
     assert x.dtype == torch.float32
-    torch.testing.assert_close(x, _t(BOX_X, torch.float32), atol=1e-4, rtol=0)
+    torch.testing.assert_close(x, tensor(BOX_X, torch.float32), atol=1e-4, rtol=0)
 
 
 def test_non_default_torch_stream_constructor_and_current():
     qp = _box_qp()
     stream = torch.cuda.Stream()
-    layer = DenseSolverLayer(stream=stream)
-    layer.settings.verbose = False
+    layer = quiet(DenseSolverLayer(stream=stream))
     with torch.cuda.stream(stream):
         c = qp["c"] * 0.5                      # interior solution (0.25, 0.15)
         layer.setup(**qp)
         x = layer(c=c)
     stream.synchronize()
-    torch.testing.assert_close(x, _t([[0.25, 0.15]]))
+    torch.testing.assert_close(x, tensor([[0.25, 0.15]]))
     layer2 = _make_layer()
     with torch.cuda.stream(torch.cuda.Stream()):
         layer2.setup(**qp)
         x2 = layer2()
     torch.cuda.synchronize()
-    torch.testing.assert_close(x2, _t(BOX_X))
+    torch.testing.assert_close(x2, tensor(BOX_X))
 
 
 def test_result_clone_survives_next_call():
@@ -314,7 +276,7 @@ def test_result_clone_survives_next_call():
     layer()
     kept = layer.result.clone()
     layer(c=-qp["c"])
-    torch.testing.assert_close(kept.x, _t(BOX_X))
+    torch.testing.assert_close(kept.x, tensor(BOX_X))
     assert Status(int(kept.status[0])) == Status.CUPIQP_SOLVED
 
 
@@ -343,7 +305,7 @@ def test_setup_twice_requires_reset():
     layer.reset()
     assert not layer.is_setup
     layer.setup(**qp)
-    torch.testing.assert_close(layer(), _t(BOX_X))
+    torch.testing.assert_close(layer(), tensor(BOX_X))
 
 
 def test_structure_mismatch_errors():
@@ -556,8 +518,8 @@ def test_shared_input_gradient_is_summed_over_batch():
     n, batch_size = 3, 4
     rng = np.random.default_rng(11)
     M = rng.standard_normal((n, n))
-    P = _t(M @ M.T + n * np.eye(n))
-    c = _t(rng.standard_normal((batch_size, n)))
+    P = tensor(M @ M.T + n * np.eye(n))
+    c = tensor(rng.standard_normal((batch_size, n)))
     layer = _make_layer()
     layer.setup(P, c)
     P_shared = P.clone().requires_grad_(True)
@@ -582,15 +544,15 @@ def test_gradient_accumulates_across_calls():
 @pytest.mark.parametrize("mode", ["differentiate", "zero"])
 def test_backward_proceeds_with_unsolved_problem_in_batch(mode):
     P = torch.eye(2, dtype=DTYPE, device=DEVICE)
-    c = _t([[1.0, 1.0], [1.0, 1.0]]).requires_grad_(True)
-    A = _t([[1.0, 0.0], [1.0, 0.0]])
-    b = _t([[0.0, 0.0], [0.0, 1.0]])                 # problem 1 is infeasible
+    c = tensor([[1.0, 1.0], [1.0, 1.0]]).requires_grad_(True)
+    A = tensor([[1.0, 0.0], [1.0, 0.0]])
+    b = tensor([[0.0, 0.0], [0.0, 1.0]])                 # problem 1 is infeasible
     layer = _make_layer(gradient_on_failure=mode)
     layer.setup(P, c.detach(), A=A, b=b)
     layer(c=c).sum().backward()
     statuses = layer_statuses(layer)
     assert statuses[0] == Status.CUPIQP_SOLVED and statuses[1] != Status.CUPIQP_SOLVED
-    torch.testing.assert_close(c.grad[0], _t([0.0, -1.0]), atol=1e-6, rtol=0)
+    torch.testing.assert_close(c.grad[0], tensor([0.0, -1.0]), atol=1e-6, rtol=0)
     if mode == "zero":
         assert torch.all(c.grad[1] == 0.0)
 
@@ -600,7 +562,7 @@ def test_training_loop():
     layer = _make_layer()
     layer.setup(**qp)
     theta = torch.zeros(2, dtype=DTYPE, device=DEVICE, requires_grad=True)
-    target = _t([[0.25, 0.75]])
+    target = tensor([[0.25, 0.75]])
     opt = torch.optim.SGD([theta], lr=0.5)
     for _ in range(40):
         opt.zero_grad()
@@ -952,7 +914,7 @@ def test_capacity_one_rejects_no_grad_calls_while_pending():
     with torch.no_grad():
         with pytest.raises(RuntimeError, match="pending backward"):
             layer(c=qp["c"])              # would overwrite the factorization
-    torch.testing.assert_close(x.detach(), _t(BOX_X))   # untouched
+    torch.testing.assert_close(x.detach(), tensor(BOX_X))   # untouched
     x.sum().backward()
 
 

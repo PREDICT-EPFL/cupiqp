@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from cupiqp import DenseSolver, MultistageSolver
-from tests.helpers import all_solved, broadcast, to_wp
+from tests.helpers import all_solved, assert_all_solved, broadcast, quiet, to_wp
 
 
 def _assert_within_gap_bound(x, x_star, duality_gap):
@@ -36,9 +36,7 @@ def test_wide_dense_box_qp(enable_cuda_graph):
     rng = np.random.default_rng(0)
     c = rng.standard_normal((B, n)) * 2.0
     x_l, x_u = -np.ones(n), np.ones(n)
-    s = DenseSolver()
-    s.settings.verbose = False
-    s.settings.enable_cuda_graph = enable_cuda_graph
+    s = quiet(DenseSolver(), enable_cuda_graph=enable_cuda_graph)
     s.setup(P=to_wp(np.eye(n)), c=to_wp(c), x_l=to_wp(x_l), x_u=to_wp(x_u))
     s.solve()
     info = s.result.info.to_host()
@@ -60,13 +58,12 @@ def test_wide_dense_with_equalities_and_inequalities():
     G = rng.standard_normal((m, n))
     h_u = np.abs(rng.standard_normal(m)) + 1.0
     h_l = -np.abs(rng.standard_normal(m)) - 1.0
-    s = DenseSolver()
-    s.settings.verbose = False
+    s = quiet(DenseSolver())
     s.setup(P=to_wp(P), c=broadcast(to_wp(c), B), A=to_wp(A), b=to_wp(b),
             G=to_wp(G), h_l=to_wp(h_l), h_u=to_wp(h_u),
             x_l=to_wp(-3 * np.ones(n)), x_u=to_wp(3 * np.ones(n)))
     s.solve()
-    assert all_solved(s.result.info.to_host().status)
+    assert_all_solved(s)
     x = s.result.x.numpy()
     # Both batch entries hold the template problem: identical solutions,
     # feasible to tolerance, and stationary in the sense of the reported residuals.
@@ -85,8 +82,7 @@ def test_wide_multistage_box_qp():
     rng = np.random.default_rng(2)
     c = rng.standard_normal((B, N, d))
     P_diag = to_wp(np.broadcast_to(np.eye(d), (N, d, d)))
-    s = MultistageSolver()
-    s.settings.verbose = False
+    s = quiet(MultistageSolver())
     s.setup(P=(P_diag, None), c=to_wp(c),
             x_l=to_wp(-np.ones((N, d))), x_u=to_wp(np.ones((N, d))))
     s.solve()

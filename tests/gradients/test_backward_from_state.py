@@ -11,7 +11,7 @@ import warp as wp
 
 import cupiqp
 from cupiqp import DenseSolver, MultistageSolver, SparseSolver, Status
-from tests.helpers import csr_triple, to_wp, to_wp_dict
+from tests.helpers import assert_all_solved, csr_triple, quiet, random_feasible_qp, to_wp, to_wp_dict
 
 
 STATE_FIELDS = ("x", "y", "z_u", "z_l", "z_bu", "z_bl", "s_u", "s_l", "s_bu", "s_bl")
@@ -20,42 +20,13 @@ STATE_FIELDS = ("x", "y", "z_u", "z_l", "z_bu", "z_bl", "s_u", "s_l", "s_bu", "s
 # ---------------------------------------------------------------------------
 # Problems and helpers
 # ---------------------------------------------------------------------------
-def _dense_qp(n=5, p=1, m=3, seed=0, batch_size=1):
-    """Strictly convex QP with equalities, two-sided inequalities and box
-    bounds; a batch of perturbed copies when batch_size > 1."""
-    rng = np.random.default_rng(seed)
-    M = rng.standard_normal((n, n))
-    P = M @ M.T + n * np.eye(n)
-    A = rng.standard_normal((p, n))
-    G = rng.standard_normal((m, n))
-    qp = dict(P=P, A=A, G=G)
-    vecs = []
-    for b in range(batch_size):
-        # Feasible by construction: a point x* satisfies the equalities and
-        # lies strictly inside the inequalities and the box.
-        x_star = rng.standard_normal(n)
-        c = rng.standard_normal(n)
-        bb = A @ x_star
-        mid = G @ x_star
-        rad = 0.2 + rng.random(m)
-        xr = 0.5 + rng.random(n)
-        vecs.append(dict(c=c, b=bb, h_l=mid - rad, h_u=mid + rad, x_l=x_star - xr, x_u=x_star + xr))
-    for key in vecs[0]:
-        qp[key] = np.stack([v[key] for v in vecs]) if batch_size > 1 else vecs[0][key]
-    return qp
-
-
 def _settings(solver, preconditioner_iter, dtype):
-    s = solver.settings
-    s.enable_grad = True
-    s.preconditioner_iter = preconditioner_iter
-    s.verbose = False
-    s.enable_cuda_graph = False
     # Tight tolerances: the immediate backward linearizes at the last Newton
     # iterate, backward_from_state() at the final point; they agree to the
     # solve tolerance.
-    s.eps_abs = 1e-12 if dtype == np.float64 else 1e-6
-    s.eps_rel = 1e-12 if dtype == np.float64 else 1e-6
+    eps = {np.float64: 1e-12, np.float32: 1e-6}[dtype]
+    quiet(solver, enable_grad=True, preconditioner_iter=preconditioner_iter, enable_cuda_graph=False,
+          eps_abs=eps, eps_rel=eps)
 
 
 def _dense_solver(qp, preconditioner_iter=0, dtype=np.float64, **extra):
@@ -116,11 +87,6 @@ def _grads_to_numpy(grads, names):
     return out
 
 
-def _assert_solved(solver):
-    statuses = solver.result.info.to_host().status
-    assert all(s == Status.CUPIQP_SOLVED for s in statuses), statuses
-
-
 DENSE_GRADS = ("P", "c", "A", "b", "G", "h_u", "h_l", "x_u", "x_l")
 
 
@@ -130,10 +96,10 @@ DENSE_GRADS = ("P", "c", "A", "b", "G", "h_u", "h_l", "x_u", "x_l")
 @pytest.mark.parametrize("preconditioner_iter", [0, 10])
 @pytest.mark.parametrize("dtype", [np.float64, np.float32])
 def test_dense_matches_immediate(preconditioner_iter, dtype):
-    qp = _dense_qp(batch_size=3)
+    qp = random_feasible_qp(0, batch_size=3)
     solver = _dense_solver(qp, preconditioner_iter, dtype)
     solver.solve()
-    _assert_solved(solver)
+    assert_all_solved(solver)
     B, n = 3, 5
     grad_x = to_wp(np.random.default_rng(1).standard_normal((B, n)), dtype)
     grad_zu = to_wp(np.ones((B, 3)), dtype)
@@ -156,10 +122,10 @@ def test_dense_matches_immediate(preconditioner_iter, dtype):
 
 @pytest.mark.parametrize("preconditioner_iter", [0, 10])
 def test_sparse_matches_immediate(preconditioner_iter):
-    qp = _dense_qp(batch_size=2, seed=3)
+    qp = random_feasible_qp(3, batch_size=2)
     solver = _sparse_solver(qp, preconditioner_iter)
     solver.solve()
-    _assert_solved(solver)
+    assert_all_solved(solver)
     grad_x = to_wp(np.random.default_rng(2).standard_normal((2, 5)))
     state = _saved_state(solver)
     immediate = _grads_to_numpy(solver.backward(grad_x=grad_x), DENSE_GRADS)
@@ -172,7 +138,7 @@ def test_sparse_matches_immediate(preconditioner_iter):
 def test_multistage_matches_immediate(preconditioner_iter):
     solver = _multistage_solver(preconditioner_iter=preconditioner_iter)
     solver.solve()
-    _assert_solved(solver)
+    assert_all_solved(solver)
     grad_x = to_wp(np.ones((1, 2)))
     state = _saved_state(solver)
     names = ("P_diag", "P_offdiag", "c")
@@ -186,10 +152,10 @@ def test_multistage_matches_immediate(preconditioner_iter):
 def test_smoothing_matches_immediate(preconditioner_iter):
     """With gradient smoothing the relaxed Newton loop starts from the given
     point; the result must match the immediate smoothed backward."""
-    qp = _dense_qp(batch_size=2, seed=8)
+    qp = random_feasible_qp(8, batch_size=2)
     solver = _dense_solver(qp, preconditioner_iter, gradient_smoothing=True)
     solver.solve()
-    _assert_solved(solver)
+    assert_all_solved(solver)
     grad_x = to_wp(np.random.default_rng(3).standard_normal((2, 5)))
     state = _saved_state(solver)
     immediate = _grads_to_numpy(solver.backward(grad_x=grad_x), DENSE_GRADS)
@@ -208,7 +174,7 @@ def test_zero_width_fields_are_accepted():
               A=rng.standard_normal((1, n)), b=rng.standard_normal((B, 1)))
     solver = _dense_solver(qp)
     solver.solve()
-    _assert_solved(solver)
+    assert_all_solved(solver)
     state = _saved_state(solver)
     widths = {name: state[name].shape[1] for name in STATE_FIELDS}
     assert widths == dict(x=n, y=1, z_u=0, z_l=0, z_bu=0, z_bl=0, s_u=0, s_l=0, s_bu=0, s_bl=0)
@@ -224,7 +190,7 @@ def test_zero_width_fields_are_accepted():
 
 def test_accepts_warp_and_torch_arrays():
     torch = pytest.importorskip("torch")
-    qp = _dense_qp(batch_size=2, seed=4)
+    qp = random_feasible_qp(4, batch_size=2)
     solver = _dense_solver(qp)
     solver.solve()
     state = _saved_state(solver)
@@ -244,14 +210,14 @@ def test_accepts_warp_and_torch_arrays():
 @pytest.mark.parametrize("preconditioner_iter", [0, 10])
 @pytest.mark.parametrize("order", ["AB", "BA"])
 def test_two_solves_backward_later_in_any_order(preconditioner_iter, order):
-    qp_a = _dense_qp(seed=10)
+    qp_a = random_feasible_qp(10)
     qp_b = dict(qp_a, c=qp_a["c"] + 0.7, h_u=qp_a["h_u"] + 0.3, x_l=qp_a["x_l"] - 0.2)
     grad_x = to_wp(np.random.default_rng(4).standard_normal((1, 5)))
 
     def reference(qp):
         s = _dense_solver(qp, preconditioner_iter)
         s.solve()
-        _assert_solved(s)
+        assert_all_solved(s)
         return _grads_to_numpy(s.backward(grad_x=grad_x), DENSE_GRADS)
 
     ref_a, ref_b = reference(qp_a), reference(qp_b)
@@ -281,7 +247,7 @@ def test_two_solves_backward_later_in_any_order(preconditioner_iter, order):
 def test_state_saved_inside_a_user_capture():
     """Saving a state is plain device copies: a user can record them in a CUDA
     graph with update() and solve(), and differentiate the saved state later."""
-    qp = _dense_qp(batch_size=2, seed=14)
+    qp = random_feasible_qp(14, batch_size=2)
     costs = [qp["c"] + 0.3 * k for k in range(2)]
     solver = DenseSolver()
     _settings(solver, 0, np.float64)
@@ -323,10 +289,10 @@ def test_state_saved_inside_a_user_capture():
 @pytest.mark.parametrize("smoothing", [False, True])
 def test_caller_state_is_not_modified(smoothing):
     """Scaling, refactorization and smoothing work on solver-owned copies."""
-    qp = _dense_qp(batch_size=2, seed=5)
+    qp = random_feasible_qp(5, batch_size=2)
     solver = _dense_solver(qp, preconditioner_iter=10, gradient_smoothing=smoothing)
     solver.solve()
-    _assert_solved(solver)
+    assert_all_solved(solver)
     state = _saved_state(solver)
     before = {k: v.numpy() for k, v in state.items()}
     solver.backward_from_state(**state, grad_x=to_wp(np.ones((2, 5))))
@@ -342,7 +308,7 @@ def _expect_rejected(solver, state, exc, match, **changes):
 
 
 def test_validation_names_the_bad_argument():
-    qp = _dense_qp(batch_size=2, seed=6)
+    qp = random_feasible_qp(6, batch_size=2)
     solver = _dense_solver(qp)
     solver.solve()
     state = _saved_state(solver)
@@ -386,7 +352,7 @@ def test_zero_width_fields_are_validated():
 
 @pytest.mark.skipif(wp.get_cuda_device_count() < 2, reason="needs two GPUs")
 def test_state_on_another_device_is_rejected():
-    qp = _dense_qp(batch_size=2, seed=6)
+    qp = random_feasible_qp(6, batch_size=2)
     solver = _dense_solver(qp)
     solver.solve()
     state = _saved_state(solver)
@@ -397,7 +363,7 @@ def test_state_on_another_device_is_rejected():
 def test_rejected_call_leaves_the_cached_factor():
     """Validation runs before any work: after a rejected call, the immediate
     backward of the latest solve is still available."""
-    qp = _dense_qp(batch_size=2, seed=7)
+    qp = random_feasible_qp(7, batch_size=2)
     solver = _dense_solver(qp)
     solver.solve()
     state = _saved_state(solver)
@@ -412,10 +378,10 @@ def test_backward_from_state_needs_no_solve_of_its_own():
     """A solver that never solved differentiates a state another solver of
     the same structure produced: backward_from_state() depends on the data
     and the state only (the JAX interface relies on this)."""
-    qp = _dense_qp(batch_size=2, seed=9)
+    qp = random_feasible_qp(9, batch_size=2)
     producer = _dense_solver(qp)
     producer.solve()
-    _assert_solved(producer)
+    assert_all_solved(producer)
     state = _saved_state(producer)
     grad_x = to_wp(np.ones((2, 5)))
     expected = _grads_to_numpy(producer.backward_from_state(**state, grad_x=grad_x), ("P", "c", "b"))
@@ -429,7 +395,7 @@ def test_backward_from_state_needs_no_solve_of_its_own():
 
 
 def test_lifecycle_and_cached_factor():
-    qp = _dense_qp(batch_size=2, seed=9)
+    qp = random_feasible_qp(9, batch_size=2)
     solver = _dense_solver(qp)
     solver.solve()
     state = _saved_state(solver)
@@ -445,8 +411,7 @@ def test_lifecycle_and_cached_factor():
     solver.solve()
     solver.backward(grad_x=to_wp(np.ones((2, 5))))
 
-    no_grad = DenseSolver()
-    no_grad.settings.verbose = False
+    no_grad = quiet(DenseSolver())
     no_grad.setup(**to_wp_dict(qp))
     no_grad.solve()
     with pytest.raises(RuntimeError, match="enable_grad"):
@@ -492,10 +457,10 @@ def test_grad_valid_mask_for_a_failed_factorization(backend):
     policy, the others are untouched, and grad_valid reports it. (A NaN slack
     would not do: the regularization kernels floor the slacks with a max,
     which swallows NaN.)"""
-    qp = _dense_qp(batch_size=3, seed=12)
+    qp = random_feasible_qp(12, batch_size=3)
     solver = _dense_solver(qp) if backend == "dense" else _sparse_solver(qp)
     solver.solve()
-    _assert_solved(solver)
+    assert_all_solved(solver)
     grad_x = to_wp(np.ones((3, 5)))
     reference = _grads_to_numpy(solver.backward(grad_x=grad_x), DENSE_GRADS)
     assert (solver.grad_valid.numpy() == 1).all()
@@ -520,7 +485,7 @@ def test_grad_valid_mask_for_a_failed_factorization(backend):
 def test_dense_indefinite_regularization_is_a_factor_failure():
     """The dense Cholesky rejects an indefinite matrix: a state with a large
     negative rho fails to factorize and its gradients are zeroed."""
-    qp = _dense_qp(batch_size=2, seed=13)
+    qp = random_feasible_qp(13, batch_size=2)
     solver = _dense_solver(qp)
     solver.solve()
     state = _saved_state(solver)
@@ -532,7 +497,7 @@ def test_dense_indefinite_regularization_is_a_factor_failure():
 
 
 def test_structural_settings_are_frozen_at_setup():
-    qp = _dense_qp()
+    qp = random_feasible_qp(0)
     solver = _dense_solver(qp, preconditioner_iter=10)
     solver.solve()
     solver.settings.max_iter = 50                            # numerical: fine

@@ -18,7 +18,7 @@ sibling class on a storage mismatch. We test:
 
 import numpy as np
 import pytest
-import scipy.sparse as sp_cpu
+import scipy.sparse as sp
 
 from cupiqp import (
     DenseSolver, SparseSolver, MultistageSolver,
@@ -27,31 +27,12 @@ from cupiqp import (
 # Abstract bases aren't re-exported (they're internal); import directly
 # from their submodules for the abstract-contract tests.
 from cupiqp.solver import SolverBase
-from tests.helpers import broadcast, csr_triple, to_wp, to_wp_dict
+from tests.helpers import assert_all_solved, broadcast, csr_triple, random_dense_qp, to_wp, to_wp_dict
 
 
 # ----------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------
-
-
-def _make_qp_dense(n=8, p=3, m=5, seed=42):
-    """Random strictly convex QP returned as dense numpy arrays."""
-    rng = np.random.default_rng(seed)
-    M = rng.standard_normal((n, n))
-    P = M @ M.T + n * np.eye(n)
-    P = (P + P.T) / 2
-    return dict(
-        P=P,
-        c=rng.standard_normal(n),
-        A=rng.standard_normal((p, n)),
-        b=rng.standard_normal(p),
-        G=rng.standard_normal((m, n)),
-        h_u=np.abs(rng.standard_normal(m)) + 2.0,
-        h_l=-np.abs(rng.standard_normal(m)) - 2.0,
-        x_u=np.abs(rng.standard_normal(n)) + 3.0,
-        x_l=-np.abs(rng.standard_normal(n)) - 3.0,
-    )
 
 
 def _qp_to_sparse(qp):
@@ -72,9 +53,9 @@ def _qp_to_scipy_sparse(qp):
     all reject scipy.sparse inputs with a clear GPU-only message.
     """
     out = dict(qp)
-    out["P"] = sp_cpu.csr_matrix(qp["P"])
-    out["A"] = sp_cpu.csr_matrix(qp["A"])
-    out["G"] = sp_cpu.csr_matrix(qp["G"])
+    out["P"] = sp.csr_matrix(qp["P"])
+    out["A"] = sp.csr_matrix(qp["A"])
+    out["G"] = sp.csr_matrix(qp["G"])
     return out
 
 
@@ -110,7 +91,7 @@ class TestDenseSolver:
     def test_dense_numpy_REJECT(self):
         """Raw numpy arrays are CPU-only and must be rejected -- they
         don't expose ``__cuda_array_interface__``."""
-        qp = _make_qp_dense()
+        qp = random_dense_qp(42)
         s = DenseSolver()
         with pytest.raises(TypeError, match=r"DenseSolver requires.*GPU dense"):
             s.setup(**qp)  # numpy directly -- should fail
@@ -118,7 +99,7 @@ class TestDenseSolver:
     def test_numpy_vector_REJECT(self):
         """Numpy `c` (a vector) is also rejected -- vectors are checked
         with the same GPU-only contract as matrices."""
-        qp = _make_qp_dense()
+        qp = random_dense_qp(42)
         # All matrices on GPU, but c stays on CPU as numpy.
         kwargs = to_wp_dict(qp)
         kwargs["c"] = qp["c"]   # numpy vector
@@ -131,7 +112,7 @@ class TestDenseSolver:
         torch = pytest.importorskip("torch")
         if not torch.cuda.is_available():
             pytest.skip("CUDA unavailable")
-        qp = _make_qp_dense()
+        qp = random_dense_qp(42)
         kwargs = to_wp_dict(qp)
         kwargs["b"] = torch.tensor(qp["b"], dtype=torch.float64)  # CPU
         s = DenseSolver()
@@ -139,7 +120,7 @@ class TestDenseSolver:
             s.setup(**kwargs)
 
     def test_dense_warp_OK(self):
-        qp = to_wp_dict(_make_qp_dense())
+        qp = to_wp_dict(random_dense_qp(42))
         s = DenseSolver()
         s.settings = _quiet_settings()
         s.setup(**qp)
@@ -148,7 +129,7 @@ class TestDenseSolver:
 
     def test_dense_cupy_OK(self):
         cp = pytest.importorskip("cupy")
-        qp = {k: cp.array(v) for k, v in _make_qp_dense().items()}
+        qp = {k: cp.array(v) for k, v in random_dense_qp(42).items()}
         s = DenseSolver()
         s.settings = _quiet_settings()
         s.setup(**qp)
@@ -159,7 +140,7 @@ class TestDenseSolver:
         torch = pytest.importorskip("torch")
         if not torch.cuda.is_available():
             pytest.skip("CUDA unavailable")
-        qp = _qp_dense_torch(_make_qp_dense())
+        qp = _qp_dense_torch(random_dense_qp(42))
         s = DenseSolver()
         s.settings = _quiet_settings()
         s.setup(**qp)
@@ -168,7 +149,7 @@ class TestDenseSolver:
 
     def test_scipy_csr_REJECT(self):
         """scipy CSR is sparse + on CPU -- fails the GPU-dense check."""
-        qp = _qp_to_scipy_sparse(_make_qp_dense())   # genuine scipy CSR
+        qp = _qp_to_scipy_sparse(random_dense_qp(42))   # genuine scipy CSR
         s = DenseSolver()
         with pytest.raises(TypeError, match=r"DenseSolver requires P.*GPU dense"):
             s.setup(**qp)
@@ -197,7 +178,7 @@ class TestDenseSolver:
 
     def test_list_of_csr_REJECT(self):
         """A list of CSRs is not a GPU dense array."""
-        qp = _qp_to_sparse(_make_qp_dense(n=4, p=2, m=2))
+        qp = _qp_to_sparse(random_dense_qp(42, n=4, p=2, m=2))
         s = DenseSolver()
         with pytest.raises(TypeError, match=r"DenseSolver requires P.*GPU dense"):
             s.setup(P=[qp["P"], qp["P"]], c=qp["c"])
@@ -219,7 +200,7 @@ class TestSparseSolver:
 
     def test_scipy_csr_REJECT(self):
         """A scipy.sparse matrix object is not a CSR triple."""
-        qp = _qp_to_scipy_sparse(_make_qp_dense())
+        qp = _qp_to_scipy_sparse(random_dense_qp(42))
         for k in ("c", "b", "h_u", "h_l", "x_u", "x_l"):
             qp[k] = to_wp(qp[k])
         s = SparseSolver()
@@ -228,7 +209,7 @@ class TestSparseSolver:
 
     def test_csr_triple_OK(self):
         """The canonical SparseSolver path: GPU CSR triples."""
-        qp = _qp_to_sparse(_make_qp_dense())
+        qp = _qp_to_sparse(random_dense_qp(42))
         s = SparseSolver()
         s.settings = _quiet_settings()
         s.setup(**qp)
@@ -237,7 +218,7 @@ class TestSparseSolver:
 
     def test_list_of_matrices_REJECT(self):
         """A list of matrices is not a CSR triple; batches are per-problem values."""
-        qp = _qp_to_sparse(_make_qp_dense(seed=1))
+        qp = _qp_to_sparse(random_dense_qp(1))
         qp["P"] = [qp["P"], qp["P"]]
         s = SparseSolver()
         with pytest.raises(TypeError, match=r"SparseSolver requires P as a CSR triple"):
@@ -245,14 +226,14 @@ class TestSparseSolver:
 
     def test_batched_values_OK(self):
         """B=2 batch: one shared pattern, per-problem values at setup()."""
-        qp_a = _make_qp_dense(seed=1)
-        qp_b = _make_qp_dense(seed=2)
+        qp_a = random_dense_qp(1)
+        qp_b = random_dense_qp(2)
 
         def batched(k):
             if k not in ("P", "A", "G"):
                 return to_wp(np.stack([qp_a[k], qp_b[k]]))
             # Both matrices are fully dense: same pattern, stacked values.
-            M_a, M_b = sp_cpu.csr_matrix(qp_a[k]), sp_cpu.csr_matrix(qp_b[k])
+            M_a, M_b = sp.csr_matrix(qp_a[k]), sp.csr_matrix(qp_b[k])
             indptr, indices, _ = csr_triple(M_a)
             return indptr, indices, to_wp(np.stack([M_a.data, M_b.data]))
 
@@ -261,17 +242,16 @@ class TestSparseSolver:
         s.setup(**{k: batched(k) for k in qp_a})
         assert s.data.batch_size == 2
         s.solve()
-        statuses = s.result.info.to_host().status
-        assert all(st == Status.CUPIQP_SOLVED for st in statuses)
+        assert_all_solved(s)
 
     def test_torch_csr_triple_OK(self):
         """The index and value tensors of a CUDA torch CSR tensor are accepted."""
         torch = pytest.importorskip("torch")
         if not torch.cuda.is_available():
             pytest.skip("CUDA unavailable")
-        qp = _make_qp_dense(n=4, p=2, m=2)
+        qp = random_dense_qp(42, n=4, p=2, m=2)
         qp_sp = _qp_to_sparse(qp)
-        P_np = sp_cpu.csr_matrix(qp["P"])
+        P_np = sp.csr_matrix(qp["P"])
         P_tsp = torch.sparse_csr_tensor(
             torch.tensor(P_np.indptr, dtype=torch.int64, device="cuda"),
             torch.tensor(P_np.indices, dtype=torch.int64, device="cuda"),
@@ -311,9 +291,9 @@ class TestSparseSolver:
     def test_host_pattern_ACCEPT(self):
         """A host pattern (numpy indptr / indices) with GPU values solves the
         same QP as the same pattern on the GPU."""
-        qp = _make_qp_dense()
-        P = sp_cpu.csr_matrix(qp["P"])
-        A = sp_cpu.csr_matrix(qp["A"])
+        qp = random_dense_qp(42)
+        P = sp.csr_matrix(qp["P"])
+        A = sp.csr_matrix(qp["A"])
         vecs = {k: to_wp(qp[k]) for k in ("c", "b")}
         xs = []
         for to_pattern in (np.asarray, to_wp):
@@ -328,7 +308,7 @@ class TestSparseSolver:
         np.testing.assert_allclose(xs[0], xs[1], rtol=0, atol=1e-12)   # cuDSS is not bit-reproducible
 
     def test_dense_numpy_REJECT(self):
-        qp = _make_qp_dense()
+        qp = random_dense_qp(42)
         s = SparseSolver()
         with pytest.raises(TypeError, match=r"SparseSolver requires P as a CSR triple"):
             s.setup(**qp)
@@ -337,7 +317,7 @@ class TestSparseSolver:
         torch = pytest.importorskip("torch")
         if not torch.cuda.is_available():
             pytest.skip("CUDA unavailable")
-        qp = _qp_dense_torch(_make_qp_dense())
+        qp = _qp_dense_torch(random_dense_qp(42))
         s = SparseSolver()
         with pytest.raises(TypeError, match=r"SparseSolver requires P as a CSR triple"):
             s.setup(**qp)
@@ -355,7 +335,7 @@ class TestSparseSolver:
 
     def test_numpy_vector_REJECT(self):
         """Vectors must be GPU dense even with sparse P/A/G."""
-        qp_raw = _make_qp_dense()
+        qp_raw = random_dense_qp(42)
         qp = _qp_to_sparse(qp_raw)
         qp["c"] = qp_raw["c"]   # numpy override: P, A, G OK; c not GPU.
         s = SparseSolver()
@@ -390,7 +370,7 @@ class TestMultistageSolver:
     def test_scipy_csr_REJECT(self):
         s = MultistageSolver()
         with pytest.raises(TypeError, match=r"\(diag, offdiag\) tuple"):
-            s.setup(P=sp_cpu.eye(4, format="csr"), c=to_wp(np.zeros(4)))
+            s.setup(P=sp.eye(4, format="csr"), c=to_wp(np.zeros(4)))
 
     def test_numpy_blocks_REJECT(self):
         s = MultistageSolver()
@@ -430,11 +410,11 @@ class TestMultistageSolver:
         s.setup(P=(to_wp(P_diag), to_wp(off_b)), c=to_wp(c.reshape(2, 2)),  # batched offdiag: B = 3
                 x_l=to_wp(-np.ones(4)), x_u=to_wp(np.ones(4)))
         s.solve()
-        assert all(st == Status.CUPIQP_SOLVED for st in s.result.info.to_host().status)
+        assert_all_solved(s)
         off_b = scales[::-1, None, None, None] * P_offdiag[None]
         s.update(P=(None, to_wp(off_b)))
         s.solve()
-        assert all(st == Status.CUPIQP_SOLVED for st in s.result.info.to_host().status)
+        assert_all_solved(s)
 
         for k in range(B):
             P = np.zeros((4, 4))
@@ -468,7 +448,7 @@ class TestDenseSparseEquivalence:
     """Same problem through DenseSolver and SparseSolver should agree."""
 
     def test_solutions_match_within_tol(self):
-        qp = _make_qp_dense(n=8, p=3, m=5, seed=42)
+        qp = random_dense_qp(42, n=8, p=3, m=5)
 
         d = DenseSolver()
         d.settings = _quiet_settings()
@@ -536,7 +516,7 @@ class TestSolverGrad:
     def test_grad_x_only_returns_dP_dc(self):
         """Cotangent only on x -> dP and dc are non-None; vector grads
         (db, dh_u, ...) are populated as Warp arrays of expected shape."""
-        qp = to_wp_dict(_make_qp_dense(n=6, p=2, m=3))
+        qp = to_wp_dict(random_dense_qp(42, n=6, p=2, m=3))
         s = DenseSolver()
         s.settings = _quiet_settings()
         s.settings.enable_grad = True
@@ -557,7 +537,7 @@ class TestSolverGrad:
 
     def test_None_means_zero(self):
         """Calling solver.grad with all cotangents None gives zero grads."""
-        qp = to_wp_dict(_make_qp_dense())
+        qp = to_wp_dict(random_dense_qp(42))
         s = DenseSolver()
         s.settings = _quiet_settings()
         s.settings.enable_grad = True
@@ -593,7 +573,7 @@ class TestSparseSolverGrad:
         ``indptr/indices`` (same sparsity pattern)."""
         from cupiqp import SparseSolver
         from cupiqp.sparse.batched_csr import UniformBatchedCsrMatrix
-        qp_raw = _make_qp_dense(n=6, p=2, m=3, seed=7)
+        qp_raw = random_dense_qp(7, n=6, p=2, m=3)
         qp = _qp_to_sparse(qp_raw)
         s = SparseSolver()
         s.settings = _quiet_settings()
@@ -620,7 +600,7 @@ class TestSparseSolverGrad:
         import numpy as np_
         from cupiqp import DenseSolver, SparseSolver
 
-        qp_raw = _make_qp_dense(n=8, p=3, m=4, seed=11)
+        qp_raw = random_dense_qp(11, n=8, p=3, m=4)
 
         # Sparse path.
         ssp = SparseSolver()
@@ -673,7 +653,7 @@ class TestSparseSolverGrad:
         import numpy as np_
         from cupiqp import DenseSolver, SparseSolver
 
-        qp_raw = _make_qp_dense(n=8, p=3, m=4, seed=11)
+        qp_raw = random_dense_qp(11, n=8, p=3, m=4)
         ssp = SparseSolver()
         ssp.settings = _quiet_settings()
         ssp.settings.enable_grad = True

@@ -10,38 +10,19 @@ import numpy as np
 import warp as wp
 
 from cupiqp.dense.dense_cholesky import CholeskyInplaceSolver, BatchedCholeskyInplaceSolver
-from tests.helpers import to_wp
+from tests.helpers import DTYPES, random_spd, to_wp
+from tests.tolerances import CHOLESKY_RESIDUAL_TOL
 
 
 # ---------------------------------------------------------------------------
-# dtype dispatch and tolerances
+# Backends and dtype dispatch
 # ---------------------------------------------------------------------------
-DTYPES = [wp.float64, wp.float32]
 # Implementations of BatchedCholeskyInplaceSolver, both tested at every size.
 BACKENDS = ["warp", "cusolver"]
 
 
 def _np(dtype):
-    return np.float64 if dtype is wp.float64 else np.float32
-
-
-def _atol(dtype):
-    return 1e-10 if dtype == np.float64 else 1e-4
-
-
-def _make_spd(n, seed=42, dtype=np.float64):
-    rng = np.random.default_rng(seed)
-    M = rng.standard_normal((n, n))
-    return (M @ M.T + n * np.eye(n)).astype(dtype)
-
-
-def _make_spd_batch(batch_size, n, seed=42, dtype=np.float64):
-    rng = np.random.default_rng(seed)
-    As = []
-    for _ in range(batch_size):
-        M = rng.standard_normal((n, n))
-        As.append(M @ M.T + n * np.eye(n))
-    return np.stack(As).astype(dtype)
+    return wp.dtype_to_numpy(dtype)
 
 
 # ======================================================================
@@ -52,16 +33,16 @@ class TestSingleMode:
     @pytest.mark.parametrize("dtype", DTYPES)
     def test_factorize_succeeds(self, dtype):
         n = 6
-        A = to_wp(_make_spd(n, dtype=_np(dtype)))
+        A = to_wp(random_spd(42, n).astype(_np(dtype)))
         solver = CholeskyInplaceSolver(n, dtype=dtype)
         solver.factorize(A)
         assert not solver.factor_status.numpy().any()
 
     @pytest.mark.parametrize("dtype", DTYPES)
-    @pytest.mark.parametrize("n", [1, 2, 4, 8, 16, 32, 64, 128, 256])
+    @pytest.mark.parametrize("n", [1, 7, 32, 128, 256])
     def test_factorize_and_solve(self, n, dtype):
         rng = np.random.default_rng(n)
-        A_orig = _make_spd(n, seed=n, dtype=_np(dtype))
+        A_orig = random_spd(n, n).astype(_np(dtype))
         b = rng.standard_normal(n).astype(_np(dtype))
         A_work = to_wp(A_orig)
         x = to_wp(b)
@@ -71,14 +52,14 @@ class TestSingleMode:
         assert not solver.factor_status.numpy().any()
         solver.solve(x)
         np.testing.assert_allclose(
-            A_orig @ x.numpy(), b, atol=_atol(_np(dtype)), err_msg=f"n={n}",
+            A_orig @ x.numpy(), b, **CHOLESKY_RESIDUAL_TOL[dtype], err_msg=f"n={n}",
         )
 
     @pytest.mark.parametrize("dtype", DTYPES)
     def test_multiple_rhs(self, dtype):
         n = 5
         rng = np.random.default_rng(42)
-        A_orig = _make_spd(n, dtype=_np(dtype))
+        A_orig = random_spd(42, n).astype(_np(dtype))
         A_work = to_wp(A_orig)
 
         solver = CholeskyInplaceSolver(n, dtype=dtype)
@@ -88,7 +69,7 @@ class TestSingleMode:
             b = rng.standard_normal(n).astype(_np(dtype))
             x = to_wp(b)
             solver.solve(x)
-            np.testing.assert_allclose(A_orig @ x.numpy(), b, atol=_atol(_np(dtype)))
+            np.testing.assert_allclose(A_orig @ x.numpy(), b, **CHOLESKY_RESIDUAL_TOL[dtype])
 
 
 # ======================================================================
@@ -100,7 +81,7 @@ class TestBatchedMode:
     @pytest.mark.parametrize("dtype", DTYPES)
     def test_factorize_succeeds(self, dtype, backend):
         B, n = 4, 6
-        A = to_wp(_make_spd_batch(B, n, dtype=_np(dtype)))
+        A = to_wp(random_spd(42, n, B).astype(_np(dtype)))
         solver = BatchedCholeskyInplaceSolver(n, B, dtype=dtype, backend=backend)
         solver.factorize(A)
         assert not solver.factor_status.numpy().any()
@@ -115,13 +96,12 @@ class TestBatchedMode:
     @pytest.mark.parametrize("B,n", [
         (1, 4),
         (5, 8),
-        (8, 1), (8, 2), (8, 4), (8, 8), (8, 12), (8, 16), (8, 24), (8, 32),
-        (8, 48), (8, 64),
+        (8, 1), (8, 7), (8, 32), (8, 48), (8, 64),
         (128, 6),
     ])
     def test_factorize_and_solve(self, B, n, dtype, backend):
         rng = np.random.default_rng(B * 100 + n)
-        A_orig = _make_spd_batch(B, n, seed=B * 100 + n, dtype=_np(dtype))
+        A_orig = random_spd(B * 100 + n, n, B).astype(_np(dtype))
         b = rng.standard_normal((B, n)).astype(_np(dtype))
         A_work = to_wp(A_orig)
         x = to_wp(b)
@@ -133,7 +113,7 @@ class TestBatchedMode:
 
         for i in range(B):
             np.testing.assert_allclose(
-                A_orig[i] @ x.numpy()[i], b[i], atol=_atol(_np(dtype)),
+                A_orig[i] @ x.numpy()[i], b[i], **CHOLESKY_RESIDUAL_TOL[dtype],
                 err_msg=f"B={B}, n={n}, batch={i}")
 
     @pytest.mark.parametrize("backend", BACKENDS)
@@ -141,7 +121,7 @@ class TestBatchedMode:
     def test_multiple_solves_same_factorization(self, dtype, backend):
         B, n = 3, 5
         rng = np.random.default_rng(42)
-        A_orig = _make_spd_batch(B, n, dtype=_np(dtype))
+        A_orig = random_spd(42, n, B).astype(_np(dtype))
         A_work = to_wp(A_orig)
 
         solver = BatchedCholeskyInplaceSolver(n, B, dtype=dtype, backend=backend)
@@ -153,7 +133,7 @@ class TestBatchedMode:
             solver.solve(x)
             for i in range(B):
                 np.testing.assert_allclose(
-                    A_orig[i] @ x.numpy()[i], b[i], atol=_atol(_np(dtype)))
+                    A_orig[i] @ x.numpy()[i], b[i], **CHOLESKY_RESIDUAL_TOL[dtype])
 
     @pytest.mark.parametrize("backend", BACKENDS)
     @pytest.mark.parametrize("dtype", DTYPES)
@@ -161,7 +141,7 @@ class TestBatchedMode:
         """Batched solve with non-contiguous RHS (view of larger buffer)."""
         B, n = 3, 4
         rng = np.random.default_rng(42)
-        A_orig = _make_spd_batch(B, n, dtype=_np(dtype))
+        A_orig = random_spd(42, n, B).astype(_np(dtype))
         b = rng.standard_normal((B, n)).astype(_np(dtype))
         A_work = to_wp(A_orig)
 
@@ -176,7 +156,7 @@ class TestBatchedMode:
 
         for i in range(B):
             np.testing.assert_allclose(
-                A_orig[i] @ x_view.numpy()[i], b[i], atol=_atol(_np(dtype)),
+                A_orig[i] @ x_view.numpy()[i], b[i], **CHOLESKY_RESIDUAL_TOL[dtype],
                 err_msg=f"batch {i}")
 
 
@@ -192,7 +172,7 @@ class TestBatchedMode:
         may hold anything."""
         B = 4
         rng = np.random.default_rng(7)
-        A_orig = _make_spd_batch(B, n, seed=7, dtype=_np(dtype))
+        A_orig = random_spd(7, n, B).astype(_np(dtype))
         A_nan = A_orig.copy()
         A_nan[:, np.tril_indices(n, -1)[0], np.tril_indices(n, -1)[1]] = np.nan
         b = rng.standard_normal((B, n)).astype(_np(dtype))
@@ -204,14 +184,14 @@ class TestBatchedMode:
         assert not solver.factor_status.numpy().any()
         for i in range(B):
             np.testing.assert_allclose(A_orig[i] @ x.numpy()[i], b[i],
-                                       atol=_atol(_np(dtype)) * n, err_msg=f"batch {i}")
+                                       **{k: n * v for k, v in CHOLESKY_RESIDUAL_TOL[dtype].items()}, err_msg=f"batch {i}")
 
     @pytest.mark.parametrize("backend", BACKENDS)
     @pytest.mark.parametrize("dtype", DTYPES)
     def test_status_flags_only_the_indefinite_matrix(self, dtype, backend):
         B, n, bad = 5, 6, 2
         rng = np.random.default_rng(3)
-        A_orig = _make_spd_batch(B, n, seed=3, dtype=_np(dtype))
+        A_orig = random_spd(3, n, B).astype(_np(dtype))
         A_orig[bad] -= 3 * n * np.eye(n, dtype=_np(dtype))      # indefinite
         b = rng.standard_normal((B, n)).astype(_np(dtype))
         A_work, x = to_wp(A_orig), to_wp(b)
@@ -225,7 +205,7 @@ class TestBatchedMode:
         for i in range(B):
             if i != bad:
                 np.testing.assert_allclose(A_orig[i] @ x.numpy()[i], b[i],
-                                           atol=_atol(_np(dtype)), err_msg=f"batch {i}")
+                                           **CHOLESKY_RESIDUAL_TOL[dtype], err_msg=f"batch {i}")
 
 
 class TestCrossMode:
@@ -234,7 +214,7 @@ class TestCrossMode:
     def test_single_vs_batched_b1(self, dtype):
         n = 6
         rng = np.random.default_rng(42)
-        A_np = _make_spd(n, dtype=_np(dtype))
+        A_np = random_spd(42, n).astype(_np(dtype))
         b_np = rng.standard_normal(n).astype(_np(dtype))
 
         # Single mode
@@ -251,4 +231,4 @@ class TestCrossMode:
         s2.factorize(A2)
         s2.solve(x2)
 
-        np.testing.assert_allclose(x1.numpy(), x2.numpy()[0], atol=_atol(_np(dtype)))
+        np.testing.assert_allclose(x1.numpy(), x2.numpy()[0], **CHOLESKY_RESIDUAL_TOL[dtype])

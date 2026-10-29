@@ -6,35 +6,20 @@ import warnings
 
 import numpy as np
 import pytest
-torch = pytest.importorskip("torch")
 
 from cupiqp import Status
 from cupiqp.torch import DenseSolverLayer, SparseSolverLayer, StructureMismatchError
 
-from tests.helpers import layer_statuses
+from tests.helpers import tight
+from tests.torch_interface.torch_helpers import DEVICE, DTYPE, layer_statuses, requires_cuda, tensor, torch
 
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+pytestmark = requires_cuda
 warnings.filterwarnings("ignore", message=".*Sparse CSR tensor support.*")
 warnings.filterwarnings("ignore", message=".*Sparse invariant checks.*")
 
-DEVICE = "cuda"
-DTYPE = torch.float64
-
-
-def _t(values):
-    return torch.tensor(values, dtype=DTYPE, device=DEVICE)
-
-
 def _make(layer_cls, **settings):
-    layer = layer_cls()
-    layer.settings.preconditioner_iter = 0
-    layer.settings.verbose = False
-    layer.settings.eps_abs = 1e-11
-    layer.settings.eps_rel = 1e-11
-    for name, value in settings.items():
-        setattr(layer.settings, name, value)
-    return layer
+    return tight(layer_cls(), **{"preconditioner_iter": 0, **settings})
 
 
 def _diag_csr(values: torch.Tensor) -> torch.Tensor:
@@ -59,7 +44,7 @@ def _tridiag_qp(n=5, seed=0):
 
 
 def _to_csr(dense: np.ndarray) -> torch.Tensor:
-    return _t(dense).to_sparse_csr()
+    return tensor(dense).to_sparse_csr()
 
 
 def _gather(dense_grad, csr):
@@ -73,7 +58,7 @@ def _gather(dense_grad, csr):
 # Setup and call contract
 # ---------------------------------------------------------------------------
 def test_setup_requires_csr_and_call_requires_values():
-    values = _t([2.0, 3.0, 4.0])
+    values = tensor([2.0, 3.0, 4.0])
     c = torch.ones(3, dtype=DTYPE, device=DEVICE)
     layer = _make(SparseSolverLayer)
     with pytest.raises(TypeError, match="sparse CSR"):
@@ -90,7 +75,7 @@ def test_setup_requires_csr_and_call_requires_values():
 
 
 def test_setup_validation_of_csr_and_vectors():
-    values = _t([2.0, 3.0, 4.0])
+    values = tensor([2.0, 3.0, 4.0])
     c = torch.ones(3, dtype=DTYPE, device=DEVICE)
     layer = _make(SparseSolverLayer)
     with pytest.raises(ValueError, match="dtype"):
@@ -118,16 +103,16 @@ def test_setup_validation_of_csr_and_vectors():
 def test_forward_matches_dense_layer():
     P, c, G, h_u, h_l = _tridiag_qp()
     sparse = _make(SparseSolverLayer)
-    sparse.setup(_to_csr(P), _t(c), G=_to_csr(G), h_u=_t(h_u), h_l=_t(h_l))
+    sparse.setup(_to_csr(P), tensor(c), G=_to_csr(G), h_u=tensor(h_u), h_l=tensor(h_l))
     dense = _make(DenseSolverLayer)
-    dense.setup(_t(P), _t(c), G=_t(G), h_u=_t(h_u), h_l=_t(h_l))
+    dense.setup(tensor(P), tensor(c), G=tensor(G), h_u=tensor(h_u), h_l=tensor(h_l))
     torch.testing.assert_close(sparse(), dense(), atol=1e-7, rtol=1e-7)
     torch.testing.assert_close(sparse.result.z_u, dense.result.z_u, atol=1e-7, rtol=1e-7)
 
 
 def test_batched_csr_setup_and_batched_values():
     B, n = 3, 4
-    values = _t([[1.0, 2.0, 3.0, 4.0]] * B) * torch.arange(1, B + 1, dtype=DTYPE, device=DEVICE).unsqueeze(1)
+    values = tensor([[1.0, 2.0, 3.0, 4.0]] * B) * torch.arange(1, B + 1, dtype=DTYPE, device=DEVICE).unsqueeze(1)
     P = torch.stack([_diag_csr(values[b]).to_dense() for b in range(B)]).to_sparse_csr()
     c = torch.ones(B, n, dtype=DTYPE, device=DEVICE)
     layer = _make(SparseSolverLayer)
@@ -138,7 +123,7 @@ def test_batched_csr_setup_and_batched_values():
 
 
 def test_forward_and_backward_allocate_nothing():
-    values = _t([2.0, 3.0, 4.0])
+    values = tensor([2.0, 3.0, 4.0])
     c = torch.ones(3, dtype=DTYPE, device=DEVICE)
     v = values.clone().requires_grad_(True)
     layer = _make(SparseSolverLayer)
@@ -158,20 +143,20 @@ def test_value_gradients_match_dense_layer():
     P, c, G, h_u, h_l = _tridiag_qp(seed=1)
     P_csr, G_csr = _to_csr(P), _to_csr(G)
     sparse = _make(SparseSolverLayer)
-    sparse.setup(P_csr, _t(c), G=G_csr, h_u=_t(h_u), h_l=_t(h_l))
+    sparse.setup(P_csr, tensor(c), G=G_csr, h_u=tensor(h_u), h_l=tensor(h_l))
     P_vals = P_csr.values().clone().requires_grad_(True)
     G_vals = G_csr.values().clone().requires_grad_(True)
-    c_s = _t(c).requires_grad_(True)
-    h_s = _t(h_u).requires_grad_(True)
+    c_s = tensor(c).requires_grad_(True)
+    h_s = tensor(h_u).requires_grad_(True)
     x = sparse(P=P_vals, c=c_s, G=G_vals, h_u=h_s)
     (x.sum() + sparse.result.z_u.sum()).backward()
 
     dense = _make(DenseSolverLayer)
-    dense.setup(_t(P), _t(c), G=_t(G), h_u=_t(h_u), h_l=_t(h_l))
-    P_d = _t(P).requires_grad_(True)
-    G_d = _t(G).requires_grad_(True)
-    c_d = _t(c).requires_grad_(True)
-    h_d = _t(h_u).requires_grad_(True)
+    dense.setup(tensor(P), tensor(c), G=tensor(G), h_u=tensor(h_u), h_l=tensor(h_l))
+    P_d = tensor(P).requires_grad_(True)
+    G_d = tensor(G).requires_grad_(True)
+    c_d = tensor(c).requires_grad_(True)
+    h_d = tensor(h_u).requires_grad_(True)
     x_d = dense(P=P_d, c=c_d, G=G_d, h_u=h_d)
     (x_d.sum() + dense.result.z_u.sum()).backward()
 
@@ -184,7 +169,7 @@ def test_value_gradients_match_dense_layer():
 
 def test_shared_values_gradient_is_summed_over_batch():
     B, n = 3, 3
-    values = _t([2.0, 3.0, 4.0])
+    values = tensor([2.0, 3.0, 4.0])
     c = torch.arange(1, B * n + 1, dtype=DTYPE, device=DEVICE).reshape(B, n)
     layer = _make(SparseSolverLayer)
     layer.setup(_diag_csr(values), c)
@@ -199,7 +184,7 @@ def test_shared_values_gradient_is_summed_over_batch():
 
 def test_pending_backward_blocks_reset_until_graph_is_dropped():
     import gc
-    values = _t([1.0, 2.0])
+    values = tensor([1.0, 2.0])
     c = torch.ones(2, dtype=DTYPE, device=DEVICE).requires_grad_(True)
     layer = _make(SparseSolverLayer)
     layer.setup(_diag_csr(values), c.detach())
@@ -221,16 +206,16 @@ def test_multi_pending_rollout_matches_single_calls():
     P_csr, G_csr = _to_csr(P), _to_csr(G)
     T = 3
     layer = _make(SparseSolverLayer)
-    layer.setup(P_csr, _t(c), G=G_csr, h_u=_t(h_u), h_l=_t(h_l), max_pending_solves=T,
+    layer.setup(P_csr, tensor(c), G=G_csr, h_u=tensor(h_u), h_l=tensor(h_l), max_pending_solves=T,
                 per_call_fields=("P", "c"))
     vals = [(P_csr.values() * (1.0 + 0.1 * k)).requires_grad_(True) for k in range(T)]
-    cs = [(_t(c) + 0.2 * k).requires_grad_(True) for k in range(T)]
+    cs = [(tensor(c) + 0.2 * k).requires_grad_(True) for k in range(T)]
     outs = [layer(P=vals[k], c=cs[k]) for k in range(T)]
     assert len({o.data_ptr() for o in outs}) == T
     sum((k + 1) * o.sum() for k, o in enumerate(outs)).backward()
     for k in range(T):
         ref = _make(SparseSolverLayer)
-        ref.setup(P_csr, _t(c), G=G_csr, h_u=_t(h_u), h_l=_t(h_l))
+        ref.setup(P_csr, tensor(c), G=G_csr, h_u=tensor(h_u), h_l=tensor(h_l))
         vk = vals[k].detach().clone().requires_grad_(True)
         ck = cs[k].detach().clone().requires_grad_(True)
         ((k + 1) * ref(P=vk, c=ck).sum()).backward()
@@ -242,8 +227,8 @@ def test_pending_solve_policy_matches_dense():
     """The policy lives in the shared base: the sparse layer follows it too."""
     from unittest import mock
     import cupiqp
-    values = _t([1.0, 2.0])
-    c0 = _t([1.0, -1.0])
+    values = tensor([1.0, 2.0])
+    c0 = tensor([1.0, -1.0])
     layer = _make(SparseSolverLayer)
     with pytest.raises(ValueError, match="per_call_fields is only used"):
         layer.setup(_diag_csr(values), c0, per_call_fields=("c",))

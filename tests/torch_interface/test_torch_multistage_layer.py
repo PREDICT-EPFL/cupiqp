@@ -7,23 +7,17 @@ import gc
 
 import numpy as np
 import pytest
-torch = pytest.importorskip("torch")
 
 from cupiqp import Status
 from cupiqp.torch import DenseSolverLayer, MultistageSolverLayer, StructureMismatchError
 
-from tests.helpers import layer_statuses
+from tests.helpers import assemble_multistage, tight
+from tests.torch_interface.torch_helpers import layer_statuses, requires_cuda, tensor, torch
 
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+pytestmark = requires_cuda
 
-DEVICE = "cuda"
-DTYPE = torch.float64
 N, D, RA, RG = 3, 2, 1, 2          # stages, stage size, equality and inequality rows per block
-
-
-def _t(a):
-    return torch.tensor(np.asarray(a), dtype=DTYPE, device=DEVICE)
 
 
 def _blocks(seed=0):
@@ -36,7 +30,7 @@ def _blocks(seed=0):
     A_diag, A_off = rng.standard_normal((N, RA, D)), rng.standard_normal((N, RA, D))
     G_diag, G_off = rng.standard_normal((N, RG, D)), rng.standard_normal((N, RG, D))
     blocks = dict(P_diag=P_diag, P_off=P_off, A_diag=A_diag, A_off=A_off, G_diag=G_diag, G_off=G_off)
-    dense = _assemble(blocks)
+    dense = dict(zip("PAG", assemble_multistage(N, D, P_diag, P_off, A_diag, A_off, G_diag, G_off)))
     x_star = rng.standard_normal(N * D)
     mid = dense["G"] @ x_star
     rad = 0.5 + rng.random(mid.shape)
@@ -45,54 +39,24 @@ def _blocks(seed=0):
     return blocks, vectors, dense
 
 
-def _assemble(blk):
-    """Dense P, A, G of the block structure (block row k of A and G holds
-    offdiag[k-1] on stage k-1 and diag[k] on stage k; row N only offdiag[N-1])."""
-    n = N * D
-    P = np.zeros((n, n))
-    for k in range(N):
-        P[k*D:(k+1)*D, k*D:(k+1)*D] = blk["P_diag"][k]
-    for k in range(N - 1):
-        P[(k+1)*D:(k+2)*D, k*D:(k+1)*D] = blk["P_off"][k]
-        P[k*D:(k+1)*D, (k+1)*D:(k+2)*D] = blk["P_off"][k].T
-
-    def bidiagonal(diag, off, r):
-        M = np.zeros(((N + 1) * r, n))
-        for k in range(N):
-            M[k*r:(k+1)*r, k*D:(k+1)*D] = diag[k]
-            M[(k+1)*r:(k+2)*r, k*D:(k+1)*D] = off[k]
-        return M
-
-    return dict(P=P, A=bidiagonal(blk["A_diag"], blk["A_off"], RA),
-                G=bidiagonal(blk["G_diag"], blk["G_off"], RG))
-
-
-def _settings(layer):
-    layer.settings.verbose = False
-    layer.settings.preconditioner_iter = 0
-    layer.settings.eps_abs = 1e-11
-    layer.settings.eps_rel = 1e-11
-    return layer
-
-
 def _multistage_layer(blocks, vectors, c=None, **setup_kwargs):
     """``c`` (default: the shared ``vectors["c"]``) fixes the batch size."""
-    layer = _settings(MultistageSolverLayer())
-    c = _t(vectors["c"]) if c is None else c
-    layer.setup(P=(_t(blocks["P_diag"]), _t(blocks["P_off"])), c=c,
-                A=(_t(blocks["A_diag"]), _t(blocks["A_off"])), b=_t(vectors["b"]),
-                G=(_t(blocks["G_diag"]), _t(blocks["G_off"])), h_u=_t(vectors["h_u"]),
-                h_l=_t(vectors["h_l"]), x_u=_t(vectors["x_u"]), x_l=_t(vectors["x_l"]),
+    layer = tight(MultistageSolverLayer(), preconditioner_iter=0)
+    c = tensor(vectors["c"]) if c is None else c
+    layer.setup(P=(tensor(blocks["P_diag"]), tensor(blocks["P_off"])), c=c,
+                A=(tensor(blocks["A_diag"]), tensor(blocks["A_off"])), b=tensor(vectors["b"]),
+                G=(tensor(blocks["G_diag"]), tensor(blocks["G_off"])), h_u=tensor(vectors["h_u"]),
+                h_l=tensor(vectors["h_l"]), x_u=tensor(vectors["x_u"]), x_l=tensor(vectors["x_l"]),
                 **setup_kwargs)
     return layer
 
 
 def _dense_layer(dense, vectors, c=None):
-    layer = _settings(DenseSolverLayer())
-    c = _t(vectors["c"]) if c is None else c
-    layer.setup(_t(dense["P"]), c, A=_t(dense["A"]), b=_t(vectors["b"]),
-                G=_t(dense["G"]), h_u=_t(vectors["h_u"]), h_l=_t(vectors["h_l"]),
-                x_u=_t(vectors["x_u"]), x_l=_t(vectors["x_l"]))
+    layer = tight(DenseSolverLayer(), preconditioner_iter=0)
+    c = tensor(vectors["c"]) if c is None else c
+    layer.setup(tensor(dense["P"]), c, A=tensor(dense["A"]), b=tensor(vectors["b"]),
+                G=tensor(dense["G"]), h_u=tensor(vectors["h_u"]), h_l=tensor(vectors["h_l"]),
+                x_u=tensor(vectors["x_u"]), x_l=tensor(vectors["x_l"]))
     return layer
 
 
@@ -102,15 +66,15 @@ def _dense_layer(dense, vectors, c=None):
 def test_forward_and_every_gradient_match_dense_layer():
     blocks, vectors, dense = _blocks(seed=1)
     B = 2
-    c_batch = _t(np.stack([vectors["c"], vectors["c"] + 0.3]))
-    weights = _t(np.random.default_rng(2).standard_normal((B, N * D)))
+    c_batch = tensor(np.stack([vectors["c"], vectors["c"] + 0.3]))
+    weights = tensor(np.random.default_rng(2).standard_normal((B, N * D)))
 
     ms = _multistage_layer(blocks, vectors, c=c_batch)
-    ms_in = dict(P_diag=_t(blocks["P_diag"]), P_offdiag=_t(blocks["P_off"]), c=c_batch.clone(),
-                 A_diag=_t(blocks["A_diag"]), A_offdiag=_t(blocks["A_off"]), b=_t(vectors["b"]),
-                 G_diag=_t(blocks["G_diag"]), G_offdiag=_t(blocks["G_off"]),
-                 h_u=_t(vectors["h_u"]), h_l=_t(vectors["h_l"]),
-                 x_u=_t(vectors["x_u"]), x_l=_t(vectors["x_l"]))
+    ms_in = dict(P_diag=tensor(blocks["P_diag"]), P_offdiag=tensor(blocks["P_off"]), c=c_batch.clone(),
+                 A_diag=tensor(blocks["A_diag"]), A_offdiag=tensor(blocks["A_off"]), b=tensor(vectors["b"]),
+                 G_diag=tensor(blocks["G_diag"]), G_offdiag=tensor(blocks["G_off"]),
+                 h_u=tensor(vectors["h_u"]), h_l=tensor(vectors["h_l"]),
+                 x_u=tensor(vectors["x_u"]), x_l=tensor(vectors["x_l"]))
     for t in ms_in.values():
         t.requires_grad_(True)
     x_ms = ms(**ms_in)
@@ -119,9 +83,9 @@ def test_forward_and_every_gradient_match_dense_layer():
     (weights * x_ms).sum().backward()
 
     de = _dense_layer(dense, vectors, c=c_batch)
-    de_in = dict(P=_t(dense["P"]), c=c_batch.clone(), A=_t(dense["A"]), b=_t(vectors["b"]),
-                 G=_t(dense["G"]), h_u=_t(vectors["h_u"]), h_l=_t(vectors["h_l"]),
-                 x_u=_t(vectors["x_u"]), x_l=_t(vectors["x_l"]))
+    de_in = dict(P=tensor(dense["P"]), c=c_batch.clone(), A=tensor(dense["A"]), b=tensor(vectors["b"]),
+                 G=tensor(dense["G"]), h_u=tensor(vectors["h_u"]), h_l=tensor(vectors["h_l"]),
+                 x_u=tensor(vectors["x_u"]), x_l=tensor(vectors["x_l"]))
     for t in de_in.values():
         t.requires_grad_(True)
     x_de = de(**de_in)
@@ -146,31 +110,31 @@ def test_forward_and_every_gradient_match_dense_layer():
     pairs = dict(P_diag="P_diag", P_offdiag="P_off", A_diag="A_diag", A_offdiag="A_off",
                  G_diag="G_diag", G_offdiag="G_off")
     for field, key in pairs.items():
-        torch.testing.assert_close(ms_in[field].grad, _t(exp[key]), **tol, msg=field)
+        torch.testing.assert_close(ms_in[field].grad, tensor(exp[key]), **tol, msg=field)
 
 
 def test_shared_block_gradient_is_summed_over_batch():
     blocks, vectors, _ = _blocks(seed=3)
     B = 3
-    c_batch = _t(np.stack([vectors["c"] + 0.2 * k for k in range(B)]))
+    c_batch = tensor(np.stack([vectors["c"] + 0.2 * k for k in range(B)]))
     layer = _multistage_layer(blocks, vectors, c=c_batch)
-    shared = _t(blocks["A_off"]).requires_grad_(True)
+    shared = tensor(blocks["A_off"]).requires_grad_(True)
     layer(c=c_batch, A_offdiag=shared).sum().backward()
-    batched = _t(blocks["A_off"]).expand(B, N, RA, D).clone().requires_grad_(True)
+    batched = tensor(blocks["A_off"]).expand(B, N, RA, D).clone().requires_grad_(True)
     layer(c=c_batch, A_offdiag=batched).sum().backward()
     torch.testing.assert_close(shared.grad, batched.grad.sum(dim=0), atol=1e-8, rtol=1e-8)
 
 
 def test_block_absent_at_setup_cannot_be_passed():
     blocks, vectors, _ = _blocks(seed=4)
-    layer = _settings(MultistageSolverLayer())
-    layer.setup(P=(_t(blocks["P_diag"]), None), c=_t(vectors["c"]),
-                x_l=_t(vectors["x_l"]), x_u=_t(vectors["x_u"]))
+    layer = tight(MultistageSolverLayer(), preconditioner_iter=0)
+    layer.setup(P=(tensor(blocks["P_diag"]), None), c=tensor(vectors["c"]),
+                x_l=tensor(vectors["x_l"]), x_u=tensor(vectors["x_u"]))
     with pytest.raises(StructureMismatchError, match="'P_offdiag' was not given at setup"):
-        layer(P_offdiag=_t(blocks["P_off"]))
+        layer(P_offdiag=tensor(blocks["P_off"]))
     with pytest.raises(StructureMismatchError, match="'A_diag' was not given at setup"):
-        layer(A_diag=_t(blocks["A_diag"]))
-    c = _t(vectors["c"]).requires_grad_(True)
+        layer(A_diag=tensor(blocks["A_diag"]))
+    c = tensor(vectors["c"]).requires_grad_(True)
     layer(c=c).sum().backward()
     assert c.grad.shape == (N * D,)
 
@@ -184,8 +148,8 @@ def test_rollout_matches_single_calls(order):
     T = 3
     layer = _multistage_layer(blocks, vectors, max_pending_solves=T,
                               per_call_fields=("c", "A_offdiag"))
-    cs = [(_t(vectors["c"]) + 0.2 * k).requires_grad_(True) for k in range(T)]
-    dyn = [(_t(blocks["A_off"]) * (1.0 + 0.05 * k)).requires_grad_(True) for k in range(T)]
+    cs = [(tensor(vectors["c"]) + 0.2 * k).requires_grad_(True) for k in range(T)]
+    dyn = [(tensor(blocks["A_off"]) * (1.0 + 0.05 * k)).requires_grad_(True) for k in range(T)]
     outs = [layer(c=cs[k], A_offdiag=dyn[k]) for k in range(T)]
     assert len({o.data_ptr() for o in outs}) == T
     terms = [(k + 1) * o.sum() for k, o in enumerate(outs)]
@@ -204,8 +168,8 @@ def test_rollout_matches_single_calls(order):
 def test_forward_and_backward_allocate_nothing():
     blocks, vectors, _ = _blocks(seed=6)
     layer = _multistage_layer(blocks, vectors)
-    c = _t(vectors["c"]).requires_grad_(True)
-    dyn = _t(blocks["A_off"]).requires_grad_(True)
+    c = tensor(vectors["c"]).requires_grad_(True)
+    dyn = tensor(blocks["A_off"]).requires_grad_(True)
     layer(c=c, A_offdiag=dyn).sum().backward()          # warm up
     torch.cuda.synchronize()
     before = torch.cuda.memory_allocated()
@@ -219,23 +183,23 @@ def test_forward_and_backward_allocate_nothing():
 # ---------------------------------------------------------------------------
 def test_setup_and_call_validation():
     blocks, vectors, _ = _blocks(seed=7)
-    layer = _settings(MultistageSolverLayer())
+    layer = tight(MultistageSolverLayer(), preconditioner_iter=0)
     with pytest.raises(TypeError, match=r"'P' must be a \(diag, offdiag\) pair"):
-        layer.setup(P=_t(blocks["P_diag"]), c=_t(vectors["c"]))
+        layer.setup(P=tensor(blocks["P_diag"]), c=tensor(vectors["c"]))
     with pytest.raises(ValueError, match="'P' needs its diagonal blocks"):
-        layer.setup(P=(None, _t(blocks["P_off"])), c=_t(vectors["c"]))
+        layer.setup(P=(None, tensor(blocks["P_off"])), c=tensor(vectors["c"]))
     with pytest.raises(ValueError, match="'P_diag' must be 3-D or 4-D"):
-        layer.setup(P=(_t(blocks["P_diag"][0]), None), c=_t(vectors["c"]))
+        layer.setup(P=(tensor(blocks["P_diag"][0]), None), c=tensor(vectors["c"]))
     with pytest.raises(ValueError, match=r"not given \['P_offdiag'\]"):
-        layer.setup(P=(_t(blocks["P_diag"]), None), c=_t(vectors["c"]),
+        layer.setup(P=(tensor(blocks["P_diag"]), None), c=tensor(vectors["c"]),
                     max_pending_solves=2, per_call_fields=("c", "P_offdiag"))
     with pytest.raises(ValueError, match=r"unknown \['P'\]"):
-        layer.setup(P=(_t(blocks["P_diag"]), None), c=_t(vectors["c"]),
+        layer.setup(P=(tensor(blocks["P_diag"]), None), c=tensor(vectors["c"]),
                     max_pending_solves=2, per_call_fields=("P",))
     assert not layer.is_setup
     layer = _multistage_layer(blocks, vectors)
     with pytest.raises(StructureMismatchError, match=r"'A_offdiag' must have shape"):
-        layer(A_offdiag=_t(blocks["A_off"][:2]))
+        layer(A_offdiag=tensor(blocks["A_off"][:2]))
     with pytest.raises(StructureMismatchError, match=r"'c' must have shape \(6,\)"):
-        layer(c=_t(vectors["c"]).reshape(N, D))       # vectors are flat in calls
-    layer(c=_t(vectors["c"]).reshape(N, D).reshape(-1))
+        layer(c=tensor(vectors["c"]).reshape(N, D))       # vectors are flat in calls
+    layer(c=tensor(vectors["c"]).reshape(N, D).reshape(-1))

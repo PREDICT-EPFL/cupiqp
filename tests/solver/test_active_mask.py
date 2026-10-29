@@ -10,13 +10,13 @@ import numpy as np
 import pytest
 import warp as wp
 
-from cupiqp import DenseSolver, Settings, Status
-from tests.helpers import random_qp, stack_qps, to_wp, to_wp_dict
+from cupiqp import DenseSolver, Status
+from tests.helpers import random_dense_qp, stack_qps, to_wp, to_wp_dict
 
 
 def _infeasible_qp(n, p, m, seed):
     """Contradictory equalities: the solver runs to ``max_iter`` or gives up."""
-    qp = random_qp(seed, n, p, m)
+    qp = random_dense_qp(seed, n, p, m)
     qp["A"][1] = qp["A"][0]
     qp["b"][0], qp["b"][1] = 0.0, 1.0
     return qp
@@ -48,8 +48,8 @@ N, P_EQ, M_INEQ = 8, 3, 5
 def test_terminated_problem_does_not_depend_on_the_rest_of_the_batch(preconditioner_iter):
     """Problem 0 reports the same result whether its batch mate converges as fast
     as it does or runs on to ``max_iter``: a terminated problem stops changing."""
-    easy = random_qp(1, N, P_EQ, M_INEQ)
-    other_easy = random_qp(2, N, P_EQ, M_INEQ)
+    easy = random_dense_qp(1, N, P_EQ, M_INEQ)
+    other_easy = random_dense_qp(2, N, P_EQ, M_INEQ)
     hard = _infeasible_qp(N, P_EQ, M_INEQ, seed=3)
 
     results = []
@@ -71,7 +71,7 @@ def test_terminated_problem_does_not_depend_on_the_rest_of_the_batch(preconditio
 def test_mixed_batch_matches_solo_solves(n):
     """Each problem of a batch with different iteration counts matches its solo
     solve. ``n = 40`` selects cuBLAS/cuSOLVER, which ignore the mask."""
-    qps = [random_qp(s, n, P_EQ, M_INEQ) for s in (11, 12, 13, 14, 15)]
+    qps = [random_dense_qp(s, n, P_EQ, M_INEQ) for s in (11, 12, 13, 14, 15)]
     batch = _solver(qps, preconditioner_iter=0)
     batch.solve()
     fields, status, iters = _snapshot(batch)
@@ -89,7 +89,7 @@ def test_mixed_batch_matches_solo_solves(n):
 
 
 def test_float32_mixed_batch():
-    qps = [random_qp(s, N, P_EQ, M_INEQ) for s in (21, 22, 23, 24)]
+    qps = [random_dense_qp(s, N, P_EQ, M_INEQ) for s in (21, 22, 23, 24)]
     batch = _solver(qps, dtype=wp.float32, preconditioner_iter=0)
     batch.solve()
     fields, status, iters = _snapshot(batch)
@@ -105,8 +105,8 @@ def test_float32_mixed_batch():
 def test_gradient_of_terminated_problem_does_not_depend_on_the_rest_of_the_batch(n):
     """backward() differentiates through the factorization at the final iterate,
     also for a problem that terminated long before the batch ended."""
-    easy = random_qp(31, n, P_EQ, M_INEQ)
-    mates = {"fast": random_qp(32, n, P_EQ, M_INEQ),
+    easy = random_dense_qp(31, n, P_EQ, M_INEQ)
+    mates = {"fast": random_dense_qp(32, n, P_EQ, M_INEQ),
              "slow": _infeasible_qp(n, P_EQ, M_INEQ, seed=33)}
     grads = {}
     for name, mate in mates.items():
@@ -126,7 +126,7 @@ def test_gradient_of_terminated_problem_does_not_depend_on_the_rest_of_the_batch
 def test_repeated_solves_with_masking():
     """The mask is rebuilt at the start of every solve: solving the same batch
     twice, and a modified batch after an update, gives the expected results."""
-    qps = [random_qp(s, N, P_EQ, M_INEQ) for s in (41, 42, 43)]
+    qps = [random_dense_qp(s, N, P_EQ, M_INEQ) for s in (41, 42, 43)]
     s = _solver(qps, preconditioner_iter=0)
     s.solve()
     first = _snapshot(s)

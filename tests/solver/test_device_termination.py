@@ -9,10 +9,9 @@ that the public device arrays ``result.info.status`` /
 """
 import numpy as np
 import pytest
-import warp as wp
 
 from cupiqp import DenseSolver, SparseSolver, MultistageSolver, Status
-from tests.helpers import csr_triple, primal_infeasible, random_qp, stack_qps, to_wp, to_wp_dict
+from tests.helpers import DTYPES, csr_triple, primal_infeasible, random_dense_qp, stack_qps, to_wp, to_wp_dict
 
 
 def _dual_infeasible(qp):
@@ -28,12 +27,12 @@ def _dual_infeasible(qp):
 
 def _mixed_batch(seed=0):
     rng = np.random.default_rng(seed)
-    qps = [random_qp(rng) for _ in range(6)]
+    qps = [random_dense_qp(rng) for _ in range(6)]
     return qps + [primal_infeasible(qps[0]), _dual_infeasible(qps[1])]
 
 
-def _stack(qps, np_dtype):
-    return to_wp_dict(stack_qps(qps), np_dtype)
+def _stack(qps, dtype):
+    return to_wp_dict(stack_qps(qps), dtype)
 
 
 def _assert_device_matches_host(solver):
@@ -44,18 +43,15 @@ def _assert_device_matches_host(solver):
     assert h.iter_total == int(info.iter_total.numpy()[0]) == int(h.iter.max())
 
 
-DTYPES = [(wp.float64, np.float64), (wp.float32, np.float32)]
-
-
-@pytest.mark.parametrize("dtype,np_dtype", DTYPES)
+@pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("enable_cuda_graph", [True, False])
 @pytest.mark.parametrize("preconditioner_iter", [10, 0])
-def test_dense_mixed_batch(dtype, np_dtype, enable_cuda_graph, preconditioner_iter):
+def test_dense_mixed_batch(dtype, enable_cuda_graph, preconditioner_iter):
     qps = _mixed_batch()
     solver = DenseSolver(dtype=dtype)
     solver.settings.enable_cuda_graph = enable_cuda_graph
     solver.settings.preconditioner_iter = preconditioner_iter
-    solver.setup(**_stack(qps, np_dtype))
+    solver.setup(**_stack(qps, dtype))
 
     solver.solve()
     statuses = solver.result.info.to_host().status
@@ -72,13 +68,13 @@ def test_dense_mixed_batch(dtype, np_dtype, enable_cuda_graph, preconditioner_it
     _assert_device_matches_host(solver)
 
 
-@pytest.mark.parametrize("dtype,np_dtype", DTYPES)
-def test_dense_max_iter(dtype, np_dtype):
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_dense_max_iter(dtype):
     max_iter = 6
     solver = DenseSolver(dtype=dtype)
     solver.settings.max_iter = max_iter
     solver.settings.preconditioner_iter = 10
-    solver.setup(**_stack(_mixed_batch(), np_dtype))
+    solver.setup(**_stack(_mixed_batch(), dtype))
 
     solver.solve()
     statuses = solver.result.info.to_host().status
@@ -93,7 +89,7 @@ def test_dense_max_iter(dtype, np_dtype):
 
 
 def test_dense_single_problem():
-    qp = random_qp(np.random.default_rng(1))
+    qp = random_dense_qp(np.random.default_rng(1))
     solver = DenseSolver()
     solver.setup(**to_wp_dict(qp))
     solver.solve()
@@ -104,7 +100,7 @@ def test_dense_single_problem():
 def test_dense_equality_only():
     """No inequalities: the full-Newton path and its rho/delta kernel."""
     rng = np.random.default_rng(2)
-    qps = [random_qp(rng) for _ in range(3)]
+    qps = [random_dense_qp(rng) for _ in range(3)]
     solver = DenseSolver()
     solver.setup(**{k: to_wp(np.stack([q[k] for q in qps])) for k in ("P", "c", "A", "b")})
     solver.solve()

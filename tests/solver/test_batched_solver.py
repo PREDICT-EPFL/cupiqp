@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 
 from cupiqp import DenseSolver, Settings, Status
-from tests.helpers import stack_qps, to_wp, to_wp_dict
+from tests.helpers import all_solved, assert_all_solved, quiet, random_dense_qp, stack_qps, to_wp, to_wp_dict
 
 
 def _setup_batched(solver, **kw):
@@ -11,29 +11,12 @@ def _setup_batched(solver, **kw):
     solver.setup(**{k: to_wp(v) for k, v in kw.items() if v is not None})
 
 
-def _make_random_qp(n=8, p=3, m=5, seed=42):
-    """Generate a single random QP (NumPy arrays)."""
-    rng = np.random.default_rng(seed)
-    M = rng.standard_normal((n, n))
-    P = M @ M.T + n * np.eye(n)
-    P = (P + P.T) / 2
-    c = rng.standard_normal(n)
-    A = rng.standard_normal((p, n))
-    b = rng.standard_normal(p)
-    G = rng.standard_normal((m, n))
-    h_u = np.abs(rng.standard_normal(m)) + 2.0
-    h_l = -np.abs(rng.standard_normal(m)) - 2.0
-    x_u = np.abs(rng.standard_normal(n)) + 3.0
-    x_l = -np.abs(rng.standard_normal(n)) - 3.0
-    return dict(P=P, c=c, A=A, b=b, G=G, h_u=h_u, h_l=h_l, x_u=x_u, x_l=x_l)
-
-
 def _make_hard_qp(n=8, p=3, m=5, seed=42):
     """A random QP whose unconstrained optimum lies far outside the box, so
     that several bounds are active at the solution. The solver needs more
     iterations for it than for :func:`_make_random_qp`; batching one with
     easy problems guarantees per-problem iteration counts that differ."""
-    qp = _make_random_qp(n, p, m, seed=seed)
+    qp = random_dense_qp(seed, n=n, p=p, m=m)
     qp["c"] = 1e3 * qp["c"]
     return qp
 
@@ -84,13 +67,13 @@ class TestBatchedSolverCorrectness:
         ref_statuses = []
         ref_x = []
         for s in seeds:
-            qp = _make_random_qp(n, p, m, seed=s)
+            qp = random_dense_qp(s, n=n, p=p, m=m)
             st, x = _solve_single(qp)
             ref_statuses.append(st)
             ref_x.append(x)
 
         # Solve batched
-        qps = [_make_random_qp(n, p, m, seed=s) for s in seeds]
+        qps = [random_dense_qp(s, n=n, p=p, m=m) for s in seeds]
         settings = Settings()
         settings.preconditioner_iter = 0
         solver = DenseSolver()
@@ -109,7 +92,7 @@ class TestBatchedSolverCorrectness:
 
     def test_single_problem(self):
         """Batch of size 1 should match individual solve."""
-        qp = _make_random_qp(n=6, p=2, m=4, seed=42)
+        qp = random_dense_qp(42, n=6, p=2, m=4)
         ref_st, ref_x = _solve_single(qp)
 
         settings = Settings()
@@ -173,8 +156,7 @@ class TestBatchedSolverBasic:
             c=rng.standard_normal((B, n)),
         )
         solver.solve()
-        statuses = solver.result.info.to_host().status
-        assert all(st == Status.CUPIQP_SOLVED for st in statuses)
+        assert_all_solved(solver)
 
 
 class TestPerProblemIterations:
@@ -198,12 +180,12 @@ class TestPerProblemIterations:
         the same number of iterations, so the hard member is what makes the
         counts differ."""
         n, p, m = 8, 3, 5
-        qps = [_make_random_qp(n, p, m, seed=s) for s in (42, 123, 77)]
+        qps = [random_dense_qp(s, n=n, p=p, m=m) for s in (42, 123, 77)]
         qps.append(_make_hard_qp(n, p, m, seed=999))
         B = len(qps)
 
         ref = [_solve_single_iter(q) for q in qps]
-        assert all(st == Status.CUPIQP_SOLVED for st, _ in ref)
+        assert all_solved(st for st, _ in ref)
 
         solver = self._make_dense_batch(qps, _iter_settings())
         solver.solve()
@@ -262,12 +244,12 @@ class TestPerProblemIterations:
         update is exercised along the way). Two easy problems and one hard
         one, so that the counts differ."""
         n, p, m = 8, 3, 5
-        qps = [_make_random_qp(n, p, m, seed=s) for s in (42, 123)]
+        qps = [random_dense_qp(s, n=n, p=p, m=m) for s in (42, 123)]
         qps.append(_make_hard_qp(n, p, m, seed=77))
 
         ref = [_solve_single_iter(q, _iter_settings(), solver_cls=DenseSolver)
                for q in qps]
-        assert all(st == Status.CUPIQP_SOLVED for st, _ in ref)
+        assert all_solved(st for st, _ in ref)
 
         solver = DenseSolver()
         solver.settings = _iter_settings()
@@ -333,11 +315,7 @@ def test_backward_with_unsolved_problem_in_batch():
     grad_x = np.ones((2, 2))
 
     def make(mode, b_in):
-        s = DenseSolver()
-        s.settings.enable_grad = True
-        s.settings.preconditioner_iter = 0
-        s.settings.verbose = False
-        s.settings.gradient_on_failure = mode
+        s = quiet(DenseSolver(), enable_grad=True, preconditioner_iter=0, gradient_on_failure=mode)
         s.setup(to_wp(P), to_wp(c), A=to_wp(A), b=to_wp(b_in))
         s.solve()
         return s
@@ -368,10 +346,7 @@ def test_structural_settings_are_frozen_at_setup():
     backward(); numerical settings may still change."""
     rng = np.random.default_rng(3)
     M = rng.standard_normal((3, 3))
-    solver = DenseSolver()
-    solver.settings.enable_grad = True
-    solver.settings.preconditioner_iter = 10
-    solver.settings.verbose = False
+    solver = quiet(DenseSolver(), enable_grad=True, preconditioner_iter=10)
     c = to_wp(rng.standard_normal(3))
     solver.setup(to_wp(M @ M.T + 3 * np.eye(3)), c, x_l=to_wp(-np.ones(3)), x_u=to_wp(np.ones(3)))
     solver.solve()

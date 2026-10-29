@@ -3,32 +3,22 @@ for every input and every solution field, shared inputs summed over the
 batch, jit/eager equality, purity across call histories, the failure policy,
 non-differentiable diagnostics, lax.scan, grad(vmap) and vmap(grad)."""
 
-import os
-
 import numpy as np
 import pytest
-
-os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
-
-jax = pytest.importorskip("jax")
-import jax.numpy as jnp
-
-jax.config.update("jax_enable_x64", True)
-
 import warp as wp
+
+# Configures JAX: must come before any import of JAX.
+from tests.jax_interface.jax_helpers import (DATA_FIELDS, VARIABLE_FIELDS, directional_fd, jax, jnp,
+                                             requires_gpu, to_jax)
 
 import cupiqp
 from cupiqp import Status
-from cupiqp.jax import DenseSolver, QPSolution
+from cupiqp.jax import DenseSolver
+from tests.helpers import primal_infeasible, random_dense_qp, tight
 
-from tests.helpers import primal_infeasible, random_qp
+pytestmark = requires_gpu
 
-pytestmark = pytest.mark.skipif(
-    not any(d.platform == "gpu" for d in jax.devices()), reason="a CUDA JAX device is required"
-)
-
-SOLUTION_FIELDS = ("x", "y", "z_l", "z_u", "z_bl", "z_bu", "s_l", "s_u", "s_bl", "s_bu")
-DATA_FIELDS = ("P", "c", "A", "b", "G", "h_u", "h_l", "x_u", "x_l")
+SOLUTION_FIELDS = VARIABLE_FIELDS
 
 
 # ---------------------------------------------------------------------------
@@ -37,11 +27,7 @@ DATA_FIELDS = ("P", "c", "A", "b", "G", "h_u", "h_l", "x_u", "x_l")
 
 def tight_solver(preconditioner_iter=10) -> DenseSolver:
     """A solver converged tightly enough for 1e-6 finite differences."""
-    solver = DenseSolver()
-    solver.settings.eps_abs = 1e-11
-    solver.settings.eps_rel = 1e-11
-    solver.settings.preconditioner_iter = preconditioner_iter
-    return solver
+    return tight(DenseSolver(), preconditioner_iter=preconditioner_iter)
 
 
 def active_qp(seed=0, n=6, p=2, m=4) -> dict:
@@ -49,7 +35,7 @@ def active_qp(seed=0, n=6, p=2, m=4) -> dict:
     bounds on both sides, with strict complementarity: the bounds cut off
     the equality-constrained optimum by a margin, the other bounds stay
     far. Every multiplier and slack then has a well-defined gradient."""
-    qp = random_qp(seed, n=n, p=p, m=m)
+    qp = random_dense_qp(seed, n=n, p=p, m=m)
     # The equality-constrained optimum, from the KKT system.
     P, c, A = qp["P"], qp["c"], qp["A"]
     kkt = np.block([[P, A.T], [A, np.zeros((p, p))]])
@@ -60,17 +46,6 @@ def active_qp(seed=0, n=6, p=2, m=4) -> dict:
     qp["x_u"][0] = x_star[0] - 0.2                   # strictly active upper bound
     qp["x_l"][1] = x_star[1] + 0.2                   # strictly active lower bound
     return qp
-
-
-def to_jax(qp: dict) -> dict:
-    return {k: jnp.asarray(v) for k, v in qp.items()}
-
-
-def directional_fd(f, args: dict, name: str, direction: np.ndarray, eps=1e-6) -> float:
-    """Central finite difference of ``f(args)`` along ``direction`` in ``args[name]``."""
-    plus = dict(args, **{name: args[name] + eps * direction})
-    minus = dict(args, **{name: args[name] - eps * direction})
-    return (float(f(**plus)) - float(f(**minus))) / (2 * eps)
 
 
 def symmetric(R: np.ndarray) -> np.ndarray:
@@ -198,7 +173,7 @@ def test_jit_grad_matches_eager_bitwise_and_is_pure():
     solver = tight_solver()
     args = to_jax(active_qp(8))
     other = to_jax(active_qp(9))
-    infeasible = to_jax(primal_infeasible(random_qp(10, n=6, p=2, m=4)))
+    infeasible = to_jax(primal_infeasible(random_dense_qp(10, n=6, p=2, m=4)))
 
     def loss(c):
         return jnp.sum(solver.solve(**dict(args, c=c)).x ** 2)
@@ -265,7 +240,7 @@ def test_diagnostics_have_no_gradient():
 def test_gradient_on_failure_policy():
     """A batch with one infeasible problem: 'zero' zeroes its gradient and
     leaves the others untouched, whatever was solved before."""
-    good = random_qp(18, n=6, p=2, m=4)
+    good = random_dense_qp(18, n=6, p=2, m=4)
     bad = primal_infeasible(good)
     base = to_jax(good)
     stacked = {k: jnp.stack([jnp.asarray(good[k]), jnp.asarray(bad[k])]) for k in ("G", "h_l", "h_u")}
@@ -285,7 +260,7 @@ def test_gradient_on_failure_policy():
     np.testing.assert_allclose(grad_zero[0], single, rtol=1e-6, atol=1e-9)
     # The same gradient after the cached solvers handled other problems,
     # feasible and infeasible, forward and backward.
-    other = to_jax(random_qp(22, n=6, p=2, m=4))
+    other = to_jax(random_dense_qp(22, n=6, p=2, m=4))
     jax.grad(lambda h_u: jnp.sum(solver.solve(**dict(other, h_u=h_u)).x ** 2))(other["h_u"])
     swapped = {k: v[::-1] for k, v in stacked.items()}
     jax.grad(loss, argnums=2)(swapped["G"], swapped["h_l"], swapped["h_u"])

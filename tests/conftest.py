@@ -11,7 +11,6 @@ Shared problem builders and conversions live in ``helpers.py``.
 Run GPU tests sequentially: concurrent pytest processes on one GPU produce
 spurious cuSOLVER errors.
 """
-import numpy as np
 import pytest
 import warp as wp
 

@@ -4,7 +4,7 @@ Verifies the full pipeline: regularization -> eliminate -> condensed solve
 -> recover, against a per-problem NumPy reference.
 
 The full-solve tests are parametrized over a matrix of ``(B, n, p, m)``
-sizes that covers:
+sizes and both precisions (float64 / float32) that covers:
 
   * single-problem mode (B = 1) and batched mode (B > 1),
   * with / without general inequality (``m > 0`` / ``m == 0``),
@@ -16,20 +16,16 @@ the GPU as Warp arrays, the only array type the KKT internals take.
 """
 import pytest
 import numpy as np
+import warp as wp
 
 from cupiqp.dense.dense_data import DenseData
-from cupiqp.dense.dense_preconditioner import DenseRuizEquilibration
-from cupiqp.kkt_systems import KKTSystem
 from cupiqp.results import Variables
 from cupiqp.settings import Settings
-from tests.helpers import to_wp, to_wp_dict, device_settings
+from tests.helpers import DTYPES, host, random_dense_qp, rounded, to_wp, to_wp_dict
+from tests.kkt.kkt_helpers import (condensed_solve, factored_kkt_system,
+                                   kkt_system, positive_variables, random_variables, zeros)
+from tests.tolerances import KKT_RESIDUAL_TOL, KKT_SOLVE_TOL, MATVEC_TOL
 
-
-def _dense_data(**kw):
-    """DenseData from host arrays."""
-    d = DenseData()
-    d.init(**to_wp_dict(kw))
-    return d
 
 # ======================================================================
 # NumPy reference implementation
@@ -149,82 +145,31 @@ def _ref_full_solve(P, A, G, x_b_scaling,
 # Helpers
 # ======================================================================
 
-def _make_data(B, n, p, m, seed=42, with_box=True):
-    """Build a batched DenseData of the requested size.
+def _make_data(B, n, p, m, dtype, seed=42, with_box=True):
+    """A batched DenseData of the requested size.
 
     A and b are supplied only when ``p > 0``; G / h_u / h_l only when
     ``m > 0``; x_u / x_l only when ``with_box=True``. This matches how a
     real caller constructs the data and exercises DenseData's "this field
     is absent" code paths, instead of always passing size-0 arrays.
     """
-    rng = np.random.default_rng(seed)
-    Ps = []
-    for _ in range(B):
-        M = rng.standard_normal((n, n))
-        Pi = M @ M.T + n * np.eye(n)
-        Ps.append((Pi + Pi.T) / 2)
-    kw = dict(
-        P=np.stack(Ps),
-        c=rng.standard_normal((B, n)),
-    )
-    if p > 0:
-        kw['A'] = rng.standard_normal((B, p, n))
-        kw['b'] = rng.standard_normal((B, p))
-    if m > 0:
-        kw['G']   = rng.standard_normal((B, m, n))
-        kw['h_u'] = np.ones((B, m)) * 5.0
-        kw['h_l'] = -np.ones((B, m)) * 5.0
-    if with_box:
-        kw['x_u'] = np.ones((B, n)) * 5.0
-        kw['x_l'] = -np.ones((B, n)) * 5.0
-    return _dense_data(**kw)
+    qp = random_dense_qp(seed, n, p, m, batch_size=B)
+    if not with_box:
+        del qp["x_l"], qp["x_u"]
+    data = DenseData(dtype=dtype)
+    data.init(**to_wp_dict({k: v for k, v in qp.items() if v.size}, dtype))
+    return data
 
 
-def _zeros(*shape):
-    """Zero-filled float64 GPU array."""
-    return to_wp(np.zeros(shape))
-
-
-def _make_positive_vars(data, seed=99):
-    """Create Variables with s, z > 0 (required for IPM scalings)."""
-    rng = np.random.default_rng(seed)
-    B = data.batch_size
-    v = Variables()
-    v.init(data)
-    v.x = to_wp(rng.standard_normal((B, data.n)))
-    if data.p > 0:
-        v.y = to_wp(rng.standard_normal((B, data.p)))
-    if data.num_ineq > 0:
-        v.s_all = to_wp(np.abs(rng.standard_normal((B, data.num_ineq))) + 0.5)
-        v.z_all = to_wp(np.abs(rng.standard_normal((B, data.num_ineq))) + 0.5)
-    return v
-
-
-def _run_full_solve(B, n, p, m, seed=42, with_box=True):
+def _run_full_solve(B, n, p, m, dtype, seed=42, with_box=True):
     """Run the KKTSystem pipeline and verify against a per-problem NumPy reference."""
-    data = _make_data(B, n, p, m, seed=seed, with_box=with_box)
-    settings = Settings()
-    kkt_sys = KKTSystem()
-    kkt_sys.init(data, settings, device_settings(settings, data))
-    pc = DenseRuizEquilibration(B, data.n, data.p, data.m, has_h_l=data.has_h_l, has_h_u=data.has_h_u, has_x_l=data.has_x_l, has_x_u=data.has_x_u)
-
+    data = _make_data(B, n, p, m, dtype, seed=seed, with_box=with_box)
+    settings = Settings.for_dtype(dtype)
     rng = np.random.default_rng(seed + 200)
-    vars = _make_positive_vars(data, seed=seed + 100)
-    rho = np.abs(rng.standard_normal(B)) + 0.1
-    delta = np.abs(rng.standard_normal(B)) + 0.1
-
-    kkt_sys.update_scalings_and_factor(data, pc, settings, False, to_wp(rho), to_wp(delta), vars)
-
-    assert not kkt_sys.factor_status.numpy().any(), "Cholesky factorization failed"
-
-    rhs = Variables()
-    rhs.init(data)
-    rhs.x = to_wp(rng.standard_normal((B, n)))
-    if p > 0:
-        rhs.y = to_wp(rng.standard_normal((B, p)))
-    if data.num_ineq > 0:
-        rhs.s_all = to_wp(rng.standard_normal((B, data.num_ineq)))
-        rhs.z_all = to_wp(rng.standard_normal((B, data.num_ineq)))
+    rho = rounded(np.abs(rng.standard_normal(B)) + 0.1, dtype)
+    delta = rounded(np.abs(rng.standard_normal(B)) + 0.1, dtype)
+    kkt_sys, pc, vars = factored_kkt_system(data, settings, rho, delta, positive_variables(data, seed + 100))
+    rhs = random_variables(data, seed + 300)
 
     lhs = Variables()
     lhs.init(data)
@@ -232,11 +177,11 @@ def _run_full_solve(B, n, p, m, seed=42, with_box=True):
 
     # --- Per-problem NumPy reference ---
     # Host copies of the data, the variables and the solution.
-    P, A, G, x_b_scaling = data.P.numpy(), data.A.numpy(), data.G.numpy(), pc.x_b_scaling.numpy()
-    h_vars = {k: getattr(vars, k).numpy() for k in ("s_u", "s_l", "s_bu", "s_bl", "z_u", "z_l", "z_bu", "z_bl")}
+    P, A, G, x_b_scaling = host(data.P), host(data.A), host(data.G), host(pc.x_b_scaling)
+    h_vars = {k: host(getattr(vars, k)) for k in ("s_u", "s_l", "s_bu", "s_bl", "z_u", "z_l", "z_bu", "z_bl")}
     fields = ("x", "y", "z_u", "z_l", "z_bu", "z_bl", "s_u", "s_l", "s_bu", "s_bl")
-    h_rhs = {k: getattr(rhs, k).numpy() for k in fields}
-    h_lhs = {k: getattr(lhs, k).numpy() for k in fields}
+    h_rhs = {k: host(getattr(rhs, k)) for k in fields}
+    h_lhs = {k: host(getattr(lhs, k)) for k in fields}
     for i in range(B):
         Pi  = P[i]
         Ai  = A[i] if data.p > 0 else np.zeros((0, data.n))
@@ -271,31 +216,31 @@ def _run_full_solve(B, n, p, m, seed=42, with_box=True):
         ref_dx, ref_dy, ref_dz_u, ref_dz_l, ref_dz_bu, ref_dz_bl, \
             ref_ds_u, ref_ds_l, ref_ds_bu, ref_ds_bl = ref
 
-        atol = 1e-8
-        np.testing.assert_allclose(h_lhs["x"][i], ref_dx, atol=atol,
+        t = KKT_SOLVE_TOL[dtype]
+        np.testing.assert_allclose(h_lhs["x"][i], ref_dx, **t,
                                    err_msg=f"dx problem {i}")
         if p > 0:
-            np.testing.assert_allclose(h_lhs["y"][i], ref_dy, atol=atol,
+            np.testing.assert_allclose(h_lhs["y"][i], ref_dy, **t,
                                        err_msg=f"dy problem {i}")
         if data.num_hu > 0:
-            np.testing.assert_allclose(h_lhs["z_u"][i], ref_dz_u, atol=atol,
+            np.testing.assert_allclose(h_lhs["z_u"][i], ref_dz_u, **t,
                                        err_msg=f"dz_u problem {i}")
-            np.testing.assert_allclose(h_lhs["s_u"][i], ref_ds_u, atol=atol,
+            np.testing.assert_allclose(h_lhs["s_u"][i], ref_ds_u, **t,
                                        err_msg=f"ds_u problem {i}")
         if data.num_hl > 0:
-            np.testing.assert_allclose(h_lhs["z_l"][i], ref_dz_l, atol=atol,
+            np.testing.assert_allclose(h_lhs["z_l"][i], ref_dz_l, **t,
                                        err_msg=f"dz_l problem {i}")
-            np.testing.assert_allclose(h_lhs["s_l"][i], ref_ds_l, atol=atol,
+            np.testing.assert_allclose(h_lhs["s_l"][i], ref_ds_l, **t,
                                        err_msg=f"ds_l problem {i}")
         if data.num_xu > 0:
-            np.testing.assert_allclose(h_lhs["z_bu"][i], ref_dz_bu, atol=atol,
+            np.testing.assert_allclose(h_lhs["z_bu"][i], ref_dz_bu, **t,
                                        err_msg=f"dz_bu problem {i}")
-            np.testing.assert_allclose(h_lhs["s_bu"][i], ref_ds_bu, atol=atol,
+            np.testing.assert_allclose(h_lhs["s_bu"][i], ref_ds_bu, **t,
                                        err_msg=f"ds_bu problem {i}")
         if data.num_xl > 0:
-            np.testing.assert_allclose(h_lhs["z_bl"][i], ref_dz_bl, atol=atol,
+            np.testing.assert_allclose(h_lhs["z_bl"][i], ref_dz_bl, **t,
                                        err_msg=f"dz_bl problem {i}")
-            np.testing.assert_allclose(h_lhs["s_bl"][i], ref_ds_bl, atol=atol,
+            np.testing.assert_allclose(h_lhs["s_bl"][i], ref_ds_bl, **t,
                                        err_msg=f"ds_bl problem {i}")
 
 
@@ -360,28 +305,30 @@ EQ_ONLY_SIZES = [
 # Full-solve correctness tests (parametrized over size matrix)
 # ======================================================================
 
+@pytest.mark.parametrize("dtype", DTYPES)
 class TestKKTSystemFullSolve:
     """Verify the full KKTSystem pipeline against the NumPy reference, across
     a matrix of problem sizes covering both single and batched modes."""
 
     @pytest.mark.parametrize("B,n,p,m", FULL_SIZES)
-    def test_all_constraints(self, B, n, p, m):
-        _run_full_solve(B=B, n=n, p=p, m=m, seed=B * 100 + n * 10 + p + m)
+    def test_all_constraints(self, dtype, B, n, p, m):
+        _run_full_solve(B=B, n=n, p=p, m=m, dtype=dtype, seed=B * 100 + n * 10 + p + m)
 
     @pytest.mark.parametrize("B,n,p,m", NO_EQ_SIZES)
-    def test_no_equality(self, B, n, p, m):
-        _run_full_solve(B=B, n=n, p=p, m=m, seed=B * 100 + n * 10 + m + 1)
+    def test_no_equality(self, dtype, B, n, p, m):
+        _run_full_solve(B=B, n=n, p=p, m=m, dtype=dtype, seed=B * 100 + n * 10 + m + 1)
 
     @pytest.mark.parametrize("B,n,p,m", NO_INEQ_SIZES)
-    def test_no_inequality_with_box(self, B, n, p, m):
+    def test_no_inequality_with_box(self, dtype, B, n, p, m):
         """``m = 0`` -- no general inequality, but ``x_u`` / ``x_l`` are present."""
-        _run_full_solve(B=B, n=n, p=p, m=m, seed=B * 100 + n * 10 + p + 2)
+        _run_full_solve(B=B, n=n, p=p, m=m, dtype=dtype, seed=B * 100 + n * 10 + p + 2)
 
     @pytest.mark.parametrize("B,n,p,m", BOX_ONLY_SIZES)
-    def test_box_bounds_only(self, B, n, p, m):
-        _run_full_solve(B=B, n=n, p=p, m=m, seed=B * 100 + n * 10 + 3)
+    def test_box_bounds_only(self, dtype, B, n, p, m):
+        _run_full_solve(B=B, n=n, p=p, m=m, dtype=dtype, seed=B * 100 + n * 10 + 3)
 
 
+@pytest.mark.parametrize("dtype", DTYPES)
 class TestKKTSystemEqualityOnly:
     """Exercise the path where the data has no inequality of any kind
     (``num_ineq == 0``). Box bounds are deliberately suppressed; this is a
@@ -389,59 +336,43 @@ class TestKKTSystemEqualityOnly:
     via x_u/x_l."""
 
     @pytest.mark.parametrize("B,n,p", EQ_ONLY_SIZES)
-    def test_equality_only(self, B, n, p):
-        rng = np.random.default_rng(B * 100 + n * 10 + p + 4)
-        Ps = []
-        for _ in range(B):
-            M = rng.standard_normal((n, n))
-            Pi = M @ M.T + n * np.eye(n)
-            Ps.append((Pi + Pi.T) / 2)
-        data = _dense_data(
-            P=np.stack(Ps),
-            c=np.zeros((B, n)),
-            A=rng.standard_normal((B, p, n)),
-            b=np.zeros((B, p)),
-        )
-        settings = Settings()
-        kkt_sys = KKTSystem()
-        kkt_sys.init(data, settings, device_settings(settings, data))
-        pc = DenseRuizEquilibration(B, data.n, data.p, data.m, has_h_l=data.has_h_l, has_h_u=data.has_h_u, has_x_l=data.has_x_l, has_x_u=data.has_x_u)
-
-        vars = Variables(); vars.init(data)
-        vars.x = 0.0
-        vars.y = 0.0
-
-        rho = to_wp(np.full(B, 1e-4))
-        delta = to_wp(np.full(B, 1e-4))
-        kkt_sys.update_scalings_and_factor(data, pc, settings, False, rho, delta, vars)
-        assert not kkt_sys.factor_status.numpy().any()
+    def test_equality_only(self, dtype, B, n, p):
+        data = _make_data(B, n, p, 0, dtype, seed=B * 100 + n * 10 + p + 4, with_box=False)
+        rng = np.random.default_rng(B * 100 + n * 10 + p + 5)
+        settings = Settings.for_dtype(dtype)
+        # rho = delta = 1e-2 as GPU numbers, so the reference uses the same values.
+        # Smaller values make K = P + rho I + A^T A / delta ill-conditioned.
+        reg = float(rounded(1e-2, dtype))
+        kkt_sys, pc, _ = factored_kkt_system(data, settings, reg, reg)
 
         rhs = Variables(); rhs.init(data)
-        rhs_x = rng.standard_normal((B, n))
-        rhs_y = rng.standard_normal((B, p))
-        rhs.x = to_wp(rhs_x)
-        rhs.y = to_wp(rhs_y)
+        rhs_x = rounded(rng.standard_normal((B, n)), dtype)
+        rhs_y = rounded(rng.standard_normal((B, p)), dtype)
+        rhs.x = to_wp(rhs_x, dtype)
+        rhs.y = to_wp(rhs_y, dtype)
 
         lhs = Variables(); lhs.init(data)
         kkt_sys.solve(data, pc, settings, rhs, lhs)
 
-        P, A, lhs_x = data.P.numpy(), data.A.numpy(), lhs.x.numpy()
+        P, A, lhs_x = host(data.P), host(data.A), host(lhs.x)
         for i in range(B):
             Pi = P[i]
             Ai = A[i]
-            d_v, r_v = 1e-4, 1e-4
-            kkt = Pi + r_v * np.eye(n) + (1.0 / d_v) * Ai.T @ Ai
+            kkt = Pi + reg * np.eye(n) + (1.0 / reg) * Ai.T @ Ai
             rhs_cond = (rhs_x[i]
-                        + (1.0 / d_v) * Ai.T @ rhs_y[i])
+                        + (1.0 / reg) * Ai.T @ rhs_y[i])
             ref_dx = np.linalg.solve(kkt, rhs_cond)
-            np.testing.assert_allclose(lhs_x[i], ref_dx, atol=1e-8,
-                                       err_msg=f"problem {i}")
+            # The small regularization (1 / reg = 100 on A^T A) costs about
+            # two digits of the KKT_SOLVE_TOL accuracy.
+            atol, rtol = (1e-8, 1e-8) if dtype == wp.float64 else (1e-4, 1e-4)
+            np.testing.assert_allclose(lhs_x[i], ref_dx, err_msg=f"problem {i}", atol=atol, rtol=rtol)
 
 
 # ======================================================================
 # Condensed K * lhs ~= rhs sanity check
 # ======================================================================
 
+@pytest.mark.parametrize("dtype", DTYPES)
 class TestKKTSystemCondensedMatvec:
     """After ``solve``, multiplying ``lhs`` by the condensed KKT operator
     should reproduce the original ``rhs`` (within solver tolerance)."""
@@ -454,48 +385,31 @@ class TestKKTSystemCondensedMatvec:
     ]
 
     @pytest.mark.parametrize("B,n,p,m", CONDENSED_SIZES)
-    def test_K_times_lhs_recovers_rhs(self, B, n, p, m):
-        data = _make_data(B, n, p, m)
-        settings = Settings()
-        kkt_sys = KKTSystem()
-        kkt_sys.init(data, settings, device_settings(settings, data))
-        pc = DenseRuizEquilibration(B, data.n, data.p, data.m, has_h_l=data.has_h_l, has_h_u=data.has_h_u, has_x_l=data.has_x_l, has_x_u=data.has_x_u)
-
-        vars = _make_positive_vars(data)
-        rho = to_wp(np.full(B, 1.0))
-        delta = to_wp(np.full(B, 1.0))
-        kkt_sys.update_scalings_and_factor(data, pc, settings, False, rho, delta, vars)
+    def test_K_times_lhs_recovers_rhs(self, dtype, B, n, p, m):
+        data = _make_data(B, n, p, m, dtype)
+        kkt_sys, _, _ = factored_kkt_system(data)
 
         rng = np.random.default_rng(B * 100 + n * 10 + p + m)
-        rhs_x = rng.standard_normal((B, n))
-        rhs_y = rng.standard_normal((B, p))
-        rhs_z = rng.standard_normal((B, m))
-        if m > 0:
-            rhs_z *= data.active_G_row.numpy()
-        lhs_x = _zeros(B, n)
-        lhs_y = _zeros(B, p)
-        lhs_z = _zeros(B, m)
-        kkt_sys._kkt_solver.solve(data, to_wp(rhs_x), to_wp(rhs_y), to_wp(rhs_z), lhs_x, lhs_y, lhs_z)
+        rhs_x = rounded(rng.standard_normal((B, n)), dtype)
+        rhs_y = rounded(rng.standard_normal((B, p)), dtype)
+        active = host(data.active_G_row)
+        rhs_z = rounded(rng.standard_normal((B, m)), dtype) * active
+        lhs = condensed_solve(kkt_sys, data, rhs_x, rhs_y, rhs_z)
 
-        check_x = _zeros(B, n)
-        check_y = _zeros(B, p)
-        check_z = _zeros(B, m)
-        kkt_sys.mul_condensed_kkt(data, lhs_x, lhs_y, lhs_z,
-                                  check_x, check_y, check_z)
-        check_x, check_y, check_z = check_x.numpy(), check_y.numpy(), check_z.numpy()
+        check_x, check_y, check_z = zeros(dtype, B, n), zeros(dtype, B, p), zeros(dtype, B, m)
+        kkt_sys.mul_condensed_kkt(data, *lhs, check_x, check_y, check_z)
 
-        assert np.allclose(rhs_x, check_x, atol=1e-8), \
-            f"x mismatch: {float(np.max(np.abs(rhs_x - check_x))):.2e}"
-        assert np.allclose(rhs_y, check_y, atol=1e-8), \
-            f"y mismatch: {float(np.max(np.abs(rhs_y - check_y))):.2e}"
-        assert np.allclose(rhs_z, check_z, atol=1e-8), \
-            f"z mismatch: {float(np.max(np.abs(rhs_z - check_z))):.2e}"
+        t = KKT_RESIDUAL_TOL[dtype]
+        np.testing.assert_allclose(host(check_x), rhs_x, err_msg="x block", **t)
+        np.testing.assert_allclose(host(check_y), rhs_y, err_msg="y block", **t)
+        np.testing.assert_allclose(host(check_z) * active, rhs_z, err_msg="z block", **t)
 
 
 # ======================================================================
 # Forwarded matvec ops
 # ======================================================================
 
+@pytest.mark.parametrize("dtype", DTYPES)
 class TestKKTSystemMatvec:
     """Sanity check for forwarded matvec operations."""
 
@@ -506,38 +420,35 @@ class TestKKTSystemMatvec:
     ]
 
     @pytest.mark.parametrize("B,n,p,m", MATVEC_SIZES)
-    def test_eval_P_x(self, B, n, p, m):
-        data = _make_data(B=B, n=n, p=p, m=m)
-        settings = Settings()
-        kkt_sys = KKTSystem()
-        kkt_sys.init(data, settings, device_settings(settings, data))
+    def test_eval_P_x(self, dtype, B, n, p, m):
+        data = _make_data(B=B, n=n, p=p, m=m, dtype=dtype)
+        kkt_sys = kkt_system(data, Settings.for_dtype(dtype))
 
-        x = np.random.default_rng(0).standard_normal((B, n))
-        z = _zeros(B, n)
-        kkt_sys.eval_P_x(data, 1.0, to_wp(x), z)
+        x = rounded(np.random.default_rng(0).standard_normal((B, n)), dtype)
+        z = zeros(dtype, B, n)
+        kkt_sys.eval_P_x(data, 1.0, to_wp(x, dtype), z)
 
-        P, z = data.P.numpy(), z.numpy()
+        P, z = host(data.P), host(z)
         for i in range(B):
             expected = P[i] @ x[i]
-            np.testing.assert_allclose(z[i], expected, atol=1e-12)
+            np.testing.assert_allclose(z[i], expected, **MATVEC_TOL[dtype])
 
     @pytest.mark.parametrize("B,n,p,m", MATVEC_SIZES)
-    def test_eval_A_xn_and_AT_xt(self, B, n, p, m):
-        data = _make_data(B=B, n=n, p=p, m=m)
-        settings = Settings()
-        kkt_sys = KKTSystem()
-        kkt_sys.init(data, settings, device_settings(settings, data))
+    def test_eval_A_xn_and_AT_xt(self, dtype, B, n, p, m):
+        data = _make_data(B=B, n=n, p=p, m=m, dtype=dtype)
+        kkt_sys = kkt_system(data, Settings.for_dtype(dtype))
 
-        x = np.random.default_rng(1).standard_normal((B, n))
-        y = np.random.default_rng(2).standard_normal((B, p))
-        out_Ax  = _zeros(B, p)
-        out_ATy = _zeros(B, n)
+        x = rounded(np.random.default_rng(1).standard_normal((B, n)), dtype)
+        y = rounded(np.random.default_rng(2).standard_normal((B, p)), dtype)
+        out_Ax  = zeros(dtype, B, p)
+        out_ATy = zeros(dtype, B, n)
 
-        kkt_sys.eval_A_xn(data, 1.0, to_wp(x), out_Ax)
-        kkt_sys.eval_AT_xt(data, 1.0, to_wp(y), out_ATy)
+        kkt_sys.eval_A_xn(data, 1.0, to_wp(x, dtype), out_Ax)
+        kkt_sys.eval_AT_xt(data, 1.0, to_wp(y, dtype), out_ATy)
 
-        A, out_Ax, out_ATy = data.A.numpy(), out_Ax.numpy(), out_ATy.numpy()
+        A, out_Ax, out_ATy = host(data.A), host(out_Ax), host(out_ATy)
+        t = MATVEC_TOL[dtype]
         for i in range(B):
             Ai = A[i]
-            np.testing.assert_allclose(out_Ax[i],  Ai @ x[i], atol=1e-12)
-            np.testing.assert_allclose(out_ATy[i], Ai.T @ y[i], atol=1e-12)
+            np.testing.assert_allclose(out_Ax[i],  Ai @ x[i], **t)
+            np.testing.assert_allclose(out_ATy[i], Ai.T @ y[i], **t)

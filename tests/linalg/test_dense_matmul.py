@@ -10,9 +10,9 @@ from cupiqp.dense.dense_matmul import (
     DenseGemv,
     DenseSyrk,
 )
-from tests.helpers import to_wp
+from tests.helpers import DTYPES, to_wp
+from tests.tolerances import MATMUL_TOL
 
-DTYPES = [(wp.float64, np.float64, 1e-12), (wp.float32, np.float32, 1e-4)]
 # (rows, cols): small enough for the Warp kernels, and large enough for cuBLAS.
 SHAPES = {
     "warp": (WARP_MATMUL_MAX_ROWS // 2, WARP_MATMUL_MAX_COLS // 2),
@@ -21,27 +21,29 @@ SHAPES = {
 }
 
 
-@pytest.mark.parametrize("wp_dtype,np_dtype,tol", DTYPES)
+@pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("shape", sorted(SHAPES))
-@pytest.mark.parametrize("B", [1, 3])
+@pytest.mark.parametrize("B", [1, 16])
 @pytest.mark.parametrize("transpose", [False, True])
-def test_gemv(wp_dtype, np_dtype, tol, shape, B, transpose):
+def test_gemv(dtype, shape, B, transpose):
     rows, cols = SHAPES[shape]
+    np_dtype = wp.dtype_to_numpy(dtype)
     rng = np.random.default_rng(0)
     M = rng.standard_normal((B, rows, cols)).astype(np_dtype)
     k_in, k_out = (rows, cols) if transpose else (cols, rows)
     x = rng.standard_normal((B, k_in)).astype(np_dtype)
     alpha = -0.5
-    gemv = DenseGemv(B, rows, cols, wp_dtype, CublasHandle())
-    z = wp.full((B, k_out), 7.0, dtype=wp_dtype, device="cuda")     # overwritten
-    gemv(to_wp(M, wp_dtype), to_wp(x, wp_dtype), z, transpose=transpose, alpha=alpha)
+    gemv = DenseGemv(B, rows, cols, dtype, CublasHandle())
+    z = wp.full((B, k_out), 7.0, dtype=dtype, device="cuda")     # overwritten
+    gemv(to_wp(M, dtype), to_wp(x, dtype), z, transpose=transpose, alpha=alpha)
     op = np.swapaxes(M, 1, 2) if transpose else M
+    t = MATMUL_TOL[dtype]
     np.testing.assert_allclose(z.numpy(), alpha * np.einsum("bij,bj->bi", op, x),
-                               rtol=tol, atol=tol * max(1, k_in))
+                               rtol=t["rtol"], atol=t["atol"] * max(1, k_in))
 
 
 @pytest.mark.parametrize("shape", ["warp", "cublas"])
-@pytest.mark.parametrize("B", [1, 3])
+@pytest.mark.parametrize("B", [1, 16])
 def test_gemv_row_strided_vectors(shape, B):
     """x and z may be column slices of wider arrays, as in the KKT solver."""
     rows, cols = SHAPES[shape]
@@ -57,19 +59,21 @@ def test_gemv_row_strided_vectors(shape, B):
     assert not out[:, 0].any() and not out[:, 1 + rows:].any()       # outside the slice untouched
 
 
-@pytest.mark.parametrize("wp_dtype,np_dtype,tol", DTYPES)
+@pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("shape", sorted(SHAPES))
-@pytest.mark.parametrize("B", [1, 3])
+@pytest.mark.parametrize("B", [1, 16])
 @pytest.mark.parametrize("accumulate", [False, True])
-def test_syrk_upper_triangle(wp_dtype, np_dtype, tol, shape, B, accumulate):
+def test_syrk_upper_triangle(dtype, shape, B, accumulate):
     rows, cols = SHAPES[shape]
+    np_dtype = wp.dtype_to_numpy(dtype)
     rng = np.random.default_rng(2)
     A = rng.standard_normal((B, rows, cols)).astype(np_dtype)
     C0 = rng.standard_normal((B, cols, cols)).astype(np_dtype)
-    C = to_wp(C0, wp_dtype)
-    DenseSyrk(B, rows, cols, wp_dtype, CublasHandle())(to_wp(A, wp_dtype), C, accumulate=accumulate)
+    C = to_wp(C0, dtype)
+    DenseSyrk(B, rows, cols, dtype, CublasHandle())(to_wp(A, dtype), C, accumulate=accumulate)
     expected = np.einsum("bki,bkj->bij", A, A) + (C0 if accumulate else 0.0)
     upper = np.triu(np.ones((cols, cols), dtype=bool))
+    t = MATMUL_TOL[dtype]
     np.testing.assert_allclose(C.numpy()[:, upper], expected[:, upper],
-                               rtol=tol, atol=tol * max(1, rows))
+                               rtol=t["rtol"], atol=t["atol"] * max(1, rows))
 

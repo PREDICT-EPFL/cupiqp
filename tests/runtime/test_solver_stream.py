@@ -11,7 +11,7 @@ import pytest
 import warp as wp
 
 from cupiqp import DenseSolver, MultistageSolver, SparseSolver, Status
-from tests.helpers import broadcast, csr_triple, to_wp, to_wp_dict
+from tests.helpers import assert_all_solved, broadcast, csr_triple, quiet, to_wp, to_wp_dict
 
 
 def _box_qp_host():
@@ -36,8 +36,7 @@ def _busy_copy(src: wp.array(dtype=wp.float64),
 
 
 def _reference_x():
-    ref = DenseSolver()
-    ref.settings.verbose = False
+    ref = quiet(DenseSolver())
     ref.setup(**_box_qp())
     ref.solve()
     return ref.result.x.numpy()
@@ -54,8 +53,7 @@ def test_borrowed_warp_stream_is_used_and_not_destroyed():
     user = wp.Stream("cuda:0")
     solver = DenseSolver(stream=user)
     assert solver.stream is user
-    solver.settings.verbose = False
-    solver.setup(**_box_qp())
+    quiet(solver).setup(**_box_qp())
     solver.solve()
     assert solver.result.info.to_host().status == [Status.CUPIQP_SOLVED]
     del solver
@@ -78,8 +76,7 @@ def test_only_warp_streams_are_accepted():
 
 def test_current_stream_is_restored_after_return_and_exception():
     before = wp.get_stream("cuda")
-    solver = DenseSolver()
-    solver.settings.verbose = False
+    solver = quiet(DenseSolver())
     solver.setup(**_box_qp())
     assert wp.get_stream("cuda") is before
     solver.solve()
@@ -100,8 +97,7 @@ def test_work_on_a_user_warp_stream_is_ordered_with_the_solver():
         c = wp.empty_like(qp["c"])               # c depends on the busy work
         wp.launch(_busy_copy, dim=3, inputs=[qp["c"], wp.int32(20_000_000)], outputs=[c])
     qp["c"] = c
-    s = DenseSolver(stream=user)
-    s.settings.verbose = False
+    s = quiet(DenseSolver(stream=user))
     s.setup(**qp)
     s.solve()
     assert s.result.info.to_host().status == [Status.CUPIQP_SOLVED]
@@ -127,8 +123,7 @@ def test_results_agree_with_default_stream_solve():
     with stream:
         qp = {k: cp.asarray(v) for k, v in _box_qp_host().items()}   # inputs on another blocking stream
     stream.synchronize()                                  # caller completes its stream first
-    s = DenseSolver()
-    s.settings.verbose = False
+    s = quiet(DenseSolver())
     s.setup(**qp)
     s.solve()
     np.testing.assert_allclose(s.result.x.numpy(), x_ref, atol=1e-10)
@@ -137,15 +132,13 @@ def test_results_agree_with_default_stream_solve():
 def test_repeated_graph_replay_and_destruction():
     """Captured graphs are replayed on the solver stream across solves and the
     solver (graphs, handles, stream) can be destroyed afterwards."""
-    s = DenseSolver()
-    s.settings.verbose = False
-    s.settings.enable_cuda_graph = True
+    s = quiet(DenseSolver(), enable_cuda_graph=True)
     qp = _box_qp()
     s.setup(**{**qp, "c": broadcast(qp["c"], 4)})               # four equal problems
     x_ref = _reference_x()
     for _ in range(3):
         s.solve()
-        assert all(st == Status.CUPIQP_SOLVED for st in s.result.info.to_host().status)
+        assert_all_solved(s)
         np.testing.assert_allclose(s.result.x.numpy()[0], x_ref[0], atol=1e-10)
     del s
     gc.collect()
@@ -153,20 +146,18 @@ def test_repeated_graph_replay_and_destruction():
 
 def test_all_backends_run_on_their_stream():
     n = 4
-    sp_ = SparseSolver()
-    sp_.settings.verbose = False
+    sp_ = quiet(SparseSolver())
     sp_.setup(P=csr_triple(np.eye(n)), c=to_wp(np.ones((2, n))), x_l=to_wp(-np.ones(n)),
               x_u=to_wp(np.ones(n)))
     sp_.solve()
-    assert all(st == Status.CUPIQP_SOLVED for st in sp_.result.info.to_host().status)
+    assert_all_solved(sp_)
 
     N, d = 3, 2
-    ms = MultistageSolver()
-    ms.settings.verbose = False
+    ms = quiet(MultistageSolver())
     ms.setup(P=(to_wp(np.broadcast_to(2.0 * np.eye(d), (N, d, d))), None), c=to_wp(np.ones((2, N, d))),
              x_l=to_wp(-np.ones((N, d))), x_u=to_wp(np.ones((N, d))))
     ms.solve()
-    assert all(st == Status.CUPIQP_SOLVED for st in ms.result.info.to_host().status)
+    assert_all_solved(ms)
 
     for s in (sp_, ms):
         assert s.stream.cuda_stream != 0
@@ -177,9 +168,8 @@ def test_all_backends_run_on_their_stream():
 
 def test_multistage_on_user_warp_stream():
     N, d = 3, 2
-    ms = MultistageSolver(stream=wp.Stream("cuda:0"))
-    ms.settings.verbose = False
+    ms = quiet(MultistageSolver(stream=wp.Stream("cuda:0")))
     ms.setup(P=(to_wp(np.broadcast_to(2.0 * np.eye(d), (N, d, d))), None), c=to_wp(np.ones((2, N, d))),
              x_l=to_wp(-np.ones((N, d))), x_u=to_wp(np.ones((N, d))))
     ms.solve()
-    assert all(st == Status.CUPIQP_SOLVED for st in ms.result.info.to_host().status)
+    assert_all_solved(ms)

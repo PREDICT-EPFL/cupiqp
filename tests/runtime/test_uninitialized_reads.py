@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 
 from cupiqp import DenseSolver, MultistageSolver, SparseSolver
-from tests.helpers import all_solved, broadcast, csr_triple, quiet, to_wp
+from tests.helpers import assert_all_solved, broadcast, csr_triple, quiet, to_wp
 
 pytestmark = pytest.mark.usefixtures("poison_uninitialized_memory")
 
@@ -27,10 +27,10 @@ def test_dense_solves_under_poison(enable_cuda_graph):
             G=to_wp(np.eye(n)), h_l=to_wp(-np.ones(n)), h_u=to_wp(np.ones(n)),
             x_l=to_wp(-2 * np.ones(n)), x_u=to_wp(2 * np.ones(n)))
     s.solve()
-    assert all_solved(s.result.info.to_host().status)
+    assert_all_solved(s)
     s.update(c=to_wp(np.array([[0.3, -0.2, 0.1], [1.0, 1.0, -1.0]])))
     s.solve()
-    assert all_solved(s.result.info.to_host().status)
+    assert_all_solved(s)
 
 
 def test_dense_backward_under_poison():
@@ -41,7 +41,7 @@ def test_dense_backward_under_poison():
     s.setup(P=to_wp(np.eye(n)), c=to_wp(np.array([-1.0, 2.0, 0.5])),
             x_l=to_wp(-np.ones(n)), x_u=to_wp(np.ones(n)))
     s.solve()
-    assert all_solved(s.result.info.to_host().status)
+    assert_all_solved(s)
     grads = s.backward(grad_x=to_wp(np.ones((1, n))))
     assert bool(np.isfinite(grads.c.numpy()).all())
 
@@ -55,10 +55,10 @@ def test_sparse_solves_under_poison():
     s.setup(P=P, c=broadcast(to_wp(np.arange(n, dtype=np.float64) - 1.5), 2),
             G=G, h_l=to_wp(-np.ones(n)), h_u=to_wp(np.ones(n)))
     s.solve()
-    assert all_solved(s.result.info.to_host().status)
+    assert_all_solved(s)
     s.update(P=to_wp(2.0 * np.ones((2, P[2].shape[0]))), c=to_wp(np.ones((2, n))))
     s.solve()
-    assert all_solved(s.result.info.to_host().status)
+    assert_all_solved(s)
 
 
 @pytest.mark.parametrize("enable_cuda_graph", [False, True])
@@ -73,7 +73,7 @@ def test_multistage_solves_under_poison(enable_cuda_graph):
     s.setup(P=(P_diag, P_off), c=to_wp(np.ones((2, N, d))), A=(A_diag, A_off),
             b=to_wp(np.zeros((N + 1, d))), x_l=to_wp(-np.ones((N, d))), x_u=to_wp(np.ones((N, d))))
     s.solve()
-    assert all_solved(s.result.info.to_host().status)
+    assert_all_solved(s)
     s.update(P=(None, to_wp(np.broadcast_to(-0.1 * np.eye(d), (2, N - 1, d, d)))))
     s.solve()
-    assert all_solved(s.result.info.to_host().status)
+    assert_all_solved(s)

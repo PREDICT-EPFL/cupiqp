@@ -8,12 +8,7 @@ from cupiqp import DenseSolver, Status
 from cupiqp.multistage.ocp_solver import OcpSolver
 from cupiqp.multistage.ocp_data import OcpData
 from cupiqp.settings import Settings
-from tests.helpers import to_wp
-
-
-def _solved(status):
-    """solve() returns a per-problem list of Status; True iff all converged."""
-    return all(st == Status.CUPIQP_SOLVED for st in status)
+from tests.helpers import all_solved, assert_all_solved, quiet, to_wp
 
 
 @pytest.fixture(autouse=True)
@@ -97,10 +92,7 @@ def _solve_dense(N, nx, nu, Qs, Rs, Ss, qs, rs, As, Bs, Es, bs, x0,
         xl = np.asarray(xl_stage, float).reshape(n)
         xu = np.asarray(xu_stage, float).reshape(n)
 
-    s = DenseSolver()
-    s.settings.eps_abs = 1e-9
-    s.settings.eps_rel = 1e-10
-    s.settings.verbose = False
+    s = quiet(DenseSolver(), eps_abs=1e-9, eps_rel=1e-10)
     kw = dict(P=to_wp(P), c=to_wp(c),
               A=to_wp(Aeq), b=to_wp(beq),
               x_l=to_wp(xl), x_u=to_wp(xu))
@@ -154,7 +146,7 @@ def test_idxbx_state_box():
         s.set("lbx", k, to_wp([-vmax]))
         s.set("ubx", k, to_wp([vmax]))
     s.solve()
-    assert _solved(s.result.info.to_host().status)
+    assert_all_solved(s)
 
     x = s.x_traj.numpy()[0]
     np.testing.assert_allclose(x[0], x0, atol=1e-7)
@@ -198,7 +190,7 @@ def test_matches_dense_box_constrained():
         s.set("ubu", k, to_wp([umax]))
     s.solve()
     status = s.result.info.to_host().status
-    assert _solved(status)
+    assert all_solved(status)
 
     x = s.x_traj.numpy()[0]
     u = s.u_traj.numpy()[0]
@@ -226,7 +218,7 @@ def test_descriptor_E():
     _fill_ocp(s, N, nx, nu, [Q] * N, [R] * N, [A] * N, [B] * N, x0,
               Es=[E] * N, Qf=Qf)
     s.solve()
-    assert _solved(s.result.info.to_host().status)
+    assert_all_solved(s)
     x = s.x_traj.numpy()[0]
     u = s.u_traj.numpy()[0]
 
@@ -243,7 +235,7 @@ def test_descriptor_E():
     _fill_ocp(s2, N, nx, nu, [Q] * N, [R] * N, [Einv @ A] * N, [Einv @ B] * N,
               x0, Qf=Qf)
     s2.solve()
-    assert _solved(s2.result.info.to_host().status)
+    assert_all_solved(s2)
     np.testing.assert_allclose(x, s2.x_traj.numpy()[0], atol=1e-5)
     np.testing.assert_allclose(u, s2.u_traj.numpy()[0], atol=1e-5)
 
@@ -286,7 +278,7 @@ def test_general_inequality():
     s.set("lg", N, to_wp([-vmax]))
     s.set("ug", N, to_wp([vmax]))
     s.solve()
-    assert _solved(s.result.info.to_host().status)
+    assert_all_solved(s)
 
     x = s.x_traj.numpy()[0]
     u = s.u_traj.numpy()[0]
@@ -319,7 +311,7 @@ def test_batched_per_x0():
     statuses = s.result.info.to_host().status
 
     assert isinstance(statuses, list) and len(statuses) == Bsz
-    assert all(st == Status.CUPIQP_SOLVED for st in statuses)
+    assert all_solved(statuses)
     x0_got = s.get("x", 0).numpy()
     np.testing.assert_allclose(x0_got, x0s, atol=1e-6)
 
@@ -359,7 +351,7 @@ def test_mpc_loop_update_only():
     for _ in range(25):
         s.set("x0", 0, to_wp(x))            # only the initial condition changes
         s.solve()
-        assert _solved(s.result.info.to_host().status)
+        assert_all_solved(s)
         u0 = float(s.get("u", 0).numpy()[0, 0])
         assert -umax - 1e-6 <= u0 <= umax + 1e-6
         x = A @ x + (B @ np.array([u0]))
@@ -394,13 +386,13 @@ def test_matrix_update_between_solves():
     s.setup(N=N, nx=nx, nu=nu)
     _fill_ocp(s, N, nx, nu, [Q] * N, [R_cheap] * N, [A] * N, [B] * N, x0, Qf=Qf)
     s.solve()
-    assert _solved(s.result.info.to_host().status)
+    assert_all_solved(s)
     u_cheap = s.u_traj.numpy()[0]
 
     for k in range(N):
         s.set("R", k, to_wp(R_pricey))        # heavier input penalty (flags the P block)
     s.solve()
-    assert _solved(s.result.info.to_host().status)
+    assert_all_solved(s)
     u_pricey = s.u_traj.numpy()[0]
 
     # a much larger input penalty shrinks the control effort
@@ -476,7 +468,7 @@ def test_set_invalidates_solution():
     s.setup(N=N, nx=nx, nu=nu)
     _fill_ocp(s, N, nx, nu, [Q] * N, [R] * N, [A] * N, [B] * N, np.array([1.0, 0.0]))
     s.solve()
-    assert _solved(s.result.info.to_host().status)
+    assert_all_solved(s)
     x_old = s.x_traj.numpy().copy()
 
     # a rejected write changes nothing: the solution stays readable
@@ -492,5 +484,5 @@ def test_set_invalidates_solution():
         s.get("u", 0)
 
     s.solve()
-    assert _solved(s.result.info.to_host().status)
+    assert_all_solved(s)
     assert not np.allclose(s.x_traj.numpy(), x_old)

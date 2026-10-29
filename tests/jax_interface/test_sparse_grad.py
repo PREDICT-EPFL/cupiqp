@@ -2,36 +2,22 @@
 differences for the stored values and the vectors, shared values summed over
 the batch, and jit / vmap of the gradient."""
 
-import os
-
 import numpy as np
 import pytest
 import scipy.sparse as sp
 
-os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
-
-jax = pytest.importorskip("jax")
-import jax.numpy as jnp
-
-jax.config.update("jax_enable_x64", True)
+# Configures JAX: must come before any import of JAX.
+from tests.jax_interface.jax_helpers import DATA_FIELDS, directional_fd, jax, jnp, patterns, requires_gpu, values
 
 from cupiqp import Status
 from cupiqp.jax import SparseSolver
+from tests.helpers import random_sparse_qp, tight
 
-from tests.jax_interface.test_sparse_solve import patterns, sparse_qp, values
-
-pytestmark = pytest.mark.skipif(
-    not any(d.platform == "gpu" for d in jax.devices()), reason="a CUDA JAX device is required"
-)
-
-DATA_FIELDS = ("P", "c", "A", "b", "G", "h_u", "h_l", "x_u", "x_l")
+pytestmark = requires_gpu
 
 
 def tight_solver(qp) -> SparseSolver:
-    solver = SparseSolver(**patterns(qp))
-    solver.settings.eps_abs = 1e-11
-    solver.settings.eps_rel = 1e-11
-    return solver
+    return tight(SparseSolver(**patterns(qp)))
 
 
 def symmetric_values(M: sp.csr_matrix, direction: np.ndarray) -> np.ndarray:
@@ -43,15 +29,9 @@ def symmetric_values(M: sp.csr_matrix, direction: np.ndarray) -> np.ndarray:
     return S.data
 
 
-def directional_fd(f, args: dict, name: str, direction: np.ndarray, eps=1e-6) -> float:
-    plus = dict(args, **{name: args[name] + eps * direction})
-    minus = dict(args, **{name: args[name] - eps * direction})
-    return (float(f(**plus)) - float(f(**minus))) / (2 * eps)
-
-
 @pytest.mark.parametrize("name", DATA_FIELDS)
 def test_gradient_wrt_each_input(name):
-    qp = sparse_qp(0)
+    qp = random_sparse_qp(0)
     solver = tight_solver(qp)
     args = values(qp)
     rng = np.random.default_rng(1)
@@ -73,7 +53,7 @@ def test_gradient_wrt_each_input(name):
 
 
 def test_shared_values_gradient_is_the_batch_sum_and_vmap_of_grad():
-    qp = sparse_qp(2)
+    qp = random_sparse_qp(2)
     solver = tight_solver(qp)
     args = values(qp)
     cs = jnp.stack([args["c"] * (1.0 + 0.3 * i) for i in range(3)])

@@ -2,33 +2,17 @@
 differences for every block array and vector, block and flat vector layouts,
 and jit / vmap of the gradient."""
 
-import os
-
 import numpy as np
 import pytest
 
-os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
-
-jax = pytest.importorskip("jax")
-import jax.numpy as jnp
-
-jax.config.update("jax_enable_x64", True)
+# Configures JAX: must come before any import of JAX.
+from tests.jax_interface.jax_helpers import directional_fd, jax, jnp, requires_gpu, to_jax
 
 from cupiqp import Status
 from cupiqp.jax import MultistageSolver
+from tests.helpers import random_multistage_qp, tight
 
-from tests.jax_interface.test_multistage_solve import problem, to_jax
-
-pytestmark = pytest.mark.skipif(
-    not any(d.platform == "gpu" for d in jax.devices()), reason="a CUDA JAX device is required"
-)
-
-
-def tight_solver() -> MultistageSolver:
-    solver = MultistageSolver()
-    solver.settings.eps_abs = 1e-11
-    solver.settings.eps_rel = 1e-11
-    return solver
+pytestmark = requires_gpu
 
 
 def flatten_args(qp: dict) -> dict:
@@ -56,19 +40,13 @@ def call_args(flat: dict) -> dict:
     return args
 
 
-def directional_fd(f, flat: dict, name: str, direction: np.ndarray, eps=1e-6) -> float:
-    plus = dict(flat, **{name: flat[name] + eps * direction})
-    minus = dict(flat, **{name: flat[name] - eps * direction})
-    return (float(f(**call_args(plus))) - float(f(**call_args(minus)))) / (2 * eps)
-
-
 FLAT_FIELDS = ("P_diag", "P_offdiag", "c", "A_diag", "A_offdiag", "b", "G_diag", "h_u", "h_l", "x_u", "x_l")
 
 
 @pytest.mark.parametrize("name", FLAT_FIELDS)
 def test_gradient_wrt_each_input(name):
-    qp = problem(seed=3, has_G_E=False)
-    solver = tight_solver()
+    qp = random_multistage_qp(3, has_G_E=False)
+    solver = tight(MultistageSolver())
     flat = flatten_args(to_jax(qp))
     rng = np.random.default_rng(4)
     weights = {f: float(rng.standard_normal()) for f in ("x", "y", "z_l", "z_u", "z_bl", "z_bu")}
@@ -83,7 +61,7 @@ def test_gradient_wrt_each_input(name):
         direction = 0.5 * (direction + np.swapaxes(direction, -1, -2))
     grad = jax.grad(lambda v: loss(**call_args(dict(flat, **{name: v}))))(flat[name])
     assert grad.shape == flat[name].shape
-    numeric = directional_fd(loss, flat, name, direction)
+    numeric = directional_fd(lambda **kw: loss(**call_args(kw)), flat, name, direction)
     scale = abs(float(loss(**call_args(flat))))
     # The loss includes the equality multipliers y. The core differentiates
     # the regularized KKT system, so its gradient of y is off by about 1e-5
@@ -95,8 +73,8 @@ def test_gradient_wrt_each_input(name):
 
 
 def test_flat_and_block_vector_gradients_agree():
-    qp = to_jax(problem(seed=5))
-    solver = tight_solver()
+    qp = to_jax(random_multistage_qp(5))
+    solver = tight(MultistageSolver())
     loss = lambda c: jnp.sum(solver.solve(**dict(qp, c=c)).x ** 2)
     g_block = jax.grad(loss)(qp["c"])
     g_flat = jax.grad(loss)(qp["c"].reshape(-1))
@@ -105,8 +83,8 @@ def test_flat_and_block_vector_gradients_agree():
 
 
 def test_jit_vmap_of_grad():
-    qp = to_jax(problem(seed=6))
-    solver = tight_solver()
+    qp = to_jax(random_multistage_qp(6))
+    solver = tight(MultistageSolver())
     loss = lambda c: jnp.sum(solver.solve(**dict(qp, c=c)).x ** 2)
     cs = jnp.stack([qp["c"] * (1.0 + 0.2 * i) for i in range(3)])
     expected = np.stack([np.asarray(jax.grad(loss)(cs[i])) for i in range(3)])

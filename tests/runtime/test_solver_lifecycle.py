@@ -13,8 +13,8 @@ import numpy as np
 import pytest
 import warp as wp
 
-from cupiqp import DenseSolver, MultistageSolver, SparseSolver, Status
-from tests.helpers import csr_triple, to_wp, to_wp_dict
+from cupiqp import DenseSolver, MultistageSolver, SparseSolver
+from tests.helpers import all_solved, assert_all_solved, csr_triple, statuses, to_wp, to_wp_dict
 
 
 def _dense_qp(n, p, m, B, seed=0):
@@ -52,10 +52,6 @@ def _multistage_solver(N=3, d=2, r=2):
     return s
 
 
-def _all_solved(solver):
-    return bool(np.all(solver.result.info.status.numpy() == Status.CUPIQP_SOLVED.value))
-
-
 CASES = {
     "dense_small_batched": lambda: _dense_solver(6, 2, 4, 4),     # Warp matrix products
     "dense_large_batched": lambda: _dense_solver(40, 10, 40, 4),  # cuBLAS matrix products
@@ -85,7 +81,7 @@ def test_dropped_solver_is_freed_by_reference_counting(case):
         solver = CASES[case]()
         solver.solve()
         wp.synchronize()
-        assert _all_solved(solver)
+        assert_all_solved(solver)
         ref = weakref.ref(solver)
         del solver
         assert ref() is None, "a reference cycle keeps the dropped solver alive"
@@ -104,7 +100,7 @@ def test_frequent_garbage_collection_during_capture():
             for case in sorted(CASES):
                 solver = CASES[case]()
                 solver.solve()
-                assert _all_solved(solver), case
+                assert all_solved(statuses(solver)), case
                 del solver
         wp.synchronize()
     finally:
