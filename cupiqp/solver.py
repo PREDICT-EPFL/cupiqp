@@ -20,7 +20,6 @@ from .solver_kernels import (
     create_update_vars_after_corrector_step_kernel,
     create_boundary_shift_kernel,
     create_calculate_step_kernel,
-    create_calculate_sigma_kernel,
     create_calculate_mu_kernel,
     create_update_residuals_r_kernel,
     create_prepare_zu_minus_zl_and_zbu_minus_zbl_kernel,
@@ -1061,7 +1060,6 @@ class SolverBase(ABC):
             self._update_vars_after_corrector_step_kernel = create_update_vars_after_corrector_step_kernel(
                 n=d.n, p=d.p, num_ineq=d.num_ineq, dtype=dtype)
             self._init_guess_center_kernel = create_init_guess_center_kernel(dtype)
-            self._calculate_sigma_kernel = create_calculate_sigma_kernel(dtype)
             self._calculate_step_kernel = create_calculate_step_kernel(dtype)
             self._calculate_mu_kernel = create_calculate_mu_kernel(dtype)
             self._update_rho_delta_with_ineq_kernel = create_update_rho_delta_with_ineq_kernel(dtype)
@@ -1104,7 +1102,7 @@ class SolverBase(ABC):
         }
         if d.num_ineq > 0:
             for kernel in (self._init_guess_center_kernel, self._calculate_step_kernel,
-                           self._calculate_mu_kernel, self._calculate_sigma_kernel):
+                           self._calculate_mu_kernel, self._prepare_corrector_step_kernel):
                 block_dims[kernel] = reduction_block_dim(d.num_ineq)
         if self.settings.enable_grad and self.settings.gradient_smoothing:
             block_dims[self._update_smoothing_residual_nr_kernel] = reduction_block_dim(max(d.n, d.p, d.m))
@@ -1167,23 +1165,23 @@ class SolverBase(ABC):
 
         self._kkt_system.solve(self._data, self._preconditioner, self.settings, self._res, self._step)
 
-        # step in the non-negative orthant
-        self._calculate_step()
-
-        # ------------------ compute centering parameter sigma ------------------
-        self._calculate_sigma()
-
         # ------------------ corrector step ------------------
+        # one fused kernel: step in the non-negative orthant (calculate_step),
+        # centering parameter sigma (calculate_sigma), then
         # res.s += -step.s * step.z + sigma * mu   (on finite-bound entries)
-        wp.launch(
+        info = self._result.info
+        wp.launch_tiled(
             kernel=self._prepare_corrector_step_kernel,
-            dim=(self._data.batch_size, self._data.num_ineq),
+            dim=[self._data.batch_size],
             inputs=[
+                self._result.s_all, self._result.z_all,
                 self._step.s_all, self._step.z_all,
-                self._result.info.sigma, self._result.info.mu,
-                self._data.finite_mask_all,
+                self._data.finite_mask_all, self._data.num_finite_bounds,
+                info.mu, self._device_settings.floats,
+                info.primal_step, info.dual_step, info.sigma,
                 self._res.s_all,
             ],
+            block_dim=reduction_block_dim(self._data.num_ineq),
             device=self._device
         )
 
@@ -1244,24 +1242,6 @@ class SolverBase(ABC):
                 self._result.s_all, self._result.z_all,
                 self._data.finite_mask_all, self._data.num_finite_bounds,
                 self._result.info.mu,
-            ],
-            block_dim=reduction_block_dim(self._data.num_ineq),
-            device=self._device
-        )
-
-    @nvtx.annotate("Solver::_calculate_sigma")
-    def _calculate_sigma(self) -> None:
-        """Calculate sigma (the centering parameter)."""
-        wp.launch_tiled(
-            kernel=self._calculate_sigma_kernel,
-            dim=[self._data.batch_size],
-            inputs=[
-                self._result.s_all, self._result.z_all,
-                self._step.s_all, self._step.z_all,
-                self._data.finite_mask_all, self._data.num_finite_bounds,
-                self._result.info.primal_step, self._result.info.dual_step,
-                self._result.info.mu,
-                self._result.info.sigma,
             ],
             block_dim=reduction_block_dim(self._data.num_ineq),
             device=self._device

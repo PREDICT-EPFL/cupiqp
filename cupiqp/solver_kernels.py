@@ -43,6 +43,93 @@ def step_candidate_masked(a: Any, b: Any, mask: Any):
     return wp.where(mask > type(mask)(0.5), step_candidate(a, b), type(a)(1.0))
 
 
+@wp.func
+def calculate_step(
+    s_all:           wp.array2d(dtype=Any),  # type: ignore  (B, num_ineq) slacks
+    z_all:           wp.array2d(dtype=Any),  # type: ignore  (B, num_ineq) duals
+    finite_mask_all: wp.array2d(dtype=Any),  # type: ignore  (B, num_ineq) 1 on finite bounds
+    step_s_all:      wp.array2d(dtype=Any),  # type: ignore  (B, num_ineq) slack direction
+    step_z_all:      wp.array2d(dtype=Any),  # type: ignore  (B, num_ineq) dual direction
+    tau:             Any,                    # fraction to the boundary
+    b:               int,
+    i:               int,
+):
+    """Primal and dual step lengths ``(alpha_s, alpha_z)`` of problem ``b``, 
+        over finite-bound entries only::
+
+        alpha_s = tau * min( 1, min_i( ds_i < 0 ? -s_i / ds_i : 1 ) )
+        alpha_z = tau * min( 1, min_i( dz_i < 0 ? -z_i / dz_i : 1 ) )
+    """
+    min_s = s_all.dtype(1.0)
+    min_z = s_all.dtype(1.0)
+    for k in range(i, s_all.shape[1], wp.block_dim()):
+        mask = finite_mask_all[b, k]
+        min_s = wp.min(min_s, step_candidate_masked(step_s_all[b, k], s_all[b, k], mask))
+        min_z = wp.min(min_z, step_candidate_masked(step_z_all[b, k], z_all[b, k], mask))
+    red_s = wp.tile_min(wp.tile(min_s))
+    red_z = wp.tile_min(wp.tile(min_z))
+    return red_s[0] * tau, red_z[0] * tau
+
+
+@wp.func
+def calculate_mu(
+    s_all:             wp.array2d(dtype=Any),  # type: ignore  (B, num_ineq) slacks
+    z_all:             wp.array2d(dtype=Any),  # type: ignore  (B, num_ineq) duals
+    finite_mask_all:   wp.array2d(dtype=Any),  # type: ignore  (B, num_ineq) 1 on finite bounds
+    num_finite_bounds: wp.array(dtype=Any),    # type: ignore  (B,)
+    b:                 int,
+    i:                 int,
+):
+    """Duality measure of problem ``b`` (PIQP ``calculate_mu``)::
+
+        mu = sum_i( mask_i * s_i * z_i ) / num_finite_bounds
+
+    or 0 when the problem has no finite bound.
+    """
+    acc = s_all.dtype(0.0)
+    for k in range(i, s_all.shape[1], wp.block_dim()):
+        acc += s_all[b, k] * z_all[b, k] * finite_mask_all[b, k]
+    total = wp.tile_sum(wp.tile(acc))
+    mu = s_all.dtype(0.0)
+    if num_finite_bounds[b] > s_all.dtype(0.0):
+        mu = total[0] / num_finite_bounds[b]
+    return mu
+
+
+@wp.func
+def calculate_sigma(
+    s_all:             wp.array2d(dtype=Any),  # type: ignore  (B, num_ineq) slacks
+    z_all:             wp.array2d(dtype=Any),  # type: ignore  (B, num_ineq) duals
+    step_s_all:        wp.array2d(dtype=Any),  # type: ignore  (B, num_ineq) affine slack direction
+    step_z_all:        wp.array2d(dtype=Any),  # type: ignore  (B, num_ineq) affine dual direction
+    finite_mask_all:   wp.array2d(dtype=Any),  # type: ignore  (B, num_ineq) 1 on finite bounds
+    num_finite_bounds: wp.array(dtype=Any),    # type: ignore  (B,)
+    alpha_s:           Any,                    # affine primal step length
+    alpha_z:           Any,                    # affine dual step length
+    mu:                Any,                    # duality measure before the step
+    b:                 int,
+    i:                 int,
+):
+    """Centering parameter of problem ``b`` (PIQP ``sigma``), from the duality
+    measure after the affine step::
+
+        mu_aff = sum_i( mask_i * (s_i + alpha_s ds_i) * (z_i + alpha_z dz_i) ) / num_finite_bounds
+        sigma  = clip( mu_aff / mu, 0, 1 ) ** 3
+
+    or 0 when ``mu * num_finite_bounds`` is not positive.
+    """
+    acc = s_all.dtype(0.0)
+    for k in range(i, s_all.shape[1], wp.block_dim()):
+        acc += (s_all[b, k] + alpha_s * step_s_all[b, k]) * (z_all[b, k] + alpha_z * step_z_all[b, k]) * finite_mask_all[b, k]
+    total = wp.tile_sum(wp.tile(acc))
+    sigma = s_all.dtype(0.0)
+    denominator = mu * num_finite_bounds[b]
+    if denominator > s_all.dtype(0.0):
+        val = wp.clamp(total[0] / denominator, s_all.dtype(0.0), s_all.dtype(1.0))
+        sigma = val * val * val
+    return sigma
+
+
 @functools.lru_cache(maxsize=None)
 def create_calculate_step_kernel(dtype=wp.float64):
     """Fused block-reduction kernel for step lengths (primal and dual).
@@ -74,19 +161,11 @@ def create_calculate_step_kernel(dtype=wp.float64):
         alpha_z: wp.array(dtype=dtype),        # (B,) output    # type: ignore
     ):
         b, i = wp.tid()
-        num_ineq = s_all.shape[1]
-        min_s = dtype(1.0)
-        min_z = dtype(1.0)
-        for k in range(i, num_ineq, wp.block_dim()):
-            mask = finite_mask_all[b, k]
-            min_s = wp.min(min_s, step_candidate_masked(step_s_all[b, k], s_all[b, k], mask))
-            min_z = wp.min(min_z, step_candidate_masked(step_z_all[b, k], z_all[b, k], mask))
-        red_s = wp.tile_min(wp.tile(min_s))
-        red_z = wp.tile_min(wp.tile(min_z))
+        a_s, a_z = calculate_step(s_all, z_all, finite_mask_all, step_s_all, step_z_all,
+                                  settings[SettingsFloatIdx.tau], b, i)
         if i == 0:
-            tau = settings[SettingsFloatIdx.tau]
-            alpha_s[b] = red_s[0] * tau
-            alpha_z[b] = red_z[0] * tau
+            alpha_s[b] = a_s
+            alpha_z[b] = a_z
 
     return calculate_step_kernel
 
@@ -113,68 +192,11 @@ def create_calculate_mu_kernel(dtype=wp.float64):
         mu:    wp.array(dtype=dtype),    # (B,) output    # type: ignore
     ):
         b, i = wp.tid()
-        num_ineq = s_all.shape[1]
-        acc = dtype(0.0)
-        for k in range(i, num_ineq, wp.block_dim()):
-            acc += s_all[b, k] * z_all[b, k] * finite_mask_all[b, k]
-        total = wp.tile_sum(wp.tile(acc))
+        mu_b = calculate_mu(s_all, z_all, finite_mask_all, num_finite_bounds, b, i)
         if i == 0:
-            denom = num_finite_bounds[b]
-            if denom > dtype(0.0):
-                mu[b] = total[0] / denom
-            else:
-                mu[b] = dtype(0.0)
+            mu[b] = mu_b
 
     return calculate_mu_kernel
-
-
-@functools.lru_cache(maxsize=None)
-def create_calculate_sigma_kernel(dtype=wp.float64):
-    """Fused block-reduction kernel for the centering parameter sigma.
-
-    For each batch ``b``, computes:
-
-        s_trial[i] = s[b, i] + alpha_s[b] * ds[b, i]
-        z_trial[i] = z[b, i] + alpha_z[b] * dz[b, i]
-        acc        = sum_i( mask[i] * s_trial[i] * z_trial[i] )
-        sigma[b]   = clip( acc / (mu[b] * num_finite_bounds[b]), 0, 1 ) ** 3
-
-    or ``0`` when the denominator is not positive. Dispatch with
-    ``wp.launch_tiled(..., dim=[B], block_dim=reduction_block_dim(width))``.
-    """
-    dtype = to_warp_dtype(dtype)
-
-    @wp.kernel(module="unique", enable_backward=False)
-    def calculate_sigma_kernel(
-        s_all: wp.array2d(dtype=dtype),        # (B, num_ineq)  # type: ignore
-        z_all: wp.array2d(dtype=dtype),        # (B, num_ineq)  # type: ignore
-        step_s_all: wp.array2d(dtype=dtype),   # (B, num_ineq)  # type: ignore
-        step_z_all: wp.array2d(dtype=dtype),   # (B, num_ineq)  # type: ignore
-        finite_mask_all: wp.array2d(dtype=dtype),   # (B, num_ineq)  # type: ignore
-        num_finite_bounds: wp.array(dtype=dtype),  # (B,)       # type: ignore
-        primal_step: wp.array(dtype=dtype),    # (B,) alpha_s   # type: ignore
-        dual_step: wp.array(dtype=dtype),      # (B,) alpha_z   # type: ignore
-        mu: wp.array(dtype=dtype),             # (B,)           # type: ignore
-        sigma: wp.array(dtype=dtype),          # (B,) output    # type: ignore
-    ):
-        b, i = wp.tid()
-        num_ineq = s_all.shape[1]
-        alpha_s = primal_step[b]
-        alpha_z = dual_step[b]
-        acc = dtype(0.0)
-        for k in range(i, num_ineq, wp.block_dim()):
-            acc += (s_all[b, k] + alpha_s * step_s_all[b, k]) * (z_all[b, k] + alpha_z * step_z_all[b, k]) * finite_mask_all[b, k]
-        total = wp.tile_sum(wp.tile(acc))
-        if i == 0:
-            denominator = mu[b] * num_finite_bounds[b]
-            if denominator > dtype(0.0):
-                val = total[0] / denominator
-                val = wp.clamp(val, dtype(0.0), dtype(1.0))
-                sigma[b] = val * val * val
-            else:
-                sigma[b] = dtype(0.0)
-
-    return calculate_sigma_kernel
 
 
 @functools.lru_cache(maxsize=None)
@@ -1395,27 +1417,48 @@ def create_prepare_predictor_step_kernel(dtype=wp.float64):
 
 @functools.lru_cache(maxsize=None)
 def create_prepare_corrector_step_kernel(dtype=wp.float64):
-    dtype = to_warp_dtype(dtype)
-    """Fused kernel for the corrector-step RHS update:
+    """Everything between the affine (predictor) solve and the corrector solve,
+    one block per problem::
 
-        res.s_all[b, i] = res.s_all[b, i] - step.s_all[b, i] * step.z_all[b, i] + sigma[b] * mu[b]
+        alpha_s, alpha_z = calculate_step(s, z, ds, dz)            # affine step
+        sigma = calculate_sigma(s, z, ds, dz, alpha_s, alpha_z, mu)
+        res.s = (res.s - ds * dz + sigma * mu) * mask              # corrector rhs
 
-        ``res.s_all`` already holds `-s*z` from the predictor step on entry;
-        the corrector adds the second-order correction `-ds*dz` plus the
-        centering term `sigma*mu` (broadcast scalar per batch).
+    ``(ds, dz)`` is the affine direction and ``res.s`` holds ``-s * z`` from
+    the predictor step on entry. The step lengths and ``sigma`` are also
+    written to ``primal_step``, ``dual_step`` and ``sigma``. Dispatch with
+    ``wp.launch_tiled(..., dim=[B], block_dim=reduction_block_dim(num_ineq))``.
     """
-    @wp.kernel
+    dtype = to_warp_dtype(dtype)
+
+    @wp.kernel(module="unique", enable_backward=False)
     def prepare_corrector_step_kernel(
-        step_s_all: wp.array2d(dtype=dtype),  # type: ignore  (B, num_ineq)
-        step_z_all: wp.array2d(dtype=dtype),  # type: ignore  (B, num_ineq)
-        sigma:      wp.array(dtype=dtype),    # type: ignore  (B,)
-        mu:         wp.array(dtype=dtype),    # type: ignore  (B,)
-        finite_mask_all: wp.array2d(dtype=dtype),  # type: ignore  (B, num_ineq)
-        res_s_all:  wp.array2d(dtype=dtype),  # type: ignore  (B, num_ineq) in-out
+        s_all:             wp.array2d(dtype=dtype),  # type: ignore  (B, num_ineq)
+        z_all:             wp.array2d(dtype=dtype),  # type: ignore  (B, num_ineq)
+        step_s_all:        wp.array2d(dtype=dtype),  # type: ignore  (B, num_ineq) affine ds
+        step_z_all:        wp.array2d(dtype=dtype),  # type: ignore  (B, num_ineq) affine dz
+        finite_mask_all:   wp.array2d(dtype=dtype),  # type: ignore  (B, num_ineq)
+        num_finite_bounds: wp.array(dtype=dtype),    # type: ignore  (B,)
+        mu:                wp.array(dtype=dtype),    # type: ignore  (B,)
+        settings:          wp.array(dtype=dtype),    # type: ignore  DeviceSettings.floats
+        primal_step:       wp.array(dtype=dtype),    # type: ignore  (B,) out alpha_s
+        dual_step:         wp.array(dtype=dtype),    # type: ignore  (B,) out alpha_z
+        sigma:             wp.array(dtype=dtype),    # type: ignore  (B,) out
+        res_s_all:         wp.array2d(dtype=dtype),  # type: ignore  (B, num_ineq) in-out
     ):
         b, i = wp.tid()
-        res_s_all[b, i] = res_s_all[b, i] - step_s_all[b, i] * step_z_all[b, i] + sigma[b] * mu[b]
-        res_s_all[b, i] = res_s_all[b, i] * finite_mask_all[b, i]
+        mu_b = mu[b]
+        alpha_s, alpha_z = calculate_step(s_all, z_all, finite_mask_all, step_s_all, step_z_all,
+                                          settings[SettingsFloatIdx.tau], b, i)
+        sigma_b = calculate_sigma(s_all, z_all, step_s_all, step_z_all, finite_mask_all, num_finite_bounds,
+                                  alpha_s, alpha_z, mu_b, b, i)
+        if i == 0:
+            primal_step[b] = alpha_s
+            dual_step[b] = alpha_z
+            sigma[b] = sigma_b
+        for k in range(i, s_all.shape[1], wp.block_dim()):
+            r = res_s_all[b, k] - step_s_all[b, k] * step_z_all[b, k] + sigma_b * mu_b
+            res_s_all[b, k] = r * finite_mask_all[b, k]
 
     return prepare_corrector_step_kernel
 

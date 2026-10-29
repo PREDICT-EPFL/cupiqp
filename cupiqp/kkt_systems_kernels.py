@@ -1,4 +1,5 @@
 import functools
+from typing import Any
 
 import warp as wp
 from .settings import SettingsFloatIdx, SettingsIntIdx
@@ -6,6 +7,34 @@ from .utils import to_warp_dtype
 
 
 wp.set_module_options({"enable_backward": False})
+
+
+@wp.func
+def update_w_delta_inv(
+    vars_s_all:      wp.array2d(dtype=Any),  # type: ignore  (B, num_ineq) slacks
+    vars_z_all:      wp.array2d(dtype=Any),  # type: ignore  (B, num_ineq) duals
+    finite_mask_all: wp.array2d(dtype=Any),  # type: ignore  (B, num_ineq) 1 on finite bounds
+    m_s_all:         wp.array2d(dtype=Any),  # type: ignore  (B, num_ineq) out s
+    m_z_inv_all:     wp.array2d(dtype=Any),  # type: ignore  (B, num_ineq) out 1 / z
+    w_delta_inv_all: wp.array2d(dtype=Any),  # type: ignore  (B, num_ineq) out 1 / (s / z + delta)
+    delta:           Any,
+    b:               int,
+    i:               int,
+):
+    """Write m_s, m_z_inv and w_delta_inv of inequality entry ``i``; return w_delta_inv."""
+    if finite_mask_all[b, i] > vars_s_all.dtype(0.5):
+        s = vars_s_all[b, i]
+        z_inv = vars_s_all.dtype(1.0) / vars_z_all[b, i]
+        w = vars_s_all.dtype(1.0) / (s * z_inv + delta)
+        m_s_all[b, i] = s
+        m_z_inv_all[b, i] = z_inv
+        w_delta_inv_all[b, i] = w
+        return w
+    else:
+        m_s_all[b, i] = vars_s_all.dtype(0.0)
+        m_z_inv_all[b, i] = vars_s_all.dtype(0.0)
+        w_delta_inv_all[b, i] = vars_s_all.dtype(0.0)
+        return vars_s_all.dtype(0.0)
 
 
 @functools.lru_cache(maxsize=None)
@@ -46,33 +75,6 @@ def create_update_regularizations_kernel(nx: int, nz: int,
     off_hu = num_hl
     off_xl = num_hl + num_hu
     off_xu = off_xl + num_xl
-
-    @wp.func
-    def update_w_delta_inv(
-        vars_s_all: wp.array2d(dtype=dtype),        # type: ignore
-        vars_z_all: wp.array2d(dtype=dtype),        # type: ignore
-        finite_mask_all: wp.array2d(dtype=dtype),   # type: ignore
-        m_s_all: wp.array2d(dtype=dtype),           # type: ignore
-        m_z_inv_all: wp.array2d(dtype=dtype),       # type: ignore
-        w_delta_inv_all: wp.array2d(dtype=dtype),   # type: ignore
-        delta: dtype,                               # type: ignore
-        b: int,
-        i: int,
-    ):
-        """Write m_s, m_z_inv and w_delta_inv of inequality entry ``i``; return w_delta_inv."""
-        if finite_mask_all[b, i] > dtype(0.5):
-            s = vars_s_all[b, i]
-            z_inv = dtype(1.0) / vars_z_all[b, i]
-            w = dtype(1.0) / (s * z_inv + delta)
-            m_s_all[b, i] = s
-            m_z_inv_all[b, i] = z_inv
-            w_delta_inv_all[b, i] = w
-            return w
-        else:
-            m_s_all[b, i] = dtype(0.0)
-            m_z_inv_all[b, i] = dtype(0.0)
-            w_delta_inv_all[b, i] = dtype(0.0)
-            return dtype(0.0)
 
     @wp.kernel
     def update_regularizations_kernel(
