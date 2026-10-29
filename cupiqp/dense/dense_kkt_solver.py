@@ -9,7 +9,7 @@ from .dense_kkt_solver_kernels import (
     create_solve_pre_cholesky_kernel,
     create_solve_post_cholesky_kernel
 )
-from .dense_matmul import CublasHandle, DenseGemv, DenseSyrk
+from .dense_matmul import CublasHandle, DenseGemv, DenseSyrk, DenseWeightedSyrk
 
 
 def use_cusolver_potrf(rows):
@@ -36,10 +36,8 @@ class DenseKKTSolver(KKTSolverBase):
         self._delta = wp.empty((B,), dtype=self._dtype, device=self._device)
         self._delta_inv = wp.empty((B,), dtype=self._dtype, device=self._device)
         self._z_reg_inv = wp.empty((B, m), dtype=self._dtype, device=self._device)
-        self._z_reg_inv_sqrt = wp.empty((B, m), dtype=self._dtype, device=self._device)
         self._kkt_mat = wp.empty((B, n, n), dtype=self._dtype, device=self._device)
         self._AtA = wp.zeros((B, n, n), dtype=self._dtype, device=self._device) if p > 0 else wp.zeros((B, 0, 0), dtype=self._dtype, device=self._device)
-        self._G_scaled = wp.empty((B, m, n), dtype=self._dtype, device=self._device) if m > 0 else wp.zeros((B, 0, 0), dtype=self._dtype, device=self._device)
         self._work_n_AT = wp.empty((B, n), dtype=self._dtype, device=self._device) if p > 0 else wp.empty((B, 0), dtype=self._dtype, device=self._device)
         self._work_n_GT = wp.empty((B, n), dtype=self._dtype, device=self._device) if m > 0 else wp.empty((B, 0), dtype=self._dtype, device=self._device)
 
@@ -55,7 +53,7 @@ class DenseKKTSolver(KKTSolverBase):
         self._A_gemv = DenseGemv(B, p, n, self._dtype, cublas)
         self._G_gemv = DenseGemv(B, m, n, self._dtype, cublas)
         self._AtA_syrk = DenseSyrk(B, p, n, self._dtype, cublas)
-        self._GtG_syrk = DenseSyrk(B, m, n, self._dtype, cublas)
+        self._GtWG_syrk = DenseWeightedSyrk(B, m, n, self._dtype, cublas, self._device)
 
         if B > 1:
             self._cholesky_solver = BatchedCholeskyInplaceSolver(n, B, dtype=self._dtype)
@@ -81,20 +79,19 @@ class DenseKKTSolver(KKTSolverBase):
     def update_and_factor_kkt(self, data: DenseData, delta: wp.array, x_reg: wp.array, z_reg: wp.array, z_reg_inv: wp.array) -> None:
         """Assemble and factor the condensed KKT matrix (CUDA graph safe)."""
 
-        # For inactive rows G[i], z_reg_inv[i] is already zero.
-        # Therefore the contribution of G[i] to the condensed KKT is zero.
         wp.launch(
             kernel=self._update_kkt_kernel,
             dim=(self._batch_size, self._update_kkt_kernel_launch_dim),
             inputs=[
-                data.P, self._AtA, data.G, delta, x_reg, z_reg_inv,
-                self._delta_inv, self._z_reg_inv, self._z_reg_inv_sqrt,
-                self._kkt_mat, self._G_scaled,
+                data.P, self._AtA, delta, x_reg, z_reg_inv,
+                self._delta_inv, self._z_reg_inv, self._kkt_mat,
             ],
             device=self._device
         )
+        # An inactive row of G (both bounds infinite) has a zero weight and
+        # adds nothing.
         if data.m > 0:
-            self._GtG_syrk(self._G_scaled, self._kkt_mat, accumulate=True)
+            self._GtWG_syrk(data.G, z_reg_inv, self._kkt_mat, accumulate=True)
 
         # B=1: CholeskyInplaceSolver expects (n, n); B>1: BatchedCholeskyInplaceSolver expects (B, n, n)
         factor_input = self._kkt_mat[0] if self._batch_size == 1 else self._kkt_mat

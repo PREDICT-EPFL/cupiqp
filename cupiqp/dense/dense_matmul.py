@@ -25,7 +25,12 @@ from .cublas_wrappers import (
     sgemv_strided_batched,
     ssyrk,
 )
-from .dense_matmul_kernels import create_batched_gemv_kernel, create_batched_syrk_kernel
+from .dense_matmul_kernels import (
+    create_batched_gemv_kernel,
+    create_batched_syrk_kernel,
+    create_batched_weighted_syrk_kernel,
+    create_scale_rows_by_sqrt_kernel,
+)
 
 
 # Largest matrix (rows x cols) whose products run as Warp kernels instead of
@@ -148,3 +153,44 @@ class DenseSyrk:
             # Column-major FILL_LOWER of (A^T A) is the row-major upper triangle.
             self._syrk(self._handle, FILL_LOWER, OP_N, self._cols, self._rows,
                        1.0, device_ptr(A), self._cols, beta, device_ptr(C), self._cols)
+
+
+class DenseWeightedSyrk:
+    """Batched ``C = G^T diag(w) G`` for matrices ``G`` of shape
+    ``(B, rows, cols)`` and nonnegative row weights ``w`` of shape ``(B, rows)``.
+
+    Same triangle contract as :class:`DenseSyrk`. The Warp kernel applies the
+    weights inside the product. cuBLAS has no weighted batched product, so its
+    path first writes ``sqrt(w) * G`` to a buffer owned by this object and
+    then runs :class:`DenseSyrk` on it.
+    """
+
+    def __init__(self, batch_size: int, rows: int, cols: int, dtype, cublas: CublasHandle, device):
+        self._batch_size = batch_size
+        self._rows = rows
+        self._cols = cols
+        self._use_warp = _use_warp(rows, cols)
+        if self._use_warp:
+            self._kernel = create_batched_weighted_syrk_kernel(False, dtype)
+            self._kernel_add = create_batched_weighted_syrk_kernel(True, dtype)
+        else:
+            self._scale_kernel = create_scale_rows_by_sqrt_kernel(dtype)
+            self._G_scaled = wp.empty((batch_size, rows, cols), dtype=dtype, device=device)
+            self._syrk = DenseSyrk(batch_size, rows, cols, dtype, cublas)
+
+    def __call__(self, G: wp.array3d, w: wp.array2d, C: wp.array3d, accumulate: bool = False) -> None:
+        if self._use_warp:
+            wp.launch(
+                kernel=self._kernel_add if accumulate else self._kernel,
+                dim=(self._batch_size, self._cols, self._cols),
+                inputs=[G, w, C],
+                device=G.device,
+            )
+        else:
+            wp.launch(
+                kernel=self._scale_kernel,
+                dim=(self._batch_size, self._rows, self._cols),
+                inputs=[G, w, self._G_scaled],
+                device=G.device,
+            )
+            self._syrk(self._G_scaled, C, accumulate=accumulate)

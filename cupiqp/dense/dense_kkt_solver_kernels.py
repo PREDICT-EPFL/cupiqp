@@ -10,51 +10,38 @@ wp.set_module_options({"enable_backward": False})
 @functools.lru_cache(maxsize=None)
 def create_update_kkt_kernel(n: int, p: int, m: int, dtype=wp.float64):
     dtype = to_warp_dtype(dtype)
-    """Fused warp kernel replacing the cupy ops in ``DenseKKTSolver.update_kkt``
-    (everything that ran before the trailing ``syrk``).
+    """Fused warp kernel of the part of ``DenseKKTSolver.update_and_factor_kkt``
+    before the ``G^T diag(z_reg_inv) G`` product.
 
     One launch builds, in parallel:
-      - ``delta_inv[b, 0]      = 1 / delta[b]``                      (per-batch scalar)
+      - ``delta_inv[b]         = 1 / delta[b]``                      (per-batch scalar)
       - ``kkt_mat[b, i, j]     = P[b, i, j]
                                   + (i == j) * x_reg[b, i]
                                   + AtA[b, i, j] / delta[b]``
       - ``z_reg_inv_out[b, k]  = z_reg_inv[b, k]``  (cached copy, k in [0, m))
-      - ``z_reg_inv_sqrt[b, k] = sqrt(z_reg_inv[b, k])``
-      - ``G_scaled[b, i, j]    = sqrt(z_reg_inv[b, i]) * G[b, i, j]``  (sqrt recomputed
-                                  per (i, j) thread to avoid cross-thread sync)
 
-    Here ``z_reg_inv`` is the condensed inequality row weight ``w_l + w_u``. The
-    condensed dense assembly needs the weight directly (the explicit augmented
-    diagonal ``z_reg = 1 / weight`` is not used here). A zero weight is valid and
-    means the full-length row is inactive, so it contributes neither to
-    ``G_scaled`` nor to ``G.T @ diag(z_reg_inv) @ G``.
-
+    Here ``z_reg_inv`` is the condensed inequality row weight ``w_l + w_u``. A
+    zero weight is valid and means the full-length row is inactive.
     """
     n_n_total  = n * n
-    m_n_total  = m * n
-    total_dim  = n_n_total + m + m_n_total
+    total_dim  = n_n_total + m
 
     @wp.kernel
     def update_kkt_kernel(
         # Inputs
         data_P:    wp.array3d(dtype=dtype),   # type: ignore  (B, n, n)
         data_AtA:  wp.array3d(dtype=dtype),   # type: ignore  (B, n, n)  (zero-shape if p == 0)
-        data_G:    wp.array3d(dtype=dtype),   # type: ignore  (B, m, n)  (zero-shape if m == 0)
         delta:     wp.array(dtype=dtype),     # type: ignore  (B,)
         x_reg:     wp.array2d(dtype=dtype),   # type: ignore  (B, n)
         z_reg_inv: wp.array2d(dtype=dtype),   # type: ignore  (B, m)
         # Outputs
         delta_inv:        wp.array(dtype=dtype),    # type: ignore  (B,)
         z_reg_inv_out:    wp.array2d(dtype=dtype),  # type: ignore  (B, m), copy z_reg_inv to here
-        z_reg_inv_sqrt:   wp.array2d(dtype=dtype),  # type: ignore  (B, m)
         kkt_mat:          wp.array3d(dtype=dtype),  # type: ignore  (B, n, n)
-        G_scaled:         wp.array3d(dtype=dtype),  # type: ignore  (B, m, n)
     ):
         b, t = wp.tid()
         n_static    = wp.static(n)
-        m_static    = wp.static(m)
         n_n_static  = wp.static(n_n_total)
-        m_n_static  = wp.static(m_n_total)
 
         # Per-batch scalar (one writer per batch).
         if t == 0:
@@ -70,22 +57,10 @@ def create_update_kkt_kernel(n: int, p: int, m: int, dtype=wp.float64):
             if wp.static(p > 0):
                 v = v + (dtype(1.0) / delta[b]) * data_AtA[b, i, j]
             kkt_mat[b, i, j] = v
-        elif t < n_n_static + m_static:
-            # Cache the row weight and its sqrt for solve()/recovery.
-            # NOTE: z_reg_inv contains zeros for inactive rows s.t. -inf <= G[i] * x <= +inf
-            k = t - n_n_static
-            w = z_reg_inv[b, k]
-            z_reg_inv_out[b, k] = w
-            z_reg_inv_sqrt[b, k] = wp.sqrt(w)
-        elif t < n_n_static + m_static + m_n_static:
-            # G_scaled = sqrt(weight[b, i]) * G[b, i, j]; inactive rows (weight 0)
-            # contribute nothing to G.T @ diag(z_reg_inv) @ G.
-            k = t - n_n_static - m_static
-            i = k // n_static
-            j = k % n_static
-            G_scaled[b, i, j] = wp.sqrt(z_reg_inv[b, i]) * data_G[b, i, j]
         else:
-            return
+            # Cache the row weight for solve()/recovery.
+            k = t - n_n_static
+            z_reg_inv_out[b, k] = z_reg_inv[b, k]
 
     return update_kkt_kernel, total_dim
 

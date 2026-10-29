@@ -73,3 +73,56 @@ def create_batched_syrk_kernel(accumulate: bool, dtype=wp.float64):
             C[b, i, j] = acc
 
     return batched_syrk_kernel
+
+
+@functools.lru_cache(maxsize=None)
+def create_batched_weighted_syrk_kernel(accumulate: bool, dtype=wp.float64):
+    """Batched ``C = G^T diag(w) G`` (or ``C += G^T diag(w) G`` with
+    ``accumulate``) for small matrices, one thread per entry of ``C``.
+
+    The weights are applied inside the dot product, so no scaled copy of ``G``
+    is written. Same triangle contract as
+    :func:`create_batched_syrk_kernel`. ``G`` is ``(B, k, n)``, ``w`` is
+    ``(B, k)`` and nonnegative, ``C`` is ``(B, n, n)``. Dispatch with
+    ``wp.launch(..., dim=(B, n, n))``.
+    """
+    dtype = to_warp_dtype(dtype)
+
+    @wp.kernel
+    def batched_weighted_syrk_kernel(
+        G: wp.array3d(dtype=dtype),  # type: ignore  (B, k, n)
+        w: wp.array2d(dtype=dtype),  # type: ignore  (B, k), row weights
+        C: wp.array3d(dtype=dtype),  # type: ignore  (B, n, n)
+    ):
+        b, i, j = wp.tid()
+        if i > j:
+            return
+        acc = dtype(0.0)
+        for k in range(G.shape[1]):
+            acc += (w[b, k] * G[b, k, i]) * G[b, k, j]
+        if wp.static(accumulate):
+            C[b, i, j] = C[b, i, j] + acc
+        else:
+            C[b, i, j] = acc
+
+    return batched_weighted_syrk_kernel
+
+
+@functools.lru_cache(maxsize=None)
+def create_scale_rows_by_sqrt_kernel(dtype=wp.float64):
+    """``G_scaled[b, k, j] = sqrt(w[b, k]) * G[b, k, j]``: the scaled copy that
+    the cuBLAS path of ``G^T diag(w) G`` multiplies. Dispatch with
+    ``wp.launch(..., dim=(B, k, n))``.
+    """
+    dtype = to_warp_dtype(dtype)
+
+    @wp.kernel
+    def scale_rows_by_sqrt_kernel(
+        G:        wp.array3d(dtype=dtype),  # type: ignore  (B, k, n)
+        w:        wp.array2d(dtype=dtype),  # type: ignore  (B, k), row weights
+        G_scaled: wp.array3d(dtype=dtype),  # type: ignore  (B, k, n)
+    ):
+        b, k, j = wp.tid()
+        G_scaled[b, k, j] = wp.sqrt(w[b, k]) * G[b, k, j]
+
+    return scale_rows_by_sqrt_kernel

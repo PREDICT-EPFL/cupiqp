@@ -1,4 +1,5 @@
-"""DenseGemv / DenseSyrk against numpy, on both the Warp and the cuBLAS path."""
+"""DenseGemv / DenseSyrk / DenseWeightedSyrk against numpy, on both the Warp
+and the cuBLAS path."""
 import numpy as np
 import pytest
 import warp as wp
@@ -9,6 +10,7 @@ from cupiqp.dense.dense_matmul import (
     CublasHandle,
     DenseGemv,
     DenseSyrk,
+    DenseWeightedSyrk,
 )
 from tests.helpers import DTYPES, to_wp
 from tests.tolerances import MATMUL_TOL
@@ -77,3 +79,25 @@ def test_syrk_upper_triangle(dtype, shape, B, accumulate):
     np.testing.assert_allclose(C.numpy()[:, upper], expected[:, upper],
                                rtol=t["rtol"], atol=t["atol"] * max(1, rows))
 
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("shape", sorted(SHAPES))
+@pytest.mark.parametrize("B", [1, 16])
+@pytest.mark.parametrize("accumulate", [False, True])
+def test_weighted_syrk_upper_triangle(dtype, shape, B, accumulate):
+    rows, cols = SHAPES[shape]
+    np_dtype = wp.dtype_to_numpy(dtype)
+    rng = np.random.default_rng(3)
+    G = rng.standard_normal((B, rows, cols)).astype(np_dtype)
+    w = np.abs(rng.standard_normal((B, rows))).astype(np_dtype)
+    w[:, ::3] = 0.0                     # zero weights: rows that must add nothing
+    C0 = rng.standard_normal((B, cols, cols)).astype(np_dtype)
+    C = to_wp(C0, dtype)
+    syrk = DenseWeightedSyrk(B, rows, cols, dtype, CublasHandle(), "cuda")
+    syrk(to_wp(G, dtype), to_wp(w, dtype), C, accumulate=accumulate)
+    expected = np.einsum("bki,bk,bkj->bij", G, w, G) + (C0 if accumulate else 0.0)
+    upper = np.triu(np.ones((cols, cols), dtype=bool))
+    t = MATMUL_TOL[dtype]
+    np.testing.assert_allclose(C.numpy()[:, upper], expected[:, upper],
+                               rtol=t["rtol"], atol=t["atol"] * max(1, rows))
