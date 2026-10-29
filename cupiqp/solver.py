@@ -15,10 +15,9 @@ from .typedef import STATUS_MAX_ITER_REACHED, STATUS_NUMERICAL_ISSUES
 from .solver_kernels import (
     create_init_guess_rhs_kernel,
     create_init_guess_center_kernel,
-    create_prepare_predictor_step_kernel,
+    create_prepare_factor_and_predictor_step_kernel,
     create_prepare_corrector_step_kernel,
     create_update_vars_after_corrector_step_kernel,
-    create_boundary_shift_kernel,
     create_calculate_step_kernel,
     create_calculate_mu_kernel,
     create_update_residuals_r_kernel,
@@ -717,34 +716,35 @@ class SolverBase(ABC):
         the loop condition ``_continue_flag`` for the next iteration.
         """
         info = self._result.info
-        # avoid getting too close to boundary which can result in a division by zero
         if self._data.num_ineq > 0:
-            wp.launch(
-                kernel=self._boundary_shift_kernel,
-                dim=(self._data.batch_size,
-                     self._data.num_hl + self._data.num_hu
-                     + self._data.num_xl + self._data.num_xu),
+            # one fused kernel: apply_finetune on the problems the termination
+            # kernel flagged (avoid converging to a local minimum), boundary_shift
+            # (avoid getting too close to the boundary, which can divide by zero),
+            # calculate_mu, and the predictor rhs res.s = -s * z
+            wp.launch_tiled(
+                kernel=self._prepare_factor_and_predictor_step_kernel,
+                dim=[self._data.batch_size],
                 inputs=[
-                    self._unsolved_mask,
-                    self._data.finite_mask_hl, self._data.finite_mask_hu,
-                    self._data.finite_mask_xl, self._data.finite_mask_xu,
-                    self._result.z_l, self._result.z_u,
-                    self._result.z_bl, self._result.z_bu,
+                    self._unsolved_mask, self._finetune_mask, self._device_settings.floats,
+                    self._data.finite_mask_all, self._data.num_finite_bounds,
+                    self._result.s_all, self._result.z_all,
+                    info.reg_limit, info.no_primal_update, info.no_dual_update,
+                    info.mu, self._res.s_all,
                 ],
+                block_dim=reduction_block_dim(self._data.num_ineq),
                 device=self._device
             )
-            self._calculate_mu()
-
-        # avoid possibility of converging to a local minimum -> decrease the
-        # minimum regularization value of the problems the termination kernel flagged
-        wp.launch(
-            kernel=self._apply_finetune_kernel,
-            dim=(self._data.batch_size,),
-            inputs=[self._finetune_mask, info.reg_limit,
-                    info.no_primal_update, info.no_dual_update,
-                    self._device_settings.floats],
-            device=self._device
-        )
+        else:
+            # avoid possibility of converging to a local minimum -> decrease the
+            # minimum regularization value of the problems the termination kernel flagged
+            wp.launch(
+                kernel=self._apply_finetune_kernel,
+                dim=(self._data.batch_size,),
+                inputs=[self._finetune_mask, info.reg_limit,
+                        info.no_primal_update, info.no_dual_update,
+                        self._device_settings.floats],
+                device=self._device
+            )
 
         self._update_and_factorize_kkt()
 
@@ -1053,9 +1053,7 @@ class SolverBase(ABC):
         d = self._data
         dtype = d.dtype
         if d.num_ineq > 0:
-            self._boundary_shift_kernel = create_boundary_shift_kernel(
-                d.num_hl, d.num_hu, d.num_xl, d.num_xu, dtype=dtype)
-            self._prepare_predictor_step_kernel = create_prepare_predictor_step_kernel(dtype=dtype)
+            self._prepare_factor_and_predictor_step_kernel = create_prepare_factor_and_predictor_step_kernel(dtype)
             self._prepare_corrector_step_kernel = create_prepare_corrector_step_kernel(dtype=dtype)
             self._update_vars_after_corrector_step_kernel = create_update_vars_after_corrector_step_kernel(
                 n=d.n, p=d.p, num_ineq=d.num_ineq, dtype=dtype)
@@ -1102,7 +1100,8 @@ class SolverBase(ABC):
         }
         if d.num_ineq > 0:
             for kernel in (self._init_guess_center_kernel, self._calculate_step_kernel,
-                           self._calculate_mu_kernel, self._prepare_corrector_step_kernel):
+                           self._calculate_mu_kernel, self._prepare_factor_and_predictor_step_kernel,
+                           self._prepare_corrector_step_kernel):
                 block_dims[kernel] = reduction_block_dim(d.num_ineq)
         if self.settings.enable_grad and self.settings.gradient_smoothing:
             block_dims[self._update_smoothing_residual_nr_kernel] = reduction_block_dim(max(d.n, d.p, d.m))
@@ -1155,14 +1154,7 @@ class SolverBase(ABC):
         # Drop the quadratic term ds o dz (first-order Newton linearization) to get the linear system S dz + Z ds = - s o z.
         # Thus the predictor RHS for the slack/dual complementarity equations is - s o z (elementwise product).
 
-        # one fused kernel: res.s_all[b, i] = -s_all[b, i] * z_all[b, i].
-        wp.launch(
-            kernel=self._prepare_predictor_step_kernel,
-            dim=(self._data.batch_size, self._data.num_ineq),
-            inputs=[self._result.s_all, self._result.z_all, self._data.finite_mask_all, self._res.s_all],
-            device=self._device
-        )
-
+        # res.s = -s * z was built by the prepare_factor_and_predictor_step kernel before the factorization.
         self._kkt_system.solve(self._data, self._preconditioner, self.settings, self._res, self._step)
 
         # ------------------ corrector step ------------------

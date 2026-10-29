@@ -130,6 +130,53 @@ def calculate_sigma(
     return sigma
 
 
+@wp.func
+def apply_finetune(
+    finetune_mask:    wp.array(dtype=wp.bool),   # type: ignore  (B,) problems to finetune
+    reg_limit:        wp.array(dtype=Any),       # type: ignore  (B,) in-out
+    no_primal_update: wp.array(dtype=wp.int32),  # type: ignore  (B,) in-out
+    no_dual_update:   wp.array(dtype=wp.int32),  # type: ignore  (B,) in-out
+    settings:         wp.array(dtype=Any),       # type: ignore  DeviceSettings.floats
+    b:                int,
+):
+    """Regularization finetuning of problem ``b`` if the termination step
+    selected it (PIQP: lower ``reg_limit`` to avoid converging to a local
+    minimum)::
+
+        reg_limit = reg_finetune_lower_limit;  no_primal_update = 0;  no_dual_update = 0
+    """
+    if finetune_mask[b]:
+        reg_limit[b] = settings[SettingsFloatIdx.reg_finetune_lower_limit]
+        no_primal_update[b] = wp.int32(0)
+        no_dual_update[b] = wp.int32(0)
+
+
+@wp.func
+def boundary_shift(
+    z_all:           wp.array2d(dtype=Any),  # type: ignore  (B, num_ineq) duals, in-out
+    finite_mask_all: wp.array2d(dtype=Any),  # type: ignore  (B, num_ineq) 1 on finite bounds
+    eps:             Any,                    # machine epsilon of the dtype
+    b:               int,
+    i:               int,
+):
+    """Keep the duals of problem ``b`` away from the boundary (PIQP: avoid
+    getting too close to the boundary, which can divide by zero)::
+
+        z_i += eps   on finite-bound entries with z_i < eps
+        z_i  = 0     on infinite-bound entries
+
+    Infinite-bound entries are not barrier variables, so they are zeroed
+    instead of shifted: they must not affect step lengths, mu, sigma,
+    residual norms or the public outputs. Block-strided like the reductions.
+    """
+    for k in range(i, z_all.shape[1], wp.block_dim()):
+        if finite_mask_all[b, k] > z_all.dtype(0.5):
+            if z_all[b, k] < eps:
+                z_all[b, k] = z_all[b, k] + eps
+        else:
+            z_all[b, k] = z_all.dtype(0.0)
+
+
 @functools.lru_cache(maxsize=None)
 def create_calculate_step_kernel(dtype=wp.float64):
     """Fused block-reduction kernel for step lengths (primal and dual).
@@ -956,10 +1003,7 @@ def create_apply_finetune_kernel(dtype=wp.float64):
         settings:              wp.array(dtype=dtype),     # type: ignore  DeviceSettings.floats
     ):
         b = wp.tid()
-        if mask[b]:
-            reg_limit[b] = settings[SettingsFloatIdx.reg_finetune_lower_limit]
-            no_primal_update[b] = wp.int32(0)
-            no_dual_update[b] = wp.int32(0)
+        apply_finetune(mask, reg_limit, no_primal_update, no_dual_update, settings, b)
 
     return apply_finetune_kernel
 
@@ -1392,27 +1436,54 @@ def create_init_guess_rhs_kernel(n: int, p: int,
 
 
 @functools.lru_cache(maxsize=None)
-def create_prepare_predictor_step_kernel(dtype=wp.float64):
-    dtype = to_warp_dtype(dtype)
-    """Fused kernel for the predictor-step RHS assembly:
+def create_prepare_factor_and_predictor_step_kernel(dtype=wp.float64):
+    """Prepare the KKT factorization and the predictor step of an iteration,
+    one block per problem::
 
-        res.s_all[b, i] = -s_all[b, i] * z_all[b, i]
+        # factorization inputs
+        apply_finetune(...)                        # reg_limit of the problems flagged by the last termination step
+        boundary_shift(z)                          # active problems only
+        # predictor step
+        mu = calculate_mu(s, z)
+        res.s = -s * z * mask                      # predictor (affine) rhs
+
+    Launch it before the factorization, which must see the shifted ``z``.
+    The predictor rhs is not changed by the factorization and is first read
+    by the predictor solve.
+    Dispatch with ``wp.launch_tiled(..., dim=[B], block_dim=reduction_block_dim(num_ineq))``.
     """
-    @wp.kernel
-    def prepare_predictor_step_kernel(
-        s_all:     wp.array2d(dtype=dtype),  # type: ignore  (B, num_ineq)
-        z_all:     wp.array2d(dtype=dtype),  # type: ignore  (B, num_ineq)
-        finite_mask_all: wp.array2d(dtype=dtype),  # type: ignore  (B, num_ineq)
-        res_s_all: wp.array2d(dtype=dtype),  # type: ignore  (B, num_ineq) output
+    dtype = to_warp_dtype(dtype)
+    # Machine epsilon of the dtype (np.finfo(dtype).eps).
+    EPS = wp.constant(dtype(2.220446049250313e-16) if dtype == wp.float64 else dtype(1.1920928955078125e-07))
+
+    @wp.kernel(module="unique", enable_backward=False)
+    def prepare_factor_and_predictor_step_kernel(
+        active_mask:       wp.array(dtype=wp.bool),   # type: ignore  (B,)
+        finetune_mask:     wp.array(dtype=wp.bool),   # type: ignore  (B,)
+        settings:          wp.array(dtype=dtype),     # type: ignore  DeviceSettings.floats
+        finite_mask_all:   wp.array2d(dtype=dtype),   # type: ignore  (B, num_ineq)
+        num_finite_bounds: wp.array(dtype=dtype),     # type: ignore  (B,)
+        s_all:             wp.array2d(dtype=dtype),   # type: ignore  (B, num_ineq)
+        z_all:             wp.array2d(dtype=dtype),   # type: ignore  (B, num_ineq) in-out
+        reg_limit:         wp.array(dtype=dtype),     # type: ignore  (B,) in-out
+        no_primal_update:  wp.array(dtype=wp.int32),  # type: ignore  (B,) in-out
+        no_dual_update:    wp.array(dtype=wp.int32),  # type: ignore  (B,) in-out
+        mu:                wp.array(dtype=dtype),     # type: ignore  (B,) out
+        res_s_all:         wp.array2d(dtype=dtype),   # type: ignore  (B, num_ineq) out
     ):
         b, i = wp.tid()
-        res_s_all[b, i] = wp.where(
-            finite_mask_all[b, i] > dtype(0.5),
-            -s_all[b, i] * z_all[b, i],
-            dtype(0.0)
-        )
+        if i == 0:
+            apply_finetune(finetune_mask, reg_limit, no_primal_update, no_dual_update, settings, b)
+        if active_mask[b]:
+            boundary_shift(z_all, finite_mask_all, EPS, b, i)
+        # Each thread reads back only the z entries it shifted itself.
+        mu_b = calculate_mu(s_all, z_all, finite_mask_all, num_finite_bounds, b, i)
+        if i == 0:
+            mu[b] = mu_b
+        for k in range(i, s_all.shape[1], wp.block_dim()):
+            res_s_all[b, k] = wp.where(finite_mask_all[b, k] > dtype(0.5), -s_all[b, k] * z_all[b, k], dtype(0.0))
 
-    return prepare_predictor_step_kernel
+    return prepare_factor_and_predictor_step_kernel
 
 
 @functools.lru_cache(maxsize=None)
@@ -1871,78 +1942,6 @@ def create_update_rho_delta_without_ineq_kernel(n: int, p: int, dtype=wp.float64
             prox_y[b, t] = wp.where(primal_improved, result_y[b, t], prox_y[b, t])
 
     return update_rho_delta_without_ineq_kernel
-
-
-@functools.lru_cache(maxsize=None)
-def create_boundary_shift_kernel(num_hl: int, num_hu: int, num_xl: int, num_xu: int, dtype=wp.float64):
-    dtype = to_warp_dtype(dtype)
-    """Per-element ``z`` boundary shift to avoid division-by-zero in the IPM.
-
-    Only finite-bound entries are shifted::
-
-        if finite_mask_hl[b, k] and z_hl[b, k] < eps: z_hl[b, k] += eps
-        if finite_mask_hu[b, k] and z_hu[b, k] < eps: z_hu[b, k] += eps
-        if finite_mask_xl[b, k] and z_bl[b, k] < eps: z_bl[b, k] += eps
-        if finite_mask_xu[b, k] and z_bu[b, k] < eps: z_bu[b, k] += eps
-
-    Inactive entries correspond to infinite bounds in the full-length layout.
-    They are set to exactly zero here instead of being shifted positive, because
-    they are not barrier variables and must not affect step lengths, mu/sigma,
-    residual norms, or public dual/slack outputs.
-    """
-    # IEEE 754 float64 machine epsilon (== np.finfo(np.float64).eps).
-    EPS_F64 = wp.constant(dtype(2.220446049250313e-16))
-
-    @wp.kernel
-    def boundary_shift_kernel(
-        active_mask: wp.array(dtype=wp.bool), # type: ignore  (B,)
-        finite_mask_hl: wp.array2d(dtype=dtype),  # type: ignore  (B, num_hl)
-        finite_mask_hu: wp.array2d(dtype=dtype),  # type: ignore  (B, num_hu)
-        finite_mask_xl: wp.array2d(dtype=dtype),  # type: ignore  (B, num_xl)
-        finite_mask_xu: wp.array2d(dtype=dtype),  # type: ignore  (B, num_xu)
-        z_hl: wp.array2d(dtype=dtype),  # type: ignore  (B, num_hl)
-        z_hu: wp.array2d(dtype=dtype),  # type: ignore  (B, num_hu)
-        z_bl: wp.array2d(dtype=dtype),  # type: ignore  (B, num_xl)
-        z_bu: wp.array2d(dtype=dtype),  # type: ignore  (B, num_xu)
-    ):
-        b, t = wp.tid()
-        if not active_mask[b]:
-            return
-
-        n_hl = wp.static(num_hl)
-        n_hu = wp.static(num_hu)
-        n_xl = wp.static(num_xl)
-        n_xu = wp.static(num_xu)
-
-        if t < n_hl:
-            if finite_mask_hl[b, t] > dtype(0.5):
-                if z_hl[b, t] < EPS_F64:
-                    z_hl[b, t] = z_hl[b, t] + EPS_F64
-            else:
-                z_hl[b, t] = dtype(0.0)
-        elif t < n_hl + n_hu:
-            i = t - n_hl
-            if finite_mask_hu[b, i] > dtype(0.5):
-                if z_hu[b, i] < EPS_F64:
-                    z_hu[b, i] = z_hu[b, i] + EPS_F64
-            else:
-                z_hu[b, i] = dtype(0.0)
-        elif t < n_hl + n_hu + n_xl:
-            i = t - n_hl - n_hu
-            if finite_mask_xl[b, i] > dtype(0.5):
-                if z_bl[b, i] < EPS_F64:
-                    z_bl[b, i] = z_bl[b, i] + EPS_F64
-            else:
-                z_bl[b, i] = dtype(0.0)
-        elif t < n_hl + n_hu + n_xl + n_xu:
-            i = t - n_hl - n_hu - n_xl
-            if finite_mask_xu[b, i] > dtype(0.5):
-                if z_bu[b, i] < EPS_F64:
-                    z_bu[b, i] = z_bu[b, i] + EPS_F64
-            else:
-                z_bu[b, i] = dtype(0.0)
-
-    return boundary_shift_kernel
 
 
 @functools.lru_cache(maxsize=None)
