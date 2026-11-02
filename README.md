@@ -2,7 +2,8 @@
 
 [![Institution](https://img.shields.io/badge/Institution-Automatic%20Control%20Laboratory,%20EPFL-%23E1251B?style=flat)](https://www.epfl.ch)
 [![Funding](https://img.shields.io/badge/Grant-NCCR%20Automation%20(51NF40__180545)-90e3dc.svg)](https://nccr-automation.ch/)
-![License](https://img.shields.io/badge/License-BSD--2--Clause-brightgreen.svg)
+![License](https://img.shields.io/badge/License-BSD--2--Clause-3DA639)
+[![arXiv](https://img.shields.io/badge/arXiv-2610.41021-3775A9.svg)](https://arxiv.org/abs/2610.41021)
 
 CuPIQP is a GPU-accelerated convex Quadratic Programming (QP) solver implementing the [PIQP](https://github.com/PREDICT-EPFL/piqp) (Proximal Interior Point Quadratic Programming) algorithm entirely on NVIDIA GPUs. Its core strength is solving **large batches** of small-to-medium QPs in a single GPU launch, and the solution is **differentiable** with respect to the problem data. It **also scales to large-scale** sparse and dense QPs, in the same class as GPU solvers such as [cuClarabel](https://github.com/cvxgrp/CuClarabel), [cuOpt](https://github.com/NVIDIA/cuopt), and [QOCO-GPU](https://github.com/qoco-org/qoco).
 
@@ -116,9 +117,20 @@ CuPIQP implements the same [Proximal Interior Point](https://doi.org/10.1007/s12
 
 ## Citing
 
-If you use cuPIQP in academic work, please cite the underlying PIQP algorithm
-paper and this implementation. A BibTeX entry will be provided once a
-cuPIQP-specific publication is available.
+If you use cuPIQP in your work, please cite
+[our paper](https://arxiv.org/abs/2610.41021):
+
+```bibtex
+@misc{song2026cupiqp,
+      title={{CuPIQP}: A Batched and Differentiable QP Solver on {GPUs} for Robot Learning and Control}, 
+      author={Fenglong Song and Roland Schwan and Yuwen Chen and Yuning Jiang and Colin N. Jones},
+      year={2026},
+      eprint={2610.41021},
+      archivePrefix={arXiv},
+      primaryClass={math.OC},
+      url={https://arxiv.org/abs/2610.41021}, 
+}
+```
 
 ## License
 
